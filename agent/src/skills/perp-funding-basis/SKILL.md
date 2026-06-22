@@ -180,20 +180,33 @@ def oi_funding_matrix(oi_change_24h_pct, funding_rate):
 
 ## Data Access
 
-### Via OKX API
+### PRIMARY: 贾维斯真实数据脚本（推荐，免 Key，已验证可用）
 
-```python
-# Funding rate history
-# GET /api/v5/public/funding-rate-history?instId=BTC-USDT-SWAP
+> ⚠️ 重要：OKX API 在当前部署网络不可达。**严禁凭记忆估算资金费率/OI/多空比等数字** —— 必须先运行下面的脚本拿真实数据，再做分析。
 
-# Current funding rate
-# GET /api/v5/public/funding-rate?instId=BTC-USDT-SWAP
+通过 `bash` 工具运行（工作目录即 Vibe-Trading 根目录）：
 
-# Open interest
-# GET /api/v5/public/open-interest?instType=SWAP&instId=BTC-USDT-SWAP
+```bash
+python jarvis_crypto_data.py BTCUSDT
+# 或 ETHUSDT / SOLUSDT 等；加 --json 输出结构化 JSON
 ```
 
-Use `load_skill("okx-market")` for OKX data retrieval patterns.
+该脚本实时拉取并返回（免 Key，多源真实数据）：
+- **资金费率/基差**：当前 8h 资金费率 + 年化 + 7 日均值 + regime 分类；标记价/指数价/现货价；期现基差(perp-spot basis)% + 升贴水状态
+- **未平仓量(OI)**：当前值 + 24h 变化 + 7 日趋势
+- **多空持仓**：全网多空账户比(7 日序列) + 大户多空比 + 主动买卖量比(taker)
+- **市场结构**(CoinGecko)：BTC/ETH 市占率 + 全市场总市值 + 24h 成交量 + 总市值 24h 变化
+- **市场情绪**：恐慌贪婪指数(当前 + 14 日均值/区间)
+- **BTC 链上基本面**(仅 BTC，blockchain.info/mempool.space)：全网算力 + 挖矿难度 + 内存池待确认笔数 + 链上手续费(sat/vB)
+
+拿到脚本输出的真实数字后，再套用本文档的信号框架（regime 表、OI×Funding 矩阵、背离信号）做解读。
+
+### 备用：OKX API（当前网络不可达，仅作参考）
+
+```python
+# GET /api/v5/public/funding-rate-history?instId=BTC-USDT-SWAP  (当前不可达)
+# GET /api/v5/public/open-interest?instType=SWAP&instId=BTC-USDT-SWAP  (当前不可达)
+```
 
 ### Key Metrics to Track
 
