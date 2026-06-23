@@ -95,6 +95,7 @@ def kline(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 200):
             ts = time.localtime(k[0] / 1000)
             rows.append({
                 "t": time.strftime(fmt, ts),
+                "ts": int(k[0]),
                 "o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
                 "c": float(k[4]), "v": round(float(k[5]), 2),
             })
@@ -283,9 +284,161 @@ def api_trader_cycle(symbols: str = "BTC,ETH,SOL", dry_run: bool = False):
     return JSONResponse(jpt.run_cycle(syms, cfg, dry_run=dry_run))
 
 
+# ─────────────────────────── 事件流 + 智能问答 API ───────────────────────────
+
+_EXIT_REASON_CN = {
+    "stop_loss": "触发止损离场",
+    "take_profit": "触发止盈落袋",
+    "time_stop": "持有到期离场",
+    "signal_flip": "信号反转离场",
+    "manual": "手动平仓",
+}
+
+
+@app.get("/api/events")
+def api_events(symbol: str | None = None, limit: int = 40):
+    """聚合模拟盘开仓/平仓/止盈止损/信号反转事件，按时间倒序滚动给前端。"""
+    sym = None
+    if symbol:
+        s = symbol.upper().replace("-", "").replace("/", "")
+        sym = s if s.endswith("USDT") else s + "USDT"
+
+    def _calc():
+        evs: list[dict] = []
+        for p in jpt.all_positions(sym):
+            side_cn = "开多" if (p.get("side") or "buy") == "buy" else "开空"
+            if p.get("opened_ts"):
+                evs.append({
+                    "ts": float(p["opened_ts"]),
+                    "kind": "open",
+                    "symbol": p["symbol"],
+                    "title": f"{side_cn} {p['symbol']}",
+                    "detail": f"入场 {p.get('entry_price','—')} · 数量 {p.get('qty','—')}"
+                              + (f" · 止损 {p['stop_loss']}" if p.get("stop_loss") else "")
+                              + (f" · 止盈 {p['take_profit']}" if p.get("take_profit") else ""),
+                    "tone": "buy",
+                })
+            if p.get("status") == "closed" and p.get("closed_ts"):
+                pnl = p.get("realized_pnl_usdt")
+                pnl_pct = p.get("realized_pnl_pct")
+                reason = _EXIT_REASON_CN.get(p.get("exit_reason"), p.get("exit_reason") or "平仓")
+                tone = "win" if (pnl or 0) > 0 else ("loss" if (pnl or 0) < 0 else "flat")
+                pnl_str = ""
+                if pnl is not None:
+                    pnl_str = f"{'+' if pnl >= 0 else ''}{round(pnl, 2)}U"
+                    if pnl_pct is not None:
+                        pnl_str += f"（{'+' if pnl_pct >= 0 else ''}{round(pnl_pct, 2)}%）"
+                evs.append({
+                    "ts": float(p["closed_ts"]),
+                    "kind": "close",
+                    "symbol": p["symbol"],
+                    "title": f"平仓 {p['symbol']} · {reason}",
+                    "detail": f"出场 {p.get('exit_price','—')}"
+                              + (f" · 盈亏 {pnl_str}" if pnl_str else ""),
+                    "tone": tone,
+                })
+        evs.sort(key=lambda e: e["ts"], reverse=True)
+        for e in evs:
+            e["time"] = time.strftime("%m-%d %H:%M", time.localtime(e["ts"]))
+        return {"events": evs[: max(1, min(int(limit), 200))]}
+
+    return JSONResponse(_cached(f"events:{sym}:{limit}", 20, _calc))
+
+
+def _answer_question(q: str, snap: dict, st: dict) -> str:
+    """根据当前决策快照 + 模拟盘战绩，把问题用人话回答（无需外部 LLM）。"""
+    d = (snap or {}).get("decision", {}) or {}
+    fac = (snap or {}).get("factor_state", {}) or {}
+    sym = (snap or {}).get("symbol", "该币")
+    if "_error" in d or "_error" in fac:
+        return f"现在 {sym} 取数暂时不可用（{d.get('_error') or fac.get('_error')}），稍后再问我一次。"
+
+    score = d.get("conviction_score", 0) or 0
+    pos = d.get("suggested_position_pct", 0) or 0
+    price = fac.get("price")
+    direction = d.get("direction", "中性观望")
+    entry = d.get("entry_zone")
+    sl = d.get("stop_loss")
+    tp = d.get("take_profit_ref")
+    days = d.get("time_stop_days")
+    reasons = d.get("reasons", []) or []
+    ql = (q or "").lower()
+
+    def buy_line():
+        if pos > 0:
+            return (f"现在 {sym} 偏多（信心分 {score}），可以小仓试多，建议仓位约 {pos}%。"
+                    f"入场区间 {entry}，进场前先把止损 {sl} 设好。")
+        if score <= -0.6:
+            return f"现在 {sym} 偏空（信心分 {score}），别追多，建议空仓观望，等信号转好再说。"
+        return f"现在 {sym} 信号偏中性（信心分 {score}），建议先观望，不值得为了买而买。"
+
+    # 关键词路由
+    if any(k in q for k in ("止盈", "卖", "出货", "落袋", "什么时候卖")):
+        if pos > 0 and tp:
+            return f"{sym} 参考止盈在 {tp}（约 +8%），价格到了就可以分批落袋；最多持有 {days} 天，到期没走也建议离场。"
+        return f"现在 {sym} 没有建议持仓，谈不上卖点；等出现偏多信号、开了仓再设止盈。"
+    if any(k in q for k in ("止损", "风险", "亏", "守不住", "跌")):
+        if pos > 0 and sl:
+            return f"{sym} 硬止损设在 {sl}（约 -10%），跌破就无条件离场，别扛单。当前组合最大风险敞口约 {d.get('max_risk_pct','—')}%。"
+        return f"现在 {sym} 没有建议持仓，先不用设止损；真要买，记住硬止损是纪律，不设不进场。"
+    if any(k in q for k in ("仓位", "买多少", "投多少", "多少钱", "多少仓")):
+        if pos > 0:
+            return f"{sym} 建议仓位约 {pos}%（弱因子刻意保守）。入场 {entry}，止损 {sl}，止盈 {tp}。"
+        return f"现在 {sym} 建议仓位 0%——信号不够强，空仓也是一种持仓。"
+    if any(k in q for k in ("为什么", "原因", "理由", "凭什么", "依据")):
+        rs = reasons[:3]
+        body = "；".join(rs) if rs else "当前因子偏中性，没有特别强的方向依据。"
+        return f"{sym} 之所以判 {direction}（信心分 {score}），主要因为：{body}。"
+    if any(k in q for k in ("现价", "价格", "多少钱一个", "报价")):
+        return f"{sym} 现价约 {price}。距历史高点回撤 {fac.get('drawdown_from_ath_pct','—')}%，30 日动量 {fac.get('momentum_30d_pct','—')}%。"
+    if any(k in q for k in ("战绩", "胜率", "赚", "盈亏", "表现", "准不准")):
+        if st and st.get("closed_trades"):
+            return (f"模拟盘到目前：已平仓 {st['closed_trades']} 笔，胜率 {st.get('win_rate_pct','—')}%，"
+                    f"盈亏比 {st.get('profit_factor','—')}，账户总权益 {st.get('equity_usdt','—')}U"
+                    f"（较起始 {st.get('equity_change_pct','—')}%）。还在攒样本，多跑一阵更有说服力。")
+        return "模拟盘还没有已平仓记录，先让它自动跟盘跑一阵子，再回来看胜率和盈亏比。"
+    if any(k in q for k in ("买", "该买", "能买", "进场", "入场", "做多", "操作", "怎么办", "建议")):
+        return buy_line()
+
+    # 默认：给一份一句话总览
+    base = buy_line()
+    if pos > 0:
+        base += f" 止盈 {tp}、止损 {sl}，最多持有 {days} 天。"
+    return base
+
+
+@app.post("/api/ask")
+def api_ask(symbol: str = "BTCUSDT", q: str = ""):
+    """小白问答：结合当前币决策 + 模拟盘战绩，用人话回答。"""
+    sym = symbol.upper().replace("-", "").replace("/", "")
+    spot = sym if sym.endswith("USDT") else sym + "USDT"
+    question = (q or "").strip()
+    if not question:
+        return JSONResponse({"ok": False, "answer": "你想问点啥？比如「现在该买吗」「止盈止损在哪」「最近战绩怎样」。"})
+    snap = _cached(f"snap:{spot}", 300, lambda: jb.build(spot))
+    try:
+        st = jpt.stats(_trader_cfg(), spot)
+    except Exception:  # noqa: BLE001
+        st = {}
+    answer = _answer_question(question, snap, st)
+    return JSONResponse({"ok": True, "symbol": spot, "question": question, "answer": answer})
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTML
+
+
+@app.get("/lite", response_class=HTMLResponse)
+def lite():
+    """小白模式单页：只看结论 + 操作 + K线信号 + 模拟战绩，自动刷新。"""
+    return LITE_HTML
+
+
+@app.get("/cockpit", response_class=HTMLResponse)
+def cockpit():
+    """小白驾驶舱：左 K 线(画线提示点位) + 右 AI 面板/事件流/问答，自动跟盘。"""
+    return COCKPIT_HTML
 
 
 HTML = r"""<!doctype html>
@@ -861,6 +1014,537 @@ function renderFactor(f){
 
 window.addEventListener('resize',()=>{[gauge,cPrice,cFng,cTrack,cKline,cCalib,cAttr].forEach(c=>c&&c.resize());});
 loadAll();
+</script>
+</body>
+</html>
+"""
+
+
+LITE_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>贾维斯 · 小白模式</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<style>
+  :root{--bg:#0b0e14;--card:#141a24;--bd:#222c3a;--fg:#e6edf3;--mut:#8b98a9;--up:#16c784;--down:#ea3943;--accent:#3b82f6;--warn:#f0b90b;}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--fg);font-family:-apple-system,"PingFang SC","Microsoft YaHei",Inter,sans-serif;padding:16px;max-width:760px;margin:0 auto;}
+  .top{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px}
+  h1{font-size:19px;font-weight:700}
+  select,button{background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:8px;padding:7px 12px;font-size:14px;cursor:pointer}
+  button.primary{background:var(--accent);border-color:var(--accent)}
+  button:hover{filter:brightness(1.15)}
+  .refresh{margin-left:auto;color:var(--mut);font-size:12px;text-align:right;line-height:1.5}
+  .verdict{background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:20px;margin:12px 0;text-align:center}
+  .verdict .big{font-size:34px;font-weight:800;letter-spacing:1px}
+  .verdict .sub{color:var(--mut);font-size:14px;margin-top:8px}
+  .conf{display:inline-block;padding:2px 12px;border-radius:999px;font-size:13px;font-weight:700;margin-left:6px}
+  .ops{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin:12px 0}
+  .op{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:12px 14px}
+  .op .k{color:var(--mut);font-size:12px}
+  .op .v{font-size:19px;font-weight:700;margin-top:5px}
+  .why{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:14px 16px;margin:12px 0;font-size:14px;line-height:1.95}
+  .why b{color:var(--fg)} .why .li{color:var(--mut)}
+  .sec{margin:16px 0 8px;font-size:14px;font-weight:600;color:var(--mut)}
+  .chart{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:10px;height:340px}
+  .ivbar{display:flex;gap:6px;margin-bottom:8px}
+  .ivbar button{padding:5px 12px;font-size:13px}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px}
+  .stat{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:12px;text-align:center}
+  .stat .k{color:var(--mut);font-size:12px}
+  .stat .v{font-size:20px;font-weight:700;margin-top:5px}
+  .pos{color:var(--up)} .neg{color:var(--down)}
+  .foot{color:var(--mut);font-size:11px;margin-top:18px;line-height:1.7;text-align:center}
+  .foot a{color:var(--accent)}
+  .pulse{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--up);margin-right:5px;animation:p 1.6s infinite}
+  @keyframes p{0%{opacity:.3}50%{opacity:1}100%{opacity:.3}}
+</style>
+</head>
+<body>
+  <div class="top">
+    <h1>🤖 贾维斯 · 小白模式</h1>
+    <select id="symbol" onchange="loadAll()">
+      <option>BTCUSDT</option><option>ETHUSDT</option><option>SOLUSDT</option><option>BNBUSDT</option>
+    </select>
+    <button class="primary" onclick="loadAll()">立即刷新</button>
+    <span class="refresh"><span class="pulse"></span><span id="upAt">加载中…</span><br><span id="nextIn"></span></span>
+  </div>
+
+  <div class="verdict" id="verdict"><div class="big">加载中…</div></div>
+
+  <div class="sec">该怎么操作（模拟，不构成投资建议）</div>
+  <div class="ops" id="ops"></div>
+
+  <div class="why" id="why"></div>
+
+  <div class="sec" style="display:flex;align-items:center;gap:10px">
+    K 线 + 贾维斯的建议线（蓝=入场 红=止损 绿=止盈）
+    <span class="ivbar" id="ivbar">
+      <button data-iv="1h" class="primary" onclick="setIv('1h')">1h</button>
+      <button data-iv="4h" onclick="setIv('4h')">4h</button>
+      <button data-iv="1d" onclick="setIv('1d')">1d</button>
+    </span>
+  </div>
+  <div class="chart"><div id="kline" style="height:100%"></div></div>
+
+  <div class="sec">模拟盘战绩（贾维斯自己跟单的真实表现）</div>
+  <div class="stats" id="stats"></div>
+
+  <div class="foot" id="foot">
+    数据来源：Binance / CoinGecko / alternative.me / 链上（真实拉取）。本页每 60 秒自动刷新一次。<br>
+    想看完整专业版（因子归因 / 置信度校准 / 挂单台账）？打开 <a href="/">完整仪表盘</a>。
+  </div>
+
+<script>
+const $ = id => document.getElementById(id);
+const REFRESH = 60;                 // 自动刷新间隔（秒）
+let kline, lastDec = null, klineIv = '1h', countdown = REFRESH, tick = null;
+
+function pct(x){return (x==null?'—':((x>0?'+':'')+x+'%'));}
+function cls(x){return x>0?'pos':(x<0?'neg':'');}
+
+function verdictOf(d){
+  const s = d.conviction_score ?? 0, abs = Math.abs(s);
+  const conf = abs>=1.2?'高':(abs>=0.6?'中':'低');
+  if(s>=0.6)  return {txt:'可小仓试多 📈', color:'#16c784', conf, score:s};
+  if(s<=-0.6) return {txt:'偏空 · 别追多 📉', color:'#ea3943', conf, score:s};
+  return {txt:'先观望 ⏸', color:'#8b98a9', conf:'低', score:s};
+}
+
+function renderVerdict(s){
+  const d = s.decision || {}; lastDec = d;
+  const v = verdictOf(d);
+  const price = (s.factor_state||{}).price;
+  $('verdict').innerHTML =
+    `<div class="big" style="color:${v.color}">${v.txt}</div>`+
+    `<div class="sub">${($('symbol').value)} 现价约 <b style="color:var(--fg)">${price??'—'}</b> · `+
+    `贾维斯把握度 <span class="conf" style="background:${v.color}22;color:${v.color}">${v.conf}</span> `+
+    `<span style="font-size:12px">(信心分 ${v.score})</span></div>`;
+  // 操作卡
+  const pos = d.suggested_position_pct ?? 0;
+  let ops = `<div class="op"><div class="k">建议仓位</div><div class="v">${pos}%</div></div>`;
+  if(pos>0){
+    ops += `<div class="op"><div class="k">入场区间</div><div class="v" style="font-size:15px">${d.entry_zone||'—'}</div></div>`;
+    ops += `<div class="op"><div class="k">止损（守不住就卖）</div><div class="v neg">${d.stop_loss||'—'}</div></div>`;
+    ops += `<div class="op"><div class="k">止盈（到了可落袋）</div><div class="v pos">${d.take_profit_ref||'—'}</div></div>`;
+    ops += `<div class="op"><div class="k">最多持有</div><div class="v">${d.time_stop_days||'—'} 天</div></div>`;
+  } else {
+    ops += `<div class="op" style="grid-column:1/-1"><div class="k">为什么不给点位</div><div class="v" style="font-size:14px;color:var(--mut)">当前信号不够强，贾维斯建议空仓等更好的机会，不硬找入场点。</div></div>`;
+  }
+  $('ops').innerHTML = ops;
+  // 通俗依据（取前 3 条）
+  const rs = (d.reasons||[]).slice(0,3);
+  $('why').innerHTML = `<b>贾维斯为什么这么说：</b><br>` +
+    (rs.length ? rs.map(r=>'<span class="li">· '+r+'</span>').join('<br>') : '<span class="li">暂无明确依据，信号偏中性。</span>');
+  if(kline) renderKlineOverlay();
+}
+
+function setIv(iv){
+  klineIv = iv;
+  document.querySelectorAll('#ivbar button').forEach(b=>{
+    b.className = (b.getAttribute('data-iv')===iv) ? 'primary' : '';
+  });
+  loadKline();
+}
+
+async function loadKline(){
+  try{
+    const sym = $('symbol').value;
+    const d = await (await fetch('/api/kline?symbol='+sym+'&interval='+klineIv+'&limit=160')).json();
+    if(d.error) return;
+    renderKline(d);
+  }catch(e){}
+}
+
+let lastKline = null;
+function renderKline(d){
+  lastKline = d;
+  if(!kline) kline = echarts.init($('kline'));
+  renderKlineOverlay();
+}
+
+function renderKlineOverlay(){
+  if(!kline || !lastKline) return;
+  const rows = lastKline.rows || [];
+  const dates = rows.map(r=>r.t);
+  const ohlc = rows.map(r=>[r.o,r.c,r.l,r.h]);
+  const ax = {axisLine:{lineStyle:{color:'#8b98a9'}},splitLine:{lineStyle:{color:'#1c2530'}}};
+  const ml = []; const dec = lastDec || {};
+  if(dec.suggested_position_pct>0){
+    if(dec.stop_loss) ml.push({yAxis:dec.stop_loss,lineStyle:{color:'#ea3943'},label:{formatter:'止损 '+dec.stop_loss,color:'#ea3943',position:'insideEndTop'}});
+    if(dec.take_profit_ref) ml.push({yAxis:dec.take_profit_ref,lineStyle:{color:'#16c784'},label:{formatter:'止盈 '+dec.take_profit_ref,color:'#16c784',position:'insideEndTop'}});
+    if(dec.entry_zone){(''+dec.entry_zone).split('~').map(s=>parseFloat(s.trim())).filter(x=>!isNaN(x))
+      .forEach(p=>ml.push({yAxis:p,lineStyle:{color:'#3b82f6',type:'dashed'},label:{formatter:'入场 '+p,color:'#3b82f6',position:'insideEndTop'}}));}
+  }
+  kline.setOption({
+    tooltip:{trigger:'axis',axisPointer:{type:'cross'}},
+    grid:{left:55,right:18,top:14,bottom:48},
+    xAxis:{type:'category',data:dates,...ax,axisLabel:{color:'#8b98a9'},boundaryGap:true},
+    yAxis:{scale:true,...ax,axisLabel:{color:'#8b98a9'}},
+    dataZoom:[{type:'inside',start:50,end:100},{type:'slider',bottom:8,height:14,start:50,end:100,textStyle:{color:'#8b98a9'}}],
+    series:[{type:'candlestick',data:ohlc,itemStyle:{color:'#16c784',color0:'#ea3943',borderColor:'#16c784',borderColor0:'#ea3943'},
+      markLine:{symbol:'none',data:ml,silent:true}}]
+  });
+}
+
+async function loadStats(){
+  try{
+    const st = await (await fetch('/api/trader/status')).json();
+    const cards = [
+      ['总权益', (st.equity_usdt??'—')+' U', cls(st.equity_change_pct)],
+      ['总收益', pct(st.equity_change_pct), cls(st.equity_change_pct)],
+      ['胜率', (st.win_rate_pct==null?'—':st.win_rate_pct+'%'), ''],
+      ['盈亏比', (st.profit_factor??'—'), ''],
+      ['已平仓', (st.closed_trades??0)+' 笔', ''],
+    ];
+    $('stats').innerHTML = cards.map(c=>
+      `<div class="stat"><div class="k">${c[0]}</div><div class="v ${c[2]}">${c[1]}</div></div>`).join('');
+  }catch(e){ $('stats').innerHTML='<div class="stat"><div class="k">模拟盘</div><div class="v" style="font-size:13px">还没跑跟盘</div></div>'; }
+}
+
+async function loadAll(){
+  countdown = REFRESH;
+  $('upAt').textContent = '更新中…';
+  try{
+    const sym = $('symbol').value;
+    const snap = await (await fetch('/api/snapshot?symbol='+sym)).json();
+    renderVerdict(snap);
+    const t = new Date();
+    $('upAt').textContent = '更新于 ' + t.toLocaleTimeString('zh-CN',{hour12:false});
+  }catch(e){ $('upAt').textContent = '刷新失败，下次重试'; }
+  loadKline();
+  loadStats();
+}
+
+function startTimer(){
+  if(tick) clearInterval(tick);
+  tick = setInterval(()=>{
+    countdown--;
+    $('nextIn').textContent = countdown>0 ? (countdown+' 秒后自动刷新') : '刷新中…';
+    if(countdown<=0) loadAll();
+  }, 1000);
+}
+
+window.addEventListener('resize',()=>{ if(kline) kline.resize(); });
+loadAll();
+startTimer();
+</script>
+</body>
+</html>
+"""
+
+
+COCKPIT_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>贾维斯 · 驾驶舱</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<style>
+  :root{--bg:#0b0e14;--card:#121822;--card2:#0f141d;--bd:#222c3a;--fg:#e6edf3;--mut:#8b98a9;--up:#16c784;--down:#ea3943;--accent:#3b82f6;--warn:#f0b90b;}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--fg);font-family:-apple-system,"PingFang SC","Microsoft YaHei",Inter,sans-serif;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+  .hdr{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--bd);flex-wrap:wrap}
+  .logo{font-size:16px;font-weight:800;display:flex;align-items:center;gap:7px}
+  .chips{display:flex;gap:6px}
+  .chip{background:var(--card);border:1px solid var(--bd);border-radius:999px;padding:5px 13px;font-size:13px;cursor:pointer;color:var(--mut)}
+  .chip.on{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700}
+  .symin{background:var(--card2);color:var(--fg);border:1px solid var(--bd);border-radius:8px;padding:6px 10px;font-size:13px;width:120px}
+  .price{font-size:18px;font-weight:800;margin-left:4px}
+  .price small{font-size:12px;color:var(--mut);font-weight:500}
+  .spacer{flex:1}
+  .live{color:var(--mut);font-size:12px;text-align:right;line-height:1.4}
+  .pulse{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--up);margin-right:5px;animation:p 1.6s infinite}
+  @keyframes p{0%{opacity:.3}50%{opacity:1}100%{opacity:.3}}
+  .cockpit{flex:1;display:grid;grid-template-columns:1fr 392px;gap:12px;padding:12px;min-height:0}
+  .chartcol{display:flex;flex-direction:column;gap:8px;min-height:0}
+  .ivbar{display:flex;gap:6px;align-items:center}
+  .ivbar button{background:var(--card);color:var(--mut);border:1px solid var(--bd);border-radius:7px;padding:5px 12px;font-size:13px;cursor:pointer}
+  .ivbar button.on{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700}
+  .ivbar .hint{color:var(--mut);font-size:12px;margin-left:auto}
+  #kline{flex:1;background:var(--card);border:1px solid var(--bd);border-radius:12px;min-height:0}
+  .sidecol{display:flex;flex-direction:column;gap:12px;min-height:0;overflow:hidden}
+  .card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:14px}
+  .copilot .vd{font-size:24px;font-weight:800;letter-spacing:.5px}
+  .copilot .vsub{color:var(--mut);font-size:12px;margin-top:5px}
+  .conf{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12px;font-weight:700;margin-left:4px}
+  .opgrid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:12px}
+  .op{background:var(--card2);border:1px solid var(--bd);border-radius:9px;padding:9px 10px}
+  .op .k{color:var(--mut);font-size:11px}
+  .op .v{font-size:15px;font-weight:700;margin-top:3px}
+  .why{margin-top:11px;font-size:13px;line-height:1.7;color:var(--mut);border-top:1px solid var(--bd);padding-top:10px}
+  .why b{color:var(--fg)}
+  .panelhd{font-size:13px;font-weight:700;color:var(--mut);margin-bottom:9px;display:flex;align-items:center;gap:7px}
+  .events{flex:1;display:flex;flex-direction:column;min-height:120px}
+  .evlist{flex:1;overflow:auto;display:flex;flex-direction:column;gap:8px}
+  .ev{display:flex;gap:9px;font-size:12px;border-left:2px solid var(--bd);padding:3px 0 3px 9px}
+  .ev.buy{border-color:var(--accent)} .ev.win{border-color:var(--up)} .ev.loss{border-color:var(--down)} .ev.flat{border-color:var(--mut)}
+  .ev .t{color:var(--mut);white-space:nowrap;font-size:11px}
+  .ev .tt{font-weight:600} .ev .dd{color:var(--mut);margin-top:2px}
+  .empty{color:var(--mut);font-size:12px;text-align:center;padding:18px 0}
+  .ask{display:flex;flex-direction:column;height:248px}
+  .chat{flex:1;overflow:auto;display:flex;flex-direction:column;gap:9px;padding-right:2px}
+  .msg{font-size:13px;line-height:1.6;max-width:92%;padding:8px 11px;border-radius:11px}
+  .msg.u{align-self:flex-end;background:var(--accent);color:#fff;border-bottom-right-radius:3px}
+  .msg.a{align-self:flex-start;background:var(--card2);border:1px solid var(--bd);border-bottom-left-radius:3px}
+  .askbar{display:flex;gap:7px;margin-top:9px}
+  .askbar input{flex:1;background:var(--card2);color:var(--fg);border:1px solid var(--bd);border-radius:9px;padding:9px 11px;font-size:13px}
+  .askbar button{background:var(--accent);border:none;border-radius:9px;color:#fff;padding:0 15px;font-weight:700;cursor:pointer}
+  .qsugg{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+  .qsugg span{background:var(--card2);border:1px solid var(--bd);border-radius:999px;padding:4px 10px;font-size:11px;color:var(--mut);cursor:pointer}
+  .strip{display:flex;align-items:stretch;gap:10px;padding:10px 12px;border-top:1px solid var(--bd);overflow-x:auto}
+  .stat{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:8px 13px;min-width:96px;text-align:center;flex-shrink:0}
+  .stat .k{color:var(--mut);font-size:11px} .stat .v{font-size:16px;font-weight:700;margin-top:3px}
+  .pos{color:var(--up)} .neg{color:var(--down)} .mut{color:var(--mut)}
+  .actbtn{margin-left:auto;display:flex;gap:8px;align-items:center;flex-shrink:0}
+  .actbtn button{background:var(--accent);border:none;border-radius:9px;color:#fff;padding:9px 15px;font-weight:700;cursor:pointer;font-size:13px}
+  .actbtn button.ghost{background:var(--card);border:1px solid var(--bd);color:var(--fg)}
+  .actbtn button:hover{filter:brightness(1.12)}
+  .holds{font-size:11px;color:var(--mut);align-self:center;flex-shrink:0;max-width:300px}
+  .foot{color:var(--mut);font-size:10px;padding:0 14px 8px;line-height:1.5}
+  .foot a{color:var(--accent)}
+  @media(max-width:980px){.cockpit{grid-template-columns:1fr;overflow:auto}.sidecol{overflow:visible}#kline{height:340px;flex:none}.ask{height:300px}}
+</style>
+</head>
+<body>
+  <div class="hdr">
+    <div class="logo">🤖 贾维斯驾驶舱</div>
+    <div class="chips" id="chips"></div>
+    <input class="symin" id="symin" placeholder="看其它币 如 DOGE" onkeydown="if(event.key==='Enter')pickInput()"/>
+    <div class="price"><span id="px">—</span> <small id="pxsub"></small></div>
+    <div class="spacer"></div>
+    <div class="live"><span class="pulse"></span><span id="upAt">加载中…</span><br><span id="nextIn"></span></div>
+  </div>
+
+  <div class="cockpit">
+    <div class="chartcol">
+      <div class="ivbar" id="ivbar">
+        <button data-iv="15m" onclick="setIv('15m')">15分</button>
+        <button data-iv="1h" class="on" onclick="setIv('1h')">1时</button>
+        <button data-iv="4h" onclick="setIv('4h')">4时</button>
+        <button data-iv="1d" onclick="setIv('1d')">日线</button>
+        <span class="hint">蓝=入场 红=止损 绿=止盈 ▲▼=模拟买卖点</span>
+      </div>
+      <div id="kline"></div>
+    </div>
+
+    <div class="sidecol">
+      <div class="card copilot" id="copilot"><div class="vd">加载中…</div></div>
+
+      <div class="card events">
+        <div class="panelhd">📡 实时事件流 <span class="mut" style="font-weight:400">（模拟盘动作）</span></div>
+        <div class="evlist" id="evlist"><div class="empty">加载中…</div></div>
+      </div>
+
+      <div class="card ask">
+        <div class="panelhd">💬 问贾维斯</div>
+        <div class="chat" id="chat"></div>
+        <div class="qsugg" id="qsugg">
+          <span onclick="quick('现在该买吗')">现在该买吗</span>
+          <span onclick="quick('止盈止损在哪')">止盈止损在哪</span>
+          <span onclick="quick('为什么这么判断')">为什么</span>
+          <span onclick="quick('最近战绩怎么样')">最近战绩</span>
+        </div>
+        <div class="askbar">
+          <input id="qin" placeholder="问问该买什么、卖多少、为什么…" onkeydown="if(event.key==='Enter')sendAsk()"/>
+          <button onclick="sendAsk()">问</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="strip" id="strip"></div>
+  <div class="foot">全程模拟盘(paper)不碰真钱 · 数据来自 Binance/CoinGecko/alternative.me · 仅研究不构成投资建议 · <a href="/lite">小白单页</a> · <a href="/">专业版</a></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const REFRESH = 60;
+const SYMS = ['BTCUSDT','ETHUSDT','SOLUSDT'];
+let sym = 'BTCUSDT', iv = '1h';
+let chart, lastDec=null, lastFac=null, lastKline=null, lastPositions=[];
+let countdown = REFRESH, tick=null;
+
+function fmt(n){ if(n==null||isNaN(n)) return '—'; n=+n; const d=Math.abs(n)>=100?2:(Math.abs(n)>=1?3:6); return n.toLocaleString('en-US',{maximumFractionDigits:d}); }
+function pct(x){ return x==null?'—':((x>0?'+':'')+x+'%'); }
+
+function renderChips(){
+  $('chips').innerHTML = SYMS.map(s=>`<div class="chip ${s===sym?'on':''}" onclick="pick('${s}')">${s.replace('USDT','')}</div>`).join('')
+    + (SYMS.includes(sym)?'':`<div class="chip on">${sym.replace('USDT','')}</div>`);
+}
+function pick(s){ sym=s; renderChips(); loadAll(); }
+function pickInput(){ let v=$('symin').value.trim().toUpperCase().replace(/[-/]/g,''); if(!v) return; if(!v.endsWith('USDT')) v+='USDT'; $('symin').value=''; sym=v; renderChips(); loadAll(); }
+function setIv(x){ iv=x; document.querySelectorAll('#ivbar button').forEach(b=>b.className=(b.getAttribute('data-iv')===x?'on':'')); loadKline(); }
+
+function verdictOf(d){
+  const s=d.conviction_score??0, a=Math.abs(s);
+  const conf=a>=1.2?'高':(a>=0.6?'中':'低');
+  if(s>=0.6)  return {txt:'可小仓试多 📈',color:'#16c784',conf,s};
+  if(s<=-0.6) return {txt:'偏空·别追多 📉',color:'#ea3943',conf,s};
+  return {txt:'先观望 ⏸',color:'#8b98a9',conf:'低',s};
+}
+function rr(d){
+  const sl=+d.stop_loss, tp=+d.take_profit_ref; let e=null;
+  if(d.entry_zone){ const ps=(''+d.entry_zone).split('~').map(x=>parseFloat(x)).filter(x=>!isNaN(x)); if(ps.length) e=ps.reduce((a,b)=>a+b,0)/ps.length; }
+  if(!e||isNaN(sl)||isNaN(tp)||e<=sl) return null;
+  return ((tp-e)/(e-sl));
+}
+function entryMid(d){ if(!d.entry_zone) return null; const ps=(''+d.entry_zone).split('~').map(x=>parseFloat(x)).filter(x=>!isNaN(x)); return ps.length?ps.reduce((a,b)=>a+b,0)/ps.length:null; }
+
+function renderCopilot(snap){
+  const d=snap.decision||{}, fac=snap.factor_state||{}; lastDec=d; lastFac=fac;
+  const price=fac.price; $('px').textContent=fmt(price); $('pxsub').textContent=sym.replace('USDT','/USDT');
+  if(d._error||fac._error){ $('copilot').innerHTML=`<div class="vd" style="color:var(--mut)">取数暂不可用</div><div class="why">${d._error||fac._error||''}</div>`; return; }
+  const v=verdictOf(d), pos=d.suggested_position_pct??0, r=rr(d);
+  let ops='';
+  ops+=`<div class="op"><div class="k">建议仓位</div><div class="v">${pos}%</div></div>`;
+  if(pos>0){
+    ops+=`<div class="op"><div class="k">入场区间</div><div class="v" style="font-size:13px">${d.entry_zone||'—'}</div></div>`;
+    ops+=`<div class="op"><div class="k">盈亏比</div><div class="v pos">${r?r.toFixed(2)+':1':'—'}</div></div>`;
+    ops+=`<div class="op"><div class="k">止损</div><div class="v neg">${fmt(d.stop_loss)}</div></div>`;
+    ops+=`<div class="op"><div class="k">止盈</div><div class="v pos">${fmt(d.take_profit_ref)}</div></div>`;
+    ops+=`<div class="op"><div class="k">最多持有</div><div class="v">${d.time_stop_days||'—'}天</div></div>`;
+  }else{
+    ops+=`<div class="op" style="grid-column:2/4"><div class="k">为什么不给点位</div><div class="v" style="font-size:12px;color:var(--mut)">信号不够强，空仓等更好机会</div></div>`;
+  }
+  const rs=(d.reasons||[]).slice(0,2);
+  $('copilot').innerHTML=
+    `<div class="vd" style="color:${v.color}">${v.txt}<span class="conf" style="background:${v.color}22;color:${v.color}">把握${v.conf}</span></div>`+
+    `<div class="vsub">${sym.replace('USDT','')} 现价 ${fmt(price)} · 信心分 ${v.s}</div>`+
+    `<div class="opgrid">${ops}</div>`+
+    `<div class="why"><b>为什么：</b>${rs.length?rs.join('；'):'当前因子偏中性，无明确方向。'}</div>`;
+  if(chart) drawOverlay();
+}
+
+async function loadKline(){
+  try{
+    const d=await (await fetch('/api/kline?symbol='+sym+'&interval='+iv+'&limit=180')).json();
+    if(d.error){ return; }
+    lastKline=d; drawChart();
+  }catch(e){}
+}
+
+function drawChart(){
+  if(!chart) chart=echarts.init($('kline'),'dark',{renderer:'canvas'});
+  drawOverlay();
+}
+
+function nearestIdx(tsMs){
+  const rows=(lastKline&&lastKline.rows)||[]; if(!rows.length||!rows[0].ts) return -1;
+  let best=-1,bd=Infinity;
+  for(let i=0;i<rows.length;i++){ const dd=Math.abs(rows[i].ts-tsMs); if(dd<bd){bd=dd;best=i;} }
+  return best;
+}
+
+function drawOverlay(){
+  if(!chart||!lastKline) return;
+  const rows=lastKline.rows||[];
+  const dates=rows.map(r=>r.t);
+  const ohlc=rows.map(r=>[r.o,r.c,r.l,r.h]);
+  const d=lastDec||{}, fac=lastFac||{};
+  const mlines=[];
+  const e=entryMid(d);
+  if((d.suggested_position_pct||0)>0){
+    if(e) mlines.push({yAxis:+e.toFixed(2),lineStyle:{color:'#3b82f6',type:'dashed'},label:{formatter:'入场 '+fmt(e),color:'#3b82f6',position:'insideEndTop',backgroundColor:'#3b82f622',padding:[2,4]}});
+    if(d.stop_loss) mlines.push({yAxis:+d.stop_loss,lineStyle:{color:'#ea3943'},label:{formatter:'止损 '+fmt(d.stop_loss),color:'#ea3943',position:'insideEndBottom',backgroundColor:'#ea394322',padding:[2,4]}});
+    if(d.take_profit_ref) mlines.push({yAxis:+d.take_profit_ref,lineStyle:{color:'#16c784'},label:{formatter:'止盈 '+fmt(d.take_profit_ref),color:'#16c784',position:'insideEndTop',backgroundColor:'#16c78422',padding:[2,4]}});
+  }
+  if(fac.price) mlines.push({yAxis:+fac.price,lineStyle:{color:'#8b98a9',type:'dotted'},label:{formatter:'现价 '+fmt(fac.price),color:'#cfd8e3',position:'insideStartTop'}});
+  const mareas=[];
+  if((d.suggested_position_pct||0)>0 && e){
+    if(d.stop_loss) mareas.push([{yAxis:+d.stop_loss,itemStyle:{color:'rgba(234,57,67,0.07)'}},{yAxis:+e.toFixed(2)}]);
+    if(d.take_profit_ref) mareas.push([{yAxis:+e.toFixed(2),itemStyle:{color:'rgba(22,199,132,0.07)'}},{yAxis:+d.take_profit_ref}]);
+  }
+  // 模拟买卖点
+  const mpts=[];
+  (lastPositions||[]).forEach(p=>{
+    if(p.opened_ts&&p.entry_price){ const i=nearestIdx(p.opened_ts*1000); if(i>=0) mpts.push({coord:[i,p.entry_price],symbol:'triangle',symbolSize:13,itemStyle:{color:'#16c784'},label:{show:false},name:'买'}); }
+    if(p.status==='closed'&&p.closed_ts&&p.exit_price){ const i=nearestIdx(p.closed_ts*1000); if(i>=0){ const win=(p.realized_pnl_usdt||0)>=0; mpts.push({coord:[i,p.exit_price],symbol:'triangle',symbolRotate:180,symbolSize:13,itemStyle:{color:win?'#16c784':'#ea3943'},label:{show:false},name:'卖'}); } }
+  });
+  chart.setOption({
+    backgroundColor:'transparent',
+    grid:{left:8,right:74,top:14,bottom:42},
+    tooltip:{trigger:'axis',axisPointer:{type:'cross'}},
+    xAxis:{type:'category',data:dates,boundaryGap:true,axisLine:{lineStyle:{color:'#2a3645'}},axisLabel:{color:'#8b98a9',fontSize:10},splitLine:{show:false}},
+    yAxis:{scale:true,position:'right',axisLine:{show:false},axisLabel:{color:'#8b98a9',fontSize:10,formatter:v=>fmt(v)},splitLine:{lineStyle:{color:'#1a2230'}}},
+    dataZoom:[{type:'inside',start:55,end:100},{type:'slider',height:16,bottom:16,start:55,end:100,borderColor:'#2a3645',textStyle:{color:'#8b98a9'}}],
+    series:[{
+      type:'candlestick',data:ohlc,
+      itemStyle:{color:'#16c784',color0:'#ea3943',borderColor:'#16c784',borderColor0:'#ea3943'},
+      markLine:{symbol:'none',animation:false,data:mlines},
+      markArea:{silent:true,data:mareas},
+      markPoint:{data:mpts,silent:true}
+    }]
+  },{notMerge:true});
+}
+
+async function loadEvents(){
+  try{
+    const d=await (await fetch('/api/events?symbol='+sym+'&limit=30')).json();
+    const evs=d.events||[];
+    $('evlist').innerHTML = evs.length ? evs.map(e=>
+      `<div class="ev ${e.tone}"><div><div class="tt">${e.title}</div><div class="dd">${e.detail||''}</div></div><div class="t" style="margin-left:auto">${e.time}</div></div>`
+    ).join('') : '<div class="empty">暂无模拟盘动作。点右下「自动跟盘」让贾维斯开始跟单。</div>';
+  }catch(e){ $('evlist').innerHTML='<div class="empty">事件加载失败</div>'; }
+}
+
+async function loadStats(){
+  try{
+    const st=await (await fetch('/api/trader/status?symbol=')).json();
+    lastPositions=await (await fetch('/api/positions?status=all')).json();
+    const tp=st.total_pnl_usdt, eq=st.equity_change_pct;
+    $('strip').innerHTML=
+      `<div class="stat"><div class="k">账户权益</div><div class="v">${fmt(st.equity_usdt)}U</div></div>`+
+      `<div class="stat"><div class="k">总盈亏</div><div class="v ${tp>0?'pos':(tp<0?'neg':'')}">${tp>0?'+':''}${fmt(tp)}U</div></div>`+
+      `<div class="stat"><div class="k">较起始</div><div class="v ${eq>0?'pos':(eq<0?'neg':'')}">${pct(eq)}</div></div>`+
+      `<div class="stat"><div class="k">胜率</div><div class="v">${st.win_rate_pct==null?'—':st.win_rate_pct+'%'}</div></div>`+
+      `<div class="stat"><div class="k">盈亏比</div><div class="v">${st.profit_factor??'—'}</div></div>`+
+      `<div class="stat"><div class="k">持仓/已平</div><div class="v">${st.open_positions}/${st.closed_trades}</div></div>`+
+      `<div class="holds">${(st.open_detail||[]).length?('持仓：'+st.open_detail.map(o=>o.symbol.replace('USDT','')+' @'+fmt(o.entry)+(o.unrealized_usdt!=null?(' '+(o.unrealized_usdt>=0?'+':'')+fmt(o.unrealized_usdt)+'U'):'')).join('，')):'当前无持仓'}</div>`+
+      `<div class="actbtn"><button class="ghost" onclick="loadAll()">刷新</button><button onclick="runCycle()" id="cycBtn">▶ 自动跟盘一轮</button></div>`;
+    if(chart) drawOverlay();
+  }catch(e){ $('strip').innerHTML='<div class="empty">战绩加载失败</div>'; }
+}
+
+async function runCycle(){
+  const b=$('cycBtn'); if(b){ b.textContent='跟盘中…(约10-30秒)'; b.disabled=true; }
+  try{
+    const syms=[...new Set([...SYMS, sym])].map(s=>s.replace('USDT','')).join(',');
+    await fetch('/api/trader/cycle?symbols='+encodeURIComponent(syms),{method:'POST'});
+  }catch(e){}
+  if(b){ b.textContent='▶ 自动跟盘一轮'; b.disabled=false; }
+  loadEvents(); loadStats();
+}
+
+function addMsg(t,who){ const m=document.createElement('div'); m.className='msg '+who; m.textContent=t; $('chat').appendChild(m); $('chat').scrollTop=$('chat').scrollHeight; return m; }
+function quick(q){ $('qin').value=q; sendAsk(); }
+async function sendAsk(){
+  const q=$('qin').value.trim(); if(!q) return; $('qin').value='';
+  addMsg(q,'u'); const a=addMsg('贾维斯思考中…','a');
+  try{
+    const d=await (await fetch('/api/ask?symbol='+sym+'&q='+encodeURIComponent(q),{method:'POST'})).json();
+    a.textContent=d.answer||'我暂时答不上来，换个问法试试。';
+  }catch(e){ a.textContent='网络抖动，稍后再问我一次。'; }
+}
+
+async function loadSnapshot(){
+  try{
+    const snap=await (await fetch('/api/snapshot?symbol='+sym)).json();
+    renderCopilot(snap);
+    $('upAt').textContent='更新于 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
+  }catch(e){ $('upAt').textContent='刷新失败，下次重试'; }
+}
+
+function loadAll(){ countdown=REFRESH; loadSnapshot(); loadKline(); loadEvents(); loadStats(); }
+function startTimer(){ if(tick)clearInterval(tick); tick=setInterval(()=>{ countdown--; $('nextIn').textContent=countdown>0?(countdown+' 秒后自动刷新'):'刷新中…'; if(countdown<=0)loadAll(); },1000); }
+
+window.addEventListener('resize',()=>{ if(chart)chart.resize(); });
+renderChips();
+addMsg('你好！我是贾维斯。问我「现在该买什么」「卖多少」「为什么这么判断」，或直接点下面的快捷问题。','a');
+loadAll();
+startTimer();
 </script>
 </body>
 </html>
