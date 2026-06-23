@@ -1242,7 +1242,7 @@ COCKPIT_HTML = r"""<!doctype html>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>贾维斯 · 驾驶舱</title>
-<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@5.0.8/dist/lightweight-charts.standalone.production.js"></script>
 <style>
   :root{--bg:#0b0e14;--card:#121822;--card2:#0f141d;--bd:#222c3a;--fg:#e6edf3;--mut:#8b98a9;--up:#16c784;--down:#ea3943;--accent:#3b82f6;--warn:#f0b90b;}
   *{box-sizing:border-box;margin:0;padding:0}
@@ -1364,8 +1364,11 @@ const $ = id => document.getElementById(id);
 const REFRESH = 60;
 const SYMS = ['BTCUSDT','ETHUSDT','SOLUSDT'];
 let sym = 'BTCUSDT', iv = '1h';
-let chart, lastDec=null, lastFac=null, lastKline=null, lastPositions=[];
+let chart, candleSeries=null, trendSeries=null, markersPrim=null, priceLines=[];
+let lastDec=null, lastFac=null, lastKline=null, lastPositions=[];
 let countdown = REFRESH, tick=null;
+const TZ = new Date().getTimezoneOffset()*60;   // 秒：让 X 轴显示本地时间
+const barTime = r => Math.floor(r.ts/1000) - TZ;
 
 function fmt(n){ if(n==null||isNaN(n)) return '—'; n=+n; const d=Math.abs(n)>=100?2:(Math.abs(n)>=1?3:6); return n.toLocaleString('en-US',{maximumFractionDigits:d}); }
 function pct(x){ return x==null?'—':((x>0?'+':'')+x+'%'); }
@@ -1427,57 +1430,77 @@ async function loadKline(){
 }
 
 function drawChart(){
-  if(!chart) chart=echarts.init($('kline'),'dark',{renderer:'canvas'});
+  if(!chart){
+    chart = LightweightCharts.createChart($('kline'), {
+      autoSize:true,
+      layout:{ background:{type:'solid',color:'#121822'}, textColor:'#8b98a9', fontFamily:'-apple-system,PingFang SC,Microsoft YaHei,sans-serif' },
+      grid:{ vertLines:{color:'#161e2a'}, horzLines:{color:'#161e2a'} },
+      rightPriceScale:{ borderColor:'#2a3645', scaleMargins:{top:0.08,bottom:0.08} },
+      timeScale:{ borderColor:'#2a3645', timeVisible:true, secondsVisible:false, rightOffset:6 },
+      crosshair:{ mode:1 },
+      localization:{ locale:'zh-CN', priceFormatter:p=>fmt(p) }
+    });
+    candleSeries = chart.addSeries(LightweightCharts.CandlestickSeries, {
+      upColor:'#16c784', downColor:'#ea3943', borderVisible:false,
+      wickUpColor:'#16c784', wickDownColor:'#ea3943'
+    });
+    trendSeries = chart.addSeries(LightweightCharts.LineSeries, {
+      color:'rgba(240,185,11,0.65)', lineWidth:2,
+      priceLineVisible:false, lastValueVisible:false, crosshairMarkerVisible:false
+    });
+    markersPrim = LightweightCharts.createSeriesMarkers(candleSeries, []);
+  }
+  const rows=(lastKline&&lastKline.rows)||[];
+  candleSeries.setData(rows.map(r=>({time:barTime(r),open:r.o,high:r.h,low:r.l,close:r.c})));
   drawOverlay();
 }
 
-function nearestIdx(tsMs){
-  const rows=(lastKline&&lastKline.rows)||[]; if(!rows.length||!rows[0].ts) return -1;
-  let best=-1,bd=Infinity;
-  for(let i=0;i<rows.length;i++){ const dd=Math.abs(rows[i].ts-tsMs); if(dd<bd){bd=dd;best=i;} }
+function nearestRow(tsMs){
+  const rows=(lastKline&&lastKline.rows)||[]; if(!rows.length||!rows[0].ts) return null;
+  let best=null,bd=Infinity;
+  for(const r of rows){ const dd=Math.abs(r.ts-tsMs); if(dd<bd){bd=dd;best=r;} }
   return best;
 }
 
 function drawOverlay(){
-  if(!chart||!lastKline) return;
+  if(!chart||!candleSeries||!lastKline) return;
   const rows=lastKline.rows||[];
-  const dates=rows.map(r=>r.t);
-  const ohlc=rows.map(r=>[r.o,r.c,r.l,r.h]);
-  const d=lastDec||{}, fac=lastFac||{};
-  const mlines=[];
-  const e=entryMid(d);
-  if((d.suggested_position_pct||0)>0){
-    if(e) mlines.push({yAxis:+e.toFixed(2),lineStyle:{color:'#3b82f6',type:'dashed'},label:{formatter:'入场 '+fmt(e),color:'#3b82f6',position:'insideEndTop',backgroundColor:'#3b82f622',padding:[2,4]}});
-    if(d.stop_loss) mlines.push({yAxis:+d.stop_loss,lineStyle:{color:'#ea3943'},label:{formatter:'止损 '+fmt(d.stop_loss),color:'#ea3943',position:'insideEndBottom',backgroundColor:'#ea394322',padding:[2,4]}});
-    if(d.take_profit_ref) mlines.push({yAxis:+d.take_profit_ref,lineStyle:{color:'#16c784'},label:{formatter:'止盈 '+fmt(d.take_profit_ref),color:'#16c784',position:'insideEndTop',backgroundColor:'#16c78422',padding:[2,4]}});
+  const LS=LightweightCharts.LineStyle;
+  priceLines.forEach(pl=>{ try{candleSeries.removePriceLine(pl);}catch(e){} }); priceLines=[];
+  function addPL(price,color,title,style){
+    if(price==null||isNaN(+price)) return;
+    priceLines.push(candleSeries.createPriceLine({price:+price,color,lineWidth:(style===LS.Dotted?1:2),lineStyle:style,axisLabelVisible:true,title}));
   }
-  if(fac.price) mlines.push({yAxis:+fac.price,lineStyle:{color:'#8b98a9',type:'dotted'},label:{formatter:'现价 '+fmt(fac.price),color:'#cfd8e3',position:'insideStartTop'}});
-  const mareas=[];
-  if((d.suggested_position_pct||0)>0 && e){
-    if(d.stop_loss) mareas.push([{yAxis:+d.stop_loss,itemStyle:{color:'rgba(234,57,67,0.07)'}},{yAxis:+e.toFixed(2)}]);
-    if(d.take_profit_ref) mareas.push([{yAxis:+e.toFixed(2),itemStyle:{color:'rgba(22,199,132,0.07)'}},{yAxis:+d.take_profit_ref}]);
+  const d=lastDec||{}, fac=lastFac||{}, e=entryMid(d), pos=(d.suggested_position_pct||0)>0;
+  if(pos){
+    if(e) addPL(+e.toFixed(2),'#3b82f6','入场',LS.Dashed);
+    addPL(d.stop_loss,'#ea3943','止损',LS.Solid);
+    addPL(d.take_profit_ref,'#16c784','止盈',LS.Solid);
   }
-  // 模拟买卖点
-  const mpts=[];
+  if(fac.price) addPL(+fac.price,'#9aa7b6','现价',LS.Dotted);
+  // 自动支撑/阻力（近窗摆动高低）
+  const win=rows.slice(-60);
+  if(win.length>5){
+    addPL(Math.max(...win.map(r=>r.h)),'rgba(234,57,67,0.45)','阻力 R1',LS.Dashed);
+    addPL(Math.min(...win.map(r=>r.l)),'rgba(22,199,132,0.45)','支撑 S1',LS.Dashed);
+  }
+  // 趋势线（最小二乘回归，给出方向感）
+  if(rows.length>8){
+    const n=rows.length; let sx=0,sy=0,sxy=0,sxx=0;
+    rows.forEach((r,i)=>{ sx+=i; sy+=r.c; sxy+=i*r.c; sxx+=i*i; });
+    const den=n*sxx-sx*sx;
+    if(den!==0){ const m=(n*sxy-sx*sy)/den, b=(sy-m*sx)/n;
+      trendSeries.setData([{time:barTime(rows[0]),value:+(b).toFixed(4)},{time:barTime(rows[n-1]),value:+(b+m*(n-1)).toFixed(4)}]);
+    }
+  } else if(trendSeries){ trendSeries.setData([]); }
+  // 模拟买卖点 ▲▼
+  const mks=[];
   (lastPositions||[]).forEach(p=>{
-    if(p.opened_ts&&p.entry_price){ const i=nearestIdx(p.opened_ts*1000); if(i>=0) mpts.push({coord:[i,p.entry_price],symbol:'triangle',symbolSize:13,itemStyle:{color:'#16c784'},label:{show:false},name:'买'}); }
-    if(p.status==='closed'&&p.closed_ts&&p.exit_price){ const i=nearestIdx(p.closed_ts*1000); if(i>=0){ const win=(p.realized_pnl_usdt||0)>=0; mpts.push({coord:[i,p.exit_price],symbol:'triangle',symbolRotate:180,symbolSize:13,itemStyle:{color:win?'#16c784':'#ea3943'},label:{show:false},name:'卖'}); } }
+    if(p.opened_ts&&p.entry_price){ const r=nearestRow(p.opened_ts*1000); if(r) mks.push({time:barTime(r),position:'belowBar',color:'#16c784',shape:'arrowUp',text:'买'}); }
+    if(p.status==='closed'&&p.closed_ts&&p.exit_price){ const r=nearestRow(p.closed_ts*1000); if(r){ const isWin=(p.realized_pnl_usdt||0)>=0; mks.push({time:barTime(r),position:'aboveBar',color:isWin?'#16c784':'#ea3943',shape:'arrowDown',text:'卖'}); } }
   });
-  chart.setOption({
-    backgroundColor:'transparent',
-    grid:{left:8,right:74,top:14,bottom:42},
-    tooltip:{trigger:'axis',axisPointer:{type:'cross'}},
-    xAxis:{type:'category',data:dates,boundaryGap:true,axisLine:{lineStyle:{color:'#2a3645'}},axisLabel:{color:'#8b98a9',fontSize:10},splitLine:{show:false}},
-    yAxis:{scale:true,position:'right',axisLine:{show:false},axisLabel:{color:'#8b98a9',fontSize:10,formatter:v=>fmt(v)},splitLine:{lineStyle:{color:'#1a2230'}}},
-    dataZoom:[{type:'inside',start:55,end:100},{type:'slider',height:16,bottom:16,start:55,end:100,borderColor:'#2a3645',textStyle:{color:'#8b98a9'}}],
-    series:[{
-      type:'candlestick',data:ohlc,
-      itemStyle:{color:'#16c784',color0:'#ea3943',borderColor:'#16c784',borderColor0:'#ea3943'},
-      markLine:{symbol:'none',animation:false,data:mlines},
-      markArea:{silent:true,data:mareas},
-      markPoint:{data:mpts,silent:true}
-    }]
-  },{notMerge:true});
+  mks.sort((a,b)=>a.time-b.time);
+  if(markersPrim) markersPrim.setMarkers(mks);
 }
 
 async function loadEvents(){
@@ -1540,7 +1563,6 @@ async function loadSnapshot(){
 function loadAll(){ countdown=REFRESH; loadSnapshot(); loadKline(); loadEvents(); loadStats(); }
 function startTimer(){ if(tick)clearInterval(tick); tick=setInterval(()=>{ countdown--; $('nextIn').textContent=countdown>0?(countdown+' 秒后自动刷新'):'刷新中…'; if(countdown<=0)loadAll(); },1000); }
 
-window.addEventListener('resize',()=>{ if(chart)chart.resize(); });
 renderChips();
 addMsg('你好！我是贾维斯。问我「现在该买什么」「卖多少」「为什么这么判断」，或直接点下面的快捷问题。','a');
 loadAll();
