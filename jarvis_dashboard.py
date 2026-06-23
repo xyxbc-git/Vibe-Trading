@@ -1364,7 +1364,7 @@ const $ = id => document.getElementById(id);
 const REFRESH = 60;
 const SYMS = ['BTCUSDT','ETHUSDT','SOLUSDT'];
 let sym = 'BTCUSDT', iv = '1h';
-let chart, candleSeries=null, trendSeries=null, markersPrim=null, priceLines=[];
+let chart, candleSeries=null, markersPrim=null, priceLines=[], chartKey='';
 let lastDec=null, lastFac=null, lastKline=null, lastPositions=[];
 let countdown = REFRESH, tick=null;
 const TZ = new Date().getTimezoneOffset()*60;   // 秒：让 X 轴显示本地时间
@@ -1422,9 +1422,14 @@ function renderCopilot(snap){
 }
 
 async function loadKline(){
+  const reqSym=sym, reqIv=iv;
   try{
-    const d=await (await fetch('/api/kline?symbol='+sym+'&interval='+iv+'&limit=180')).json();
-    if(d.error){ return; }
+    const d=await (await fetch('/api/kline?symbol='+reqSym+'&interval='+reqIv+'&limit=180')).json();
+    if(reqSym!==sym||reqIv!==iv) return;            // 期间已切币，丢弃过期响应
+    if(d.error||!(d.rows&&d.rows.length)){
+      if(sym+'|'+iv!==chartKey&&candleSeries){ candleSeries.setData([]); chartKey=sym+'|'+iv; }
+      return;
+    }
     lastKline=d; drawChart();
   }catch(e){}
 }
@@ -1433,26 +1438,60 @@ function drawChart(){
   if(!chart){
     chart = LightweightCharts.createChart($('kline'), {
       autoSize:true,
-      layout:{ background:{type:'solid',color:'#121822'}, textColor:'#8b98a9', fontFamily:'-apple-system,PingFang SC,Microsoft YaHei,sans-serif' },
-      grid:{ vertLines:{color:'#161e2a'}, horzLines:{color:'#161e2a'} },
-      rightPriceScale:{ borderColor:'#2a3645', scaleMargins:{top:0.08,bottom:0.08} },
-      timeScale:{ borderColor:'#2a3645', timeVisible:true, secondsVisible:false, rightOffset:6 },
-      crosshair:{ mode:1 },
+      layout:{ background:{type:'solid',color:'#0f141d'}, textColor:'#9aa7b6', fontSize:11, fontFamily:'-apple-system,PingFang SC,Microsoft YaHei,sans-serif', attributionLogo:false },
+      grid:{ vertLines:{color:'rgba(42,54,69,0.35)'}, horzLines:{color:'rgba(42,54,69,0.35)'} },
+      rightPriceScale:{ borderColor:'#2a3645', scaleMargins:{top:0.12,bottom:0.12} },
+      timeScale:{ borderColor:'#2a3645', timeVisible:true, secondsVisible:false, rightOffset:8, barSpacing:9, minBarSpacing:3 },
+      crosshair:{ mode:1, vertLine:{color:'#3b82f6',width:1,style:LightweightCharts.LineStyle.Dotted,labelBackgroundColor:'#3b82f6'}, horzLine:{color:'#3b82f6',labelBackgroundColor:'#3b82f6'} },
       localization:{ locale:'zh-CN', priceFormatter:p=>fmt(p) }
     });
     candleSeries = chart.addSeries(LightweightCharts.CandlestickSeries, {
-      upColor:'#16c784', downColor:'#ea3943', borderVisible:false,
-      wickUpColor:'#16c784', wickDownColor:'#ea3943'
-    });
-    trendSeries = chart.addSeries(LightweightCharts.LineSeries, {
-      color:'rgba(240,185,11,0.65)', lineWidth:2,
-      priceLineVisible:false, lastValueVisible:false, crosshairMarkerVisible:false
+      upColor:'#0ecb81', downColor:'#f6465d', borderVisible:true,
+      borderUpColor:'#0ecb81', borderDownColor:'#f6465d',
+      wickUpColor:'#0ecb81', wickDownColor:'#f6465d'
     });
     markersPrim = LightweightCharts.createSeriesMarkers(candleSeries, []);
   }
   const rows=(lastKline&&lastKline.rows)||[];
-  candleSeries.setData(rows.map(r=>({time:barTime(r),open:r.o,high:r.h,low:r.l,close:r.c})));
+  const data=rows.map(r=>({time:barTime(r),open:r.o,high:r.h,low:r.l,close:r.c}));
+  const key=sym+'|'+iv;
+  if(key!==chartKey){
+    candleSeries.setData(data);
+    chart.timeScale().fitContent();
+    chartKey=key;
+    openWS();                 // 历史就位后，切到 Binance WebSocket 逐 tick 实时推送
+  }
+  // key 未变时不在这里更新蜡烛——由 WebSocket 实时 update()，避免 REST 旧值覆盖更新
   drawOverlay();
+}
+
+// ───────── Binance WebSocket 逐 tick 实时 K 线 ─────────
+let ws=null, wsRetry=0, wsWanted='', wsStatus='连接实时行情…';
+function wsLive(){ return ws && ws.readyState===1; }
+function renderLive(){
+  const el=$('nextIn'); if(!el) return;
+  el.textContent = wsStatus + ' · 决策 ' + (countdown>0?countdown+'s 后刷新':'刷新中…');
+}
+function setWsStatus(t){ wsStatus=t; renderLive(); }
+function closeWS(){ if(ws){ try{ ws.onclose=null; ws.onerror=null; ws.close(); }catch(e){} ws=null; } }
+function openWS(){
+  const want=sym+'|'+iv; wsWanted=want; closeWS();
+  let sock;
+  try{ sock=new WebSocket('wss://stream.binance.com:9443/ws/'+sym.toLowerCase()+'@kline_'+iv); }
+  catch(e){ setWsStatus('🟡 实时不可用·轮询兜底'); return; }
+  ws=sock;
+  sock.onopen=()=>{ wsRetry=0; setWsStatus('🟢 实时 · Binance WS'); };
+  sock.onmessage=(ev)=>{
+    if(wsWanted!==want) return;                 // 期间已切币/切周期，忽略旧流
+    let m; try{ m=JSON.parse(ev.data); }catch(e){ return; }
+    const k=m.k; if(!k||!candleSeries) return;
+    const bar={time:Math.floor(k.t/1000)-TZ, open:+k.o, high:+k.h, low:+k.l, close:+k.c};
+    try{ candleSeries.update(bar); }catch(e){}  // 逐 tick 更新当前蜡烛，丝滑不重画
+    $('px').textContent=fmt(+k.c);
+    $('upAt').textContent='实时 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
+  };
+  sock.onerror=()=>{ try{ sock.close(); }catch(e){} };
+  sock.onclose=()=>{ if(wsWanted===want){ wsRetry=Math.min(wsRetry+1,6); setWsStatus('🟡 实时重连中…'); setTimeout(()=>{ if(wsWanted===want) openWS(); }, 1000*wsRetry); } };
 }
 
 function nearestRow(tsMs){
@@ -1478,21 +1517,12 @@ function drawOverlay(){
     addPL(d.take_profit_ref,'#16c784','止盈',LS.Solid);
   }
   if(fac.price) addPL(+fac.price,'#9aa7b6','现价',LS.Dotted);
-  // 自动支撑/阻力（近窗摆动高低）
+  // 自动支撑/阻力（近窗摆动高低 · 细虚线，不抢戏）
   const win=rows.slice(-60);
   if(win.length>5){
-    addPL(Math.max(...win.map(r=>r.h)),'rgba(234,57,67,0.45)','阻力 R1',LS.Dashed);
-    addPL(Math.min(...win.map(r=>r.l)),'rgba(22,199,132,0.45)','支撑 S1',LS.Dashed);
+    addPL(Math.max(...win.map(r=>r.h)),'rgba(246,70,93,0.35)','阻力',LS.Dashed);
+    addPL(Math.min(...win.map(r=>r.l)),'rgba(14,203,129,0.35)','支撑',LS.Dashed);
   }
-  // 趋势线（最小二乘回归，给出方向感）
-  if(rows.length>8){
-    const n=rows.length; let sx=0,sy=0,sxy=0,sxx=0;
-    rows.forEach((r,i)=>{ sx+=i; sy+=r.c; sxy+=i*r.c; sxx+=i*i; });
-    const den=n*sxx-sx*sx;
-    if(den!==0){ const m=(n*sxy-sx*sy)/den, b=(sy-m*sx)/n;
-      trendSeries.setData([{time:barTime(rows[0]),value:+(b).toFixed(4)},{time:barTime(rows[n-1]),value:+(b+m*(n-1)).toFixed(4)}]);
-    }
-  } else if(trendSeries){ trendSeries.setData([]); }
   // 模拟买卖点 ▲▼
   const mks=[];
   (lastPositions||[]).forEach(p=>{
@@ -1556,12 +1586,14 @@ async function loadSnapshot(){
   try{
     const snap=await (await fetch('/api/snapshot?symbol='+sym)).json();
     renderCopilot(snap);
-    $('upAt').textContent='更新于 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
-  }catch(e){ $('upAt').textContent='刷新失败，下次重试'; }
+    if(!wsLive()) $('upAt').textContent='更新于 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
+  }catch(e){ if(!wsLive()) $('upAt').textContent='刷新失败，下次重试'; }
 }
 
-function loadAll(){ countdown=REFRESH; loadSnapshot(); loadKline(); loadEvents(); loadStats(); }
-function startTimer(){ if(tick)clearInterval(tick); tick=setInterval(()=>{ countdown--; $('nextIn').textContent=countdown>0?(countdown+' 秒后自动刷新'):'刷新中…'; if(countdown<=0)loadAll(); },1000); }
+// 侧栏（决策/事件/战绩）走 60s 轮询；K 线由 WebSocket 实时推送，二者解耦
+function refreshSide(){ loadSnapshot(); loadEvents(); loadStats(); }
+function loadAll(){ countdown=REFRESH; loadKline(); refreshSide(); }   // 切币/切周期/首次：重拉历史 K 线并重连 WS
+function startTimer(){ if(tick)clearInterval(tick); tick=setInterval(()=>{ countdown--; renderLive(); if(countdown<=0){ countdown=REFRESH; refreshSide(); } },1000); }
 
 renderChips();
 addMsg('你好！我是贾维斯。问我「现在该买什么」「卖多少」「为什么这么判断」，或直接点下面的快捷问题。','a');
