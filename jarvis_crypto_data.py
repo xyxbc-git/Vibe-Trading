@@ -34,8 +34,37 @@ CG_API = "https://api.coingecko.com/api/v3"
 BLOCKCHAIN_Q = "https://blockchain.info/q"
 MEMPOOL_API = "https://mempool.space/api"
 OKX_API = "https://www.okx.com"  # T-06 备用源：Binance 主源失败时切 OKX（免 Key 公开行情）
+# T-13 扩展数据源（需 Key；无 Key 时优雅降级为 _skipped，绝不报错）。
+COINGLASS_API = "https://open-api-v4.coinglass.com"   # 爆仓热力图 / 清算数据
+GLASSNODE_API = "https://api.glassnode.com"           # 链上：交易所净流 / 大额转账
 TIMEOUT = 15
 _HEADERS = {"User-Agent": "jarvis-crypto-data/1.0"}
+
+# T-13 凭据不硬编码：优先 env，其次 ~/.vibe-trading/data_keys.json。
+DATA_KEYS_PATH = os.path.expanduser("~/.vibe-trading/data_keys.json")
+
+
+def _data_key(env: str, file_key: str) -> str:
+    """取扩展数据源 API Key：env > data_keys.json > 空串（空串=未配置→降级）。"""
+    v = os.getenv(env)
+    if v:
+        return v.strip()
+    try:
+        if os.path.exists(DATA_KEYS_PATH):
+            with open(DATA_KEYS_PATH, encoding="utf-8") as f:
+                return str(json.load(f).get(file_key, "") or "").strip()
+    except Exception:  # noqa: BLE001 — Key 文件异常视为未配置
+        pass
+    return ""
+
+
+def _coin(symbol: str) -> str:
+    """合约代码 -> 币种基名，如 BTCUSDT -> BTC。"""
+    s = (symbol or "").upper().replace("-", "").replace("/", "")
+    for suffix in ("USDT", "USDC", "USD"):
+        if s.endswith(suffix):
+            return s[: -len(suffix)]
+    return s
 
 # T-06 数据源单点故障降级：主源成功即落缓存，主源彻底失败时回退最近缓存（透明兜底）。
 CACHE_DIR = os.path.expanduser("~/.vibe-trading/cache")
@@ -431,6 +460,68 @@ def fetch_onchain() -> dict:
     return out
 
 
+def fetch_liquidations(symbol: str) -> dict:
+    """[T-13] Coinglass 爆仓/清算数据（需 Key）。无 Key → 优雅降级 _skipped。
+
+    免 Key 时不报错、不阻塞主链路；配置 `JARVIS_COINGLASS_KEY`（或 data_keys.json
+    的 `coinglass`）后返回 24h 多空清算额等。任何网络/格式异常都降级为 _error 但不抛出。
+    """
+    key = _data_key("JARVIS_COINGLASS_KEY", "coinglass")
+    if not key:
+        return {"_skipped": True, "reason": "未配置 COINGLASS_KEY（链上/清算数据降级为 —）"}
+    out: dict = {"_source": "coinglass"}
+    try:
+        url = f"{COINGLASS_API}/api/futures/liquidation/history"
+        r = requests.get(url, params={"symbol": _coin(symbol), "interval": "1d", "limit": 1},
+                         headers={**_HEADERS, "CG-API-KEY": key}, timeout=TIMEOUT)
+        body = r.json()
+        rows = body.get("data") if isinstance(body, dict) else None
+        if isinstance(rows, list) and rows:
+            last = rows[-1] if isinstance(rows[-1], dict) else {}
+            long_liq = last.get("longLiquidationUsd") or last.get("long_liquidation_usd")
+            short_liq = last.get("shortLiquidationUsd") or last.get("short_liquidation_usd")
+            if long_liq is not None:
+                out["long_liquidation_usd_24h"] = float(long_liq)
+            if short_liq is not None:
+                out["short_liquidation_usd_24h"] = float(short_liq)
+            if long_liq is not None and short_liq is not None and (float(long_liq) + float(short_liq)) > 0:
+                tot = float(long_liq) + float(short_liq)
+                out["long_liq_share_pct"] = round(float(long_liq) / tot * 100, 1)
+        else:
+            out["_error"] = (body.get("msg") if isinstance(body, dict) else "no data") or "no data"
+    except Exception as exc:  # noqa: BLE001 — 扩展源失败不影响主链路
+        out["_error"] = repr(exc)[:160]
+    return out
+
+
+def fetch_exchange_flows(symbol: str) -> dict:
+    """[T-13] Glassnode 链上：交易所净流（需 Key）。无 Key → 优雅降级 _skipped。
+
+    净流为负=资金流出交易所（偏多，囤币）；为正=流入（潜在抛压）。配置
+    `JARVIS_GLASSNODE_KEY`（或 data_keys.json 的 `glassnode`）后生效。
+    """
+    key = _data_key("JARVIS_GLASSNODE_KEY", "glassnode")
+    if not key:
+        return {"_skipped": True, "reason": "未配置 GLASSNODE_KEY（交易所净流/大额转账降级为 —）"}
+    out: dict = {"_source": "glassnode"}
+    try:
+        url = f"{GLASSNODE_API}/v1/metrics/transactions/transfers_volume_exchanges_net"
+        r = requests.get(url, params={"a": _coin(symbol), "i": "24h", "api_key": key},
+                         headers=_HEADERS, timeout=TIMEOUT)
+        body = r.json()
+        if isinstance(body, list) and body:
+            last = body[-1]
+            if isinstance(last, dict) and "v" in last:
+                net = float(last["v"])
+                out["exchange_netflow_native_24h"] = round(net, 4)
+                out["netflow_state"] = "outflow(流出/偏多)" if net < 0 else "inflow(流入/潜在抛压)"
+        else:
+            out["_error"] = (body.get("message") if isinstance(body, dict) else "no data") or "no data"
+    except Exception as exc:  # noqa: BLE001
+        out["_error"] = repr(exc)[:160]
+    return out
+
+
 def collect(symbol: str) -> dict:
     funding = fetch_funding(symbol)
     mark = funding.get("mark_price", 0) if isinstance(funding, dict) else 0
@@ -447,6 +538,9 @@ def collect(symbol: str) -> dict:
     }
     if symbol.upper().startswith("BTC"):
         data["onchain"] = fetch_onchain()
+    # T-13 扩展数据源（Coinglass 清算 + Glassnode 交易所净流）：无 Key 时 _skipped 降级。
+    data["liquidations"] = fetch_liquidations(symbol)
+    data["exchange_flows"] = fetch_exchange_flows(symbol)
     # T-06 数据源透明度：汇总各核心字段实际来源（binance / okx），便于排障与降级感知。
     data["_sources"] = {
         "funding": funding.get("_source") if isinstance(funding, dict) else None,
@@ -499,6 +593,28 @@ def to_markdown(d: dict) -> str:
             f"- 全网算力: {oc.get('hashrate_eh_s', 'N/A')} EH/s | 挖矿难度: {oc.get('difficulty_t', 'N/A')} T",
             f"- 内存池待确认交易: {oc.get('mempool_tx_count', 'N/A')} 笔 | 最快手续费: {oc.get('fee_fastest_sat_vb', 'N/A')} sat/vB (1小时档: {oc.get('fee_hour_sat_vb', 'N/A')})",
         ]
+    # T-13 扩展数据源（清算 / 交易所净流）：无 Key 时显示「—（未配置 Key）」。
+    liq = d.get("liquidations", {}) or {}
+    fl = d.get("exchange_flows", {}) or {}
+    if liq or fl:
+        lines += ["", "### 扩展数据源（T-13：需 Key）"]
+        if liq.get("_skipped"):
+            lines.append("- 清算(Coinglass): —（未配置 JARVIS_COINGLASS_KEY）")
+        elif liq.get("_error"):
+            lines.append(f"- 清算(Coinglass): 取数失败 {liq.get('_error')}")
+        else:
+            lines.append(
+                f"- 24h 清算: 多 {liq.get('long_liquidation_usd_24h', 'N/A')}U / "
+                f"空 {liq.get('short_liquidation_usd_24h', 'N/A')}U（多头占比 {liq.get('long_liq_share_pct', 'N/A')}%）"
+            )
+        if fl.get("_skipped"):
+            lines.append("- 交易所净流(Glassnode): —（未配置 JARVIS_GLASSNODE_KEY）")
+        elif fl.get("_error"):
+            lines.append(f"- 交易所净流(Glassnode): 取数失败 {fl.get('_error')}")
+        else:
+            lines.append(
+                f"- 交易所净流(24h): {fl.get('exchange_netflow_native_24h', 'N/A')} | {fl.get('netflow_state', 'N/A')}"
+            )
     lines += [
         "",
         "> 数据来源: Binance Futures/Spot + alternative.me + CoinGecko + blockchain.info/mempool.space（真实拉取，非估算）。",

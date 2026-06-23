@@ -152,19 +152,51 @@ def grow_step(symbols: list[str], *, apply_retrain: bool = False) -> dict:
     return res
 
 
+def morning_step(symbols: list[str], *, notify: bool = True, dry_run: bool = False) -> dict:
+    """生成并（可选）推送每日晨报（T-14）。永不抛出，失败只记日志。"""
+    res: dict = {"started_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    try:
+        import jarvis_morning_report as jmr
+        report = jmr.build(symbols)
+        r = report.get("radar", {})
+        hits = len(r.get("data", {}).get("actionable", [])) if r.get("ok") else 0
+        res["actionable"] = hits
+        _log(f"☀️ 晨报生成：达标信号 {hits} 个")
+        if notify:
+            push = jmr.send(report, dry_run=dry_run)
+            res["push"] = push
+            _log(f"☀️ 晨报推送：{push}")
+    except Exception as e:  # noqa: BLE001 — 晨报失败不影响主心跳
+        res["error"] = repr(e)[:300]
+        _log("☀️ 晨报 ❌ 异常（已兜底）: " + repr(e)[:200])
+    res["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    return res
+
+
 def loop(symbols: list[str], interval_hours: float, paper_trade: bool = False,
-         *, auto_grow: bool = False, grow_every: int = 30, auto_retrain_apply: bool = False) -> int:
+         *, auto_grow: bool = False, grow_every: int = 30, auto_retrain_apply: bool = False,
+         auto_morning: bool = False, morning_dry_run: bool = False) -> int:
     interval = max(60.0, interval_hours * 3600.0)
     _log(f"🤖 贾维斯定时引擎启动：symbols={symbols} 周期={interval_hours}h "
          f"自动跟盘={'开' if paper_trade else '关'} "
          f"自进化={'开（每'+str(grow_every)+'轮，重训'+('采纳' if auto_retrain_apply else '仅建议')+'）' if auto_grow else '关'}")
     cycle_count = 0
+    last_morning_date = None
     while True:
         try:
             run_cycle(symbols, paper_trade=paper_trade)
         except Exception:  # noqa: BLE001 — 兜底，确保循环不死
             _log("本轮异常（已兜底，继续运行）:\n" + traceback.format_exc())
         cycle_count += 1
+        # [T-14] 每日晨报：日历日切换即触发一次（避免高频；首轮也会发一封）。
+        if auto_morning:
+            today = time.strftime("%Y-%m-%d")
+            if today != last_morning_date:
+                last_morning_date = today
+                try:
+                    morning_step(symbols, notify=True, dry_run=morning_dry_run)
+                except Exception:  # noqa: BLE001 — 晨报失败绝不拖垮主心跳
+                    _log("晨报异常（已兜底，继续运行）:\n" + traceback.format_exc())
         if auto_grow and grow_every > 0 and cycle_count % grow_every == 0:
             _log(f"🌱 触发第 {cycle_count} 轮自进化（总结不足"
                  + ("+重训采纳）" if auto_retrain_apply else "，重训仅建议）"))
@@ -226,6 +258,12 @@ def main() -> int:
                     help="自进化时不仅总结，还把重训建议写入权重（OOS+护栏内）；默认仅建议不写")
     ap.add_argument("--grow-now", action="store_true",
                     help="立刻跑一次自进化步骤（总结不足）然后退出，便于手动体检")
+    ap.add_argument("--auto-morning", action="store_true",
+                    help="[T-14] 开启每日晨报：日历日切换自动生成+推送一封；默认关闭")
+    ap.add_argument("--morning-now", action="store_true",
+                    help="[T-14] 立刻生成并推送一封晨报然后退出，便于手动体检")
+    ap.add_argument("--morning-dry-run", action="store_true",
+                    help="[T-14] 晨报只打印不真发（联网前演练）")
     ap.add_argument("--install-launchd", action="store_true", help="生成 macOS launchd plist")
     args = ap.parse_args()
 
@@ -248,6 +286,11 @@ def main() -> int:
         _log("单次自进化完成")
         return 0
 
+    if args.morning_now:
+        morning_step(symbols, notify=True, dry_run=args.morning_dry_run)
+        _log("单次晨报完成")
+        return 0
+
     if args.once:
         cycle = run_cycle(symbols, paper_trade=args.paper_trade)
         ok = all(v.get("record", {}) and v["record"].get("ok") for v in cycle["symbols"].values())
@@ -256,7 +299,8 @@ def main() -> int:
 
     return loop(symbols, args.interval_hours, paper_trade=args.paper_trade,
                 auto_grow=args.auto_grow, grow_every=args.grow_every,
-                auto_retrain_apply=args.auto_retrain_apply)
+                auto_retrain_apply=args.auto_retrain_apply,
+                auto_morning=args.auto_morning, morning_dry_run=args.morning_dry_run)
 
 
 if __name__ == "__main__":

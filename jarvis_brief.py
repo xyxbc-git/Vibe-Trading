@@ -24,6 +24,7 @@ import json
 import sys
 import time
 
+import jarvis_config as jcfg
 import jarvis_crypto_data as jcd
 import jarvis_lessons as jl
 import jarvis_weights as jw
@@ -116,9 +117,17 @@ def score_and_plan(deriv: dict, fac: dict, fng_now: int) -> dict:
     score = round(max(-2.0, min(2.0, score)), 2)
 
     # 信心分 → 方向 + 仓位（弱因子，仓位上限保守）
+    # [T-15] 止损/止盈/时间止损/入场带/仓位上限从配置中心读取（默认=原硬编码，零回归）。
     TH = jw.get_thresholds()
+    C = jcfg.load()
+    pos_cap = float(C["max_position_pct"]) / 100.0
+    sl_drop = float(C["stop_loss_drop_pct"]) / 100.0
+    tp_up = float(C["take_profit_pct"]) / 100.0
+    band_lo = float(C["entry_band_below_pct"]) / 100.0
+    band_hi = float(C["entry_band_above_pct"]) / 100.0
+    time_stop = int(C["time_stop_days"])
     if score >= TH["long"]:
-        direction, base_pos = "偏多（战术）", min(0.4, 0.2 + score * 0.1)
+        direction, base_pos = "偏多（战术）", min(pos_cap, 0.2 + score * 0.1)
     elif score <= TH["short"]:
         direction, base_pos = "偏空/观望", 0.0
     else:
@@ -133,14 +142,15 @@ def score_and_plan(deriv: dict, fac: dict, fng_now: int) -> dict:
         "attribution": attribution,
     }
     if price and base_pos > 0:
-        plan["entry_zone"] = f"{round(price*0.985,2)} ~ {round(price*1.005,2)}"
-        plan["stop_loss"] = round(price * 0.90, 2)  # -10% 硬止损
-        plan["take_profit_ref"] = round(price * 1.08, 2)  # 参考 +8%
-        plan["time_stop_days"] = 30  # 因子是 30 天均值回归，过期离场
-        plan["max_risk_pct"] = round(base_pos * 10, 1)  # 仓位×止损幅度=组合最大风险
+        plan["entry_zone"] = f"{round(price*(1-band_lo),2)} ~ {round(price*(1+band_hi),2)}"
+        plan["stop_loss"] = round(price * (1 - sl_drop), 2)  # 硬止损（默认 -10%）
+        plan["take_profit_ref"] = round(price * (1 + tp_up), 2)  # 参考止盈（默认 +8%）
+        plan["time_stop_days"] = time_stop  # 因子是均值回归，过期离场（默认 30 天）
+        plan["max_risk_pct"] = round(base_pos * float(C["stop_loss_drop_pct"]), 1)  # 仓位×止损幅度=组合最大风险
         # [T-08] 期望值计入永续 funding 成本：弱 edge 可能被持仓期 funding 费吃光。
         plan["expected_value"] = _expected_value(
-            deriv, score, tp_pct=8.0, sl_pct=-10.0, hold_days=plan["time_stop_days"]
+            deriv, score, tp_pct=float(C["take_profit_pct"]), sl_pct=-float(C["stop_loss_drop_pct"]),
+            hold_days=plan["time_stop_days"],
         )
         ev = plan["expected_value"]
         if ev.get("net_ev_pct") is not None and ev["net_ev_pct"] <= 0:

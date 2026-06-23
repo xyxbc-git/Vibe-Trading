@@ -26,10 +26,22 @@ import sys
 import time
 
 import jarvis_brief as jb
+import jarvis_config as jcfg
 import jarvis_correlation as jcorr
 
 # 默认篮子（与仪表盘币种下拉一致，可扩展）。
+# [T-15] 优先取配置中心 watchlist；配置缺失时回退此内置原值（零回归）。
 DEFAULT_WATCHLIST = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT"]
+
+
+def _watchlist() -> list[str]:
+    try:
+        wl = jcfg.get("watchlist")
+        if isinstance(wl, list) and wl:
+            return [str(s) for s in wl]
+    except Exception:  # noqa: BLE001
+        pass
+    return DEFAULT_WATCHLIST
 
 LOG_DIR = os.path.expanduser("~/.vibe-trading")
 STATUS_PATH = os.path.join(LOG_DIR, "jarvis_radar_status.json")
@@ -66,7 +78,7 @@ def _correlation_overlay(actionable: list[dict], max_effective_pct: float, corr_
 def scan(symbols: list[str] | None = None, min_conviction: float = 0.8,
          max_effective_pct: float = jcorr.DEFAULT_MAX_EFFECTIVE_PCT, corr_days: int = 30) -> dict:
     """扫一篮子币，返回全量 + 达标信号。永不抛出（单币异常被吞）。"""
-    symbols = [_norm(s) for s in (symbols or DEFAULT_WATCHLIST)]
+    symbols = [_norm(s) for s in (symbols or _watchlist())]
     results = []
     errors = []
     for sym in symbols:

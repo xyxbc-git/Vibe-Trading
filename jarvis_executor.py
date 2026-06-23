@@ -54,6 +54,8 @@ DEFAULTS = {
     "max_portfolio_risk_pct": 1.5, # 组合最大风险红线
     "min_conviction": 0.8,         # 信心分门槛（与 brief 偏多触发一致）
     "stop_loss_drop_pct": 10.0,    # 用于 sizing 的止损幅度（brief 硬止损 -10%）
+    "sizing_method": "fixed",      # [T-11] fixed=固定比例（默认）| kelly=分数凯利
+    "kelly_fraction": 0.5,         # [T-11] 分数凯利系数（越小越保守）
     "request_timeout_s": 30,
 }
 
@@ -74,8 +76,19 @@ def _log(msg: str) -> None:
 
 
 def load_config(cli: dict | None = None) -> dict:
-    """合并 默认 < 配置文件 < 环境变量 < CLI。"""
+    """合并 内置默认 < 配置中心(T-15) < executor 配置文件 < 环境变量 < CLI。"""
     cfg = dict(DEFAULTS)
+    # [T-15] 统一配置中心的共享风控旋钮作为基线（默认=内置默认，零回归）。
+    try:
+        import jarvis_config as jcfg
+        C = jcfg.load()
+        for k in ("max_position_pct", "max_portfolio_risk_pct", "min_conviction",
+                  "stop_loss_drop_pct", "account_equity_usdt",
+                  "sizing_method", "kelly_fraction"):
+            if k in C:
+                cfg[k] = C[k]
+    except Exception as exc:  # noqa: BLE001 — 配置中心异常不拖垮执行手
+        _log(f"⚠️ 读取配置中心失败（用内置默认继续）: {exc}")
     try:
         if os.path.exists(CONFIG_PATH):
             with open(CONFIG_PATH, encoding="utf-8") as f:
@@ -134,6 +147,31 @@ def evaluate_guardrails(decision: dict, cfg: dict) -> dict:
     if not entry_price or entry_price <= 0:
         return {"action": "skip", "reason": "无有效入场价（行情取数失败？）→ 暂不下单"}
 
+    # [T-11] 动态仓位：sizing_method=kelly 时按胜率+盈亏比用分数凯利重算建议仓位。
+    # 凯利只会更保守或相近，绝不突破下方的仓位上限/组合风险红线（红线永远最后封顶）。
+    sizing_info: dict = {"method": str(cfg.get("sizing_method", "fixed")), "applied": False}
+    if str(cfg.get("sizing_method", "fixed")) == "kelly":
+        ev = decision.get("expected_value") or {}
+        try:
+            import jarvis_sizing as js
+            sug = js.suggest_position_pct(
+                ev.get("win_prob"), ev.get("take_profit_pct"), ev.get("stop_loss_pct"),
+                method="kelly", kelly_fraction=float(cfg.get("kelly_fraction", 0.5)),
+                cap_pct=float(cfg["max_position_pct"]), fixed_pct=pos_pct,
+            )
+            if sug.get("position_pct") is not None and "fixed" not in str(sug.get("method", "")):
+                sizing_info = {
+                    "method": "kelly", "applied": True, "fixed_pct": pos_pct,
+                    "kelly_pct": sug["position_pct"], "kelly_star": sug.get("kelly_star"),
+                    "reason": sug.get("reason"),
+                }
+                pos_pct = sug["position_pct"]
+        except Exception:  # noqa: BLE001 — sizing 异常回退固定比例
+            sizing_info = {"method": "fixed(fallback)", "applied": False, "reason": "凯利计算异常"}
+
+    if pos_pct <= 0:
+        return {"action": "skip", "reason": "动态仓位建议≈0（负 edge / 凯利归零）→ 观望不下单"}
+
     # 3. 单笔仓位上限封顶。
     clamped = False
     if pos_pct > float(cfg["max_position_pct"]):
@@ -158,6 +196,16 @@ def evaluate_guardrails(decision: dict, cfg: dict) -> dict:
     if qty <= 0:
         return {"action": "skip", "reason": "下单数量≈0（权益过小或币价过高）→ 不下单"}
 
+    # [T-07] 下单前滑点预估：按名义额 + 币种流动性给出预估冲击成本与成交价。
+    slippage = None
+    try:
+        import jarvis_slippage as js
+        sym = decision.get("symbol") or cfg.get("_symbol") or ""
+        slippage = js.estimate_slippage_pct(sym, notional, side="buy")
+        slippage["est_fill_price"] = js.apply_fill_price(entry_price, "buy", slippage.get("one_way_bps", 0))
+    except Exception:  # noqa: BLE001 — 滑点预估失败不影响下单
+        slippage = None
+
     return {
         "action": "place",
         "reason": "护栏通过",
@@ -170,6 +218,8 @@ def evaluate_guardrails(decision: dict, cfg: dict) -> dict:
         "take_profit": float(take_profit) if take_profit else None,
         "projected_risk_pct": round(projected_risk, 3),
         "clamped": clamped,
+        "sizing": sizing_info,
+        "slippage": slippage,
     }
 
 
@@ -275,6 +325,7 @@ def execute(symbol: str, cfg: dict, dry_run: bool = False) -> dict:
         "take_profit_ref": decision.get("take_profit_ref"),
     }
 
+    cfg["_symbol"] = symbol  # [T-07] 供滑点预估识别币种流动性分层
     guard = evaluate_guardrails(decision, cfg)
     result["guardrails"] = guard
 

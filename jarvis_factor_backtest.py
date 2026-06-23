@@ -131,12 +131,15 @@ def _sharpe(daily_rets: list) -> float:
 
 def backtest(dates: list, prices: dict, fng: dict, funding: dict,
              fear_thresh: int, greed_thresh: int, use_funding: bool,
-             allow_short: bool) -> dict:
+             allow_short: bool, cost_bps: float = 0.0) -> dict:
     """逐日回测。仓位由前一日信号决定（防前瞻）。
 
     多头条件: F&G < fear_thresh (且若 use_funding，要求当日资金费率 <= 0)
     空头/离场: F&G > greed_thresh (allow_short=True 则做空，否则空仓)
     其余: 维持上一仓位（持有惯性）。
+
+    [T-07] cost_bps：每次换仓（开/平/翻转）扣减的单边滑点成本（bps）。
+    默认 0 = 零回归（与历史 P3/P4 结果一致）；传入正值即得「滑点后 edge」。
     """
     pos = 0  # -1 / 0 / 1
     strat_equity = [1.0]
@@ -160,13 +163,17 @@ def backtest(dates: list, prices: dict, fng: dict, funding: dict,
                     new_pos = 1
             elif fg_prev > greed_thresh:
                 new_pos = -1 if allow_short else 0
-        if new_pos != prev_pos:
+        turned = new_pos != prev_pos
+        if turned:
             trades += 1
         prev_pos = new_pos
         pos = new_pos
 
         ret = prices[d_cur] / prices[d_prev] - 1.0
         strat_ret = pos * ret
+        # [T-07] 换仓滑点成本：仓位变动当日按单边 cost_bps 扣减（开/平/翻转各计一次）。
+        if turned and cost_bps:
+            strat_ret -= float(cost_bps) / 10000.0
         strat_rets.append(strat_ret)
         strat_equity.append(strat_equity[-1] * (1 + strat_ret))
         bh_equity.append(bh_equity[-1] * (1 + ret))
@@ -186,6 +193,7 @@ def backtest(dates: list, prices: dict, fng: dict, funding: dict,
         "greed_thresh": greed_thresh,
         "use_funding": use_funding,
         "allow_short": allow_short,
+        "cost_bps": cost_bps,
         "days": n,
         "days_in_market": days_in_market,
         "exposure_pct": round(days_in_market / n * 100, 1) if n else 0,
@@ -310,7 +318,7 @@ def event_study_advanced(dates: list, prices: dict, fng: dict, horizon: int = 30
     }
 
 
-def run() -> dict:
+def run(cost_bps: float = 0.0) -> dict:
     prices = fetch_price_daily()
     fng = fetch_fng_all()
     funding = fetch_funding_daily()
@@ -322,11 +330,11 @@ def run() -> dict:
     scenarios = []
     # 基线：纯恐慌贪婪反向(多/空仓)
     for fear in (20, 25, 30):
-        scenarios.append(backtest(dates, prices, fng, funding, fear, 80, False, False))
+        scenarios.append(backtest(dates, prices, fng, funding, fear, 80, False, False, cost_bps))
     # 叠加资金费率过滤
-    scenarios.append(backtest(dates, prices, fng, funding, 25, 80, True, False))
+    scenarios.append(backtest(dates, prices, fng, funding, 25, 80, True, False, cost_bps))
     # 允许做空(极度贪婪时做空)
-    scenarios.append(backtest(dates, prices, fng, funding, 25, 75, False, True))
+    scenarios.append(backtest(dates, prices, fng, funding, 25, 75, False, True, cost_bps))
 
     return {
         "symbol": "BTCUSDT",
@@ -335,6 +343,7 @@ def run() -> dict:
         "sample_end": dates[-1],
         "sample_days": len(dates),
         "funding_history_days": len(funding),
+        "cost_bps": cost_bps,
         "scenarios": scenarios,
         "event_study": event_study(dates, prices, fng),
         "factor2": event_study_advanced(dates, prices, fng, horizon=30),
@@ -408,8 +417,10 @@ def to_markdown(r: dict) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description="贾维斯 P3 因子回测")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--slippage-bps", type=float, default=0.0,
+                    help="[T-07] 每次换仓单边滑点成本(bps)，默认0；传入即得滑点后 edge")
     args = ap.parse_args()
-    r = run()
+    r = run(cost_bps=args.slippage_bps)
     print(json.dumps(r, ensure_ascii=False, indent=2) if args.json else to_markdown(r))
     return 0
 
