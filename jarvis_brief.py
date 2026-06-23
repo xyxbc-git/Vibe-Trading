@@ -26,6 +26,7 @@ import time
 
 import jarvis_crypto_data as jcd
 import jarvis_lessons as jl
+import jarvis_weights as jw
 from jarvis_factor_backtest import _build_series, fetch_fng_all, fetch_price_daily
 
 
@@ -64,10 +65,15 @@ def current_factor_state(symbol_base: str) -> dict:
 
 
 def score_and_plan(deriv: dict, fac: dict, fng_now: int) -> dict:
-    """把因子状态汇成信心分，再翻译成带风控的交易计划。"""
+    """把因子状态汇成信心分，再翻译成带风控的交易计划。
+
+    因子权重与方向阈值从 jarvis_weights 读取（可被重训覆盖）；配置不存在时
+    回退内置默认（= 历史硬编码原值），保证零回归。
+    """
     reasons: list[str] = []
     attribution: list[dict] = []  # 因子归因：每项对信心分的带符号贡献
     score = 0.0  # 正=偏多, 负=偏空，范围约 [-2, 2]
+    W = jw.get_weights()
 
     def _add(name: str, value: float, note: str) -> None:
         nonlocal score
@@ -77,21 +83,21 @@ def score_and_plan(deriv: dict, fac: dict, fng_now: int) -> dict:
 
     # 因子1：回撤抄底（弱因子，小权重）
     if fac.get("dd30_signal_active"):
-        _add("深度回撤抄底", 0.5, f"距高点回撤 {fac['drawdown_from_ath_pct']}% ≤-30%（弱抄底因子，样本外 +0.46%/胜率55%）")
+        _add("深度回撤抄底", W["dd30_dip"], f"距高点回撤 {fac['drawdown_from_ath_pct']}% ≤-30%（弱抄底因子，样本外 +0.46%/胜率55%）")
     # 因子2：极度恐惧 + 下跌趋势（反弹）
     below_ma = fac.get("above_ma200") is False
     if fng_now < 20 and below_ma:
-        _add("下跌中恐惧", 0.6, f"F&G {fng_now}<20 且 价<200MA（下跌中恐惧，历史30天胜率62.9%）")
+        _add("下跌中恐惧", W["fear_in_downtrend"], f"F&G {fng_now}<20 且 价<200MA（下跌中恐惧，历史30天胜率62.9%）")
     elif fng_now < 20 and fac.get("above_ma200"):
-        _add("牛市中恐惧", -0.3, f"F&G {fng_now}<20 但 价>200MA（牛市中恐惧，历史为利空 edge-6.6%）")
+        _add("牛市中恐惧", W["fear_in_uptrend"], f"F&G {fng_now}<20 但 价>200MA（牛市中恐惧，历史为利空 edge-6.6%）")
 
     # 衍生品确认/反驳
     f = deriv.get("funding", {})
     regime = f.get("funding_regime", "")
     if "overheated_short" in regime:
-        _add("资金费率转负", 0.4, "资金费率深度转负（空头拥挤，易轧空）")
+        _add("资金费率转负", W["funding_overheated_short"], "资金费率深度转负（空头拥挤，易轧空）")
     elif "overheated_long" in regime:
-        _add("资金费率过热", -0.4, "资金费率过热（多头拥挤，回调风险）")
+        _add("资金费率过热", W["funding_overheated_long"], "资金费率过热（多头拥挤，回调风险）")
 
     ls = deriv.get("long_short", {})
     g7 = ls.get("global_ls_7d")
@@ -100,19 +106,20 @@ def score_and_plan(deriv: dict, fac: dict, fng_now: int) -> dict:
 
     # 200MA 大方向
     if fac.get("above_ma200"):
-        _add("200MA 多头结构", 0.3, "价格在 200 日均线之上（中期多头结构）")
+        _add("200MA 多头结构", W["ma200_above"], "价格在 200 日均线之上（中期多头结构）")
     else:
-        _add("200MA 偏弱结构", -0.2, "价格在 200 日均线之下（中期偏弱）")
+        _add("200MA 偏弱结构", W["ma200_below"], "价格在 200 日均线之下（中期偏弱）")
 
     # 因子（T-04 新增）：20日新高突破（正交动量因子，已验证 OOS+蒙卡）
     if fac.get("breakout_20d_active"):
-        _add("20日新高突破", 0.6, "创20日新高·正交动量因子（edge+2.95%/OOS+1.79%/蒙卡p=0.0016）")
+        _add("20日新高突破", W["breakout_20d"], "创20日新高·正交动量因子（edge+2.95%/OOS+1.79%/蒙卡p=0.0016）")
     score = round(max(-2.0, min(2.0, score)), 2)
 
     # 信心分 → 方向 + 仓位（弱因子，仓位上限保守）
-    if score >= 0.8:
+    TH = jw.get_thresholds()
+    if score >= TH["long"]:
         direction, base_pos = "偏多（战术）", min(0.4, 0.2 + score * 0.1)
-    elif score <= -0.8:
+    elif score <= TH["short"]:
         direction, base_pos = "偏空/观望", 0.0
     else:
         direction, base_pos = "中性观望", 0.1 if score > 0 else 0.0

@@ -35,6 +35,28 @@ import jarvis_paper_trader as jpt
 import jarvis_wallet as jw
 from jarvis_factor_backtest import _build_series, event_study, fetch_fng_all, fetch_price_daily
 
+def _load_env_file() -> None:
+    """零依赖加载脚本同目录下的 .env（KEY=VALUE，每行一条，# 开头为注释）。
+    已存在于真实环境变量的不覆盖；让用户有一个文件可填 DeepSeek/OpenAI key。"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except OSError:
+        pass
+
+
+_load_env_file()
+
 app = FastAPI(title="贾维斯仪表盘")
 
 # 简单内存缓存：{key: (ts, value)}，TTL 控制刷新频率

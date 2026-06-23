@@ -32,6 +32,7 @@ import sys
 import time
 
 import jarvis_brief as jb
+import jarvis_weights as jw
 from jarvis_factor_backtest import _build_series, fetch_fng_all, fetch_price_daily
 
 DB_DIR = os.path.expanduser("~/.vibe-trading")
@@ -149,27 +150,31 @@ def _price_only_decision(dd: float, fng_val: int | None, above_ma200: bool) -> t
     """仅用历史可得的「价格因子」重建决策（不含衍生品，因为历史 funding/多空比难回溯）。
 
     复刻 jarvis_brief.score_and_plan 的价格相关部分，保证回测与实盘口径一致：
-      - 回撤≤-30% → +0.5（弱抄底）
-      - F&G<20 且 价<200MA → +0.6（下跌中恐惧，反弹）
-      - F&G<20 且 价>200MA → -0.3（牛市中恐惧为利空）
-      - 价>200MA → +0.3，否则 -0.2
+      因子权重与方向阈值统一从 jarvis_weights 读取（可被重训覆盖），
+      配置缺失时回退内置默认（= 历史硬编码原值），保证零回归。
+      - 回撤≤-30%（dd30_dip）
+      - F&G<20 且 价<200MA（fear_in_downtrend）
+      - F&G<20 且 价>200MA（fear_in_uptrend）
+      - 价>200MA（ma200_above）/ 价<200MA（ma200_below）
     """
+    W = jw.get_weights()
+    TH = jw.get_thresholds()
     score = 0.0
     if dd <= -0.30:
-        score += 0.5
+        score += W["dd30_dip"]
     if fng_val is not None and fng_val < 20:
         if not above_ma200:
-            score += 0.6
+            score += W["fear_in_downtrend"]
         else:
-            score -= 0.3
+            score += W["fear_in_uptrend"]
     if above_ma200:
-        score += 0.3
+        score += W["ma200_above"]
     else:
-        score -= 0.2
+        score += W["ma200_below"]
     score = round(max(-2.0, min(2.0, score)), 2)
-    if score >= 0.8:
+    if score >= TH["long"]:
         direction, pos = "偏多（战术）", min(0.4, 0.2 + score * 0.1)
-    elif score <= -0.8:
+    elif score <= TH["short"]:
         direction, pos = "偏空/观望", 0.0
     else:
         direction, pos = "中性观望", 0.1 if score > 0 else 0.0

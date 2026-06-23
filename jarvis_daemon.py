@@ -119,14 +119,59 @@ def run_cycle(symbols: list[str], paper_trade: bool = False) -> dict:
     return cycle
 
 
-def loop(symbols: list[str], interval_hours: float, paper_trade: bool = False) -> int:
+def grow_step(symbols: list[str], *, apply_retrain: bool = False) -> dict:
+    """自进化「总结不足 + 训」一步（低频触发）。永不抛出，失败只记日志。
+
+    - 先产出自评报告（jarvis_forward_report，纯只读）写日志摘要；
+    - apply_retrain=True 时再跑 jarvis_retrain --apply 温和调权（OOS+护栏内）。
+    默认 apply_retrain=False：只总结不改权重（看趋势，人工决定何时真正采纳）。
+    """
+    res: dict = {"started_at": time.strftime("%Y-%m-%d %H:%M:%S"), "reports": {}, "retrain": {}}
+    try:
+        import jarvis_forward_report as jfr
+        for sym in symbols:
+            rep = jfr.build(sym)
+            weak = rep.get("weaknesses", [])
+            res["reports"][sym] = {"weaknesses": len(weak), "top": weak[0] if weak else None}
+            _log(f"🔬 自评 {sym}：不足 {len(weak)} 条" + (f"｜首要：{weak[0]}" if weak else ""))
+    except Exception as e:  # noqa: BLE001
+        res["reports"]["error"] = repr(e)[:300]
+        _log("🔬 自评 ❌ 异常（已兜底）: " + repr(e)[:200])
+    if apply_retrain:
+        try:
+            import jarvis_retrain as jr
+            for sym in symbols:
+                rt = jr.run(sym, apply=True)
+                res["retrain"][sym] = {"adopted": rt.get("adopted_count"), "version": rt.get("new_version")}
+                _log(f"🧠 重训 {sym}：采纳 {rt.get('adopted_count')} 项"
+                     + (f"→ 权重 v{rt.get('new_version')}" if rt.get("applied") else "（无采纳，权重不变）"))
+        except Exception as e:  # noqa: BLE001
+            res["retrain"]["error"] = repr(e)[:300]
+            _log("🧠 重训 ❌ 异常（已兜底）: " + repr(e)[:200])
+    res["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    return res
+
+
+def loop(symbols: list[str], interval_hours: float, paper_trade: bool = False,
+         *, auto_grow: bool = False, grow_every: int = 30, auto_retrain_apply: bool = False) -> int:
     interval = max(60.0, interval_hours * 3600.0)
-    _log(f"🤖 贾维斯定时引擎启动：symbols={symbols} 周期={interval_hours}h 自动跟盘={'开' if paper_trade else '关'}")
+    _log(f"🤖 贾维斯定时引擎启动：symbols={symbols} 周期={interval_hours}h "
+         f"自动跟盘={'开' if paper_trade else '关'} "
+         f"自进化={'开（每'+str(grow_every)+'轮，重训'+('采纳' if auto_retrain_apply else '仅建议')+'）' if auto_grow else '关'}")
+    cycle_count = 0
     while True:
         try:
             run_cycle(symbols, paper_trade=paper_trade)
         except Exception:  # noqa: BLE001 — 兜底，确保循环不死
             _log("本轮异常（已兜底，继续运行）:\n" + traceback.format_exc())
+        cycle_count += 1
+        if auto_grow and grow_every > 0 and cycle_count % grow_every == 0:
+            _log(f"🌱 触发第 {cycle_count} 轮自进化（总结不足"
+                 + ("+重训采纳）" if auto_retrain_apply else "，重训仅建议）"))
+            try:
+                grow_step(symbols, apply_retrain=auto_retrain_apply)
+            except Exception:  # noqa: BLE001 — 自进化失败绝不拖垮主心跳
+                _log("自进化异常（已兜底，继续运行）:\n" + traceback.format_exc())
         _log(f"😴 休眠 {interval_hours}h，下轮 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time() + interval))}")
         time.sleep(interval)
 
@@ -173,6 +218,14 @@ def main() -> int:
     ap.add_argument("--once", action="store_true", help="只跑一轮就退出（cron/launchd 友好）")
     ap.add_argument("--paper-trade", action="store_true",
                     help="每轮额外跑一次模拟跟盘（撮合+盯平仓+按决策开仓）；默认关闭")
+    ap.add_argument("--auto-grow", action="store_true",
+                    help="开启自进化：每 N 轮自动总结不足（+可选重训）；默认关闭")
+    ap.add_argument("--grow-every", type=int, default=30,
+                    help="自进化触发周期（每多少轮一次），默认 30")
+    ap.add_argument("--auto-retrain-apply", action="store_true",
+                    help="自进化时不仅总结，还把重训建议写入权重（OOS+护栏内）；默认仅建议不写")
+    ap.add_argument("--grow-now", action="store_true",
+                    help="立刻跑一次自进化步骤（总结不足）然后退出，便于手动体检")
     ap.add_argument("--install-launchd", action="store_true", help="生成 macOS launchd plist")
     args = ap.parse_args()
 
@@ -190,13 +243,20 @@ def main() -> int:
         print(f"  launchctl unload {path}")
         return 0
 
+    if args.grow_now:
+        grow_step(symbols, apply_retrain=args.auto_retrain_apply)
+        _log("单次自进化完成")
+        return 0
+
     if args.once:
         cycle = run_cycle(symbols, paper_trade=args.paper_trade)
         ok = all(v.get("record", {}) and v["record"].get("ok") for v in cycle["symbols"].values())
         _log("单轮完成" + ("（全部成功）" if ok else "（含失败，见日志）"))
         return 0
 
-    return loop(symbols, args.interval_hours, paper_trade=args.paper_trade)
+    return loop(symbols, args.interval_hours, paper_trade=args.paper_trade,
+                auto_grow=args.auto_grow, grow_every=args.grow_every,
+                auto_retrain_apply=args.auto_retrain_apply)
 
 
 if __name__ == "__main__":
