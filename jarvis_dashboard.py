@@ -1463,6 +1463,7 @@ function drawChart(){
   }
   // key 未变时不在这里更新蜡烛——由 WebSocket 实时 update()，避免 REST 旧值覆盖更新
   drawTrendlines();
+  drawPattern();
   drawOverlay();
 }
 
@@ -1487,8 +1488,9 @@ function addTrend(p1,p2,color){
   const rows=lastKline.rows, lastT=barTime(rows[rows.length-1]);
   const slope=(p2.v-p1.v)/(p2.t-p1.t);
   const endV=p2.v+slope*(lastT-p2.t);                 // 沿趋势延伸到最新一根
-  const s=chart.addSeries(LightweightCharts.LineSeries,{color,lineWidth:2,
-    lastValueVisible:false,priceLineVisible:false,crosshairMarkerVisible:false});
+  const s=chart.addSeries(LightweightCharts.LineSeries,{color,lineWidth:1,
+    lastValueVisible:false,priceLineVisible:false,crosshairMarkerVisible:false,
+    pointMarkersVisible:false});
   s.setData([{time:p1.t,value:+p1.v},{time:lastT,value:+endV.toFixed(2)}]);
   trendSeries.push(s);
 }
@@ -1499,8 +1501,69 @@ function drawTrendlines(){
   const win=rows.slice(-Math.min(rows.length,120));
   const k=Math.max(2,Math.round(win.length/24));      // 摆动点检测半窗
   const hs=pivots(win,k,'high'), ls=pivots(win,k,'low');
-  if(hs.length>=2) addTrend(hs[hs.length-2],hs[hs.length-1],'rgba(240,185,11,0.85)');   // 上轨/阻力趋势线（黄）
-  if(ls.length>=2) addTrend(ls[ls.length-2],ls[ls.length-1],'rgba(22,199,132,0.85)');   // 下轨/支撑趋势线（绿）
+  if(hs.length>=2) addTrend(hs[hs.length-2],hs[hs.length-1],'rgba(214,184,92,0.78)');    // 上轨/阻力趋势线（雅致金，1px）
+  if(ls.length>=2) addTrend(ls[ls.length-2],ls[ls.length-1],'rgba(64,196,160,0.78)');    // 下轨/支撑趋势线（雅致青，1px）
+}
+
+// ───────── V 形反转顶 形态（左低点→顶→右低点 阴影三角 · 自绘 canvas 图元）─────────
+function detectVtop(rows){
+  const W=Math.min(rows.length,90); if(W<25) return null;
+  const seg=rows.slice(-W);
+  let pi=-1,ph=-Infinity;
+  for(let i=8;i<seg.length-4;i++){ if(seg[i].h>ph){ph=seg[i].h;pi=i;} }   // 留边距找最高点=反转顶
+  if(pi<0) return null;
+  const lstart=Math.max(0,pi-30); let li=lstart,lv=Infinity;
+  for(let i=lstart;i<=pi;i++){ if(seg[i].l<lv){lv=seg[i].l;li=i;} }        // 顶左侧最低=左基
+  const rend=Math.min(seg.length-1,pi+30); let ri=pi,rv=Infinity;
+  for(let i=pi;i<=rend;i++){ if(seg[i].l<rv){rv=seg[i].l;ri=i;} }          // 顶右侧最低=右基
+  if(li>=pi||ri<=pi) return null;
+  const peak=seg[pi].h;
+  const dropL=(peak-seg[li].l)/peak, dropR=(peak-seg[ri].l)/peak;
+  if(dropL<0.004||dropR<0.004) return null;                               // 两侧涨/跌幅太小不算反转
+  return { left:{time:barTime(seg[li]),value:seg[li].l},
+           peak:{time:barTime(seg[pi]),value:peak},
+           right:{time:barTime(seg[ri]),value:seg[ri].l} };
+}
+
+function makeVtopPrimitive(){
+  return {
+    pts:null, chart:null, series:null, req:null,
+    attached(p){ this.chart=p.chart; this.series=p.series; this.req=p.requestUpdate; },
+    detached(){ this.chart=this.series=this.req=null; },
+    setPts(pts){ this.pts=pts; if(this.req) this.req(); },
+    paneViews(){
+      const self=this;
+      return [{ renderer(){ return { draw(target){
+        const pts=self.pts; if(!pts) return;
+        target.useBitmapCoordinateSpace(scope=>{
+          const ctx=scope.context, hr=scope.horizontalPixelRatio, vr=scope.verticalPixelRatio, ts=self.chart.timeScale();
+          const P=[pts.left,pts.peak,pts.right].map(p=>{
+            const x=ts.timeToCoordinate(p.time), y=self.series.priceToCoordinate(p.value);
+            return (x==null||y==null)?null:{x:x*hr,y:y*vr};
+          });
+          if(P.some(p=>p==null)) return;
+          ctx.beginPath(); ctx.moveTo(P[0].x,P[0].y); ctx.lineTo(P[1].x,P[1].y); ctx.lineTo(P[2].x,P[2].y); ctx.closePath();
+          ctx.fillStyle='rgba(124,92,214,0.16)'; ctx.fill();
+          ctx.lineWidth=1*hr; ctx.strokeStyle='rgba(214,150,60,0.85)'; ctx.stroke();
+          // 标签「V 形反转顶」+ 向下箭头
+          const peak=P[1], fs=11*vr;
+          ctx.font='600 '+fs+'px -apple-system,PingFang SC,sans-serif';
+          ctx.textAlign='center'; ctx.fillStyle='rgba(232,200,120,0.95)';
+          ctx.fillText('V 形反转顶', peak.x, peak.y-22*vr);
+          ctx.beginPath(); ctx.moveTo(peak.x,peak.y-16*vr); ctx.lineTo(peak.x-3*hr,peak.y-21*vr); ctx.lineTo(peak.x+3*hr,peak.y-21*vr); ctx.closePath();
+          ctx.fillStyle='rgba(232,200,120,0.95)'; ctx.fill();
+        });
+      } }; } }];
+    }
+  };
+}
+
+let vtopPrim=null;
+function drawPattern(){
+  if(!chart||!candleSeries||!lastKline) return;
+  if(!vtopPrim){ vtopPrim=makeVtopPrimitive(); try{ candleSeries.attachPrimitive(vtopPrim); }catch(e){ vtopPrim=null; return; } }
+  const v=detectVtop(lastKline.rows||[]);
+  vtopPrim.setPts(v);   // 无形态时传 null，渲染器自动跳过
 }
 
 // ───────── Binance WebSocket 逐 tick 实时 K 线 ─────────
