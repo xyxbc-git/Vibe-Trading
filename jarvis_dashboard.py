@@ -17,7 +17,11 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import time
+import urllib.error
+import urllib.request
 
 import uvicorn
 from fastapi import FastAPI
@@ -295,9 +299,99 @@ _EXIT_REASON_CN = {
 }
 
 
+def _market_events(spot: str) -> list[dict]:
+    """从真实行情数据（恐慌贪婪/资金费率/持仓量/多空比/市值/动量）+ K 线急涨急跌，
+    生成真实市场事件，而非模拟盘动作。全部基于 jcd.collect / kline 实拉数据，不编造。"""
+    evs: list[dict] = []
+    now = time.time()
+
+    def _add(ts, title, detail, tone):
+        evs.append({"ts": float(ts), "kind": "market", "symbol": spot,
+                    "title": title, "detail": detail, "tone": tone})
+
+    # 1) 市场状态事件（来自 snapshot 实时真实数据，时间戳=快照生成时刻）
+    try:
+        snap = _cached(f"snap:{spot}", 300, lambda: jb.build(spot))
+        rd = snap.get("real_data", {}) or {}
+        fac = snap.get("factor_state", {}) or {}
+        fng = rd.get("fear_greed", {}) or {}
+        fund = rd.get("funding", {}) or {}
+        oi = rd.get("open_interest", {}) or {}
+        ls = rd.get("long_short", {}) or {}
+        ms = rd.get("market_structure", {}) or {}
+
+        v = fng.get("fng_value")
+        if v is not None:
+            tone = "loss" if v <= 25 else ("win" if v >= 75 else "info")
+            _add(now, f"恐慌贪婪指数 {v} · {fng.get('fng_class', '')}",
+                 "市场情绪极端，常是反向参考" if (v <= 25 or v >= 75) else "市场情绪中性", tone)
+
+        fr = fund.get("last_funding_rate_8h_pct")
+        if fr is not None:
+            reg = fund.get("funding_regime", "")
+            tone = "loss" if fr >= 0.05 else ("win" if fr <= -0.01 else "info")
+            _add(now, f"资金费率 {fr}% / 8h · {reg}",
+                 "多头拥挤·留意回调" if fr >= 0.05 else ("空头付费·偏多有利" if fr <= -0.01 else "费率平稳"), tone)
+
+        oic = oi.get("oi_change_24h_pct")
+        if oic is not None:
+            tone = "info"
+            _add(now, f"持仓量 24h {'+' if oic >= 0 else ''}{oic}%",
+                 "杠杆增加·波动可能放大" if oic >= 5 else ("杠杆撤离·去风险" if oic <= -5 else "持仓平稳"),
+                 "loss" if oic >= 8 else tone)
+
+        lsr = ls.get("global_long_short_ratio")
+        if lsr is not None:
+            _add(now, f"全网多空比 {lsr}",
+                 "散户偏多·注意反向" if lsr >= 1.5 else ("散户偏空·注意反向" if lsr <= 0.7 else "多空均衡"),
+                 "info")
+
+        mcc = ms.get("market_cap_change_24h_pct")
+        if mcc is not None:
+            _add(now, f"总市值 24h {'+' if mcc >= 0 else ''}{mcc}%",
+                 "大盘整体走强" if mcc >= 2 else ("大盘整体走弱" if mcc <= -2 else "大盘平稳"),
+                 "win" if mcc >= 2 else ("loss" if mcc <= -2 else "info"))
+
+        dd = fac.get("drawdown_from_ath_pct")
+        if dd is not None and dd <= -25:
+            _add(now, f"距历史高点回撤 {dd}%", "进入深度回撤区·弱抄底因子关注", "win")
+
+        mom = fac.get("momentum_30d_pct")
+        if mom is not None:
+            if mom >= 10:
+                _add(now, f"30 日动量 +{mom}%", "中期趋势偏强", "win")
+            elif mom <= -10:
+                _add(now, f"30 日动量 {mom}%", "中期趋势偏弱", "loss")
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 2) 价格异动事件（来自真实 1h K 线，单根 |涨跌| ≥ 2% 记一条，用真实 bar 时间戳）
+    try:
+        kraw = jcd._get(jcd.SPOT_API + "/api/v3/klines",
+                        {"symbol": spot, "interval": "1h", "limit": 120})
+        if not isinstance(kraw, dict):
+            cnt = 0
+            for k in reversed(kraw[-48:]):
+                o, c = float(k[1]), float(k[4])
+                if o <= 0:
+                    continue
+                chg = (c - o) / o * 100
+                if abs(chg) >= 2.0:
+                    cnt += 1
+                    _add(k[0] / 1000,
+                         f"{'急涨' if chg > 0 else '急跌'} {'+' if chg > 0 else ''}{round(chg, 2)}%（1h）",
+                         f"收于 {round(c, 2)}", "win" if chg > 0 else "loss")
+                if cnt >= 8:
+                    break
+    except Exception:  # noqa: BLE001
+        pass
+
+    return evs
+
+
 @app.get("/api/events")
 def api_events(symbol: str | None = None, limit: int = 40):
-    """聚合模拟盘开仓/平仓/止盈止损/信号反转事件，按时间倒序滚动给前端。"""
+    """聚合模拟盘开仓/平仓/止盈止损/信号反转 + 真实市场事件，按时间倒序滚动给前端。"""
     sym = None
     if symbol:
         s = symbol.upper().replace("-", "").replace("/", "")
@@ -305,6 +399,8 @@ def api_events(symbol: str | None = None, limit: int = 40):
 
     def _calc():
         evs: list[dict] = []
+        if sym:
+            evs.extend(_market_events(sym))
         for p in jpt.all_positions(sym):
             side_cn = "开多" if (p.get("side") or "buy") == "buy" else "开空"
             if p.get("opened_ts"):
@@ -407,9 +503,86 @@ def _answer_question(q: str, snap: dict, st: dict) -> str:
     return base
 
 
+def _llm_config() -> dict | None:
+    """从环境变量读取 LLM 配置；未配置返回 None（此时走规则问答兜底）。
+    支持任意 OpenAI 兼容服务（OpenAI / DeepSeek / 国产中转等）：
+      - JARVIS_LLM_API_KEY 或 OPENAI_API_KEY 或 DEEPSEEK_API_KEY
+      - JARVIS_LLM_BASE_URL（DeepSeek 用 https://api.deepseek.com）
+      - JARVIS_LLM_MODEL（DeepSeek 默认 deepseek-chat，OpenAI 默认 gpt-4o-mini）"""
+    ds_key = os.environ.get("DEEPSEEK_API_KEY")
+    key = os.environ.get("JARVIS_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY") or ds_key
+    if not key:
+        return None
+    base = os.environ.get("JARVIS_LLM_BASE_URL")
+    if not base:
+        base = "https://api.deepseek.com" if ds_key else "https://api.openai.com/v1"
+    base = base.rstrip("/")
+    is_deepseek = "deepseek" in base.lower()
+    model = os.environ.get("JARVIS_LLM_MODEL") or ("deepseek-chat" if is_deepseek else "gpt-4o-mini")
+    return {"key": key, "base": base, "model": model}
+
+
+def _llm_answer(question: str, snap: dict, st: dict, sym: str) -> str | None:
+    """接入真实 LLM 回答问题；失败/未配置返回 None 让上层走规则兜底。"""
+    cfg = _llm_config()
+    if not cfg:
+        return None
+    d = (snap or {}).get("decision", {}) or {}
+    fac = (snap or {}).get("factor_state", {}) or {}
+    rd = (snap or {}).get("real_data", {}) or {}
+    context = {
+        "symbol": sym,
+        "price": fac.get("price"),
+        "conviction_score": d.get("conviction_score"),
+        "direction": d.get("direction"),
+        "suggested_position_pct": d.get("suggested_position_pct"),
+        "entry_zone": d.get("entry_zone"),
+        "stop_loss": d.get("stop_loss"),
+        "take_profit_ref": d.get("take_profit_ref"),
+        "time_stop_days": d.get("time_stop_days"),
+        "reasons": d.get("reasons", []),
+        "expected_value": d.get("expected_value"),
+        "drawdown_from_ath_pct": fac.get("drawdown_from_ath_pct"),
+        "momentum_30d_pct": fac.get("momentum_30d_pct"),
+        "fear_greed": rd.get("fear_greed"),
+        "funding": rd.get("funding"),
+        "paper_stats": {
+            "win_rate_pct": st.get("win_rate_pct"),
+            "profit_factor": st.get("profit_factor"),
+            "closed_trades": st.get("closed_trades"),
+            "equity_usdt": st.get("equity_usdt"),
+        } if st else {},
+    }
+    system = (
+        "你是『贾维斯』加密交易助手，面向新手用户。只依据下面 JSON 给出的真实决策与数据回答，"
+        "不得编造数据或价位。用简体中文、口语化、3 句以内说清：该不该买/仓位/止盈止损/理由。"
+        "始终提醒这是模拟盘研究、不构成投资建议。若数据缺失就如实说明。"
+    )
+    payload = json.dumps({
+        "model": cfg["model"],
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"决策与数据(JSON)：{json.dumps(context, ensure_ascii=False)}\n\n用户问题：{question}"},
+        ],
+        "temperature": 0.4,
+        "max_tokens": 400,
+    }, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        cfg["base"] + "/chat/completions", data=payload, method="POST",
+        headers={"Authorization": f"Bearer {cfg['key']}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        ans = (body.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+        return ans or None
+    except (urllib.error.URLError, TimeoutError, ValueError, KeyError):
+        return None
+
+
 @app.post("/api/ask")
 def api_ask(symbol: str = "BTCUSDT", q: str = ""):
-    """小白问答：结合当前币决策 + 模拟盘战绩，用人话回答。"""
+    """小白问答：优先接真实 LLM（按环境变量配置），失败/未配置则用规则问答兜底。"""
     sym = symbol.upper().replace("-", "").replace("/", "")
     spot = sym if sym.endswith("USDT") else sym + "USDT"
     question = (q or "").strip()
@@ -420,8 +593,10 @@ def api_ask(symbol: str = "BTCUSDT", q: str = ""):
         st = jpt.stats(_trader_cfg(), spot)
     except Exception:  # noqa: BLE001
         st = {}
-    answer = _answer_question(question, snap, st)
-    return JSONResponse({"ok": True, "symbol": spot, "question": question, "answer": answer})
+    llm = _llm_answer(question, snap, st, spot)
+    answer = llm if llm else _answer_question(question, snap, st)
+    return JSONResponse({"ok": True, "symbol": spot, "question": question,
+                         "answer": answer, "engine": "llm" if llm else "rule"})
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1284,8 +1459,8 @@ COCKPIT_HTML = r"""<!doctype html>
   .live{color:var(--mut);font-size:12px;text-align:right;line-height:1.4}
   .pulse{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--up);margin-right:5px;animation:p 1.6s infinite}
   @keyframes p{0%{opacity:.3}50%{opacity:1}100%{opacity:.3}}
-  .cockpit{flex:1;display:grid;grid-template-columns:1fr 392px;gap:12px;padding:12px;min-height:0}
-  .chartcol{display:flex;flex-direction:column;gap:8px;min-height:0}
+  .cockpit{flex:1;display:grid;grid-template-columns:1fr 392px;gap:var(--sp3);padding:var(--sp3);min-height:0}
+  .chartcol{display:flex;flex-direction:column;gap:var(--sp2);min-height:0}
   .ivbar{display:flex;gap:6px;align-items:center}
   .ivbar button{background:var(--card);color:var(--mut);border:1px solid var(--bd);border-radius:8px;padding:5px 13px;font-size:13px;font-weight:600;cursor:pointer;transition:all .2s var(--ease)}
   .ivbar button:hover{color:var(--fg);border-color:var(--bd2)}
@@ -1306,11 +1481,11 @@ COCKPIT_HTML = r"""<!doctype html>
   .op .v{font-size:15px;font-weight:700;margin-top:4px;font-family:var(--mono);font-variant-numeric:tabular-nums;letter-spacing:-.2px}
   .why{margin-top:11px;font-size:13px;line-height:1.7;color:var(--mut);border-top:1px solid var(--bd);padding-top:10px}
   .why b{color:var(--fg)}
-  .panelhd{font-size:13px;font-weight:700;color:var(--mut);margin-bottom:9px;display:flex;align-items:center;gap:7px}
+  .panelhd{font-size:12px;font-weight:700;color:var(--mut);margin-bottom:11px;display:flex;align-items:center;gap:7px;text-transform:uppercase;letter-spacing:.6px}
   .events{flex:1;display:flex;flex-direction:column;min-height:120px}
   .evlist{flex:1;overflow:auto;display:flex;flex-direction:column;gap:8px}
   .ev{display:flex;gap:9px;font-size:12px;border-left:2px solid var(--bd);padding:3px 0 3px 9px}
-  .ev.buy{border-color:var(--accent)} .ev.win{border-color:var(--up)} .ev.loss{border-color:var(--down)} .ev.flat{border-color:var(--mut)}
+  .ev.buy{border-color:var(--accent)} .ev.win{border-color:var(--up)} .ev.loss{border-color:var(--down)} .ev.flat{border-color:var(--mut)} .ev.info{border-color:var(--accent2)}
   .ev .t{color:var(--mut);white-space:nowrap;font-size:11px}
   .ev .tt{font-weight:600} .ev .dd{color:var(--mut);margin-top:2px}
   .empty{color:var(--mut);font-size:12px;text-align:center;padding:18px 0}
@@ -1359,7 +1534,7 @@ COCKPIT_HTML = r"""<!doctype html>
         <button data-iv="1h" class="on" onclick="setIv('1h')">1时</button>
         <button data-iv="4h" onclick="setIv('4h')">4时</button>
         <button data-iv="1d" onclick="setIv('1d')">日线</button>
-        <span class="hint">蓝=入场 红=止损 绿=止盈 ▲▼=买卖点 · 黄/绿斜线=趋势上下轨</span>
+        <span class="hint">蓝=入场 红=止损 绿=止盈 ▲▼=买卖点 · 黄=MA7 蓝=MA25 · 底部柱=成交量</span>
       </div>
       <div id="kline"></div>
     </div>
@@ -1368,7 +1543,7 @@ COCKPIT_HTML = r"""<!doctype html>
       <div class="card copilot" id="copilot"><div class="vd">加载中…</div></div>
 
       <div class="card events">
-        <div class="panelhd">📡 实时事件流 <span class="mut" style="font-weight:400">（模拟盘动作）</span></div>
+        <div class="panelhd">📡 实时事件流 <span class="mut" style="font-weight:400">（真实行情 + 模拟盘）</span></div>
         <div class="evlist" id="evlist"><div class="empty">加载中…</div></div>
       </div>
 
@@ -1397,7 +1572,7 @@ const $ = id => document.getElementById(id);
 const REFRESH = 60;
 const SYMS = ['BTCUSDT','ETHUSDT','SOLUSDT'];
 let sym = 'BTCUSDT', iv = '1h';
-let chart, candleSeries=null, markersPrim=null, priceLines=[], chartKey='';
+let chart, candleSeries=null, volSeries=null, maSeries={}, markersPrim=null, priceLines=[], chartKey='';
 let lastDec=null, lastFac=null, lastKline=null, lastPositions=[];
 let countdown = REFRESH, tick=null;
 const TZ = new Date().getTimezoneOffset()*60;   // 秒：让 X 轴显示本地时间
@@ -1483,6 +1658,15 @@ function drawChart(){
       borderUpColor:'#0ecb81', borderDownColor:'#f6465d',
       wickUpColor:'#0ecb81', wickDownColor:'#f6465d'
     });
+    // 成交量副图（底部 ~18%，独立价格轴，对标 trendiq）
+    volSeries = chart.addSeries(LightweightCharts.HistogramSeries, {
+      priceScaleId:'vol', priceFormat:{type:'volume'},
+      lastValueVisible:false, priceLineVisible:false
+    });
+    chart.priceScale('vol').applyOptions({ scaleMargins:{top:0.82,bottom:0}, borderVisible:false });
+    // MA 均线（细线，半透，不抢蜡烛戏）
+    maSeries.ma7  = chart.addSeries(LightweightCharts.LineSeries,{color:'rgba(240,185,11,0.85)',lineWidth:1,lastValueVisible:false,priceLineVisible:false,crosshairMarkerVisible:false});
+    maSeries.ma25 = chart.addSeries(LightweightCharts.LineSeries,{color:'rgba(96,165,250,0.85)',lineWidth:1,lastValueVisible:false,priceLineVisible:false,crosshairMarkerVisible:false});
     markersPrim = LightweightCharts.createSeriesMarkers(candleSeries, []);
   }
   const rows=(lastKline&&lastKline.rows)||[];
@@ -1490,6 +1674,7 @@ function drawChart(){
   const key=sym+'|'+iv;
   if(key!==chartKey){
     candleSeries.setData(data);
+    drawVolMA(rows);
     chart.timeScale().fitContent();
     chartKey=key;
     openWS();                 // 历史就位后，切到 Binance WebSocket 逐 tick 实时推送
@@ -1498,6 +1683,26 @@ function drawChart(){
   drawTrendlines();
   drawPattern();
   drawOverlay();
+}
+
+// ───────── 成交量副图 + MA 均线（对标 trendiq）─────────
+function ma(rows,n){
+  const out=[]; let sum=0;
+  for(let i=0;i<rows.length;i++){
+    sum+=rows[i].c;
+    if(i>=n) sum-=rows[i-n].c;
+    if(i>=n-1) out.push({time:barTime(rows[i]),value:+(sum/n).toFixed(2)});
+  }
+  return out;
+}
+function drawVolMA(rows){
+  if(!chart||!volSeries||!rows||!rows.length) return;
+  volSeries.setData(rows.map(r=>({
+    time:barTime(r), value:+r.v||0,
+    color:(r.c>=r.o)?'rgba(14,203,129,0.45)':'rgba(246,70,93,0.45)'
+  })));
+  if(maSeries.ma7)  maSeries.ma7.setData(ma(rows,7));
+  if(maSeries.ma25) maSeries.ma25.setData(ma(rows,25));
 }
 
 // ───────── 斜趋势线（连真实摆动高/低点，形成上下轨通道，对标 trendiq）─────────
@@ -1619,8 +1824,10 @@ function openWS(){
     if(wsWanted!==want) return;                 // 期间已切币/切周期，忽略旧流
     let m; try{ m=JSON.parse(ev.data); }catch(e){ return; }
     const k=m.k; if(!k||!candleSeries) return;
-    const bar={time:Math.floor(k.t/1000)-TZ, open:+k.o, high:+k.h, low:+k.l, close:+k.c};
+    const t=Math.floor(k.t/1000)-TZ;
+    const bar={time:t, open:+k.o, high:+k.h, low:+k.l, close:+k.c};
     try{ candleSeries.update(bar); }catch(e){}  // 逐 tick 更新当前蜡烛，丝滑不重画
+    try{ if(volSeries) volSeries.update({time:t, value:+k.v||0, color:(+k.c>=+k.o)?'rgba(14,203,129,0.45)':'rgba(246,70,93,0.45)'}); }catch(e){}
     $('px').textContent=fmt(+k.c);
     $('upAt').textContent='实时 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
   };
@@ -1712,7 +1919,7 @@ async function sendAsk(){
   addMsg(q,'u'); const a=addMsg('贾维斯思考中…','a');
   try{
     const d=await (await fetch('/api/ask?symbol='+sym+'&q='+encodeURIComponent(q),{method:'POST'})).json();
-    a.textContent=d.answer||'我暂时答不上来，换个问法试试。';
+    a.textContent=(d.answer||'我暂时答不上来，换个问法试试。')+(d.engine==='llm'?' 🧠':'');
   }catch(e){ a.textContent='网络抖动，稍后再问我一次。'; }
 }
 
