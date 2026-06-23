@@ -1326,7 +1326,7 @@ COCKPIT_HTML = r"""<!doctype html>
         <button data-iv="1h" class="on" onclick="setIv('1h')">1时</button>
         <button data-iv="4h" onclick="setIv('4h')">4时</button>
         <button data-iv="1d" onclick="setIv('1d')">日线</button>
-        <span class="hint">蓝=入场 红=止损 绿=止盈 ▲▼=模拟买卖点</span>
+        <span class="hint">蓝=入场 红=止损 绿=止盈 ▲▼=买卖点 · 黄/绿斜线=趋势上下轨</span>
       </div>
       <div id="kline"></div>
     </div>
@@ -1462,7 +1462,45 @@ function drawChart(){
     openWS();                 // 历史就位后，切到 Binance WebSocket 逐 tick 实时推送
   }
   // key 未变时不在这里更新蜡烛——由 WebSocket 实时 update()，避免 REST 旧值覆盖更新
+  drawTrendlines();
   drawOverlay();
+}
+
+// ───────── 斜趋势线（连真实摆动高/低点，形成上下轨通道，对标 trendiq）─────────
+let trendSeries=[];
+function clearTrend(){ trendSeries.forEach(s=>{ try{chart.removeSeries(s);}catch(e){} }); trendSeries=[]; }
+function pivots(rows,k,type){
+  const out=[];
+  for(let i=k;i<rows.length-k;i++){
+    let ok=true;
+    for(let j=i-k;j<=i+k&&ok;j++){
+      if(j===i) continue;
+      if(type==='high'){ if(rows[j].h>rows[i].h) ok=false; }
+      else{ if(rows[j].l<rows[i].l) ok=false; }
+    }
+    if(ok) out.push({t:barTime(rows[i]), v:(type==='high'?rows[i].h:rows[i].l)});
+  }
+  return out;
+}
+function addTrend(p1,p2,color){
+  if(!lastKline||!lastKline.rows.length||p2.t<=p1.t) return;
+  const rows=lastKline.rows, lastT=barTime(rows[rows.length-1]);
+  const slope=(p2.v-p1.v)/(p2.t-p1.t);
+  const endV=p2.v+slope*(lastT-p2.t);                 // 沿趋势延伸到最新一根
+  const s=chart.addSeries(LightweightCharts.LineSeries,{color,lineWidth:2,
+    lastValueVisible:false,priceLineVisible:false,crosshairMarkerVisible:false});
+  s.setData([{time:p1.t,value:+p1.v},{time:lastT,value:+endV.toFixed(2)}]);
+  trendSeries.push(s);
+}
+function drawTrendlines(){
+  if(!chart||!lastKline) return;
+  clearTrend();
+  const rows=lastKline.rows||[]; if(rows.length<20) return;
+  const win=rows.slice(-Math.min(rows.length,120));
+  const k=Math.max(2,Math.round(win.length/24));      // 摆动点检测半窗
+  const hs=pivots(win,k,'high'), ls=pivots(win,k,'low');
+  if(hs.length>=2) addTrend(hs[hs.length-2],hs[hs.length-1],'rgba(240,185,11,0.85)');   // 上轨/阻力趋势线（黄）
+  if(ls.length>=2) addTrend(ls[ls.length-2],ls[ls.length-1],'rgba(22,199,132,0.85)');   // 下轨/支撑趋势线（绿）
 }
 
 // ───────── Binance WebSocket 逐 tick 实时 K 线 ─────────
@@ -1590,8 +1628,9 @@ async function loadSnapshot(){
   }catch(e){ if(!wsLive()) $('upAt').textContent='刷新失败，下次重试'; }
 }
 
-// 侧栏（决策/事件/战绩）走 60s 轮询；K 线由 WebSocket 实时推送，二者解耦
-function refreshSide(){ loadSnapshot(); loadEvents(); loadStats(); }
+// 侧栏（决策/事件/战绩）走 60s 轮询；K 线蜡烛由 WebSocket 实时推送，二者解耦。
+// loadKline 在此仅用于刷新趋势线/档位（key 未变不会重画蜡烛、不扰动 WS）。
+function refreshSide(){ loadSnapshot(); loadEvents(); loadStats(); loadKline(); }
 function loadAll(){ countdown=REFRESH; loadKline(); refreshSide(); }   // 切币/切周期/首次：重拉历史 K 线并重连 WS
 function startTimer(){ if(tick)clearInterval(tick); tick=setInterval(()=>{ countdown--; renderLive(); if(countdown<=0){ countdown=REFRESH; refreshSide(); } },1000); }
 
