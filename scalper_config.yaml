@@ -1,0 +1,45 @@
+# ===== 15m 短线自动交易配置 =====
+# 所有参数均可热更新（修改后无需重启）
+
+# ── 风控参数 ──
+risk:
+  # 单日亏损限额（占总余额比例），如 -0.02 表示亏 2%
+  daily_loss_limit: -0.02
+  # 触达限额后的行为：warn=只告警继续交易 / pause=暂停1小时 / stop=停手
+  daily_loss_action: "warn"
+  # 最大同时持仓数量
+  max_concurrent_positions: 3
+  # 单笔最大仓位占总余额比例
+  single_trade_risk: 0.01
+  # 低于此余额才真正停止交易（USDT）
+  min_balance_to_trade: 10
+
+# ── 交易行为 ──
+trading:
+  # 永不主动停盘，有余额就交易
+  always_on: true
+  # 信号置信度门槛（0-1，越高越保守）
+  confidence_threshold: 0.6
+  # 自信模式：信号达标即果断进场，不犹豫
+  aggressive_mode: true
+  # 连续亏损后冷却K线数（0=不冷却，立即继续）
+  cool_down_bars: 0
+
+# ── 基本参数 ──
+# K线周期
+timeframe: "15m"
+# 交易对
+symbol: "BTCUSDT"
+
+# ── 进化引擎参数 ──
+evolve:
+  # 最大进化轮数
+  max_rounds: 10
+  # 达标胜率（%）
+  min_win_rate: 52
+  # 达标盈亏比
+  min_profit_factor: 1.2
+  # 达标最大回撤（%）
+  max_drawdown_pct: 15
+  # 墓地查重相似度阈值
+  graveyard_similarity_threshold: 0.8

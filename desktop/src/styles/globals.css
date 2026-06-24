@@ -1,0 +1,61 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: #30363d;
+    border-radius: 3px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: #484f58;
+  }
+}
+
+@layer components {
+  .card {
+    @apply bg-jarvis-card border border-jarvis-border rounded-xl p-5;
+  }
+
+  .stat-value {
+    @apply text-2xl font-semibold text-jarvis-text font-mono;
+  }
+
+  .stat-label {
+    @apply text-sm text-jarvis-text-secondary;
+  }
+
+  .btn-primary {
+    @apply px-4 py-2 bg-jarvis-blue text-white rounded-lg font-medium
+           hover:bg-jarvis-blue/80 transition-colors;
+  }
+
+  .btn-success {
+    @apply px-4 py-2 bg-jarvis-green text-white rounded-lg font-medium
+           hover:bg-jarvis-green/80 transition-colors;
+  }
+
+  .btn-danger {
+    @apply px-4 py-2 bg-jarvis-red text-white rounded-lg font-medium
+           hover:bg-jarvis-red/80 transition-colors;
+  }
+
+  .page-title {
+    @apply text-xl font-semibold text-jarvis-text mb-6;
+  }
+}

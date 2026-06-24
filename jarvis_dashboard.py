@@ -621,6 +621,304 @@ def api_ask(symbol: str = "BTCUSDT", q: str = ""):
                          "answer": answer, "engine": "llm" if llm else "rule"})
 
 
+# ─────────────────────────── 短线自动交易 API ───────────────────────────
+
+try:
+    import jarvis_scalper_trader as jst
+    _HAS_SCALPER_TRADER = True
+except ImportError:
+    _HAS_SCALPER_TRADER = False
+
+try:
+    import jarvis_scalper_evolve as jse
+    _HAS_SCALPER_EVOLVE = True
+except ImportError:
+    _HAS_SCALPER_EVOLVE = False
+
+try:
+    import yaml as _yaml
+    _HAS_YAML = True
+except ImportError:
+    _HAS_YAML = False
+
+_SCALPER_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scalper_config.yaml")
+
+
+@app.get("/api/scalper/status")
+def api_scalper_status():
+    if not _HAS_SCALPER_TRADER:
+        return JSONResponse({"error": "jarvis_scalper_trader 模块未安装"}, status_code=503)
+    try:
+        report = jst.get_report()
+        cfg = jst.load_config()
+        best = None
+        if _HAS_SCALPER_EVOLVE:
+            best = jse.get_best_strategy()
+        return JSONResponse({
+            "running": False,
+            "strategy": best.get("name") if best else None,
+            "symbol": cfg.get("symbol", "BTCUSDT"),
+            "timeframe": cfg.get("timeframe", "15m"),
+            "report": report,
+            "config": {
+                "confidence_threshold": cfg.get("trading", {}).get("confidence_threshold", 0.6),
+                "max_positions": cfg.get("risk", {}).get("max_concurrent_positions", 3),
+                "aggressive_mode": cfg.get("trading", {}).get("aggressive_mode", False),
+            },
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/scalper/report")
+def api_scalper_report():
+    if not _HAS_SCALPER_TRADER:
+        return JSONResponse({"error": "jarvis_scalper_trader 模块未安装"}, status_code=503)
+    try:
+        return JSONResponse(jst.get_report())
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/scalper/log")
+def api_scalper_log(limit: int = 50):
+    log_path = os.path.expanduser("~/.vibe-trading/jarvis_scalper_trader.log")
+    if not os.path.exists(log_path):
+        return JSONResponse({"lines": [], "total": 0})
+    try:
+        with open(log_path, encoding="utf-8") as f:
+            lines = f.readlines()
+        lines = [l.rstrip() for l in lines if l.strip()]
+        total = len(lines)
+        return JSONResponse({"lines": lines[-min(limit, total):], "total": total})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/scalper/start")
+def api_scalper_start(symbol: str = "BTCUSDT"):
+    return JSONResponse({"ok": False, "reason": "短线交易需通过命令行启动: python jarvis_scalper_trader.py run --symbol " + symbol})
+
+
+@app.post("/api/scalper/stop")
+def api_scalper_stop():
+    return JSONResponse({"ok": False, "reason": "短线交易需通过命令行停止（Ctrl+C）"})
+
+
+# ─────────────────────────── 进化引擎 API ───────────────────────────
+
+@app.get("/api/evolve/status")
+def api_evolve_status():
+    if not _HAS_SCALPER_EVOLVE:
+        return JSONResponse({"error": "jarvis_scalper_evolve 模块未安装"}, status_code=503)
+    try:
+        gy = jse.load_graveyard()
+        hof = jse.load_hall_of_fame()
+        best = jse.get_best_strategy()
+        return JSONResponse({
+            "graveyard_count": len(gy),
+            "hall_of_fame_count": len(hof),
+            "best_strategy": best.get("name") if best else None,
+            "best_win_rate": best.get("win_rate_pct") if best else None,
+            "best_profit_factor": best.get("profit_factor") if best else None,
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/evolve/start")
+def api_evolve_start(rounds: int = 10):
+    return JSONResponse({"ok": False, "reason": f"进化引擎需通过命令行启动: python jarvis_scalper_evolve.py evolve --rounds {rounds}"})
+
+
+@app.post("/api/evolve/stop")
+def api_evolve_stop():
+    return JSONResponse({"ok": False, "reason": "进化引擎需通过命令行停止（Ctrl+C）"})
+
+
+@app.get("/api/evolve/graveyard")
+def api_evolve_graveyard():
+    if not _HAS_SCALPER_EVOLVE:
+        return JSONResponse({"error": "jarvis_scalper_evolve 模块未安装"}, status_code=503)
+    try:
+        return JSONResponse(jse.load_graveyard())
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/evolve/hall-of-fame")
+def api_evolve_hall_of_fame():
+    if not _HAS_SCALPER_EVOLVE:
+        return JSONResponse({"error": "jarvis_scalper_evolve 模块未安装"}, status_code=503)
+    try:
+        return JSONResponse(jse.load_hall_of_fame())
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ─────────────────────────── 成长进度 API ───────────────────────────
+
+@app.get("/api/growth/timeline")
+def api_growth_timeline():
+    if not _HAS_SCALPER_EVOLVE:
+        return JSONResponse([])
+    try:
+        gy = jse.load_graveyard()
+        hof = jse.load_hall_of_fame()
+        events = []
+        for entry in gy:
+            events.append({
+                "time": entry.get("buried_at", ""),
+                "event": f"策略「{entry.get('name', '?')}」失败入墓",
+                "result": "fail",
+                "detail": entry.get("failure_reason", "未达标"),
+                "metrics": {
+                    "win_rate": entry.get("win_rate_pct"),
+                    "profit_factor": entry.get("profit_factor"),
+                },
+            })
+        for entry in hof:
+            events.append({
+                "time": entry.get("promoted_at", ""),
+                "event": f"策略「{entry.get('name', '?')}」达标入榜",
+                "result": "success",
+                "detail": f"胜率 {entry.get('win_rate_pct', '?')}%，盈亏比 {entry.get('profit_factor', '?')}",
+                "metrics": {
+                    "win_rate": entry.get("win_rate_pct"),
+                    "profit_factor": entry.get("profit_factor"),
+                },
+            })
+        events.sort(key=lambda e: e["time"], reverse=True)
+        return JSONResponse(events)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/growth/milestones")
+def api_growth_milestones():
+    if not _HAS_SCALPER_EVOLVE:
+        return JSONResponse([])
+    try:
+        gy = jse.load_graveyard()
+        hof = jse.load_hall_of_fame()
+        milestones = []
+        total_strategies = len(gy) + len(hof)
+        if total_strategies > 0:
+            milestones.append({"title": "第一个策略", "achieved": True, "detail": f"已尝试 {total_strategies} 个策略"})
+        if len(hof) > 0:
+            milestones.append({"title": "第一个达标策略", "achieved": True, "detail": f"名人堂已有 {len(hof)} 个策略"})
+        else:
+            milestones.append({"title": "第一个达标策略", "achieved": False, "detail": "仍在进化中..."})
+        if _HAS_SCALPER_TRADER:
+            report = jst.get_report()
+            trades = report.get("total_trades", 0)
+            if trades >= 10:
+                milestones.append({"title": f"累计交易 {trades} 笔", "achieved": True, "detail": f"胜率 {report.get('win_rate_pct', 0)}%"})
+            if report.get("win_rate_pct", 0) >= 55:
+                milestones.append({"title": "胜率突破 55%", "achieved": True, "detail": f"当前胜率 {report['win_rate_pct']}%"})
+        if total_strategies >= 10:
+            milestones.append({"title": "试错 10 个策略", "achieved": True, "detail": f"已尝试 {total_strategies} 个"})
+        if total_strategies >= 50:
+            milestones.append({"title": "试错 50 个策略", "achieved": True, "detail": f"已尝试 {total_strategies} 个"})
+        elif total_strategies >= 10:
+            milestones.append({"title": "试错 50 个策略", "achieved": False, "detail": f"进度 {total_strategies}/50"})
+        return JSONResponse(milestones)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/growth/stats")
+def api_growth_stats():
+    if not _HAS_SCALPER_EVOLVE:
+        return JSONResponse({"dimensions": [], "values": []})
+    try:
+        gy = jse.load_graveyard()
+        hof = jse.load_hall_of_fame()
+        all_strategies = gy + hof
+        total = len(all_strategies)
+
+        trend_score = 50
+        risk_score = 50
+        timing_score = 50
+        position_score = 50
+        learning_score = 50
+
+        if total > 0:
+            win_rates = [s.get("win_rate_pct", 0) for s in all_strategies if s.get("win_rate_pct")]
+            if win_rates:
+                trend_score = min(100, max(0, int(sum(win_rates) / len(win_rates))))
+            pfs = [s.get("profit_factor", 0) for s in all_strategies if s.get("profit_factor")]
+            if pfs:
+                risk_score = min(100, max(0, int(sum(pfs) / len(pfs) * 40)))
+            if len(hof) > 0:
+                timing_score = min(100, int(len(hof) / max(1, total) * 200))
+            position_score = min(100, int(total * 3))
+            learning_score = min(100, int((1 - len(gy) / max(1, total * 2)) * 100 + len(hof) * 20))
+
+        dimensions = ["趋势识别", "风控能力", "择时精准", "仓位管理", "学习速度"]
+        values = [trend_score, risk_score, timing_score, position_score, learning_score]
+
+        failure_reasons = {}
+        for s in gy:
+            reason = s.get("failure_reason", "未知")
+            failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
+
+        return JSONResponse({
+            "dimensions": dimensions,
+            "values": values,
+            "total_strategies": total,
+            "success_count": len(hof),
+            "failure_count": len(gy),
+            "failure_reasons": failure_reasons,
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ─────────────────────────── 配置 API ───────────────────────────
+
+@app.get("/api/config")
+def api_config_get():
+    if _HAS_YAML and os.path.exists(_SCALPER_CONFIG_PATH):
+        try:
+            with open(_SCALPER_CONFIG_PATH, encoding="utf-8") as f:
+                cfg = _yaml.safe_load(f)
+            return JSONResponse(cfg or {})
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    return JSONResponse({})
+
+
+@app.put("/api/config")
+def api_config_put(data: dict):
+    if not _HAS_YAML:
+        return JSONResponse({"ok": False, "reason": "PyYAML 未安装"}, status_code=503)
+    try:
+        with open(_SCALPER_CONFIG_PATH, "w", encoding="utf-8") as f:
+            _yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        return JSONResponse({"ok": False, "reason": str(e)}, status_code=500)
+
+
+# ─────────────────────────── 市场概览 API ───────────────────────────
+
+@app.get("/api/market/overview")
+def api_market_overview():
+    try:
+        snap = _cached("snap:BTCUSDT", 300, lambda: jb.build("BTCUSDT"))
+        rd = snap.get("real_data", {}) or {}
+        fac = snap.get("factor_state", {}) or {}
+        return JSONResponse({
+            "btc_price": fac.get("price"),
+            "fear_greed": rd.get("fear_greed", {}),
+            "funding": rd.get("funding", {}),
+            "market_structure": rd.get("market_structure", {}),
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTML
