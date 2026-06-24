@@ -12,7 +12,7 @@ function fmtUsd(n: number) {
 
 export default function Trading() {
   const { symbol } = useSymbol();
-  const { data: positions } = usePolling(api.positions, 10_000);
+  const { data: positions } = usePolling(api.positions, 3_000);
   const { data: orders } = usePolling(api.orders, 15_000);
   const { data: wallet } = usePolling(api.wallet, 30_000);
   const { data: traderStatus } = usePolling(api.traderStatus, 15_000);
@@ -69,7 +69,7 @@ export default function Trading() {
               <div className="grid grid-cols-2 gap-3">
                 {pos.map((p, i) => (
                   <PositionCard
-                    key={i}
+                    key={`${String(p.symbol ?? "—")}-${i}`}
                     symbol={String(p.symbol ?? "—")}
                     direction={
                       String(p.direction ?? "long") === "short"
@@ -77,10 +77,14 @@ export default function Trading() {
                         : "long"
                     }
                     entryPrice={Number(p.entry_price ?? 0)}
-                    currentPrice={Number(
-                      p.current_price ?? p.entry_price ?? 0,
-                    )}
-                    pnlPct={Number(p.pnl_pct ?? 0)}
+                    currentPrice={
+                      p.current_price != null
+                        ? Number(p.current_price)
+                        : undefined
+                    }
+                    pnlPct={
+                      p.pnl_pct != null ? Number(p.pnl_pct) : undefined
+                    }
                     stopLoss={p.stop_loss ? Number(p.stop_loss) : undefined}
                     takeProfit={
                       p.take_profit ? Number(p.take_profit) : undefined

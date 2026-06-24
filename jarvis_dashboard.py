@@ -268,7 +268,7 @@ def api_positions(symbol: str | None = None, status: str = "all"):
         if not sym or entry in (None, 0):
             continue
         try:
-            price = _cached(f"pos_price:{sym}", 60, lambda s=sym: jpt.latest_price(cfg, s))
+            price = _cached(f"pos_price:{sym}", 3, lambda s=sym: jpt.latest_price(cfg, s))
         except Exception:  # noqa: BLE001
             price = None
         if price is None:
