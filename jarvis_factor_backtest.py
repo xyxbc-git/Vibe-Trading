@@ -254,8 +254,13 @@ def event_study(dates: list, prices: dict, fng: dict, horizons=(7, 30, 90)) -> d
 
 
 def _build_series(dates: list, prices: dict):
-    """返回 closes / 200日均线 / 距滚动历史高点回撤 三条对齐序列。"""
+    """返回 closes / 200日均线 / 距滚动历史高点回撤 三条对齐序列。
+
+    dates 为空时返回三条空列表（避免 dashboard /api/series 在外部行情拉取失败时 500）。
+    """
     closes = [prices[d] for d in dates]
+    if not closes:
+        return [], [], []
     ma200: list[Optional[float]] = []
     dd: list[float] = []
     peak = closes[0]

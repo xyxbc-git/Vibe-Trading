@@ -253,6 +253,31 @@ def api_positions(symbol: str | None = None, status: str = "all"):
         rows = [r for r in rows if r["status"] == "open"]
     elif status == "closed":
         rows = [r for r in rows if r["status"] == "closed"]
+
+    # 给所有行补 direction（前端按 long/short 渲染，DB 里只有 buy/sell）
+    # 同时给 open 持仓补 current_price / pnl_pct / pnl_usdt
+    # （latest_price 走 60s 缓存，避免每次轮询都打外部 API；取价失败 → 字段为 None，前端按缺失态显示）。
+    cfg = _trader_cfg()
+    for r in rows:
+        side = (r.get("side") or "buy").lower()
+        r["direction"] = "long" if side == "buy" else "short"
+        if r.get("status") != "open":
+            continue
+        sym = r.get("symbol")
+        entry = r.get("entry_price")
+        if not sym or entry in (None, 0):
+            continue
+        try:
+            price = _cached(f"pos_price:{sym}", 60, lambda s=sym: jpt.latest_price(cfg, s))
+        except Exception:  # noqa: BLE001
+            price = None
+        if price is None:
+            continue
+        sign = 1 if side == "buy" else -1
+        qty = r.get("qty") or 0
+        r["current_price"] = round(float(price), 8)
+        r["pnl_pct"] = round((price / entry - 1.0) * 100 * sign, 2)
+        r["pnl_usdt"] = round((price - entry) * qty * sign, 4)
     return JSONResponse(rows)
 
 

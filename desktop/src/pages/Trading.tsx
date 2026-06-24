@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { usePolling } from "@/hooks/useApi";
+import { useSymbol } from "@/hooks/useSymbol";
 import { api } from "@/api/client";
 import PositionCard from "@/components/cards/PositionCard";
 import { ArrowLeftRight, ShieldCheck, AlertTriangle } from "lucide-react";
@@ -10,6 +11,7 @@ function fmtUsd(n: number) {
 }
 
 export default function Trading() {
+  const { symbol } = useSymbol();
   const { data: positions } = usePolling(api.positions, 10_000);
   const { data: orders } = usePolling(api.orders, 15_000);
   const { data: wallet } = usePolling(api.wallet, 30_000);
@@ -33,7 +35,7 @@ export default function Trading() {
     setOrdering(true);
     try {
       await api.post("/orders/place", {
-        symbol: "BTCUSDT",
+        symbol,
         direction: orderForm.direction,
         amount: parseFloat(orderForm.amount),
         stop_loss_pct: parseFloat(orderForm.stopLoss),

@@ -1,5 +1,6 @@
 import { useState, useMemo } from "react";
 import { usePolling } from "@/hooks/useApi";
+import { useSymbol } from "@/hooks/useSymbol";
 import { api } from "@/api/client";
 import KlineChart from "@/components/charts/KlineChart";
 import { CandlestickChart } from "lucide-react";
@@ -24,7 +25,7 @@ const LIMITS: Record<Timeframe, number> = {
 
 export default function Chart() {
   const [tf, setTf] = useState<Timeframe>("15m");
-  const [symbol] = useState("BTCUSDT");
+  const { symbol } = useSymbol();
 
   const { data: rawKline, loading, error } = usePolling(
     () => api.kline(symbol, tf, LIMITS[tf]),

@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { Bot, Send, User, Loader2 } from "lucide-react";
 import { api } from "@/api/client";
+import { useSymbol } from "@/hooks/useSymbol";
 
 interface Message {
   id: string;
@@ -38,6 +39,7 @@ function simpleMarkdown(text: string): string {
 }
 
 export default function AIChat() {
+  const { symbol } = useSymbol();
   const [messages, setMessages] = useState<Message[]>([
     {
       id: "welcome",
@@ -75,7 +77,7 @@ export default function AIChat() {
     setLoading(true);
 
     try {
-      const res = await api.ask(text.trim());
+      const res = await api.ask(text.trim(), symbol);
       const aiMsg: Message = {
         id: `ai-${Date.now()}`,
         role: "assistant",
