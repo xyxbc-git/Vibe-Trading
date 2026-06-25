@@ -11,6 +11,8 @@ import {
   RotateCcw,
   LineChart as LineChartIcon,
   Terminal as TerminalIcon,
+  ChevronLeft,
+  ChevronRight,
 } from "lucide-react";
 import {
   PieChart,
@@ -88,6 +90,7 @@ export default function StrategyLab() {
   const [busy, setBusy] = useState(false);
   const [rounds, setRounds] = useState(10);
   const [mode, setMode] = useState<"evolve" | "combo">("evolve");
+  const [gravePage, setGravePage] = useState(1);
 
   const { data: rawStatus, refetch: refetchStatus } = usePolling(
     () => api.evolveStatus(),
@@ -99,6 +102,12 @@ export default function StrategyLab() {
   const status = (rawStatus as unknown as EvolveStatus) ?? PLACEHOLDER_STATUS;
   const hall = (rawHall as unknown as HofEntry[]) ?? [];
   const graveyard = (rawGraveyard as unknown as GraveEntry[]) ?? [];
+
+  const GRAVE_PAGE_SIZE = 8;
+  const graveTotalPages = Math.max(1, Math.ceil(graveyard.length / GRAVE_PAGE_SIZE));
+  const graveSafePage = Math.min(gravePage, graveTotalPages);
+  const graveOffset = (graveSafePage - 1) * GRAVE_PAGE_SIZE;
+  const pagedGraveyard = graveyard.slice(graveOffset, graveOffset + GRAVE_PAGE_SIZE);
 
   const handleStart = async () => {
     setBusy(true);
@@ -336,10 +345,11 @@ export default function StrategyLab() {
                 </tr>
               </thead>
               <tbody>
-                {graveyard.map((g, i) => {
+                {pagedGraveyard.map((g, i) => {
                   const r = g.result ?? {};
+                  const idx = graveOffset + i;
                   return (
-                    <tr key={`${g.name}-${i}`} className="border-b border-jarvis-border/50 last:border-0">
+                    <tr key={`${g.name}-${idx}`} className="border-b border-jarvis-border/50 last:border-0">
                       <td className="py-2 text-jarvis-text">{g.name}</td>
                       <td className="py-2">
                         <span className="text-xs px-2 py-0.5 rounded-full bg-jarvis-red/20 text-jarvis-red">
@@ -358,6 +368,32 @@ export default function StrategyLab() {
                 })}
               </tbody>
             </table>
+          )}
+
+          {graveyard.length > GRAVE_PAGE_SIZE && (
+            <div className="flex items-center justify-between pt-3 mt-1 border-t border-jarvis-border/50">
+              <span className="text-xs text-jarvis-text-secondary">
+                共 {graveyard.length} 条 · 第 {graveSafePage}/{graveTotalPages} 页
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setGravePage((p) => Math.max(1, p - 1))}
+                  disabled={graveSafePage <= 1}
+                  className="flex items-center gap-1 px-2 py-1 text-xs rounded-md border border-jarvis-border text-jarvis-text disabled:opacity-40 disabled:cursor-not-allowed hover:border-jarvis-blue"
+                >
+                  <ChevronLeft size={12} />
+                  上一页
+                </button>
+                <button
+                  onClick={() => setGravePage((p) => Math.min(graveTotalPages, p + 1))}
+                  disabled={graveSafePage >= graveTotalPages}
+                  className="flex items-center gap-1 px-2 py-1 text-xs rounded-md border border-jarvis-border text-jarvis-text disabled:opacity-40 disabled:cursor-not-allowed hover:border-jarvis-blue"
+                >
+                  下一页
+                  <ChevronRight size={12} />
+                </button>
+              </div>
+            </div>
           )}
         </div>
       </div>
