@@ -27,6 +27,7 @@ import os
 import sys
 import time
 import uuid
+from datetime import datetime, timedelta
 from typing import Any
 
 import requests
@@ -121,6 +122,59 @@ def _api_request(
 
 # ═══════════════════════════ 核心功能 ═══════════════════════════
 
+# QD 引擎按 K 线根数限制单次回测：15m 周期约 365 天（≈35040 根）为上限预算，
+# 据此按周期换算各自允许的最大跨度（高周期更长、低周期更短）。
+_MAX_BARS_BUDGET = 365 * 96  # 35040
+
+
+def _timeframe_minutes(timeframe: str) -> int | None:
+    """把 '15m' / '1h' / '1d' 解析为每根 K 线分钟数；无法解析返回 None。"""
+    tf = (timeframe or "").strip().lower()
+    if len(tf) < 2:
+        return None
+    unit = tf[-1]
+    try:
+        n = int(tf[:-1])
+    except ValueError:
+        return None
+    if n <= 0:
+        return None
+    if unit == "m":
+        return n
+    if unit == "h":
+        return n * 60
+    if unit == "d":
+        return n * 1440
+    return None
+
+
+def _clamp_date_range(start_date: str, end_date: str, timeframe: str) -> tuple[str, str]:
+    """按 QD 引擎 K 线根数预算收窄过长的回测区间（保留 end_date，前移 start_date）。
+
+    无法解析周期或日期时原样返回，避免影响正常请求。
+    """
+    minutes = _timeframe_minutes(timeframe)
+    if not minutes:
+        return start_date, end_date
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return start_date, end_date
+    if end <= start:
+        return start_date, end_date
+    max_days = int(_MAX_BARS_BUDGET * minutes / 1440)
+    span_days = (end - start).days
+    if span_days <= max_days:
+        return start_date, end_date
+    new_start_str = (end - timedelta(days=max_days)).strftime("%Y-%m-%d")
+    _log(
+        f"⚠ 回测区间 {span_days} 天超过 {timeframe} 周期上限 {max_days} 天，"
+        f"自动收窄起始日期 {start_date} → {new_start_str}（保留结束日期 {end_date}）"
+    )
+    return new_start_str, end_date
+
+
 def submit_backtest(
     code: str,
     symbol: str = "BTC/USDT",
@@ -148,6 +202,8 @@ def submit_backtest(
     token = cfg["agent_token"]
     if not token:
         raise ValueError("缺少 QUANTDINGER_AGENT_TOKEN 环境变量")
+
+    start_date, end_date = _clamp_date_range(start_date, end_date, timeframe)
 
     idempotency_key = f"scalper-{strategy_name or 'unnamed'}-{uuid.uuid4().hex[:8]}"
 
