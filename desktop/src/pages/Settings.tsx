@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { Settings as SettingsIcon, Save, RefreshCw, Wifi, Key, Palette, Server, Plug } from "lucide-react";
+import { Settings as SettingsIcon, Save, RefreshCw, Wifi, Key, Palette, Server, Plug, Download } from "lucide-react";
 import { api, type QdConfig, type QdConfigTest } from "@/api/client";
 import { useApi } from "@/hooks/useApi";
 
@@ -139,10 +139,44 @@ function QdGatewayCard() {
   const [msg, setMsg] = useState("");
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<QdConfigTest | null>(null);
+  const [showIssue, setShowIssue] = useState(false);
+  const [issueUser, setIssueUser] = useState("quantdinger");
+  const [issuePass, setIssuePass] = useState("");
+  const [issuing, setIssuing] = useState(false);
+  const [issueMsg, setIssueMsg] = useState("");
 
   useEffect(() => {
     if (qd) setGatewayBase(qd.gateway_base ?? "");
   }, [qd]);
+
+  const handleIssue = async () => {
+    if (!issuePass.trim()) {
+      setIssueMsg("请填写密码");
+      return;
+    }
+    setIssuing(true);
+    setIssueMsg("");
+    try {
+      const res = await api.issueQdToken({
+        username: issueUser.trim() || "quantdinger",
+        password: issuePass.trim(),
+        scopes: "R,B",
+        gateway_base: gatewayBase.trim() || undefined,
+      });
+      if (res.ok) {
+        setIssueMsg(`签发成功 ✓ ${res.agent_token_masked ?? ""}`);
+        setIssuePass("");
+        setShowIssue(false);
+        refetch();
+      } else {
+        setIssueMsg(`签发失败: ${res.reason ?? "未知错误"}`);
+      }
+    } catch (e) {
+      setIssueMsg(`签发失败: ${e instanceof Error ? e.message : "网络错误"}`);
+    } finally {
+      setIssuing(false);
+    }
+  };
 
   const handleTest = async () => {
     setTesting(true);
@@ -213,11 +247,20 @@ function QdGatewayCard() {
       <div className="py-2">
         <div className="flex items-center justify-between mb-1.5">
           <p className="text-sm text-jarvis-text">Agent Token</p>
-          {qd?.has_token && (
-            <span className="text-xs font-mono text-jarvis-text-secondary">
-              当前：{qd.agent_token_masked}
-            </span>
-          )}
+          <div className="flex items-center gap-2">
+            {qd?.has_token && (
+              <span className="text-xs font-mono text-jarvis-text-secondary">
+                当前：{qd.agent_token_masked}
+              </span>
+            )}
+            <button
+              onClick={() => setShowIssue((v) => !v)}
+              className="flex items-center gap-1 text-xs text-jarvis-blue hover:underline"
+            >
+              <Download size={12} />
+              自动获取
+            </button>
+          </div>
         </div>
         <input
           type="password"
@@ -231,6 +274,45 @@ function QdGatewayCard() {
           <p className="text-xs text-jarvis-yellow mt-1">
             ⚠ 已设置 QUANTDINGER_AGENT_TOKEN 环境变量，将覆盖此处 Token
           </p>
+        )}
+
+        {showIssue && (
+          <div className="mt-2 bg-jarvis-bg rounded-md p-3 space-y-2 border border-jarvis-border">
+            <p className="text-xs text-jarvis-text-secondary">
+              用 QD 账号密码登录并自动签发 token（scope R,B · paper-only），成功后写入配置。
+            </p>
+            <input
+              type="text"
+              value={issueUser}
+              onChange={(e) => setIssueUser(e.target.value)}
+              placeholder="QD 账号（默认 quantdinger）"
+              autoComplete="off"
+              className="w-full px-2 py-1.5 text-sm bg-jarvis-card border border-jarvis-border rounded-md text-jarvis-text focus:outline-none focus:border-jarvis-blue"
+            />
+            <input
+              type="password"
+              value={issuePass}
+              onChange={(e) => setIssuePass(e.target.value)}
+              placeholder="QD 密码"
+              autoComplete="off"
+              className="w-full px-2 py-1.5 text-sm bg-jarvis-card border border-jarvis-border rounded-md text-jarvis-text focus:outline-none focus:border-jarvis-blue"
+            />
+            <div className="flex items-center gap-3">
+              <button
+                onClick={handleIssue}
+                disabled={issuing}
+                className="btn-primary flex items-center gap-2"
+              >
+                <Download size={14} />
+                {issuing ? "签发中..." : "登录并签发"}
+              </button>
+              {issueMsg && (
+                <span className={`text-xs ${issueMsg.includes("成功") ? "text-jarvis-green" : "text-jarvis-red"}`}>
+                  {issueMsg}
+                </span>
+              )}
+            </div>
+          </div>
         )}
       </div>
 

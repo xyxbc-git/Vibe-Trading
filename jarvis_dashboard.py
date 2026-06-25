@@ -1535,6 +1535,76 @@ def api_qd_config_test():
     })
 
 
+@app.post("/api/qd-config/issue-token")
+def api_qd_config_issue_token(data: dict):
+    """用 QD 账号密码登录并自动签发 agent token（默认 scope R,B、paper_only），写入配置文件。"""
+    username = str(data.get("username") or "quantdinger").strip()
+    password = str(data.get("password") or "").strip()
+    scopes = str(data.get("scopes") or "R,B").strip()
+    name = str(data.get("name") or "jarvis-backtest").strip()
+    if not password:
+        return JSONResponse({"ok": False, "reason": "缺少 QD 账号密码"}, status_code=400)
+    try:
+        cfg = _read_qd_config()
+    except Exception:
+        cfg = {}
+    gateway = str(
+        data.get("gateway_base") or cfg.get("gateway_base") or _QD_DEFAULT_GATEWAY
+    ).strip().rstrip("/")
+    try:
+        import requests
+    except Exception as e:
+        return JSONResponse({"ok": False, "reason": f"requests 模块不可用: {e}"}, status_code=500)
+    try:
+        login = requests.post(
+            f"{gateway}/api/auth/login",
+            json={"username": username, "password": password},
+            timeout=15,
+        )
+        if login.status_code != 200:
+            return JSONResponse(
+                {"ok": False, "reason": f"登录失败 HTTP {login.status_code}: {login.text[:200]}"},
+                status_code=502,
+            )
+        jwt = ((login.json() or {}).get("data") or {}).get("token")
+        if not jwt:
+            return JSONResponse({"ok": False, "reason": "登录响应中无 JWT"}, status_code=502)
+
+        issued = requests.post(
+            f"{gateway}/api/agent/v1/me/tokens",
+            headers={"Authorization": f"Bearer {jwt}", "Content-Type": "application/json"},
+            json={
+                "name": name,
+                "scopes": scopes,
+                "paper_only": True,
+                "rate_limit_per_min": 120,
+            },
+            timeout=15,
+        )
+        if issued.status_code not in (200, 201):
+            return JSONResponse(
+                {"ok": False, "reason": f"签发失败 HTTP {issued.status_code}: {issued.text[:200]}"},
+                status_code=502,
+            )
+        agent_token = ((issued.json() or {}).get("data") or {}).get("token")
+        if not agent_token:
+            return JSONResponse({"ok": False, "reason": "签发响应中无 token"}, status_code=502)
+
+        cfg["gateway_base"] = gateway
+        cfg["agent_token"] = agent_token
+        os.makedirs(os.path.dirname(_QD_CONFIG_PATH), exist_ok=True)
+        with open(_QD_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        return JSONResponse({
+            "ok": True,
+            "agent_token_masked": _mask_token(agent_token),
+            "scopes": scopes,
+            "gateway_base": gateway,
+        })
+    except Exception as e:
+        return JSONResponse({"ok": False, "reason": str(e)}, status_code=500)
+
+
 # ─────────────────────────── 市场概览 API ───────────────────────────
 
 @app.get("/api/market/overview")

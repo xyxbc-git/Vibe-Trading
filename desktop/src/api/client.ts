@@ -109,6 +109,17 @@ export const api = {
     api.put<{ ok: boolean; reason?: string }>("/qd-config", data),
   testQdConfig: () =>
     request<QdConfigTest>("/qd-config/test", { method: "POST" }, 20_000),
+  issueQdToken: (data: {
+    username?: string;
+    password: string;
+    scopes?: string;
+    gateway_base?: string;
+  }) =>
+    request<QdTokenIssue>(
+      "/qd-config/issue-token",
+      { method: "POST", body: JSON.stringify(data) },
+      20_000,
+    ),
   marketOverview: () => api.get<Record<string, unknown>>("/market/overview"),
 
   actionBrief: (symbol = "BTCUSDT") =>
@@ -178,6 +189,14 @@ export interface QdConfigTest {
   health_error?: string | null;
   token_error?: string | null;
   whoami?: Record<string, unknown> | null;
+  reason?: string;
+}
+
+export interface QdTokenIssue {
+  ok: boolean;
+  agent_token_masked?: string;
+  scopes?: string;
+  gateway_base?: string;
   reason?: string;
 }
 
