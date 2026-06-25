@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""贾维斯 JARVIS — 15m 自动跟盘引擎（S-06）。
+"""贾维斯 JARVIS — 15m 自动跟盘引擎（S-06 v2）。
 
-使用进化引擎产出的最优策略，实时 15 分钟自动交易。
-只要有余额就持续交易，所有风控参数从 scalper_config.yaml 读取，
-支持热更新（修改配置后无需重启）。
+v2 升级：集成三层复合策略框架 + 行情分类器 + 动态止损 + 多时间框架。
 
 核心循环：
   永续循环:
-    1. 拉最新 15m K 线
-    2. 用最优策略计算信号
-    3. 信号达标 + 余额充足 + 仓位未满 → 果断开仓
-    4. 管理现有持仓（止盈/止损/移动止损）
-    5. 记录战绩
-    6. 等待下一根 K 线
+    1. 拉最新 15m/1h/4h 多级别 K 线
+    2. 行情分类器判定当前市场状态（震荡/趋势/突破）
+    3. 复合策略三层决策（进攻/解困/保命）
+    4. ATR 动态止盈止损 + 移动止损
+    5. 管理现有持仓
+    6. 记录战绩 + 行情分类日志
+    7. 等待下一根 K 线
 
 依赖：
+  - jarvis_regime_classifier（行情分类器）
+  - jarvis_composite_strategy（三层复合策略）
   - jarvis_scalper_evolve（获取最优策略）
   - jarvis_wallet（记账）
-  - jarvis_crypto_data（拉 K 线）
   - scalper_config.yaml（配置文件）
 
 用法：
@@ -36,9 +36,14 @@ import sys
 import time
 from typing import Any
 
+import pandas as pd
+
 import jarvis_scalper_evolve as evolve
 import jarvis_wallet as jw
 import jarvis_journal as jj
+import jarvis_regime_classifier as rc
+import jarvis_composite_strategy as cs
+import jarvis_performance_tracker as pt
 
 CONFIG_DIR = os.path.expanduser("~/.vibe-trading")
 LOG_PATH = os.path.join(CONFIG_DIR, "jarvis_scalper_trader.log")
@@ -149,7 +154,7 @@ def _reset_daily_if_needed(state: dict[str, Any]) -> None:
 
 # ═══════════════════════════ K 线获取 ═══════════════════════════
 
-def _fetch_latest_klines(symbol: str, timeframe: str = "15m", limit: int = 100) -> list[dict] | None:
+def _fetch_latest_klines(symbol: str, timeframe: str = "15m", limit: int = 200) -> list[dict] | None:
     """从 Binance 获取最新 K 线数据。"""
     try:
         import requests
@@ -297,10 +302,22 @@ def _open_position(
     return position
 
 
+_tracker: pt.PerformanceTracker | None = None
+
+
+def _get_tracker() -> pt.PerformanceTracker:
+    """获取全局表现追踪器（懒初始化）。"""
+    global _tracker
+    if _tracker is None:
+        _tracker = pt.PerformanceTracker()
+    return _tracker
+
+
 def _close_position(
     state: dict, position: dict, price: float, reason: str,
+    regime_name: str = "unknown",
 ) -> float:
-    """模拟平仓，返回盈亏。"""
+    """模拟平仓，返回盈亏。自动记录到表现追踪器。"""
     entry = position["entry_price"]
     qty = position["qty"]
     direction = position["direction"]
@@ -329,76 +346,171 @@ def _close_position(
     _log(f"平仓: {direction} {position['symbol']} @ {price:.2f} | "
          f"盈亏 {pnl:+.2f} USDT | 原因: {reason}")
 
+    try:
+        tracker = _get_tracker()
+        tracker.record_trade({
+            "symbol": position.get("symbol", ""),
+            "direction": direction,
+            "entry_price": entry,
+            "exit_price": price,
+            "qty": qty,
+            "pnl": round(pnl, 4),
+            "regime": regime_name,
+            "reason": reason,
+            "bars_held": position.get("bars_held", 0),
+            "is_hedge": position.get("is_hedge", False),
+        })
+    except Exception as e:
+        _log(f"表现追踪记录失败（不影响交易）: {e}")
+
     return pnl
 
 
-def _manage_positions(state: dict, cfg: dict, current_price: float, signals: dict) -> None:
-    """管理现有持仓：检查止盈止损。"""
+def _manage_positions(
+    state: dict, cfg: dict, current_price: float, signals: dict,
+    regime: rc.RegimeResult | None = None, atr: float = 0.0,
+    composite: cs.CompositeStrategy | None = None,
+) -> None:
+    """管理现有持仓：使用复合策略的动态止盈止损。"""
+    regime_name = regime.regime if regime else "unknown"
+
     for pos in state.get("positions", []):
         if pos.get("status") != "open":
             continue
 
         pos["bars_held"] = pos.get("bars_held", 0) + 1
-        entry = pos["entry_price"]
-        direction = pos["direction"]
 
-        # 简易止损止盈（基于价格百分比）
-        sl_pct = 0.015
-        tp_pct = 0.025
-
-        if direction == "long":
-            if current_price <= entry * (1 - sl_pct):
-                _close_position(state, pos, current_price, "止损")
-            elif current_price >= entry * (1 + tp_pct):
-                _close_position(state, pos, current_price, "止盈")
-            elif signals.get("close_long"):
-                _close_position(state, pos, current_price, "信号反转")
+        if composite and regime and atr > 0:
+            cs_pos = cs.Position(
+                id=pos.get("id", ""),
+                symbol=pos.get("symbol", ""),
+                direction=pos["direction"],
+                entry_price=pos["entry_price"],
+                qty=pos["qty"],
+                size_usdt=pos.get("size_usdt", 0),
+                open_time=pos.get("open_time", ""),
+                bars_held=pos.get("bars_held", 0),
+                avg_price=pos.get("avg_price", pos["entry_price"]),
+                total_qty=pos.get("total_qty", pos["qty"]),
+                total_size=pos.get("total_size", pos.get("size_usdt", 0)),
+                stop_loss=pos.get("stop_loss", 0),
+                take_profit=pos.get("take_profit", 0),
+                trailing_high=pos.get("trailing_high", 0),
+                trailing_low=pos.get("trailing_low", 999999),
+            )
+            decision = composite.manage_position(cs_pos, regime, current_price, atr, signals)
+            pos["stop_loss"] = cs_pos.stop_loss
+            pos["trailing_high"] = cs_pos.trailing_high
+            pos["trailing_low"] = cs_pos.trailing_low
+            if decision:
+                _close_position(state, pos, current_price, decision.reasoning, regime_name)
         else:
-            if current_price >= entry * (1 + sl_pct):
-                _close_position(state, pos, current_price, "止损")
-            elif current_price <= entry * (1 - tp_pct):
-                _close_position(state, pos, current_price, "止盈")
-            elif signals.get("close_short"):
-                _close_position(state, pos, current_price, "信号反转")
+            direction = pos["direction"]
+            sl = pos.get("stop_loss", 0)
+            tp = pos.get("take_profit", 0)
+
+            if sl > 0:
+                if direction == "long" and current_price <= sl:
+                    _close_position(state, pos, current_price, "止损", regime_name)
+                    continue
+                if direction == "short" and current_price >= sl:
+                    _close_position(state, pos, current_price, "止损", regime_name)
+                    continue
+            if tp > 0:
+                if direction == "long" and current_price >= tp:
+                    _close_position(state, pos, current_price, "止盈", regime_name)
+                    continue
+                if direction == "short" and current_price <= tp:
+                    _close_position(state, pos, current_price, "止盈", regime_name)
+                    continue
+
+            if direction == "long" and signals.get("close_long"):
+                _close_position(state, pos, current_price, "信号反转", regime_name)
+            elif direction == "short" and signals.get("close_short"):
+                _close_position(state, pos, current_price, "信号反转", regime_name)
 
 
 # ═══════════════════════════ 主循环 ═══════════════════════════
 
 def run_cycle(symbol: str, dry_run: bool = False) -> dict[str, Any]:
-    """执行一个交易周期。
+    """执行一个交易周期（v2：三层复合策略 + 行情分类）。
 
     Returns:
-        {"action": str, "signals": dict, "price": float, ...}
+        {"action": str, "signals": dict, "price": float, "regime": dict, ...}
     """
     cfg = load_config()
     state = _load_state()
     _reset_daily_if_needed(state)
 
-    # 获取最优策略
+    # 获取最优策略（用于信号计算）
     best = evolve.get_best_strategy()
-    if not best:
-        _log("名人堂为空，请先运行进化引擎")
-        return {"action": "no_strategy", "reason": "名人堂为空"}
+    strategy_code = best.get("code", "") if best else ""
 
-    strategy_code = best.get("code", "")
-    if not strategy_code:
-        _log("最优策略无代码")
-        return {"action": "no_code", "reason": "策略无代码"}
-
-    # 拉取 K 线
-    klines = _fetch_latest_klines(symbol, cfg.get("timeframe", "15m"))
+    # 拉取多时间框架 K 线
+    klines = _fetch_latest_klines(symbol, cfg.get("timeframe", "15m"), 200)
     if not klines:
         return {"action": "no_data", "reason": "K 线获取失败"}
 
-    current_price = klines[-1]["close"]
+    df_15m = pd.DataFrame(klines)
+    current_price = df_15m["close"].iloc[-1]
     _log(f"当前价格: {symbol} = {current_price:.2f}")
 
-    # 计算信号
-    signals = _compute_signals(klines, strategy_code)
+    # 拉取 1h 和 4h 数据用于多时间框架分析
+    klines_1h = _fetch_latest_klines(symbol, "1h", 200)
+    klines_4h = _fetch_latest_klines(symbol, "4h", 200)
+    df_1h = pd.DataFrame(klines_1h) if klines_1h else None
+    df_4h = pd.DataFrame(klines_4h) if klines_4h else None
+
+    # 行情分类
+    regime = rc.classify_multi_tf(df_15m, df_1h, df_4h)
+    _log(f"行情分类: {regime.regime} | {regime.direction} | "
+         f"置信度 {regime.confidence:.0%} | {regime.reasoning}")
+
+    # 计算 ATR
+    atr = rc._atr(df_15m["high"], df_15m["low"], df_15m["close"], 14).iloc[-1]
+
+    # 计算交易信号
+    if strategy_code:
+        signals = _compute_signals(klines, strategy_code)
+    else:
+        signals = {
+            "open_long": regime.direction == "bullish" and regime.confidence > 0.6,
+            "open_short": regime.direction == "bearish" and regime.confidence > 0.6,
+            "close_long": regime.direction == "bearish" and regime.confidence > 0.7,
+            "close_short": regime.direction == "bullish" and regime.confidence > 0.7,
+        }
     _log(f"信号: {signals}")
 
-    # 管理现有持仓
-    _manage_positions(state, cfg, current_price, signals)
+    # 初始化复合策略
+    composite = cs.CompositeStrategy(cfg.get("composite_strategy"))
+
+    # 构建持仓列表
+    cs_positions = []
+    for p in state.get("positions", []):
+        if p.get("status") != "open":
+            continue
+        cs_positions.append(cs.Position(
+            id=p.get("id", ""),
+            symbol=p.get("symbol", symbol),
+            direction=p["direction"],
+            entry_price=p["entry_price"],
+            qty=p["qty"],
+            size_usdt=p.get("size_usdt", 0),
+            open_time=p.get("open_time", ""),
+            bars_held=p.get("bars_held", 0),
+            add_count=p.get("add_count", 0),
+            avg_price=p.get("avg_price", p["entry_price"]),
+            total_qty=p.get("total_qty", p["qty"]),
+            total_size=p.get("total_size", p.get("size_usdt", 0)),
+            stop_loss=p.get("stop_loss", 0),
+            take_profit=p.get("take_profit", 0),
+            trailing_high=p.get("trailing_high", 0),
+            trailing_low=p.get("trailing_low", 999999),
+            is_hedge=p.get("is_hedge", False),
+        ))
+
+    # 管理现有持仓（动态止损）
+    _manage_positions(state, cfg, current_price, signals, regime, atr, composite)
 
     # 风控检查
     jw.init_db()
@@ -408,18 +520,45 @@ def run_cycle(symbol: str, dry_run: bool = False) -> dict[str, Any]:
     can_trade, risk_reason = _check_risk(state, cfg, balance)
 
     action = "hold"
+    decision_info = {}
 
     if can_trade:
-        if signals.get("open_long"):
-            if not dry_run:
-                _open_position(state, cfg, "long", current_price, balance, symbol)
-            action = "open_long"
-            _log(f"{'[DRY-RUN] ' if dry_run else ''}开多 {symbol}")
-        elif signals.get("open_short"):
-            if not dry_run:
-                _open_position(state, cfg, "short", current_price, balance, symbol)
-            action = "open_short"
-            _log(f"{'[DRY-RUN] ' if dry_run else ''}开空 {symbol}")
+        decision = composite.decide(
+            regime=regime,
+            signals=signals,
+            positions=cs_positions,
+            current_price=current_price,
+            atr=atr,
+            balance=balance,
+        )
+
+        action = decision.action
+        decision_info = decision.to_dict()
+        _log(f"复合策略决策: {decision.action} | 层: {decision.layer} | {decision.reasoning}")
+
+        if not dry_run and decision.action not in ("hold",):
+            if "open_long" in decision.action or "add_long" in decision.action:
+                pos = _open_position(state, cfg, "long", current_price, balance, symbol)
+                if pos:
+                    pos["stop_loss"] = decision.stop_loss
+                    pos["take_profit"] = decision.take_profit
+            elif "open_short" in decision.action or "add_short" in decision.action:
+                pos = _open_position(state, cfg, "short", current_price, balance, symbol)
+                if pos:
+                    pos["stop_loss"] = decision.stop_loss
+                    pos["take_profit"] = decision.take_profit
+            elif "hedge_long" in decision.action:
+                pos = _open_position(state, cfg, "long", current_price, balance, symbol)
+                if pos:
+                    pos["is_hedge"] = True
+                    pos["stop_loss"] = decision.stop_loss
+                    pos["take_profit"] = decision.take_profit
+            elif "hedge_short" in decision.action:
+                pos = _open_position(state, cfg, "short", current_price, balance, symbol)
+                if pos:
+                    pos["is_hedge"] = True
+                    pos["stop_loss"] = decision.stop_loss
+                    pos["take_profit"] = decision.take_profit
     else:
         _log(f"风控拦截: {risk_reason}")
         action = f"blocked:{risk_reason}"
@@ -431,20 +570,30 @@ def run_cycle(symbol: str, dry_run: bool = False) -> dict[str, Any]:
         "signals": signals,
         "price": current_price,
         "balance": balance,
-        "strategy": best.get("name", "?"),
-        "open_positions": len([p for p in state.get("positions", []) if p["status"] == "open"]),
+        "strategy": best.get("name", "行情驱动") if best else "行情驱动",
+        "regime": regime.to_dict(),
+        "atr": round(atr, 2),
+        "decision": decision_info,
+        "open_positions": len([p for p in state.get("positions", []) if p.get("status") == "open"]),
         "daily_pnl": state.get("daily_pnl", 0),
     }
 
 
 def run_loop(symbol: str, dry_run: bool = False) -> None:
-    """永续交易循环。"""
+    """永续交易循环（v2：含衰退检测 + 自动再进化 + 周报）。"""
     cfg = load_config()
     timeframe = cfg.get("timeframe", "15m")
     interval_sec = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400}.get(timeframe, 900)
 
     _log(f"启动永续交易循环: {symbol} | 周期 {timeframe} | 间隔 {interval_sec}s")
     _log(f"配置: {json.dumps(cfg, ensure_ascii=False, default=str)}")
+
+    cycle_count = 0
+    last_decay_check = 0
+    last_weekly_report = ""
+
+    DECAY_CHECK_INTERVAL = 50
+    WEEKLY_REPORT_DAY = 6
 
     while True:
         try:
@@ -461,9 +610,44 @@ def run_loop(symbol: str, dry_run: bool = False) -> None:
                 continue
 
             result = run_cycle(symbol, dry_run=dry_run)
+            cycle_count += 1
             _log(f"周期结果: {result.get('action', '?')} | "
                  f"持仓 {result.get('open_positions', 0)} | "
                  f"日盈亏 {result.get('daily_pnl', 0):+.2f}")
+
+            # 定期衰退检测（每 DECAY_CHECK_INTERVAL 个周期）
+            if cycle_count - last_decay_check >= DECAY_CHECK_INTERVAL:
+                last_decay_check = cycle_count
+                try:
+                    tracker = _get_tracker()
+                    if len(tracker._history) >= 20:
+                        report = tracker.evaluate(recent_n=30)
+                        if report.is_decaying:
+                            _log(f"⚠️ 衰退检测: {report.decay_signals}")
+                            tuner = pt.AdaptiveTuner()
+                            tune_result = tuner.tune(report, cfg)
+                            if tune_result.adjusted:
+                                _log(f"📊 自适应调整: {tune_result.reasoning}")
+                            if len(report.decay_signals) >= 2 and not dry_run:
+                                _log("🔄 触发自动再进化...")
+                                evolve.check_and_trigger_re_evolve(symbol=symbol)
+                        else:
+                            _log(f"✓ 表现正常: 胜率{report.win_rate:.0f}% "
+                                 f"PF{report.profit_factor:.2f}")
+                except Exception as e:
+                    _log(f"衰退检测异常（不影响交易）: {e}")
+
+            # 每周日自动生成周报
+            import datetime
+            today = datetime.date.today()
+            week_key = today.strftime("%Y-W%W")
+            if today.weekday() == WEEKLY_REPORT_DAY and week_key != last_weekly_report:
+                last_weekly_report = week_key
+                try:
+                    md = pt.generate_weekly_report()
+                    _log(f"📋 周报已生成: {week_key}")
+                except Exception as e:
+                    _log(f"周报生成异常: {e}")
 
         except KeyboardInterrupt:
             _log("收到中断信号，停止交易")
