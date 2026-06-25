@@ -47,7 +47,7 @@ def _legacy_price_only(dd: float, fng_val, above_ma200: bool):
     if score >= 0.8:
         direction, pos = "偏多（战术）", min(0.4, 0.2 + score * 0.1)
     elif score <= -0.8:
-        direction, pos = "偏空/观望", 0.0
+        direction, pos = "偏空（战术）", min(0.4, 0.2 + abs(score) * 0.1)
     else:
         direction, pos = "中性观望", 0.1 if score > 0 else 0.0
     return score, direction, round(pos * 100, 0)
@@ -70,7 +70,7 @@ def _new_price_only_via_weights(dd, fng_val, above_ma200):
     if score >= TH["long"]:
         direction, pos = "偏多（战术）", min(0.4, 0.2 + score * 0.1)
     elif score <= TH["short"]:
-        direction, pos = "偏空/观望", 0.0
+        direction, pos = "偏空（战术）", min(0.4, 0.2 + abs(score) * 0.1)
     else:
         direction, pos = "中性观望", 0.1 if score > 0 else 0.0
     return score, direction, round(pos * 100, 0)

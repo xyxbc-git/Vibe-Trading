@@ -63,7 +63,7 @@ STATIC_LESSONS: list[dict] = [
     {
         "id": "short_horizon_coinflip",
         "title": "7 天预测本质是抛硬币，短期别重仓",
-        "trigger": {"direction_in": ["偏多（战术）", "偏空/观望"]},
+        "trigger": {"direction_in": ["偏多（战术）", "偏空（战术）"]},
         "advice": "因子是 30 天均值回归信号；校准显示 7 天 BSS 为负（不如瞎猜）。有方向观点时也别赌短期兑现，按 30 天周期管理。",
         "evidence": "[补完-4] 校准：7 天 BSS -0.118（102 样本），30 天 BSS +0.092",
         "severity": "medium",

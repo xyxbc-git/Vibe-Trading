@@ -10,6 +10,8 @@ import {
   Bot,
   Zap,
   Sprout,
+  LineChart,
+  Terminal,
   Settings,
   PanelLeftClose,
   PanelLeftOpen,
@@ -26,10 +28,12 @@ const NAV_ITEMS: NavItem[] = [
   { to: "/chart", label: "K线", icon: <CandlestickChart size={20} /> },
   { to: "/trading", label: "交易", icon: <ArrowLeftRight size={20} /> },
   { to: "/strategy", label: "策略", icon: <FlaskConical size={20} /> },
+  { to: "/backtest", label: "回测", icon: <LineChart size={20} /> },
   { to: "/market", label: "情报", icon: <Globe size={20} /> },
   { to: "/ai", label: "AI助手", icon: <Bot size={20} /> },
   { to: "/scalper", label: "短线", icon: <Zap size={20} /> },
   { to: "/growth", label: "成长", icon: <Sprout size={20} /> },
+  { to: "/terminal", label: "终端", icon: <Terminal size={20} /> },
 ];
 
 export default function Sidebar() {

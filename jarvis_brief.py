@@ -126,10 +126,12 @@ def score_and_plan(deriv: dict, fac: dict, fng_now: int) -> dict:
     band_lo = float(C["entry_band_below_pct"]) / 100.0
     band_hi = float(C["entry_band_above_pct"]) / 100.0
     time_stop = int(C["time_stop_days"])
+    is_short = False
     if score >= TH["long"]:
         direction, base_pos = "偏多（战术）", min(pos_cap, 0.2 + score * 0.1)
     elif score <= TH["short"]:
-        direction, base_pos = "偏空/观望", 0.0
+        direction, base_pos = "偏空（战术）", min(pos_cap, 0.2 + abs(score) * 0.1)
+        is_short = True
     else:
         direction, base_pos = "中性观望", 0.1 if score > 0 else 0.0
 
@@ -142,15 +144,19 @@ def score_and_plan(deriv: dict, fac: dict, fng_now: int) -> dict:
         "attribution": attribution,
     }
     if price and base_pos > 0:
-        plan["entry_zone"] = f"{round(price*(1-band_lo),2)} ~ {round(price*(1+band_hi),2)}"
-        plan["stop_loss"] = round(price * (1 - sl_drop), 2)  # 硬止损（默认 -10%）
-        plan["take_profit_ref"] = round(price * (1 + tp_up), 2)  # 参考止盈（默认 +8%）
-        plan["time_stop_days"] = time_stop  # 因子是均值回归，过期离场（默认 30 天）
-        plan["max_risk_pct"] = round(base_pos * float(C["stop_loss_drop_pct"]), 1)  # 仓位×止损幅度=组合最大风险
-        # [T-08] 期望值计入永续 funding 成本：弱 edge 可能被持仓期 funding 费吃光。
+        if is_short:
+            plan["entry_zone"] = f"{round(price*(1-band_hi),2)} ~ {round(price*(1+band_lo),2)}"
+            plan["stop_loss"] = round(price * (1 + sl_drop), 2)
+            plan["take_profit_ref"] = round(price * (1 - tp_up), 2)
+        else:
+            plan["entry_zone"] = f"{round(price*(1-band_lo),2)} ~ {round(price*(1+band_hi),2)}"
+            plan["stop_loss"] = round(price * (1 - sl_drop), 2)
+            plan["take_profit_ref"] = round(price * (1 + tp_up), 2)
+        plan["time_stop_days"] = time_stop
+        plan["max_risk_pct"] = round(base_pos * float(C["stop_loss_drop_pct"]), 1)
         plan["expected_value"] = _expected_value(
             deriv, score, tp_pct=float(C["take_profit_pct"]), sl_pct=-float(C["stop_loss_drop_pct"]),
-            hold_days=plan["time_stop_days"],
+            hold_days=plan["time_stop_days"], is_short=is_short,
         )
         ev = plan["expected_value"]
         if ev.get("net_ev_pct") is not None and ev["net_ev_pct"] <= 0:
@@ -164,15 +170,17 @@ def score_and_plan(deriv: dict, fac: dict, fng_now: int) -> dict:
     return plan
 
 
-def _expected_value(deriv: dict, score: float, tp_pct: float, sl_pct: float, hold_days: int) -> dict:
-    """[T-08] 多头交易的期望值，扣减持仓期永续 funding 成本。
+def _expected_value(deriv: dict, score: float, tp_pct: float, sl_pct: float, hold_days: int,
+                    *, is_short: bool = False) -> dict:
+    """[T-08] 交易期望值，扣减持仓期永续 funding 成本。
 
-    - 胜率 p 由信心分启发式映射（0.5 基线，越强偏多 p 越高，封顶 0.66，贴近历史强因子胜率）。
+    - 胜率 p 由信心分绝对值启发式映射（0.5 基线，封顶 0.66）。
     - 毛期望 gross = p·tp + (1-p)·sl（tp 正、sl 负，单位 %）。
-    - funding 成本：对多头，正费率=付费（拖累）。fwd 8h 费率优先取 7 日均，× 持仓周期 intervals(3/天)。
+    - funding 成本：多头正费率=付费（拖累），空头正费率=收费（利好），符号翻转。
     - 净期望 net = gross − funding_cost；funding 缺数据时 net=gross 并标注。
     """
-    p = max(0.5, min(0.66, 0.5 + max(0.0, score) * 0.06))
+    abs_score = abs(score)
+    p = max(0.5, min(0.66, 0.5 + max(0.0, abs_score) * 0.06))
     gross = round(p * tp_pct + (1 - p) * sl_pct, 3)
 
     f = deriv.get("funding", {}) if isinstance(deriv, dict) else {}
@@ -194,7 +202,8 @@ def _expected_value(deriv: dict, score: float, tp_pct: float, sl_pct: float, hol
         out["note"] = "无 funding 数据，净期望未扣 funding 成本"
         return out
     intervals = hold_days * 3  # 永续每 8h 一次，3 次/天
-    funding_cost = round(float(fwd_8h) * intervals, 3)  # 多头：正费率=正成本（拖累）
+    sign = -1 if is_short else 1  # 空头：正费率=收入；多头：正费率=支出
+    funding_cost = round(float(fwd_8h) * intervals * sign, 3)
     net = round(gross - funding_cost, 3)
     out["funding_8h_pct"] = round(float(fwd_8h), 5)
     out["funding_intervals"] = intervals
@@ -262,19 +271,23 @@ def to_markdown(b: dict) -> str:
         f"- **信心分: {d['conviction_score']}（范围 -2~+2）→ {d['direction']}**",
         f"- 建议仓位: **{d['suggested_position_pct']}%**（弱因子，刻意保守）",
     ]
+    is_short_dir = (d.get("direction") or "").startswith("偏空")
     if d.get("suggested_position_pct", 0) > 0:
+        sl_label = "+10%，涨破止损" if is_short_dir else "-10%"
+        tp_label = "-8%" if is_short_dir else "+8%"
         lines += [
             f"- 入场区间: {d.get('entry_zone')}",
-            f"- 硬止损: {d.get('stop_loss')}（-10%）| 参考止盈: {d.get('take_profit_ref')}（+8%）",
+            f"- 硬止损: {d.get('stop_loss')}（{sl_label}）| 参考止盈: {d.get('take_profit_ref')}（{tp_label}）",
             f"- 时间止损: {d.get('time_stop_days')} 天（因子是 30 天均值回归，过期离场）",
             f"- 组合最大风险敞口: 约 {d.get('max_risk_pct')}%",
         ]
         ev = d.get("expected_value")
         if isinstance(ev, dict):
             cost = ev.get("funding_cost_pct")
+            funding_label = "funding 收益" if is_short_dir and cost is not None and cost < 0 else "funding 成本"
             cost_str = f"{cost}%（{ev.get('funding_intervals')}期×{ev.get('funding_8h_pct')}%）" if cost is not None else "无数据"
             lines.append(
-                f"- 期望值(T-08): 毛期望 {ev.get('gross_ev_pct')}%（胜率{ev.get('win_prob')}）− funding 成本 {cost_str} "
+                f"- 期望值(T-08): 毛期望 {ev.get('gross_ev_pct')}%（胜率{ev.get('win_prob')}）− {funding_label} {cost_str} "
                 f"= **净期望 {ev.get('net_ev_pct')}%**"
                 + (f"，funding 侵蚀 {ev.get('funding_drag_share_pct')}%" if ev.get('funding_drag_share_pct') is not None else "")
             )

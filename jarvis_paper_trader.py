@@ -154,7 +154,7 @@ def all_positions(symbol: str | None = None) -> list:
 # ─────────────────────────── 开仓 ───────────────────────────
 
 def open_from_decision(symbol: str, cfg: dict, dry_run: bool = False) -> dict:
-    """按决策开仓（仅偏多 + 护栏通过 + 该币无未平仓）。"""
+    """按决策开仓（偏多或偏空 + 护栏通过 + 该币无未平仓）。"""
     sym = (symbol if symbol.endswith("USDT") else symbol + "USDT").upper()
     if open_positions(sym):
         return {"action": "skip", "symbol": sym, "reason": "已有未平仓持仓"}
@@ -184,11 +184,13 @@ def open_from_decision(symbol: str, cfg: dict, dry_run: bool = False) -> dict:
     entry_price = guard["entry_price"]
     as_of = brief.get("factor_state", {}).get("as_of") or time.strftime("%Y-%m-%d")
 
+    trade_side = guard.get("side", "buy")
+
     # 钱包预检：按参考入场价估算名义市值，余额不足直接拒单（和真实交易所一致）
     est_notional = round(guard["qty"] * entry_price, 2)
     wal = jw.ensure_account(cfg.get("account_equity_usdt", 1000.0))
     if dry_run:
-        return {"action": "would_open", "symbol": sym, "qty": guard["qty"],
+        return {"action": "would_open", "symbol": sym, "side": trade_side, "qty": guard["qty"],
                 "entry_price": entry_price, "stop_loss": guard["stop_loss"],
                 "take_profit": guard["take_profit"], "est_notional_usdt": est_notional,
                 "cash_available_usdt": round(wal["cash_usdt"], 2)}
@@ -196,7 +198,6 @@ def open_from_decision(symbol: str, cfg: dict, dry_run: bool = False) -> dict:
         return {"action": "skip", "symbol": sym,
                 "reason": f"钱包余额不足：需≈{est_notional}U，可用 {round(wal['cash_usdt'], 2)}U"}
 
-    # 真实下买单
     order_uid = None
     fill = None
     if cfg.get("agent_token"):
@@ -208,37 +209,38 @@ def open_from_decision(symbol: str, cfg: dict, dry_run: bool = False) -> dict:
         except Exception as exc:  # noqa: BLE001
             _log(f"⚠️ {sym} 开仓下单异常（仍按决策价登记持仓）: {exc!r}"[:160])
 
-    # 成交价优先用真实 fill，回退决策参考价
     eff_entry = float(fill) if fill is not None else entry_price
     notional = round(guard["qty"] * eff_entry, 8)
 
-    # 钱包扣款（按真实成交价口径）；余额不足则不建仓
-    deb = jw.debit_buy(sym, notional, ref=f"open-{sym}-{as_of}")
+    # 钱包扣款（做多做空都冻结保证金）
+    deb = jw.debit_buy(sym, notional, ref=f"open-{trade_side}-{sym}-{as_of}")
     if not deb.get("ok"):
         return {"action": "skip", "symbol": sym, "reason": deb.get("reason")}
 
     pid = _insert_position(sym, guard["qty"], as_of, eff_entry, order_uid,
                            guard["stop_loss"], guard["take_profit"],
-                           dec.get("time_stop_days", 30), dec.get("conviction_score"))
+                           dec.get("time_stop_days", 30), dec.get("conviction_score"),
+                           side=trade_side)
 
     if jr and order_uid:
         try:
             jr.link_order(order_uid=order_uid, symbol=sym, as_of_date=as_of,
-                          side="buy", qty=guard["qty"], decision_price=entry_price,
+                          side=trade_side, qty=guard["qty"], decision_price=entry_price,
                           status=(fill is not None and "filled" or "rejected"))
         except Exception:  # noqa: BLE001
             pass
 
-    _log(f"🟢 {sym} 开仓 #{pid} qty={guard['qty']} 名义{notional}U 入场≈{eff_entry} "
+    side_label = "🔴 做空" if trade_side == "sell" else "🟢 做多"
+    _log(f"{side_label} {sym} 开仓 #{pid} qty={guard['qty']} 名义{notional}U 入场≈{eff_entry} "
          f"止损{guard['stop_loss']} 止盈{guard['take_profit']} 余额{deb.get('cash_after')}U")
-    return {"action": "opened", "symbol": sym, "position_id": pid, "qty": guard["qty"],
-            "entry_price": eff_entry, "order_uid": order_uid, "fill_price": fill,
-            "notional_usdt": notional, "cash_after": deb.get("cash_after")}
+    return {"action": "opened", "symbol": sym, "side": trade_side, "position_id": pid,
+            "qty": guard["qty"], "entry_price": eff_entry, "order_uid": order_uid,
+            "fill_price": fill, "notional_usdt": notional, "cash_after": deb.get("cash_after")}
 
 
 def _insert_position(sym: str, qty: float, entry_date: str, entry_price: float,
                      order_uid: str | None, stop_loss, take_profit,
-                     time_stop_days, conviction_score) -> int:
+                     time_stop_days, conviction_score, *, side: str = "buy") -> int:
     """登记一条 open 持仓，返回 position_id。"""
     init_positions_table()
     with jj._conn() as conn:
@@ -247,9 +249,9 @@ def _insert_position(sym: str, qty: float, entry_date: str, entry_price: float,
             INSERT INTO paper_positions
               (symbol, status, side, qty, entry_date, entry_price, entry_order_uid,
                stop_loss, take_profit, time_stop_days, conviction_score, opened_ts)
-            VALUES (?, 'open', 'buy', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (sym, qty, entry_date, entry_price, order_uid,
+            (sym, side, qty, entry_date, entry_price, order_uid,
              stop_loss, take_profit, time_stop_days, conviction_score, time.time()),
         )
         return cur.lastrowid
@@ -258,13 +260,15 @@ def _insert_position(sym: str, qty: float, entry_date: str, entry_price: float,
 # ─────────────────────────── 平仓 ───────────────────────────
 
 def _close_position(pos: dict, exit_price: float, reason: str, cfg: dict) -> dict:
-    """平掉一个持仓：下卖单 + 算 realized PnL + 落库。"""
+    """平掉一个持仓：下反向单 + 算 realized PnL + 落库。"""
     sym = pos["symbol"]
     qty = pos["qty"]
+    open_side = (pos.get("side") or "buy").lower()
+    close_side = "buy" if open_side == "sell" else "sell"
     order_uid = None
     if cfg.get("agent_token"):
         try:
-            resp = jx.place_paper_order(cfg, sym, {"side": "sell", "qty": qty},
+            resp = jx.place_paper_order(cfg, sym, {"side": close_side, "qty": qty},
                                         f"jarvis-close-{sym}-{int(time.time())}")
             data = (resp.get("body") or {}).get("data") or {}
             order_uid = data.get("order_uid")
@@ -276,8 +280,9 @@ def _close_position(pos: dict, exit_price: float, reason: str, cfg: dict) -> dic
     entry = float(pos["entry_price"]) if pos.get("entry_price") else None
     pnl_usdt = pnl_pct = None
     if entry and exit_price and entry > 0:
-        pnl_usdt = round((exit_price - entry) * qty, 4)
-        pnl_pct = round((exit_price / entry - 1.0) * 100, 2)
+        sign = -1 if open_side == "sell" else 1
+        pnl_usdt = round((exit_price - entry) * qty * sign, 4)
+        pnl_pct = round((exit_price / entry - 1.0) * 100 * sign, 2)
 
     with jj._conn() as conn:
         conn.execute(
@@ -309,10 +314,17 @@ def _exit_reason(pos: dict, price: float, fresh_direction: str | None) -> str | 
     """判断是否触发平仓，返回原因或 None。"""
     sl = pos.get("stop_loss")
     tp = pos.get("take_profit")
-    if sl and price <= float(sl):
-        return "stop"
-    if tp and price >= float(tp):
-        return "take"
+    is_short = (pos.get("side") or "buy").lower() == "sell"
+    if is_short:
+        if sl and price >= float(sl):
+            return "stop"
+        if tp and price <= float(tp):
+            return "take"
+    else:
+        if sl and price <= float(sl):
+            return "stop"
+        if tp and price >= float(tp):
+            return "take"
     if pos.get("entry_date") and pos.get("time_stop_days"):
         try:
             held = (time.time() - time.mktime(time.strptime(pos["entry_date"], "%Y-%m-%d"))) / 86400.0
@@ -320,8 +332,11 @@ def _exit_reason(pos: dict, price: float, fresh_direction: str | None) -> str | 
                 return "time"
         except Exception:  # noqa: BLE001
             pass
-    if fresh_direction is not None and not fresh_direction.startswith(LONG_PREFIX):
-        return "signal"
+    if fresh_direction is not None:
+        if is_short and not fresh_direction.startswith("偏空"):
+            return "signal"
+        elif not is_short and not fresh_direction.startswith(LONG_PREFIX):
+            return "signal"
     return None
 
 

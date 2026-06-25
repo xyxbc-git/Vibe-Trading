@@ -59,7 +59,8 @@ DEFAULTS = {
     "request_timeout_s": 30,
 }
 
-LONG_PREFIX = "偏多"  # brief 方向："偏多（战术）"
+LONG_PREFIX = "偏多"   # brief 方向："偏多（战术）"
+SHORT_PREFIX = "偏空"  # brief 方向："偏空（战术）"
 
 
 # ─────────────────────────── 配置 / 日志 ───────────────────────────
@@ -127,9 +128,11 @@ def evaluate_guardrails(decision: dict, cfg: dict) -> dict:
     stop_loss = decision.get("stop_loss")
     take_profit = decision.get("take_profit_ref")
 
-    # 1. 方向门禁：只做「偏多（战术）」。
-    if not direction.startswith(LONG_PREFIX):
-        return {"action": "skip", "reason": f"方向为「{direction or '未知'}」，非偏多 → 观望不下单"}
+    # 1. 方向门禁：偏多或偏空才放行，中性/观望跳过。
+    is_long = direction.startswith(LONG_PREFIX)
+    is_short = direction.startswith(SHORT_PREFIX)
+    if not is_long and not is_short:
+        return {"action": "skip", "reason": f"方向为「{direction or '未知'}」，非偏多/偏空 → 观望不下单"}
 
     # 1b. 信心分门槛。
     if score < float(cfg["min_conviction"]):
@@ -197,19 +200,20 @@ def evaluate_guardrails(decision: dict, cfg: dict) -> dict:
         return {"action": "skip", "reason": "下单数量≈0（权益过小或币价过高）→ 不下单"}
 
     # [T-07] 下单前滑点预估：按名义额 + 币种流动性给出预估冲击成本与成交价。
+    trade_side = "sell" if is_short else "buy"
     slippage = None
     try:
         import jarvis_slippage as js
         sym = decision.get("symbol") or cfg.get("_symbol") or ""
-        slippage = js.estimate_slippage_pct(sym, notional, side="buy")
-        slippage["est_fill_price"] = js.apply_fill_price(entry_price, "buy", slippage.get("one_way_bps", 0))
+        slippage = js.estimate_slippage_pct(sym, notional, side=trade_side)
+        slippage["est_fill_price"] = js.apply_fill_price(entry_price, trade_side, slippage.get("one_way_bps", 0))
     except Exception:  # noqa: BLE001 — 滑点预估失败不影响下单
         slippage = None
 
     return {
         "action": "place",
         "reason": "护栏通过",
-        "side": "buy",
+        "side": trade_side,
         "position_pct": pos_pct,
         "qty": qty,
         "notional_usdt": round(notional, 2),
@@ -224,7 +228,7 @@ def evaluate_guardrails(decision: dict, cfg: dict) -> dict:
 
 
 def _entry_price(decision: dict) -> float | None:
-    """从决策取参考入场价：优先 entry_zone 中点，回退 stop_loss/0.9 推回。"""
+    """从决策取参考入场价：优先 entry_zone 中点，回退按方向从止损反推。"""
     zone = decision.get("entry_zone")
     if isinstance(zone, str) and "~" in zone:
         try:
@@ -234,7 +238,10 @@ def _entry_price(decision: dict) -> float | None:
             pass
     sl = decision.get("stop_loss")
     if sl:
-        return round(float(sl) / 0.90, 2)  # brief 硬止损 = price*0.9
+        direction = (decision.get("direction") or "")
+        if direction.startswith(SHORT_PREFIX):
+            return round(float(sl) / 1.10, 2)  # 做空止损 = price*1.1
+        return round(float(sl) / 0.90, 2)  # 做多止损 = price*0.9
     return None
 
 

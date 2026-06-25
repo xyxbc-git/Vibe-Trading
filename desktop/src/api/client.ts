@@ -1,5 +1,16 @@
 const BASE_URL = "/api";
 
+/** 后端日志流的 SSE 地址（同源，经 Vite 代理转发到后端）。 */
+export const LOG_STREAM_URL = `${BASE_URL}/logs/stream`;
+
+export interface LogLine {
+  seq: number;
+  ts: string;
+  level: "info" | "warn" | "error";
+  source: string;
+  text: string;
+}
+
 async function request<T>(
   endpoint: string,
   options?: RequestInit,
@@ -79,8 +90,10 @@ export const api = {
     api.post<Record<string, unknown>>("/scalper/start", { symbol }),
   scalperStop: () => api.post<Record<string, unknown>>("/scalper/stop"),
   evolveStatus: () => api.get<Record<string, unknown>>("/evolve/status"),
-  evolveStart: (rounds = 10) =>
-    api.post<Record<string, unknown>>("/evolve/start", { rounds }),
+  evolveStart: (rounds = 10, symbol = "BTCUSDT", mode: "evolve" | "combo" = "evolve") =>
+    api.post<Record<string, unknown>>(
+      `/evolve/start?rounds=${rounds}&symbol=${symbol}&mode=${mode}`,
+    ),
   evolveGraveyard: () => api.get<Record<string, unknown>[]>("/evolve/graveyard"),
   evolveHallOfFame: () =>
     api.get<Record<string, unknown>[]>("/evolve/hall-of-fame"),
@@ -92,4 +105,102 @@ export const api = {
   updateConfig: (data: Record<string, unknown>) =>
     api.put<Record<string, unknown>>("/config", data),
   marketOverview: () => api.get<Record<string, unknown>>("/market/overview"),
+
+  actionBrief: (symbol = "BTCUSDT") =>
+    request<Record<string, unknown>>("/actions/brief?symbol=" + symbol, { method: "POST" }, 30_000),
+  actionExecute: (symbol = "BTCUSDT", dryRun = true) =>
+    request<Record<string, unknown>>(
+      `/actions/execute?symbol=${symbol}&dry_run=${dryRun}`,
+      { method: "POST" },
+      30_000,
+    ),
+  actionRadar: (symbols?: string) =>
+    request<Record<string, unknown>>(
+      "/actions/radar" + (symbols ? `?symbols=${symbols}` : ""),
+      { method: "POST" },
+      60_000,
+    ),
+  actionOpen: (symbol = "BTCUSDT", dryRun = false) =>
+    request<Record<string, unknown>>(
+      `/actions/open?symbol=${symbol}&dry_run=${dryRun}`,
+      { method: "POST" },
+      30_000,
+    ),
+  traderCycle: (symbols = "BTC,ETH,SOL", dryRun = false) =>
+    request<Record<string, unknown>>(
+      `/trader/cycle?symbols=${symbols}&dry_run=${dryRun}`,
+      { method: "POST" },
+      60_000,
+    ),
+
+  logs: (limit = 500) =>
+    api.get<{ lines: LogLine[]; total: number }>(`/logs?limit=${limit}`),
+  clearLogs: () => api.post<{ ok: boolean }>("/logs/clear"),
+
+  backtestRun: (
+    name: string,
+    symbol = "BTCUSDT",
+    timeframe = "15m",
+    start = "2025-01-01",
+    end = "2026-06-01",
+    capital = 10000,
+  ) =>
+    request<{ ok: boolean; error?: string }>(
+      `/backtest/run?name=${encodeURIComponent(name)}&symbol=${symbol}&timeframe=${timeframe}&start=${start}&end=${end}&capital=${capital}`,
+      { method: "POST" },
+      30_000,
+    ),
+  backtestResult: () => api.get<BacktestState>("/backtest/result"),
+  backtestCode: (name: string) =>
+    api.get<{ name: string; code: string; error?: string }>(
+      `/backtest/code?name=${encodeURIComponent(name)}`,
+    ),
 };
+
+export interface BacktestTrade {
+  direction?: string;
+  side?: string;
+  pnl?: number;
+  profit?: number;
+  net_pnl?: number;
+  entry_time?: string;
+  exit_time?: string;
+  entry_price?: number;
+  exit_price?: number;
+  balance?: number;
+  equity?: number;
+  bars_held?: number;
+  exit_reason?: string;
+  [k: string]: unknown;
+}
+
+export interface BacktestResult {
+  status: string;
+  total_return_pct: number;
+  win_rate: number;
+  profit_factor: number;
+  max_drawdown_pct: number;
+  sharpe_ratio: number;
+  total_trades: number;
+  avg_trade_pnl: number;
+  avg_bars_held: number;
+  trades: BacktestTrade[];
+  error?: string;
+}
+
+export interface BacktestState {
+  running: boolean;
+  started_at: number;
+  finished_at: number;
+  elapsed_seconds: number;
+  params: {
+    name: string;
+    symbol: string;
+    timeframe: string;
+    start: string;
+    end: string;
+    capital: number;
+  } | null;
+  result: BacktestResult | null;
+  error: string | null;
+}

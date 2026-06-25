@@ -24,8 +24,8 @@ import urllib.error
 import urllib.request
 
 import uvicorn
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 import jarvis_brief as jb
 import jarvis_crypto_data as jcd
@@ -59,6 +59,139 @@ _load_env_file()
 
 app = FastAPI(title="贾维斯仪表盘")
 
+# ============ 后端日志采集（供前端「终端」页面实时查看）============
+# 把 uvicorn 日志、应用 logging、以及各 jarvis 模块的 print 输出，统一收进一个
+# 内存环形缓冲，并通过 SSE 实时广播给前端「终端」页面，便于排查接口卡顿/报错。
+import logging as _logging
+import queue as _queue
+import sys as _sys
+import threading as _threading
+from collections import deque as _deque
+
+_LOG_BUFFER: "_deque[dict]" = _deque(maxlen=4000)
+_LOG_LOCK = _threading.Lock()
+_LOG_SUBSCRIBERS: "list[_queue.Queue]" = []
+_LOG_SEQ = 0
+
+
+def _log_emit(text: str, level: str = "info", source: str = "app") -> None:
+    """写入一行日志到环形缓冲并广播给所有 SSE 订阅者。"""
+    global _LOG_SEQ
+    for raw in str(text).rstrip("\n").split("\n"):
+        if raw == "":
+            continue
+        with _LOG_LOCK:
+            _LOG_SEQ += 1
+            item = {
+                "seq": _LOG_SEQ,
+                "ts": time.strftime("%H:%M:%S"),
+                "level": level,
+                "source": source,
+                "text": raw,
+            }
+            _LOG_BUFFER.append(item)
+            dead = []
+            for q in _LOG_SUBSCRIBERS:
+                try:
+                    q.put_nowait(item)
+                except _queue.Full:
+                    dead.append(q)
+            for q in dead:
+                try:
+                    _LOG_SUBSCRIBERS.remove(q)
+                except ValueError:
+                    pass
+
+
+class _BufferLogHandler(_logging.Handler):
+    """把标准 logging 记录转发进日志缓冲。"""
+
+    def emit(self, record: "_logging.LogRecord") -> None:
+        try:
+            msg = self.format(record)
+        except Exception:  # noqa: BLE001
+            return
+        if record.levelno >= _logging.ERROR:
+            level = "error"
+        elif record.levelno >= _logging.WARNING:
+            level = "warn"
+        else:
+            level = "info"
+        _log_emit(msg, level=level, source=(record.name.split(".")[0] or "log"))
+
+
+class _TeeStream:
+    """把 print 输出同时送到原始流和日志缓冲（按行切分）。"""
+
+    def __init__(self, original, level: str):
+        self._orig = original
+        self._level = level
+        self._buf = ""
+
+    def write(self, s: str) -> int:
+        try:
+            self._orig.write(s)
+        except Exception:  # noqa: BLE001
+            pass
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if line.strip():
+                _log_emit(line, level=self._level, source="stdout")
+        return len(s)
+
+    def flush(self) -> None:
+        try:
+            self._orig.flush()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def isatty(self) -> bool:
+        return False
+
+
+def _install_log_capture() -> None:
+    # 只挂到 root logger：uvicorn 在 run() 时会重配自己的 logger（会清掉外部
+    # handler），但其默认 StreamHandler 写的是 sys.stderr —— 已被下面的 Tee 接管，
+    # 故 uvicorn 的启动/错误日志仍会进入缓冲，无需也不应重复挂到 uvicorn.* 上。
+    handler = _BufferLogHandler()
+    handler.setFormatter(_logging.Formatter("%(message)s"))
+    root = _logging.getLogger("")
+    root.addHandler(handler)
+    if root.level == _logging.NOTSET:
+        root.setLevel(_logging.INFO)
+    # 捕获 jarvis 模块里大量的 print 输出（stdout=信息，stderr=警告）
+    _sys.stdout = _TeeStream(_sys.__stdout__, "info")
+    _sys.stderr = _TeeStream(_sys.__stderr__, "warn")
+
+
+_install_log_capture()
+
+
+@app.middleware("http")
+async def _access_timing(request: "Request", call_next):
+    """为每个 API 请求记录耗时与状态，便于定位「点了没反应」的慢接口。"""
+    path = request.url.path
+    # 不记录日志接口自身，避免噪声与自我递归
+    skip = path.startswith("/api/logs")
+    start = time.time()
+    try:
+        resp = await call_next(request)
+    except Exception as e:  # noqa: BLE001
+        if not skip:
+            _log_emit(
+                f"{request.method} {path} → 异常 {e} ({(time.time() - start) * 1000:.0f}ms)",
+                "error",
+                "http",
+            )
+        raise
+    if not skip:
+        dur = (time.time() - start) * 1000
+        level = "warn" if dur > 3000 else "info"
+        _log_emit(f"{request.method} {path} → {resp.status_code} ({dur:.0f}ms)", level, "http")
+    return resp
+
+
 # 简单内存缓存：{key: (ts, value)}，TTL 控制刷新频率
 _CACHE: dict[str, tuple[float, object]] = {}
 
@@ -71,6 +204,62 @@ def _cached(key: str, ttl: int, fn):
     val = fn()
     _CACHE[key] = (now, val)
     return val
+
+
+# ============ 后端日志接口（前端「终端」页面消费）============
+
+@app.get("/api/logs")
+def api_logs(limit: int = 500):
+    """拉取最近 N 行后端日志（前端首次加载或 SSE 不可用时的兜底）。"""
+    n = max(1, min(int(limit), 4000))
+    with _LOG_LOCK:
+        items = list(_LOG_BUFFER)[-n:]
+    return JSONResponse({"lines": items, "total": len(items)})
+
+
+@app.post("/api/logs/clear")
+def api_logs_clear():
+    """清空后端日志缓冲。"""
+    with _LOG_LOCK:
+        _LOG_BUFFER.clear()
+    _log_emit("日志已清空", "info", "app")
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/logs/stream")
+def api_logs_stream():
+    """SSE 实时推送后端日志。"""
+
+    def gen():
+        q: "_queue.Queue" = _queue.Queue(maxsize=2000)
+        with _LOG_LOCK:
+            backlog = list(_LOG_BUFFER)[-300:]
+            _LOG_SUBSCRIBERS.append(q)
+        try:
+            for item in backlog:
+                yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+            while True:
+                try:
+                    item = q.get(timeout=15)
+                    yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+                except _queue.Empty:
+                    yield ": keepalive\n\n"
+        finally:
+            with _LOG_LOCK:
+                try:
+                    _LOG_SUBSCRIBERS.remove(q)
+                except ValueError:
+                    pass
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.get("/api/snapshot")
@@ -335,6 +524,52 @@ def api_trader_cycle(symbols: str = "BTC,ETH,SOL", dry_run: bool = False):
     return JSONResponse(jpt.run_cycle(syms, cfg, dry_run=dry_run))
 
 
+# ─────────────────────────── 快捷操作 API ───────────────────────────
+
+@app.post("/api/actions/brief")
+def api_action_brief(symbol: str = "BTCUSDT"):
+    """一键生成决策简报。"""
+    try:
+        result = jb.build(symbol)
+        return JSONResponse({"ok": True, "data": result})
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]})
+
+
+@app.post("/api/actions/execute")
+def api_action_execute(symbol: str = "BTCUSDT", dry_run: bool = True):
+    """一键执行（默认 dry-run 演练，不真下单）。"""
+    cfg = _trader_cfg()
+    try:
+        result = jx.execute(symbol, cfg, dry_run=dry_run)
+        return JSONResponse({"ok": True, "data": result})
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]})
+
+
+@app.post("/api/actions/radar")
+def api_action_radar(symbols: str | None = None, min_conviction: float = 0.8):
+    """一键雷达扫描。"""
+    try:
+        import jarvis_radar as jr
+        syms = [s.strip().upper() for s in symbols.split(",") if s.strip()] if symbols else None
+        result = jr.scan(symbols=syms, min_conviction=min_conviction)
+        return JSONResponse({"ok": True, "data": result})
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]})
+
+
+@app.post("/api/actions/open")
+def api_action_open(symbol: str = "BTCUSDT", dry_run: bool = False):
+    """一键按决策开仓。"""
+    cfg = _trader_cfg()
+    try:
+        result = jpt.open_from_decision(symbol, cfg, dry_run=dry_run)
+        return JSONResponse({"ok": True, "data": result})
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]})
+
+
 # ─────────────────────────── 事件流 + 智能问答 API ───────────────────────────
 
 _EXIT_REASON_CN = {
@@ -507,26 +742,36 @@ def _answer_question(q: str, snap: dict, st: dict) -> str:
     reasons = d.get("reasons", []) or []
     ql = (q or "").lower()
 
+    is_short_dir = direction.startswith("偏空")
+
     def buy_line():
+        if pos > 0 and is_short_dir:
+            return (f"现在 {sym} 偏空（信心分 {score}），可以小仓试空，建议仓位约 {pos}%。"
+                    f"入场区间 {entry}，进场前先把止损 {sl} 设好（涨破止损）。")
         if pos > 0:
             return (f"现在 {sym} 偏多（信心分 {score}），可以小仓试多，建议仓位约 {pos}%。"
                     f"入场区间 {entry}，进场前先把止损 {sl} 设好。")
         if score <= -0.6:
-            return f"现在 {sym} 偏空（信心分 {score}），别追多，建议空仓观望，等信号转好再说。"
+            return f"现在 {sym} 偏空（信心分 {score}），可考虑做空或空仓观望，等信号确认再操作。"
         return f"现在 {sym} 信号偏中性（信心分 {score}），建议先观望，不值得为了买而买。"
 
     # 关键词路由
     if any(k in q for k in ("止盈", "卖", "出货", "落袋", "什么时候卖")):
+        if pos > 0 and tp and is_short_dir:
+            return f"{sym} 做空参考止盈在 {tp}（约 -8%），价格跌到就可以分批平仓落袋；最多持有 {days} 天，到期没走也建议离场。"
         if pos > 0 and tp:
             return f"{sym} 参考止盈在 {tp}（约 +8%），价格到了就可以分批落袋；最多持有 {days} 天，到期没走也建议离场。"
-        return f"现在 {sym} 没有建议持仓，谈不上卖点；等出现偏多信号、开了仓再设止盈。"
-    if any(k in q for k in ("止损", "风险", "亏", "守不住", "跌")):
+        return f"现在 {sym} 没有建议持仓，谈不上卖点；等出现偏多或偏空信号、开了仓再设止盈。"
+    if any(k in q for k in ("止损", "风险", "亏", "守不住", "跌", "涨")):
+        if pos > 0 and sl and is_short_dir:
+            return f"{sym} 做空硬止损设在 {sl}（约 +10%），涨破就无条件平仓离场，别扛单。当前组合最大风险敞口约 {d.get('max_risk_pct','—')}%。"
         if pos > 0 and sl:
             return f"{sym} 硬止损设在 {sl}（约 -10%），跌破就无条件离场，别扛单。当前组合最大风险敞口约 {d.get('max_risk_pct','—')}%。"
-        return f"现在 {sym} 没有建议持仓，先不用设止损；真要买，记住硬止损是纪律，不设不进场。"
+        return f"现在 {sym} 没有建议持仓，先不用设止损；真要开仓，记住硬止损是纪律，不设不进场。"
     if any(k in q for k in ("仓位", "买多少", "投多少", "多少钱", "多少仓")):
         if pos > 0:
-            return f"{sym} 建议仓位约 {pos}%（弱因子刻意保守）。入场 {entry}，止损 {sl}，止盈 {tp}。"
+            side_hint = "做空" if is_short_dir else "做多"
+            return f"{sym} 建议{side_hint}仓位约 {pos}%（弱因子刻意保守）。入场 {entry}，止损 {sl}，止盈 {tp}。"
         return f"现在 {sym} 建议仓位 0%——信号不够强，空仓也是一种持仓。"
     if any(k in q for k in ("为什么", "原因", "理由", "凭什么", "依据")):
         rs = reasons[:3]
@@ -669,6 +914,63 @@ except ImportError:
 _SCALPER_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scalper_config.yaml")
 
 
+# ============ 进化引擎进程管理（桌面端可见：开始/过程/结束/结果）============
+import re as _re
+import subprocess as _subprocess
+
+_DASH_ROOT = os.path.dirname(os.path.abspath(__file__))
+_EVOLVE_LOCK = _threading.Lock()
+_EVOLVE_PROC: "_subprocess.Popen | None" = None
+_EVOLVE_STATE: dict = {
+    "running": False,
+    "mode": None,
+    "symbol": None,
+    "timeframe": None,
+    "rounds": None,
+    "current_round": 0,
+    "started_at": 0.0,
+    "finished_at": 0.0,
+    "pid": None,
+    "last_line": "",
+    "exit_code": None,
+}
+_EVOLVE_ROUND_RX = _re.compile(r"第\s*(\d+)\s*/\s*(\d+)\s*轮")
+
+
+def _evolve_reader(proc: "_subprocess.Popen") -> None:
+    """读取进化子进程输出：逐行进日志缓冲（前端「终端」页可见）并解析轮次进度。"""
+    try:
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            line = raw.rstrip("\n")
+            if not line.strip():
+                continue
+            _log_emit(line, "info", "evolve")
+            with _EVOLVE_LOCK:
+                _EVOLVE_STATE["last_line"] = line
+                m = _EVOLVE_ROUND_RX.search(line)
+                if m:
+                    _EVOLVE_STATE["current_round"] = int(m.group(1))
+                    _EVOLVE_STATE["rounds"] = int(m.group(2))
+    except Exception as e:  # noqa: BLE001
+        _log_emit(f"读取进化输出异常: {e}", "error", "evolve")
+    finally:
+        try:
+            proc.wait()
+        except Exception:  # noqa: BLE001
+            pass
+        with _EVOLVE_LOCK:
+            _EVOLVE_STATE["running"] = False
+            _EVOLVE_STATE["finished_at"] = time.time()
+            _EVOLVE_STATE["exit_code"] = proc.returncode
+        ok = proc.returncode == 0
+        _log_emit(
+            f"{'✓' if ok else '✗'} 进化进程结束 (code={proc.returncode})",
+            "info" if ok else "error",
+            "evolve",
+        )
+
+
 @app.get("/api/scalper/status")
 def api_scalper_status():
     if not _HAS_SCALPER_TRADER:
@@ -734,31 +1036,240 @@ def api_scalper_stop():
 
 @app.get("/api/evolve/status")
 def api_evolve_status():
-    if not _HAS_SCALPER_EVOLVE:
-        return JSONResponse({"error": "jarvis_scalper_evolve 模块未安装"}, status_code=503)
-    try:
-        gy = jse.load_graveyard()
-        hof = jse.load_hall_of_fame()
-        best = jse.get_best_strategy()
-        return JSONResponse({
-            "graveyard_count": len(gy),
-            "hall_of_fame_count": len(hof),
-            "best_strategy": best.get("name") if best else None,
-            "best_win_rate": best.get("win_rate_pct") if best else None,
-            "best_profit_factor": best.get("profit_factor") if best else None,
-        })
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+    with _EVOLVE_LOCK:
+        st = dict(_EVOLVE_STATE)
+    elapsed = 0.0
+    if st["started_at"]:
+        end = st["finished_at"] or time.time()
+        elapsed = max(0.0, end - st["started_at"])
+    resp: dict[str, Any] = {
+        "running": st["running"],
+        "mode": st["mode"],
+        "symbol": st["symbol"],
+        "current_round": st["current_round"],
+        "total_rounds": st["rounds"] or 0,
+        "elapsed_seconds": round(elapsed, 1),
+        "last_line": st["last_line"],
+        "exit_code": st["exit_code"],
+        "status": "running" if st["running"] else ("done" if st["finished_at"] else "idle"),
+    }
+    if _HAS_SCALPER_EVOLVE:
+        try:
+            gy = jse.load_graveyard()
+            hof = jse.load_hall_of_fame()
+            best = jse.get_best_strategy()
+            resp.update({
+                "graveyard_count": len(gy),
+                "hall_of_fame_count": len(hof),
+                "best_strategy": best.get("name") if best else None,
+                "best_win_rate": best.get("win_rate_pct") if best else None,
+                "best_profit_factor": best.get("profit_factor") if best else None,
+            })
+        except Exception as e:  # noqa: BLE001
+            resp["counts_error"] = str(e)
+    return JSONResponse(resp)
 
 
 @app.post("/api/evolve/start")
-def api_evolve_start(rounds: int = 10):
-    return JSONResponse({"ok": False, "reason": f"进化引擎需通过命令行启动: python jarvis_scalper_evolve.py evolve --rounds {rounds}"})
+def api_evolve_start(rounds: int = 10, symbol: str = "BTCUSDT", timeframe: str = "15m", mode: str = "evolve"):
+    """真正后台启动进化引擎；过程输出实时进「终端」页，结果落名人堂/墓地。"""
+    global _EVOLVE_PROC
+    if not _HAS_SCALPER_EVOLVE:
+        return JSONResponse({"ok": False, "error": "jarvis_scalper_evolve 模块未安装"}, status_code=503)
+    with _EVOLVE_LOCK:
+        if _EVOLVE_STATE["running"]:
+            return JSONResponse({"ok": False, "error": "进化已在运行中"})
+    rounds = max(1, min(int(rounds), 100))
+    sym = symbol.upper().replace("-", "").replace("/", "")
+    cmd_name = "evolve-combo" if mode == "combo" else "evolve"
+    cmd = [
+        _sys.executable, "jarvis_scalper_evolve.py", cmd_name,
+        "--symbol", sym, "--rounds", str(rounds), "--timeframe", timeframe,
+    ]
+    try:
+        proc = _subprocess.Popen(
+            cmd,
+            cwd=_DASH_ROOT,
+            stdout=_subprocess.PIPE,
+            stderr=_subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except Exception as e:  # noqa: BLE001
+        _log_emit(f"✗ 进化启动失败: {e}", "error", "evolve")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+    with _EVOLVE_LOCK:
+        _EVOLVE_PROC = proc
+        _EVOLVE_STATE.update({
+            "running": True,
+            "mode": cmd_name,
+            "symbol": sym,
+            "timeframe": timeframe,
+            "rounds": rounds,
+            "current_round": 0,
+            "started_at": time.time(),
+            "finished_at": 0.0,
+            "pid": proc.pid,
+            "last_line": "",
+            "exit_code": None,
+        })
+    _log_emit(
+        f"▶ 进化开始 [{cmd_name}] symbol={sym} timeframe={timeframe} rounds={rounds} (pid={proc.pid})",
+        "info",
+        "evolve",
+    )
+    _threading.Thread(target=_evolve_reader, args=(proc,), daemon=True).start()
+    return JSONResponse({"ok": True, "pid": proc.pid, "symbol": sym, "rounds": rounds, "mode": cmd_name})
 
 
 @app.post("/api/evolve/stop")
 def api_evolve_stop():
-    return JSONResponse({"ok": False, "reason": "进化引擎需通过命令行停止（Ctrl+C）"})
+    global _EVOLVE_PROC
+    with _EVOLVE_LOCK:
+        proc = _EVOLVE_PROC
+        running = _EVOLVE_STATE["running"]
+    if not running or proc is None:
+        return JSONResponse({"ok": False, "error": "当前没有运行中的进化"})
+    try:
+        proc.terminate()
+        _log_emit("■ 已请求停止进化进程", "warn", "evolve")
+        return JSONResponse({"ok": True})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+# ============ 单次回测（QD 同款明细：资金曲线 + 逐笔成交 + 指标）============
+try:
+    import jarvis_scalper_backtest as jbt
+    _HAS_BACKTEST = True
+except ImportError:
+    _HAS_BACKTEST = False
+
+_BT_LOCK = _threading.Lock()
+_BT_STATE: dict = {
+    "running": False,
+    "started_at": 0.0,
+    "finished_at": 0.0,
+    "params": None,
+    "result": None,
+    "error": None,
+}
+
+
+def _find_hof_code(name: str) -> "str | None":
+    if not _HAS_SCALPER_EVOLVE:
+        return None
+    try:
+        for e in jse.load_hall_of_fame():
+            if e.get("name") == name:
+                return e.get("code")
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _backtest_worker(code, symbol, timeframe, start, end, capital, label):
+    _log_emit(
+        f"▶ 回测开始 [{label}] {symbol} {timeframe} {start}~{end} 本金={capital}",
+        "info",
+        "backtest",
+    )
+    t0 = time.time()
+    try:
+        res = jbt.run_backtest(
+            code=code,
+            symbol=symbol,
+            timeframe=timeframe,
+            start_date=start,
+            end_date=end,
+            initial_capital=capital,
+        )
+        ok = res.get("status") == "succeeded"
+        with _BT_LOCK:
+            _BT_STATE["result"] = res
+            _BT_STATE["error"] = None if ok else res.get("error", res.get("status"))
+        if ok:
+            _log_emit(
+                f"✓ 回测完成 收益={res.get('total_return_pct', 0):.2f}% "
+                f"胜率={res.get('win_rate', 0):.1f}% 成交={res.get('total_trades', 0)} "
+                f"({time.time() - t0:.1f}s)",
+                "info",
+                "backtest",
+            )
+        else:
+            _log_emit(f"✗ 回测未成功: {res.get('status')} {res.get('error', '')}", "error", "backtest")
+    except Exception as e:  # noqa: BLE001
+        with _BT_LOCK:
+            _BT_STATE["error"] = str(e)
+            _BT_STATE["result"] = None
+        _log_emit(f"✗ 回测异常: {e}", "error", "backtest")
+    finally:
+        with _BT_LOCK:
+            _BT_STATE["running"] = False
+            _BT_STATE["finished_at"] = time.time()
+
+
+@app.post("/api/backtest/run")
+def api_backtest_run(
+    name: str = "",
+    symbol: str = "BTCUSDT",
+    timeframe: str = "15m",
+    start: str = "2025-01-01",
+    end: str = "2026-06-01",
+    capital: float = 10000,
+):
+    """拿名人堂策略代码重跑一次 QD 回测，过程进「终端」页，结果含逐笔成交。"""
+    if not _HAS_BACKTEST:
+        return JSONResponse({"ok": False, "error": "jarvis_scalper_backtest 模块未安装"}, status_code=503)
+    with _BT_LOCK:
+        if _BT_STATE["running"]:
+            return JSONResponse({"ok": False, "error": "已有回测在运行中"})
+    if not name:
+        return JSONResponse({"ok": False, "error": "缺少策略名（name）"}, status_code=400)
+    code = _find_hof_code(name)
+    if not code:
+        return JSONResponse({"ok": False, "error": f"名人堂未找到策略代码: {name}"}, status_code=404)
+    qd_symbol = symbol.upper().replace("-", "").replace("/", "")
+    if "USDT" in qd_symbol:
+        qd_symbol = qd_symbol.replace("USDT", "/USDT")
+    with _BT_LOCK:
+        _BT_STATE.update({
+            "running": True,
+            "started_at": time.time(),
+            "finished_at": 0.0,
+            "params": {
+                "name": name, "symbol": symbol, "timeframe": timeframe,
+                "start": start, "end": end, "capital": capital,
+            },
+            "result": None,
+            "error": None,
+        })
+    _threading.Thread(
+        target=_backtest_worker,
+        args=(code, qd_symbol, timeframe, start, end, capital, name),
+        daemon=True,
+    ).start()
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/backtest/result")
+def api_backtest_result():
+    with _BT_LOCK:
+        st = dict(_BT_STATE)
+    elapsed = 0.0
+    if st["started_at"]:
+        endt = st["finished_at"] or time.time()
+        elapsed = max(0.0, endt - st["started_at"])
+    st["elapsed_seconds"] = round(elapsed, 1)
+    return JSONResponse(st)
+
+
+@app.get("/api/backtest/code")
+def api_backtest_code(name: str):
+    code = _find_hof_code(name)
+    if code is None:
+        return JSONResponse({"name": name, "code": "", "error": "未找到该策略代码"}, status_code=404)
+    return JSONResponse({"name": name, "code": code})
 
 
 @app.get("/api/evolve/graveyard")
@@ -2297,7 +2808,9 @@ def main() -> int:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=7899)
     args = ap.parse_args()
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    # access_log=False：逐请求耗时由 _access_timing 中间件统一记录，避免与
+    # uvicorn 自带访问日志重复刷屏。
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info", access_log=False)
     return 0
 
 

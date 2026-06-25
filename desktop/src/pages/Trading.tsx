@@ -3,7 +3,7 @@ import { usePolling } from "@/hooks/useApi";
 import { useSymbol } from "@/hooks/useSymbol";
 import { api } from "@/api/client";
 import PositionCard from "@/components/cards/PositionCard";
-import { ArrowLeftRight, ShieldCheck, AlertTriangle } from "lucide-react";
+import { ArrowLeftRight, ShieldCheck, AlertTriangle, Zap, FileText, Radar, Play, RotateCw, TrendingUp } from "lucide-react";
 import { clsx } from "clsx";
 
 function fmtUsd(n: number) {
@@ -29,6 +29,8 @@ export default function Trading() {
     takeProfit: "3.0",
   });
   const [ordering, setOrdering] = useState(false);
+  const [actionLoading, setActionLoading] = useState<string | null>(null);
+  const [actionResult, setActionResult] = useState<{ type: string; ok: boolean; msg: string } | null>(null);
 
   const handleOrder = async () => {
     if (!orderForm.amount) return;
@@ -45,6 +47,45 @@ export default function Trading() {
       // API 可能未就绪
     }
     setOrdering(false);
+  };
+
+  const runAction = async (name: string, fn: () => Promise<Record<string, unknown>>) => {
+    setActionLoading(name);
+    setActionResult(null);
+    try {
+      const res = await fn();
+      const ok = Boolean(res?.ok);
+      const data = res?.data as Record<string, unknown> | undefined;
+      let msg = "";
+      if (name === "brief") {
+        const dec = data?.decision as Record<string, unknown> | undefined;
+        msg = dec
+          ? `${dec.direction} | 信心 ${dec.conviction_score} | 仓位 ${dec.suggested_position_pct}%`
+          : (res?.error as string) ?? "无数据";
+      } else if (name === "execute") {
+        const g = data?.guardrails as Record<string, unknown> | undefined;
+        msg = g
+          ? `${g.action === "place" ? "可下单" : "跳过"} — ${g.reason}`
+          : (res?.error as string) ?? "无数据";
+      } else if (name === "radar") {
+        const act = data?.actionable as unknown[] | undefined;
+        const total = (data?.results as unknown[])?.length ?? 0;
+        msg = `扫描 ${total} 币，达标信号 ${act?.length ?? 0} 个`;
+      } else if (name === "cycle") {
+        const opened = (data?.opened as unknown[])?.length ?? 0;
+        const closed = (data?.closed as unknown[])?.length ?? 0;
+        msg = `开仓 ${opened} | 平仓 ${closed}`;
+      } else if (name === "open") {
+        msg = data?.action === "opened"
+          ? `已开仓 #${data.position_id} ${data.side === "sell" ? "做空" : "做多"}`
+          : `${data?.reason ?? (res?.error as string) ?? "无数据"}`;
+      }
+      setActionResult({ type: name, ok, msg });
+    } catch (e) {
+      setActionResult({ type: name, ok: false, msg: e instanceof Error ? e.message : "请求失败" });
+    } finally {
+      setActionLoading(null);
+    }
   };
 
   const dailyLoss = Number(status?.daily_pnl ?? 0);
@@ -323,6 +364,63 @@ export default function Trading() {
                   : `确认${orderForm.direction === "long" ? "做多" : "做空"}`}
               </button>
             </div>
+          </div>
+
+          <div className="card">
+            <div className="flex items-center gap-2 mb-4">
+              <Zap size={16} className="text-jarvis-yellow" />
+              <p className="stat-label">快捷操作</p>
+            </div>
+            <div className="space-y-2">
+              <button
+                onClick={() => runAction("brief", () => api.actionBrief(symbol))}
+                disabled={!!actionLoading}
+                className="w-full flex items-center gap-2 px-3 py-2.5 bg-jarvis-bg border border-jarvis-border rounded-lg text-sm text-jarvis-text hover:border-jarvis-blue transition-colors disabled:opacity-50"
+              >
+                <FileText size={14} className="text-jarvis-blue" />
+                {actionLoading === "brief" ? "生成中..." : "生成决策简报"}
+              </button>
+              <button
+                onClick={() => runAction("execute", () => api.actionExecute(symbol, true))}
+                disabled={!!actionLoading}
+                className="w-full flex items-center gap-2 px-3 py-2.5 bg-jarvis-bg border border-jarvis-border rounded-lg text-sm text-jarvis-text hover:border-jarvis-blue transition-colors disabled:opacity-50"
+              >
+                <Play size={14} className="text-jarvis-green" />
+                {actionLoading === "execute" ? "演练中..." : "执行手演练 (dry-run)"}
+              </button>
+              <button
+                onClick={() => runAction("radar", () => api.actionRadar())}
+                disabled={!!actionLoading}
+                className="w-full flex items-center gap-2 px-3 py-2.5 bg-jarvis-bg border border-jarvis-border rounded-lg text-sm text-jarvis-text hover:border-jarvis-purple transition-colors disabled:opacity-50"
+              >
+                <Radar size={14} className="text-jarvis-purple" />
+                {actionLoading === "radar" ? "扫描中..." : "雷达扫描全币种"}
+              </button>
+              <button
+                onClick={() => runAction("open", () => api.actionOpen(symbol, false))}
+                disabled={!!actionLoading}
+                className="w-full flex items-center gap-2 px-3 py-2.5 bg-jarvis-bg border border-jarvis-border rounded-lg text-sm text-jarvis-text hover:border-jarvis-green transition-colors disabled:opacity-50"
+              >
+                <TrendingUp size={14} className="text-jarvis-green" />
+                {actionLoading === "open" ? "开仓中..." : "按决策自动开仓"}
+              </button>
+              <button
+                onClick={() => runAction("cycle", () => api.traderCycle("BTC,ETH,SOL", false))}
+                disabled={!!actionLoading}
+                className="w-full flex items-center gap-2 px-3 py-2.5 bg-jarvis-bg border border-jarvis-border rounded-lg text-sm text-jarvis-text hover:border-jarvis-yellow transition-colors disabled:opacity-50"
+              >
+                <RotateCw size={14} className="text-jarvis-yellow" />
+                {actionLoading === "cycle" ? "执行中..." : "跑一轮自动跟盘"}
+              </button>
+            </div>
+            {actionResult && (
+              <div className={clsx(
+                "mt-3 p-2.5 rounded-lg text-xs",
+                actionResult.ok ? "bg-jarvis-green/10 text-jarvis-green" : "bg-jarvis-red/10 text-jarvis-red",
+              )}>
+                {actionResult.msg}
+              </div>
+            )}
           </div>
         </div>
       </div>

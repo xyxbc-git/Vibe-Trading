@@ -53,26 +53,35 @@ def _norm(sym: str) -> str:
 
 
 def _correlation_overlay(actionable: list[dict], max_effective_pct: float, corr_days: int) -> dict | None:
-    """T-10 多币相关性折算：对同向（偏多）多币仓位折算有效敞口，超 cap 等比缩减。
+    """T-10 多币相关性折算：对同向多币仓位折算有效敞口，超 cap 等比缩减。
 
-    只对 ≥2 个偏多且 position_pct>0 的信号生效；就地给这些信号写入
-    `position_pct_adjusted`，并返回组合级 portfolio 摘要（无可折算则返回 None）。
+    分别对偏多和偏空各自折算（同向之间才有相关性放大风险）；
+    就地给信号写入 `position_pct_adjusted`，返回组合级摘要。
     永不抛出——相关性计算失败时退化为不缩减。
     """
+    def _adjust_group(group: list[dict]) -> dict | None:
+        if len(group) < 2:
+            return None
+        syms = [r["symbol"] for r in group]
+        weights = [float(r["position_pct"]) for r in group]
+        try:
+            adj = jcorr.adjust_positions(syms, weights, days=corr_days, cap=max_effective_pct)
+        except Exception as exc:  # noqa: BLE001
+            return {"_error": repr(exc)[:200]}
+        by_sym = {p["symbol"]: p["position_pct_adjusted"] for p in adj.get("per_symbol", [])}
+        for r in group:
+            r["position_pct_adjusted"] = by_sym.get(r["symbol"], r.get("position_pct"))
+        return adj
+
     longs = [r for r in actionable
              if (r.get("direction") or "").startswith("偏多") and (r.get("position_pct") or 0) > 0]
-    if len(longs) < 2:
+    shorts = [r for r in actionable
+              if (r.get("direction") or "").startswith("偏空") and (r.get("position_pct") or 0) > 0]
+    long_adj = _adjust_group(longs)
+    short_adj = _adjust_group(shorts)
+    if long_adj is None and short_adj is None:
         return None
-    syms = [r["symbol"] for r in longs]
-    weights = [float(r["position_pct"]) for r in longs]
-    try:
-        adj = jcorr.adjust_positions(syms, weights, days=corr_days, cap=max_effective_pct)
-    except Exception as exc:  # noqa: BLE001 — 折算失败不拖垮雷达
-        return {"_error": repr(exc)[:200]}
-    by_sym = {p["symbol"]: p["position_pct_adjusted"] for p in adj.get("per_symbol", [])}
-    for r in longs:
-        r["position_pct_adjusted"] = by_sym.get(r["symbol"], r.get("position_pct"))
-    return adj
+    return long_adj or short_adj
 
 
 def scan(symbols: list[str] | None = None, min_conviction: float = 0.8,
@@ -183,7 +192,7 @@ def to_markdown(radar: dict) -> str:
         ]
         if p.get("scaled"):
             lines.append(
-                f"- ⚠ 有效敞口超上限 {p.get('cap_pct')}% → 各偏多仓位等比缩减 ×{p.get('scale_factor')}，"
+                f"- ⚠ 有效敞口超上限 {p.get('cap_pct')}% → 各同向仓位等比缩减 ×{p.get('scale_factor')}，"
                 f"缩减后有效敞口 {p.get('effective_after_pct')}%。"
             )
         else:
