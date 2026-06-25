@@ -1139,11 +1139,23 @@ def api_evolve_stop():
 
 
 # ============ 单次回测（QD 同款明细：资金曲线 + 逐笔成交 + 指标）============
+from pydantic import BaseModel
+
 try:
     import jarvis_scalper_backtest as jbt
     _HAS_BACKTEST = True
 except ImportError:
     _HAS_BACKTEST = False
+
+
+class BacktestReq(BaseModel):
+    name: str = ""
+    code: str = ""
+    symbol: str = "BTCUSDT"
+    timeframe: str = "15m"
+    start: str = "2025-01-01"
+    end: str = "2026-06-01"
+    capital: float = 10000
 
 _BT_LOCK = _threading.Lock()
 _BT_STATE: dict = {
@@ -1210,26 +1222,23 @@ def _backtest_worker(code, symbol, timeframe, start, end, capital, label):
 
 
 @app.post("/api/backtest/run")
-def api_backtest_run(
-    name: str = "",
-    symbol: str = "BTCUSDT",
-    timeframe: str = "15m",
-    start: str = "2025-01-01",
-    end: str = "2026-06-01",
-    capital: float = 10000,
-):
-    """拿名人堂策略代码重跑一次 QD 回测，过程进「终端」页，结果含逐笔成交。"""
+def api_backtest_run(req: BacktestReq):
+    """跑一次 QD 回测。可直接传 code（编辑后的代码），或传 name 从名人堂取代码。
+    过程进「终端」页，结果含逐笔成交。"""
     if not _HAS_BACKTEST:
         return JSONResponse({"ok": False, "error": "jarvis_scalper_backtest 模块未安装"}, status_code=503)
     with _BT_LOCK:
         if _BT_STATE["running"]:
             return JSONResponse({"ok": False, "error": "已有回测在运行中"})
-    if not name:
-        return JSONResponse({"ok": False, "error": "缺少策略名（name）"}, status_code=400)
-    code = _find_hof_code(name)
+    code = req.code.strip() if req.code else ""
+    label = req.name or "custom"
     if not code:
-        return JSONResponse({"ok": False, "error": f"名人堂未找到策略代码: {name}"}, status_code=404)
-    qd_symbol = symbol.upper().replace("-", "").replace("/", "")
+        if not req.name:
+            return JSONResponse({"ok": False, "error": "请提供策略代码或策略名"}, status_code=400)
+        code = _find_hof_code(req.name) or ""
+        if not code:
+            return JSONResponse({"ok": False, "error": f"名人堂未找到策略代码: {req.name}"}, status_code=404)
+    qd_symbol = req.symbol.upper().replace("-", "").replace("/", "")
     if "USDT" in qd_symbol:
         qd_symbol = qd_symbol.replace("USDT", "/USDT")
     with _BT_LOCK:
@@ -1238,15 +1247,15 @@ def api_backtest_run(
             "started_at": time.time(),
             "finished_at": 0.0,
             "params": {
-                "name": name, "symbol": symbol, "timeframe": timeframe,
-                "start": start, "end": end, "capital": capital,
+                "name": req.name, "symbol": req.symbol, "timeframe": req.timeframe,
+                "start": req.start, "end": req.end, "capital": req.capital,
             },
             "result": None,
             "error": None,
         })
     _threading.Thread(
         target=_backtest_worker,
-        args=(code, qd_symbol, timeframe, start, end, capital, name),
+        args=(code, qd_symbol, req.timeframe, req.start, req.end, req.capital, label),
         daemon=True,
     ).start()
     return JSONResponse({"ok": True})

@@ -137,17 +137,18 @@ export const api = {
     api.get<{ lines: LogLine[]; total: number }>(`/logs?limit=${limit}`),
   clearLogs: () => api.post<{ ok: boolean }>("/logs/clear"),
 
-  backtestRun: (
-    name: string,
-    symbol = "BTCUSDT",
-    timeframe = "15m",
-    start = "2025-01-01",
-    end = "2026-06-01",
-    capital = 10000,
-  ) =>
+  backtestRun: (payload: {
+    name?: string;
+    code?: string;
+    symbol?: string;
+    timeframe?: string;
+    start?: string;
+    end?: string;
+    capital?: number;
+  }) =>
     request<{ ok: boolean; error?: string }>(
-      `/backtest/run?name=${encodeURIComponent(name)}&symbol=${symbol}&timeframe=${timeframe}&start=${start}&end=${end}&capital=${capital}`,
-      { method: "POST" },
+      "/backtest/run",
+      { method: "POST", body: JSON.stringify(payload) },
       30_000,
     ),
   backtestResult: () => api.get<BacktestState>("/backtest/result"),
