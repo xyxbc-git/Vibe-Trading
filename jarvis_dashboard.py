@@ -1291,6 +1291,19 @@ def api_evolve_graveyard():
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@app.post("/api/evolve/graveyard/clear")
+def api_evolve_graveyard_clear():
+    """清空策略墓地（scalper_graveyard.json 置空）。"""
+    if not _HAS_SCALPER_EVOLVE:
+        return JSONResponse({"ok": False, "reason": "jarvis_scalper_evolve 模块未安装"}, status_code=503)
+    try:
+        before = len(jse.load_graveyard())
+        jse.save_graveyard([])
+        return JSONResponse({"ok": True, "cleared": before})
+    except Exception as e:
+        return JSONResponse({"ok": False, "reason": str(e)}, status_code=500)
+
+
 @app.get("/api/evolve/hall-of-fame")
 def api_evolve_hall_of_fame():
     if not _HAS_SCALPER_EVOLVE:

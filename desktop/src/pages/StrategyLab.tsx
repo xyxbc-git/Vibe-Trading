@@ -13,6 +13,7 @@ import {
   Terminal as TerminalIcon,
   ChevronLeft,
   ChevronRight,
+  Trash2,
 } from "lucide-react";
 import {
   PieChart,
@@ -97,7 +98,10 @@ export default function StrategyLab() {
     3_000,
   );
   const { data: rawHall } = usePolling(() => api.evolveHallOfFame(), 8_000);
-  const { data: rawGraveyard } = usePolling(() => api.evolveGraveyard(), 8_000);
+  const { data: rawGraveyard, refetch: refetchGraveyard } = usePolling(
+    () => api.evolveGraveyard(),
+    8_000,
+  );
 
   const status = (rawStatus as unknown as EvolveStatus) ?? PLACEHOLDER_STATUS;
   const hall = (rawHall as unknown as HofEntry[]) ?? [];
@@ -130,6 +134,18 @@ export default function StrategyLab() {
     } finally {
       setBusy(false);
       refetchStatus();
+    }
+  };
+
+  const handleClearGraveyard = async () => {
+    if (!window.confirm("确定清空策略墓地的全部失败记录吗？此操作不可撤销。")) return;
+    try {
+      await api.clearGraveyard();
+    } catch {
+      // 后端未就绪，忽略
+    } finally {
+      setGravePage(1);
+      refetchGraveyard();
     }
   };
 
@@ -326,10 +342,21 @@ export default function StrategyLab() {
 
       {/* 策略墓地 */}
       <div className="mb-4">
-        <h2 className="flex items-center gap-2 text-sm font-medium text-jarvis-text mb-3">
-          <Skull size={16} className="text-jarvis-red" />
-          策略墓地（失败教训）
-        </h2>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="flex items-center gap-2 text-sm font-medium text-jarvis-text">
+            <Skull size={16} className="text-jarvis-red" />
+            策略墓地（失败教训）
+          </h2>
+          {graveyard.length > 0 && (
+            <button
+              onClick={handleClearGraveyard}
+              className="flex items-center gap-1 px-2 py-1 text-xs rounded-md border border-jarvis-border text-jarvis-text-secondary hover:border-jarvis-red hover:text-jarvis-red transition-colors"
+            >
+              <Trash2 size={12} />
+              清空墓地
+            </button>
+          )}
+        </div>
         <div className="card overflow-x-auto">
           {graveyard.length === 0 ? (
             <p className="text-sm text-jarvis-text-secondary text-center py-4">暂无失败记录。</p>

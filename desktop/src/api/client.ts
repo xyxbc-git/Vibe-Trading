@@ -95,6 +95,10 @@ export const api = {
       `/evolve/start?rounds=${rounds}&symbol=${symbol}&mode=${mode}`,
     ),
   evolveGraveyard: () => api.get<Record<string, unknown>[]>("/evolve/graveyard"),
+  clearGraveyard: () =>
+    api.post<{ ok: boolean; cleared?: number; reason?: string }>(
+      "/evolve/graveyard/clear",
+    ),
   evolveHallOfFame: () =>
     api.get<Record<string, unknown>[]>("/evolve/hall-of-fame"),
   growthTimeline: () => api.get<Record<string, unknown>[]>("/growth/timeline"),
