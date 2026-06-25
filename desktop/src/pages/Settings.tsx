@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
-import { Settings as SettingsIcon, Save, RefreshCw, Wifi, Key, Palette } from "lucide-react";
-import { api } from "@/api/client";
+import { Settings as SettingsIcon, Save, RefreshCw, Wifi, Key, Palette, Server, Plug } from "lucide-react";
+import { api, type QdConfig, type QdConfigTest } from "@/api/client";
 import { useApi } from "@/hooks/useApi";
 
 interface ScalperConfig {
@@ -127,6 +127,163 @@ function ToggleInput({
           }`}
         />
       </button>
+    </div>
+  );
+}
+
+function QdGatewayCard() {
+  const { data: qd, refetch } = useApi<QdConfig>(() => api.qdConfig());
+  const [gatewayBase, setGatewayBase] = useState("");
+  const [token, setToken] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<QdConfigTest | null>(null);
+
+  useEffect(() => {
+    if (qd) setGatewayBase(qd.gateway_base ?? "");
+  }, [qd]);
+
+  const handleTest = async () => {
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const res = await api.testQdConfig();
+      setTestResult(res);
+    } catch (e) {
+      setTestResult({
+        ok: false,
+        reason: e instanceof Error ? e.message : "网络错误",
+      });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const handleSave = async () => {
+    setSaving(true);
+    setMsg("");
+    try {
+      const payload: { gateway_base?: string; agent_token?: string } = {
+        gateway_base: gatewayBase.trim(),
+      };
+      if (token.trim()) payload.agent_token = token.trim();
+      const res = await api.updateQdConfig(payload);
+      if (res.ok) {
+        setMsg("保存成功 ✓");
+        setToken("");
+        refetch();
+      } else {
+        setMsg(`保存失败: ${res.reason ?? "未知错误"}`);
+      }
+    } catch (e) {
+      setMsg(`保存失败: ${e instanceof Error ? e.message : "网络错误"}`);
+    } finally {
+      setSaving(false);
+      setTimeout(() => setMsg(""), 3000);
+    }
+  };
+
+  return (
+    <div className="card">
+      <h3 className="text-sm font-semibold text-jarvis-text mb-3 flex items-center gap-2">
+        <Server size={14} />
+        QD 网关 + Agent Token
+      </h3>
+      <p className="text-xs text-jarvis-text-secondary mb-3">
+        回测子进程每次运行时重读此配置，保存后无需重启 Dashboard。
+      </p>
+
+      <div className="py-2 border-b border-jarvis-border/50">
+        <p className="text-sm text-jarvis-text mb-1.5">网关地址</p>
+        <input
+          type="text"
+          value={gatewayBase}
+          onChange={(e) => setGatewayBase(e.target.value)}
+          placeholder="http://localhost:8888"
+          className="w-full px-2 py-1.5 text-sm font-mono bg-jarvis-bg border border-jarvis-border rounded-md text-jarvis-text focus:outline-none focus:border-jarvis-blue"
+        />
+        {qd?.env_base_active && (
+          <p className="text-xs text-jarvis-yellow mt-1">
+            ⚠ 已设置 QUANTDINGER_GATEWAY_BASE 环境变量，将覆盖此处配置
+          </p>
+        )}
+      </div>
+
+      <div className="py-2">
+        <div className="flex items-center justify-between mb-1.5">
+          <p className="text-sm text-jarvis-text">Agent Token</p>
+          {qd?.has_token && (
+            <span className="text-xs font-mono text-jarvis-text-secondary">
+              当前：{qd.agent_token_masked}
+            </span>
+          )}
+        </div>
+        <input
+          type="password"
+          value={token}
+          onChange={(e) => setToken(e.target.value)}
+          placeholder={qd?.has_token ? "留空表示不修改" : "粘贴 QD Agent Token（scope 需含 B）"}
+          autoComplete="off"
+          className="w-full px-2 py-1.5 text-sm font-mono bg-jarvis-bg border border-jarvis-border rounded-md text-jarvis-text focus:outline-none focus:border-jarvis-blue"
+        />
+        {qd?.env_token_active && (
+          <p className="text-xs text-jarvis-yellow mt-1">
+            ⚠ 已设置 QUANTDINGER_AGENT_TOKEN 环境变量，将覆盖此处 Token
+          </p>
+        )}
+      </div>
+
+      <div className="flex items-center gap-3 mt-2">
+        <button
+          onClick={handleSave}
+          disabled={saving}
+          className="btn-primary flex items-center gap-2"
+        >
+          <Save size={14} />
+          {saving ? "保存中..." : "保存网关配置"}
+        </button>
+        <button
+          onClick={handleTest}
+          disabled={testing}
+          className="btn-primary flex items-center gap-2 !bg-jarvis-card border border-jarvis-border"
+        >
+          <Plug size={14} />
+          {testing ? "测试中..." : "连接测试"}
+        </button>
+        {msg && (
+          <span className={`text-sm ${msg.includes("成功") ? "text-jarvis-green" : "text-jarvis-red"}`}>
+            {msg}
+          </span>
+        )}
+      </div>
+
+      {testResult && (
+        <div className="mt-3 bg-jarvis-bg rounded-md p-3 text-xs space-y-1.5">
+          <div className="flex items-center justify-between">
+            <span className="text-jarvis-text-secondary">网关健康</span>
+            <span className={testResult.healthy ? "text-jarvis-green" : "text-jarvis-red"}>
+              {testResult.healthy ? "✓ 可达" : "✗ 不可达"}
+              {testResult.health_error ? ` (${testResult.health_error})` : ""}
+            </span>
+          </div>
+          <div className="flex items-center justify-between">
+            <span className="text-jarvis-text-secondary">Token 有效性</span>
+            <span className={testResult.token_valid ? "text-jarvis-green" : "text-jarvis-red"}>
+              {testResult.token_valid ? "✓ 有效" : "✗ 无效"}
+              {testResult.token_error ? ` (${testResult.token_error})` : ""}
+            </span>
+          </div>
+          {testResult.reason && (
+            <p className="text-jarvis-red">错误：{testResult.reason}</p>
+          )}
+          {testResult.whoami && (
+            <pre className="text-jarvis-text-secondary whitespace-pre-wrap break-all pt-1 border-t border-jarvis-border/50">
+              {JSON.stringify(testResult.whoami, null, 2)}
+            </pre>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -381,6 +538,9 @@ export default function SettingsPage() {
               <span className="text-sm font-mono text-jarvis-text">7899</span>
             </div>
           </div>
+
+          {/* QD 网关 + Agent Token 配置 */}
+          <QdGatewayCard />
 
           {/* LLM 配置 */}
           <div className="card">

@@ -104,6 +104,11 @@ export const api = {
   config: () => api.get<Record<string, unknown>>("/config"),
   updateConfig: (data: Record<string, unknown>) =>
     api.put<Record<string, unknown>>("/config", data),
+  qdConfig: () => api.get<QdConfig>("/qd-config"),
+  updateQdConfig: (data: { gateway_base?: string; agent_token?: string }) =>
+    api.put<{ ok: boolean; reason?: string }>("/qd-config", data),
+  testQdConfig: () =>
+    request<QdConfigTest>("/qd-config/test", { method: "POST" }, 20_000),
   marketOverview: () => api.get<Record<string, unknown>>("/market/overview"),
 
   actionBrief: (symbol = "BTCUSDT") =>
@@ -157,6 +162,24 @@ export const api = {
       `/backtest/code?name=${encodeURIComponent(name)}`,
     ),
 };
+
+export interface QdConfig {
+  gateway_base: string;
+  agent_token_masked: string;
+  has_token: boolean;
+  env_token_active: boolean;
+  env_base_active: boolean;
+}
+
+export interface QdConfigTest {
+  ok: boolean;
+  healthy?: boolean;
+  token_valid?: boolean;
+  health_error?: string | null;
+  token_error?: string | null;
+  whoami?: Record<string, unknown> | null;
+  reason?: string;
+}
 
 export interface BacktestTrade {
   direction?: string;

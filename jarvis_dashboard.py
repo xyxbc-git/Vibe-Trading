@@ -1446,6 +1446,95 @@ def api_config_put(data: dict):
         return JSONResponse({"ok": False, "reason": str(e)}, status_code=500)
 
 
+# ─────────────────────────── QD 网关配置 API ───────────────────────────
+# 回测子进程 jarvis_scalper_backtest.py 每次运行时重读该文件，故无需重启 dashboard。
+_QD_CONFIG_PATH = os.path.join(os.path.expanduser("~/.vibe-trading"), "scalper_backtest_config.json")
+_QD_DEFAULT_GATEWAY = "http://localhost:8888"
+
+
+def _mask_token(tok: str) -> str:
+    """脱敏 Agent Token：保留前 4 后 4，中间固定 6 个圆点。"""
+    if not tok:
+        return ""
+    if len(tok) <= 8:
+        return "•" * len(tok)
+    return f"{tok[:4]}{'•' * 6}{tok[-4:]}"
+
+
+def _read_qd_config() -> dict:
+    if os.path.exists(_QD_CONFIG_PATH):
+        with open(_QD_CONFIG_PATH, encoding="utf-8") as f:
+            return json.load(f) or {}
+    return {}
+
+
+@app.get("/api/qd-config")
+def api_qd_config_get():
+    """读取 QD 网关配置，token 仅返回脱敏值，绝不回传明文。"""
+    try:
+        cfg = _read_qd_config()
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    token = str(cfg.get("agent_token", "") or "")
+    env_token = os.getenv("QUANTDINGER_AGENT_TOKEN", "")
+    env_base = os.getenv("QUANTDINGER_GATEWAY_BASE", "")
+    return JSONResponse({
+        "gateway_base": cfg.get("gateway_base", _QD_DEFAULT_GATEWAY),
+        "agent_token_masked": _mask_token(token),
+        "has_token": bool(token),
+        # 环境变量优先级高于配置文件，若已设置则前端需提示用户文件值会被覆盖
+        "env_token_active": bool(env_token),
+        "env_base_active": bool(env_base),
+    })
+
+
+@app.put("/api/qd-config")
+def api_qd_config_put(data: dict):
+    """合并写入 QD 网关配置：token 留空表示保持原值（不清空）。"""
+    try:
+        try:
+            cfg = _read_qd_config()
+        except Exception:
+            cfg = {}
+        gateway_base = data.get("gateway_base")
+        if isinstance(gateway_base, str) and gateway_base.strip():
+            cfg["gateway_base"] = gateway_base.strip()
+        token = data.get("agent_token")
+        if isinstance(token, str) and token.strip():
+            cfg["agent_token"] = token.strip()
+        os.makedirs(os.path.dirname(_QD_CONFIG_PATH), exist_ok=True)
+        with open(_QD_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        return JSONResponse({"ok": False, "reason": str(e)}, status_code=500)
+
+
+@app.post("/api/qd-config/test")
+def api_qd_config_test():
+    """连接测试：复用回测模块按生效配置（文件+env）探测网关健康与 token 有效性。"""
+    if not _HAS_BACKTEST:
+        return JSONResponse(
+            {"ok": False, "reason": "jarvis_scalper_backtest 模块未安装"},
+            status_code=503,
+        )
+    try:
+        health = jbt.check_qd_health()
+        token = jbt.check_token()
+    except Exception as e:
+        return JSONResponse({"ok": False, "reason": str(e)}, status_code=500)
+    healthy = bool(health.get("healthy"))
+    valid = bool(token.get("valid"))
+    return JSONResponse({
+        "ok": healthy and valid,
+        "healthy": healthy,
+        "token_valid": valid,
+        "health_error": health.get("error"),
+        "token_error": token.get("error"),
+        "whoami": token.get("data") if valid else None,
+    })
+
+
 # ─────────────────────────── 市场概览 API ───────────────────────────
 
 @app.get("/api/market/overview")
