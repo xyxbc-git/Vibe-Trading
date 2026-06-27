@@ -164,12 +164,15 @@ def _clamp_date_range(start_date: str, end_date: str, timeframe: str) -> tuple[s
     if end <= start:
         return start_date, end_date
     max_days = int(_MAX_BARS_BUDGET * minutes / 1440)
+    # 留 1 天余量：QD validate_backtest_range 按 (end-start).days 比对上限，
+    # 其自身推荐窗口也用 max_days-1，避免边界与少量指标 warmup 把请求顶过上限。
+    safe_days = max(1, max_days - 1)
     span_days = (end - start).days
-    if span_days <= max_days:
+    if span_days <= safe_days:
         return start_date, end_date
-    new_start_str = (end - timedelta(days=max_days)).strftime("%Y-%m-%d")
+    new_start_str = (end - timedelta(days=safe_days)).strftime("%Y-%m-%d")
     _log(
-        f"⚠ 回测区间 {span_days} 天超过 {timeframe} 周期上限 {max_days} 天，"
+        f"⚠ 回测区间 {span_days} 天超过 {timeframe} 周期上限 {safe_days} 天，"
         f"自动收窄起始日期 {start_date} → {new_start_str}（保留结束日期 {end_date}）"
     )
     return new_start_str, end_date

@@ -13,6 +13,8 @@ import {
   Terminal as TerminalIcon,
   ChevronLeft,
   ChevronRight,
+  ChevronsLeft,
+  ChevronsRight,
   Trash2,
 } from "lucide-react";
 import {
@@ -346,6 +348,11 @@ export default function StrategyLab() {
           <h2 className="flex items-center gap-2 text-sm font-medium text-jarvis-text">
             <Skull size={16} className="text-jarvis-red" />
             策略墓地（失败教训）
+            {graveyard.length > 0 && (
+              <span className="text-xs font-normal text-jarvis-text-secondary">
+                · 共 {graveyard.length} 条
+              </span>
+            )}
           </h2>
           {graveyard.length > 0 && (
             <button
@@ -404,6 +411,14 @@ export default function StrategyLab() {
               </span>
               <div className="flex items-center gap-2">
                 <button
+                  onClick={() => setGravePage(1)}
+                  disabled={graveSafePage <= 1}
+                  className="flex items-center gap-1 px-2 py-1 text-xs rounded-md border border-jarvis-border text-jarvis-text disabled:opacity-40 disabled:cursor-not-allowed hover:border-jarvis-blue"
+                >
+                  <ChevronsLeft size={12} />
+                  首页
+                </button>
+                <button
                   onClick={() => setGravePage((p) => Math.max(1, p - 1))}
                   disabled={graveSafePage <= 1}
                   className="flex items-center gap-1 px-2 py-1 text-xs rounded-md border border-jarvis-border text-jarvis-text disabled:opacity-40 disabled:cursor-not-allowed hover:border-jarvis-blue"
@@ -418,6 +433,14 @@ export default function StrategyLab() {
                 >
                   下一页
                   <ChevronRight size={12} />
+                </button>
+                <button
+                  onClick={() => setGravePage(graveTotalPages)}
+                  disabled={graveSafePage >= graveTotalPages}
+                  className="flex items-center gap-1 px-2 py-1 text-xs rounded-md border border-jarvis-border text-jarvis-text disabled:opacity-40 disabled:cursor-not-allowed hover:border-jarvis-blue"
+                >
+                  末页
+                  <ChevronsRight size={12} />
                 </button>
               </div>
             </div>
