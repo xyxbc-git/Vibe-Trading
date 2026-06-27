@@ -312,13 +312,21 @@ def parse_backtest_result(job_data: dict[str, Any]) -> dict[str, Any]:
         }
 
     result = job_data.get("result", {})
-    metrics = result.get("metrics", result.get("summary", {}))
+    # QD（run_aligned → _format_result）把指标平铺在 result 顶层、采用驼峰命名，
+    # 并无 "metrics"/"summary" 包裹层；缺包裹层时回退到 result 本身，否则全部读成 0。
+    metrics = result.get("metrics") or result.get("summary") or result
     trades = result.get("trades", result.get("trade_list", []))
 
-    total_return = metrics.get("total_return_pct", metrics.get("totalReturnPct", 0))
+    total_return = metrics.get(
+        "total_return_pct",
+        metrics.get("totalReturnPct", metrics.get("totalReturn", 0)),
+    )
     win_rate = metrics.get("win_rate", metrics.get("winRate", 0))
     profit_factor = metrics.get("profit_factor", metrics.get("profitFactor", 0))
-    max_dd = metrics.get("max_drawdown_pct", metrics.get("maxDrawdownPct", 0))
+    max_dd = metrics.get(
+        "max_drawdown_pct",
+        metrics.get("maxDrawdownPct", metrics.get("maxDrawdown", 0)),
+    )
     sharpe = metrics.get("sharpe_ratio", metrics.get("sharpeRatio", 0))
     total_trades = metrics.get("total_trades", metrics.get("totalTrades", len(trades)))
 
