@@ -31,6 +31,7 @@ import jarvis_brief as jb
 import jarvis_crypto_data as jcd
 import jarvis_executor as jx
 import jarvis_journal as jj
+import jarvis_lessons as jl
 import jarvis_paper_trader as jpt
 import jarvis_wallet as jw
 from jarvis_factor_backtest import _build_series, event_study, fetch_fng_all, fetch_price_daily
@@ -814,14 +815,44 @@ def _llm_config() -> dict | None:
     return {"key": key, "base": base, "model": model}
 
 
-def _llm_answer(question: str, snap: dict, st: dict, sym: str) -> str | None:
-    """接入真实 LLM 回答问题；失败/未配置返回 None 让上层走规则兜底。"""
+def _gather_lessons(snap: dict, sym: str) -> list[dict]:
+    """从经验教训库取出当前行情下应主动援引的教训（静态硬经验 + journal 动态挖掘）。
+
+    动态挖掘读 SQLite 失败时不能拖垮问答，整体兜底成空列表。
+    """
+    d = (snap or {}).get("decision", {}) or {}
+    fac = (snap or {}).get("factor_state", {}) or {}
+    rd = (snap or {}).get("real_data", {}) or {}
+    try:
+        return jl.applicable_lessons(fac, rd, d.get("direction"), symbol=sym)
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _llm_answer(
+    question: str, snap: dict, st: dict, sym: str, lessons: list[dict] | None = None
+) -> str | None:
+    """接入真实 LLM 回答问题；失败/未配置返回 None 让上层走规则兜底。
+
+    除当前决策快照外，还把 lessons（经验教训库命中项）一并喂给模型，
+    让贾维斯能援引"自己踩过的坑"而不是每次复述当前数据。
+    """
     cfg = _llm_config()
     if not cfg:
         return None
     d = (snap or {}).get("decision", {}) or {}
     fac = (snap or {}).get("factor_state", {}) or {}
     rd = (snap or {}).get("real_data", {}) or {}
+    lesson_brief = [
+        {
+            "title": l.get("title"),
+            "advice": l.get("advice"),
+            "severity": l.get("severity"),
+            "source": l.get("source"),
+            "evidence": l.get("evidence"),
+        }
+        for l in (lessons or [])[:5]
+    ]
     context = {
         "symbol": sym,
         "price": fac.get("price"),
@@ -838,6 +869,7 @@ def _llm_answer(question: str, snap: dict, st: dict, sym: str) -> str | None:
         "momentum_30d_pct": fac.get("momentum_30d_pct"),
         "fear_greed": rd.get("fear_greed"),
         "funding": rd.get("funding"),
+        "lessons": lesson_brief,
         "paper_stats": {
             "win_rate_pct": st.get("win_rate_pct"),
             "profit_factor": st.get("profit_factor"),
@@ -846,9 +878,13 @@ def _llm_answer(question: str, snap: dict, st: dict, sym: str) -> str | None:
         } if st else {},
     }
     system = (
-        "你是『贾维斯』加密交易助手，面向新手用户。只依据下面 JSON 给出的真实决策与数据回答，"
-        "不得编造数据或价位。用简体中文、口语化、3 句以内说清：该不该买/仓位/止盈止损/理由。"
-        "始终提醒这是模拟盘研究、不构成投资建议。若数据缺失就如实说明。"
+        "你是『贾维斯』加密交易助手。除了当前决策数据，你还有一份『经验教训库』"
+        "（context 的 lessons 字段）——那是你过去用真实数据踩过的坑、攒下的经验。"
+        "回答时：① 先给结论（该不该买 / 仓位 / 止盈止损）；"
+        "② 若命中经验，用『我以前…所以这次…』的口吻主动援引，让用户看到你在用经验思考；"
+        "③ 不得编造价位或数据，缺失就如实说明。"
+        "全程简体中文、口语化，结论清楚但允许带一两句推理。"
+        "始终提醒这是模拟盘研究、不构成投资建议。"
     )
     payload = json.dumps({
         "model": cfg["model"],
@@ -856,8 +892,8 @@ def _llm_answer(question: str, snap: dict, st: dict, sym: str) -> str | None:
             {"role": "system", "content": system},
             {"role": "user", "content": f"决策与数据(JSON)：{json.dumps(context, ensure_ascii=False)}\n\n用户问题：{question}"},
         ],
-        "temperature": 0.4,
-        "max_tokens": 400,
+        "temperature": 0.5,
+        "max_tokens": 700,
     }, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         cfg["base"] + "/chat/completions", data=payload, method="POST",
@@ -885,10 +921,12 @@ def api_ask(symbol: str = "BTCUSDT", q: str = ""):
         st = jpt.stats(_trader_cfg(), spot)
     except Exception:  # noqa: BLE001
         st = {}
-    llm = _llm_answer(question, snap, st, spot)
+    lessons = _gather_lessons(snap, spot)
+    llm = _llm_answer(question, snap, st, spot, lessons)
     answer = llm if llm else _answer_question(question, snap, st)
     return JSONResponse({"ok": True, "symbol": spot, "question": question,
-                         "answer": answer, "engine": "llm" if llm else "rule"})
+                         "answer": answer, "engine": "llm" if llm else "rule",
+                         "lessons_cited": len(lessons) if llm else 0})
 
 
 # ─────────────────────────── 短线自动交易 API ───────────────────────────
