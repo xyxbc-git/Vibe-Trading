@@ -6,9 +6,11 @@ import {
   predictProba,
   update,
   trainModel,
+  buildTrainingSet,
   type TrainSample,
 } from "../drawingModel";
 import type { BaseData } from "../drawings";
+import type { DrawingSample } from "../drawingLog";
 
 function makeBars(n: number, fn: (i: number) => number): BaseData {
   const dates: string[] = [];
@@ -83,5 +85,30 @@ describe("logistic model", () => {
       expect(p).toBeGreaterThanOrEqual(0);
       expect(p).toBeLessThanOrEqual(1);
     }
+  });
+});
+
+describe("buildTrainingSet", () => {
+  const s = (over: Partial<DrawingSample> = {}): DrawingSample => ({
+    ts: 1, bars: 100, mode: "trend", touches: 5, hits: 3,
+    hitRate: 0.6, baselineHitRate: 0.5, uplift: 0.1,
+    features: [0.2, 0.1, 0.5, 0.25],
+    ...over,
+  });
+
+  it("excludes untouched samples (touches = 0) so they don't bias the model", () => {
+    const data = buildTrainingSet([s({ touches: 0, hitRate: 0 }), s({ touches: 4 })]);
+    expect(data).toHaveLength(1);
+  });
+
+  it("excludes samples without a feature vector (older stored samples)", () => {
+    const data = buildTrainingSet([s({ features: undefined }), s({ features: [] }), s()]);
+    expect(data).toHaveLength(1);
+    expect(data[0].x).toEqual([0.2, 0.1, 0.5, 0.25]);
+  });
+
+  it("labels respected (hitRate >= 0.5) as 1, otherwise 0", () => {
+    const data = buildTrainingSet([s({ hitRate: 0.5 }), s({ hitRate: 0.49 }), s({ hitRate: 0.9 })]);
+    expect(data.map(d => d.y)).toEqual([1, 0, 1]);
   });
 });

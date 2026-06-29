@@ -14,6 +14,7 @@
 // extra persistence needed.
 
 import type { BaseData } from "./drawings";
+import type { DrawingSample } from "./drawingLog";
 
 export const FEATURE_DIM = 4;
 
@@ -127,4 +128,18 @@ export function trainModel(data: TrainSample[], epochs = 8, lr = 0.1, dim = FEAT
     for (const d of data) update(model, d.x, d.y, lr);
   }
   return model;
+}
+
+// Build a training set from accumulated samples. Only samples that were actually
+// tested (touches > 0) carry signal — a line the future never touched is neither
+// "respected" nor "failed", and including it (hitRate = 0 → y = 0) would bias the
+// model toward pessimism. Label = was the line respected on a majority of touches.
+export function buildTrainingSet(samples: DrawingSample[]): TrainSample[] {
+  const out: TrainSample[] = [];
+  for (const s of samples) {
+    if (s.touches > 0 && s.features && s.features.length) {
+      out.push({ x: s.features, y: s.hitRate >= 0.5 ? 1 : 0 });
+    }
+  }
+  return out;
 }

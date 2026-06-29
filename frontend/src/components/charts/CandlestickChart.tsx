@@ -9,7 +9,7 @@ import { echarts, CHART_GROUP, connectCharts } from "@/lib/echarts";
 import { useDarkMode } from "@/hooks/useDarkMode";
 import { computeDrawings, gridSearchParams, evaluateParams, scoreDrawings, DEFAULT_PARAMS, type DrawMode, type DrawParams } from "@/lib/drawings";
 import { appendLog, loadLog, clearLog, summarize, blendReliability, type DrawingSample } from "@/lib/drawingLog";
-import { extractFeatures, trainModel, predictProba, type TrainSample } from "@/lib/drawingModel";
+import { extractFeatures, trainModel, predictProba, buildTrainingSet } from "@/lib/drawingModel";
 
 type Sub = "vol" | "macd" | "rsi" | "kdj";
 type Range = "1M" | "3M" | "6M" | "1Y" | "ALL";
@@ -294,10 +294,7 @@ export function CandlestickChart({ data, markers, indicators, height = 500, symb
   // Phase D-3: train a structured-feature logistic model on the featured samples
   // (market context → was the line respected?). Null until enough evidence.
   const contextModel = useMemo(() => {
-    const data: TrainSample[] = [];
-    for (const s of logSamples) {
-      if (s.features && s.features.length) data.push({ x: s.features, y: s.hitRate >= 0.5 ? 1 : 0 });
-    }
+    const data = buildTrainingSet(logSamples);
     if (data.length < MODEL_MIN_SAMPLES) return null;
     return trainModel(data);
   }, [logSamples]);
