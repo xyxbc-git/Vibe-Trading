@@ -94,6 +94,8 @@ export const api = {
     api.post<Record<string, unknown>>(
       `/evolve/start?rounds=${rounds}&symbol=${symbol}&mode=${mode}`,
     ),
+  evolveStop: () =>
+    api.post<{ ok: boolean; error?: string }>("/evolve/stop"),
   evolveGraveyard: () => api.get<Record<string, unknown>[]>("/evolve/graveyard"),
   clearGraveyard: () =>
     api.post<{ ok: boolean; cleared?: number; reason?: string }>(
@@ -176,7 +178,127 @@ export const api = {
     api.get<{ name: string; code: string; error?: string }>(
       `/backtest/code?name=${encodeURIComponent(name)}`,
     ),
+
+  // ─── 价位邮件提醒 ───
+  alertConfig: () => api.get<AlertConfig>("/alerts/config"),
+  updateAlertConfig: (data: AlertConfigUpdate) =>
+    api.put<{ ok: boolean; reason?: string; config?: AlertConfig }>(
+      "/alerts/config",
+      data,
+    ),
+  testAlertEmail: (recipients?: string[]) =>
+    request<{ ok: boolean; reason?: string; to?: string[] }>(
+      "/alerts/test-email",
+      { method: "POST", body: JSON.stringify({ recipients }) },
+      25_000,
+    ),
+  alertPlans: () => api.get<AlertPlan[]>("/alerts/plans"),
+  createAlertPlan: (data: AlertPlanInput) =>
+    api.post<{ ok: boolean; reason?: string; plan?: AlertPlan }>(
+      "/alerts/plans",
+      data,
+    ),
+  updateAlertPlan: (id: string, data: Partial<AlertPlanInput>) =>
+    api.put<{ ok: boolean; reason?: string; plan?: AlertPlan }>(
+      `/alerts/plans/${id}`,
+      data,
+    ),
+  deleteAlertPlan: (id: string) =>
+    request<{ ok: boolean; reason?: string }>(`/alerts/plans/${id}`, {
+      method: "DELETE",
+    }),
+  alertCheck: (dryRun = false) =>
+    request<AlertCheckResult>(
+      "/alerts/check",
+      { method: "POST", body: JSON.stringify({ dry_run: dryRun }) },
+      30_000,
+    ),
+  alertPrice: (symbol = "BTCUSDT") =>
+    api.get<{ symbol: string; price: number | null }>(
+      `/alerts/price?symbol=${encodeURIComponent(symbol)}`,
+    ),
 };
+
+export type AlertDirection = "above" | "below";
+
+export interface AlertPlan {
+  id: string;
+  name: string;
+  symbol: string;
+  target_price: number;
+  direction: AlertDirection;
+  recipients: string[];
+  enabled: boolean;
+  repeat: boolean;
+  note: string;
+  created_at: number;
+  last_price: number | null;
+  last_triggered_at: number | null;
+  triggered_count: number;
+  last_send_result: string | null;
+}
+
+export interface AlertPlanInput {
+  name: string;
+  symbol: string;
+  target_price: number;
+  direction: AlertDirection;
+  recipients?: string[];
+  enabled?: boolean;
+  repeat?: boolean;
+  note?: string;
+}
+
+export interface AlertConfig {
+  smtp: {
+    host: string;
+    port: number;
+    use_ssl: boolean;
+    username: string;
+    from_name: string;
+    password_masked: string;
+    has_password: boolean;
+  };
+  recipients: string[];
+  poll_interval_s: number;
+  monitor: {
+    running: boolean;
+    last_run: string | null;
+    last_summary: { checked: number; triggered: number } | null;
+    last_error: string | null;
+  };
+}
+
+export interface AlertConfigUpdate {
+  smtp?: {
+    host?: string;
+    port?: number;
+    use_ssl?: boolean;
+    username?: string;
+    from_name?: string;
+    password?: string;
+  };
+  recipients?: string[];
+  poll_interval_s?: number;
+}
+
+export interface AlertCheckResult {
+  checked: number;
+  triggered: number;
+  dry_run: boolean;
+  ts: string;
+  results: {
+    id: string;
+    name: string;
+    price?: number;
+    target?: number;
+    direction?: AlertDirection;
+    sent?: boolean;
+    to?: string[];
+    reason?: string;
+    skipped?: string;
+  }[];
+}
 
 export interface QdConfig {
   gateway_base: string;

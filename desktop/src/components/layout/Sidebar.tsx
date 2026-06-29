@@ -11,6 +11,7 @@ import {
   Zap,
   Sprout,
   LineChart,
+  Bell,
   Terminal,
   Settings,
   PanelLeftClose,
@@ -33,6 +34,7 @@ const NAV_ITEMS: NavItem[] = [
   { to: "/ai", label: "AI助手", icon: <Bot size={20} /> },
   { to: "/scalper", label: "短线", icon: <Zap size={20} /> },
   { to: "/growth", label: "成长", icon: <Sprout size={20} /> },
+  { to: "/alerts", label: "提醒", icon: <Bell size={20} /> },
   { to: "/terminal", label: "终端", icon: <Terminal size={20} /> },
 ];
 

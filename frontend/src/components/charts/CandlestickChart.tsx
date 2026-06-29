@@ -7,10 +7,20 @@ import { getChartTheme } from "@/lib/chart-theme";
 import { abbreviateNum } from "@/lib/formatters";
 import { echarts, CHART_GROUP, connectCharts } from "@/lib/echarts";
 import { useDarkMode } from "@/hooks/useDarkMode";
+import { computeDrawings, gridSearchParams, scoreDrawings, DEFAULT_PARAMS, type DrawMode, type DrawParams } from "@/lib/drawings";
+import { appendLog, loadLog, clearLog, summarize, type DrawingSample } from "@/lib/drawingLog";
 
 type Sub = "vol" | "macd" | "rsi" | "kdj";
 type Range = "1M" | "3M" | "6M" | "1Y" | "ALL";
 type Overlay = "ma5" | "ma10" | "ma20" | "ma60" | "ema12" | "ema26" | "boll";
+
+const DRAW_OPTIONS: { id: DrawMode; label: string }[] = [
+  { id: "trend", label: "趋势线" },
+  { id: "sr", label: "支撑压力" },
+  { id: "fib", label: "斐波那契" },
+  { id: "channel", label: "平行通道" },
+  { id: "rect", label: "矩形区间" },
+];
 
 const OVERLAY_OPTIONS: { id: Overlay; label: string; group: string }[] = [
   { id: "ma5", label: "MA5", group: "MA" },
@@ -30,19 +40,53 @@ interface Props {
   markers?: TradeMarker[];
   indicators?: Record<string, IndicatorPoint[]>;
   height?: number;
+  symbol?: string;
 }
 
-export function CandlestickChart({ data, markers, indicators, height = 500 }: Props) {
+// Cache the self-tuned drawing params per symbol so the grid-search result
+// survives reloads (the "remembers what worked" half of "越画越准").
+const TUNE_KEY = (sym: string) => `vibe.draw.params.${sym}`;
+
+function loadTunedParams(sym: string, bars: number): DrawParams | null {
+  try {
+    const raw = localStorage.getItem(TUNE_KEY(sym));
+    if (!raw) return null;
+    const cached = JSON.parse(raw) as { params: DrawParams; bars: number };
+    return cached.bars === bars ? cached.params : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveTunedParams(sym: string, params: DrawParams, score: number, bars: number) {
+  try {
+    localStorage.setItem(TUNE_KEY(sym), JSON.stringify({ params, score, bars, ts: Date.now() }));
+  } catch {
+    /* localStorage unavailable (private mode / quota) — tuning still works, just not persisted */
+  }
+}
+
+export function CandlestickChart({ data, markers, indicators, height = 500, symbol }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<ReturnType<typeof echarts.init> | null>(null);
   const [sub, setSub] = useState<Sub>("vol");
   const [range, setRange] = useState<Range>("ALL");
   const [overlays, setOverlays] = useState<Set<Overlay>>(new Set(["ma5", "ma20"]));
+  const [draws, setDraws] = useState<Set<DrawMode>>(new Set());
   const [showMenu, setShowMenu] = useState(false);
+  const [autoTune, setAutoTune] = useState(true);
   const { dark } = useDarkMode();
 
   const toggleOverlay = useCallback((id: Overlay) => {
     setOverlays(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const toggleDraw = useCallback((id: DrawMode) => {
+    setDraws(prev => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id); else next.add(id);
       return next;
@@ -82,6 +126,128 @@ export function CandlestickChart({ data, markers, indicators, height = 500 }: Pr
       return { name: name.toUpperCase(), values: baseData.dates.map(d => lookup.get(d) ?? null) };
     });
   }, [indicators, baseData.dates]);
+
+  // Self-tuning: grid-search the drawing params with the best historical hit
+  // rate for these bars (train segment defines lines, held-out segment scores
+  // them). Cached per symbol in localStorage so it survives reloads. This is
+  // what makes the lines "越画越准" — each symbol/timeframe converges to the
+  // params that have been most accurate on its own history.
+  const tuneInfo = useMemo(() => {
+    if (!autoTune || draws.size === 0 || baseData.closes.length < 40) {
+      return { params: DEFAULT_PARAMS, score: 0, tuned: false };
+    }
+    const slim = { dates: baseData.dates, closes: baseData.closes, highs: baseData.highs, lows: baseData.lows };
+    if (symbol) {
+      const cached = loadTunedParams(symbol, baseData.closes.length);
+      if (cached) return { params: cached, score: 0, tuned: true };
+    }
+    const res = gridSearchParams(slim);
+    if (symbol) saveTunedParams(symbol, res.params, res.score, baseData.closes.length);
+    return { params: res.params, score: res.score, tuned: true };
+  }, [autoTune, draws.size, baseData, symbol]);
+
+  // Per-mode hit rate (using the tuned params), validated on the held-out
+  // segment. Drives both the toolbar badge and the per-line reliability styling.
+  const modeScores = useMemo(() => {
+    if (!tuneInfo.tuned || baseData.closes.length < 40) return null;
+    const slim = { dates: baseData.dates, closes: baseData.closes, highs: baseData.highs, lows: baseData.lows };
+    return scoreDrawings(slim, tuneInfo.params);
+  }, [tuneInfo, baseData]);
+
+  // Baseline per-mode hit rate (default params, same held-out segment) — the
+  // yardstick that proves tuning actually helped. Compared against modeScores on
+  // exactly the active modes so "命中 vs 默认" is an apples-to-apples uplift.
+  const baseScores = useMemo(() => {
+    if (!tuneInfo.tuned || baseData.closes.length < 40) return null;
+    const slim = { dates: baseData.dates, closes: baseData.closes, highs: baseData.highs, lows: baseData.lows };
+    return scoreDrawings(slim, DEFAULT_PARAMS);
+  }, [tuneInfo.tuned, baseData]);
+
+  // Reliability map (0..1 per active mode) fed into computeDrawings so reliable
+  // lines render bolder and unreliable ones fade — the visible "越画越准".
+  const reliability = useMemo(() => {
+    if (!modeScores || draws.size === 0) return undefined;
+    const map: Partial<Record<DrawMode, number>> = {};
+    for (const mode of draws) map[mode] = modeScores[mode].hitRate;
+    return map;
+  }, [modeScores, draws]);
+
+  // Evidence-weighted average hit rate over the active modes, for a given scores
+  // map. Shared by the tuned badge and the default-params baseline so both are
+  // computed identically (same weighting, same modes).
+  const weightedHitRate = useCallback((scores: ReturnType<typeof scoreDrawings> | null) => {
+    if (!scores || draws.size === 0) return null;
+    let wSum = 0;
+    let acc = 0;
+    for (const mode of draws) {
+      const s = scores[mode];
+      const w = Math.min(s.touches, 20);
+      acc += s.hitRate * w;
+      wSum += w;
+    }
+    return wSum > 0 ? acc / wSum : null;
+  }, [draws]);
+
+  // Tuned hit rate, baseline (default-params) hit rate, and the uplift between
+  // them — the visible proof of "越画越准".
+  const activeHitRate = useMemo(() => weightedHitRate(modeScores), [weightedHitRate, modeScores]);
+  const baselineHitRate = useMemo(() => weightedHitRate(baseScores), [weightedHitRate, baseScores]);
+  const uplift = useMemo(
+    () => (activeHitRate !== null && baselineHitRate !== null ? activeHitRate - baselineHitRate : null),
+    [activeHitRate, baselineHitRate],
+  );
+
+  // Phase A · 真闭环: persist each active mode's outcome into the per-symbol
+  // results log. Deduped by mode+bars inside the store, so reloads are
+  // idempotent but streaming new bars keeps accumulating a growing training set.
+  const [logVersion, setLogVersion] = useState(0);
+  useEffect(() => {
+    if (!symbol || !modeScores || !baseScores || draws.size === 0) return;
+    const now = Date.now();
+    const bars = baseData.closes.length;
+    const samples: DrawingSample[] = [];
+    for (const mode of draws) {
+      const s = modeScores[mode];
+      const b = baseScores[mode];
+      samples.push({
+        ts: now,
+        bars,
+        mode,
+        touches: s.touches,
+        hits: s.hits,
+        hitRate: s.hitRate,
+        baselineHitRate: b.hitRate,
+        uplift: s.hitRate - b.hitRate,
+      });
+    }
+    appendLog(symbol, samples);
+    setLogVersion(v => v + 1);
+  }, [symbol, modeScores, baseScores, draws, baseData.closes.length]);
+
+  // Rolling summary of the accumulated log (sample count + avg uplift), shown in
+  // the badge tooltip so "越画越准" is backed by a growing, visible track record.
+  const logSummary = useMemo(() => {
+    if (!symbol) return null;
+    // logVersion in deps so the summary refreshes right after a new append.
+    void logVersion;
+    return summarize(loadLog(symbol));
+  }, [symbol, logVersion]);
+
+  // Auto-drawings (trend/SR/fib/channel/rect) — recompute when bars grow, theme,
+  // or self-tuned params change, so the lines stay in sync with live data.
+  const drawingOverlay = useMemo(() => {
+    const t = getChartTheme();
+    return computeDrawings(draws, baseData, {
+      up: t.upColor,
+      down: t.downColor,
+      sr: t.warningColor,
+      fib: "#a855f7",
+      channel: t.infoColor,
+      rect: t.infoColor,
+      rectFill: t.infoColor + "1f",
+    }, tuneInfo.params, reliability);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draws, baseData, dark, tuneInfo, reliability]);
 
   // Init chart instance — only on mount/unmount and dark mode change
   useEffect(() => {
@@ -246,13 +412,15 @@ export function CandlestickChart({ data, markers, indicators, height = 500 }: Pr
           name: "K", type: "candlestick", data: candle, xAxisIndex: 0, yAxisIndex: 0,
           itemStyle: { color: t.upColor, color0: t.downColor, borderColor: t.upColor, borderColor0: t.downColor },
           markPoint: marks.length > 0 ? { data: marks, symbolSize: 28, tooltip: { formatter: (p: { name?: string; value?: string }) => p.name || p.value || "" } } : undefined,
+          markLine: drawingOverlay.lines.length > 0 ? { silent: true, symbol: ["none", "none"], animation: false, data: drawingOverlay.lines } : undefined,
+          markArea: drawingOverlay.areas.length > 0 ? { silent: true, data: drawingOverlay.areas } : undefined,
         },
         ...overlaySeries,
         ...extraSeries,
         ...subSeries,
       ],
     }, true);
-  }, [data, markers, baseData, indicatorCache, extraIndicators, sub, range, overlays, dark]);
+  }, [data, markers, baseData, indicatorCache, extraIndicators, drawingOverlay, sub, range, overlays, dark]);
 
   if (data.length === 0) {
     return <div className="text-muted-foreground text-sm p-4">No price data</div>;
@@ -307,6 +475,59 @@ export function CandlestickChart({ data, markers, indicators, height = 500 }: Pr
           {(["vol", "macd", "rsi", "kdj"] as const).map((id) => (
             <button key={id} onClick={() => setSub(id)} className={cn("px-1.5 py-0.5 rounded text-[10px] font-mono uppercase transition-colors", sub === id ? "bg-primary/15 text-primary font-medium" : "text-muted-foreground/50 hover:text-muted-foreground")}>{id}</button>
           ))}
+        </div>
+
+        <div className="w-px h-3 bg-border/40" />
+
+        {/* Draw-line modes — click to auto-draw, recomputes as data grows */}
+        <div className="flex gap-0.5 items-center">
+          {DRAW_OPTIONS.map((o) => (
+            <button key={o.id} onClick={() => toggleDraw(o.id)} className={cn("px-1.5 py-0.5 rounded text-[10px] transition-colors", draws.has(o.id) ? "bg-primary/15 text-primary font-medium" : "text-muted-foreground/50 hover:text-muted-foreground")}>{o.label}</button>
+          ))}
+          {draws.size > 0 && (
+            <>
+              <button
+                onClick={() => setAutoTune(v => !v)}
+                title="自调：用历史 K 线回测，自动选命中率最高的画线参数（越画越准）"
+                className={cn("px-1.5 py-0.5 rounded text-[10px] transition-colors", autoTune ? "bg-success/15 text-success font-medium" : "text-muted-foreground/50 hover:text-muted-foreground")}
+              >
+                自调{autoTune ? "·开" : "·关"}
+              </button>
+              {autoTune && activeHitRate !== null && (
+                <span
+                  title={
+                    (uplift !== null && baselineHitRate !== null
+                      ? `自调命中率 ${(activeHitRate * 100).toFixed(0)}% vs 默认参数 ${(baselineHitRate * 100).toFixed(0)}%（历史验证段）`
+                      : "当前画线在历史验证段的命中率") +
+                    (logSummary && logSummary.count > 0
+                      ? `\n累计样本 ${logSummary.count} 条 · 平均提升 ${logSummary.avgUplift >= 0 ? "+" : ""}${(logSummary.avgUplift * 100).toFixed(1)}pp`
+                      : "")
+                  }
+                  className={cn("px-1.5 py-0.5 rounded text-[10px] font-mono", activeHitRate >= 0.6 ? "text-success" : activeHitRate >= 0.4 ? "text-warning" : "text-muted-foreground/60")}
+                >
+                  命中 {(activeHitRate * 100).toFixed(0)}%
+                  {uplift !== null && baselineHitRate !== null && (
+                    <span
+                      className={cn("ml-1", uplift > 0.0005 ? "text-success" : uplift < -0.0005 ? "text-warning" : "text-muted-foreground/50")}
+                    >
+                      {uplift > 0.0005 ? "▲+" : uplift < -0.0005 ? "▼" : "±"}
+                      {(uplift * 100).toFixed(0)}pp（默认 {(baselineHitRate * 100).toFixed(0)}%）
+                    </span>
+                  )}
+                </span>
+              )}
+              {autoTune && logSummary && logSummary.count > 0 && (
+                <button
+                  onClick={() => { if (symbol) { clearLog(symbol); setLogVersion(v => v + 1); } }}
+                  title={`累计学习样本 ${logSummary.count} 条（点击重置本标的学习记录）`}
+                  className="px-1 py-0.5 rounded text-[10px] font-mono text-muted-foreground/40 hover:text-danger transition-colors"
+                >
+                  ↺{logSummary.count}
+                </button>
+              )}
+              <button onClick={() => setDraws(new Set())} className="px-1.5 py-0.5 rounded text-[10px] text-muted-foreground/50 hover:text-danger transition-colors">清除</button>
+            </>
+          )}
         </div>
       </div>
       <div ref={containerRef} style={{ height }} />

@@ -11,6 +11,7 @@ import ScalperData from "./pages/ScalperData";
 import Growth from "./pages/Growth";
 import Backtest from "./pages/Backtest";
 import Terminal from "./pages/Terminal";
+import PriceAlerts from "./pages/PriceAlerts";
 import SettingsPage from "./pages/Settings";
 
 function PageGuard({ children, name }: { children: React.ReactNode; name: string }) {
@@ -30,6 +31,7 @@ export default function App() {
         <Route path="ai" element={<PageGuard name="AI 助手"><AIChat /></PageGuard>} />
         <Route path="scalper" element={<PageGuard name="短线数据"><ScalperData /></PageGuard>} />
         <Route path="growth" element={<PageGuard name="成长进度"><Growth /></PageGuard>} />
+        <Route path="alerts" element={<PageGuard name="价位提醒"><PriceAlerts /></PageGuard>} />
         <Route path="terminal" element={<PageGuard name="后端终端"><Terminal /></PageGuard>} />
         <Route path="settings" element={<PageGuard name="设置"><SettingsPage /></PageGuard>} />
       </Route>

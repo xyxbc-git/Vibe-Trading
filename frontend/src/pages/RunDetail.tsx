@@ -344,7 +344,7 @@ function ChartTab({ run }: { run: RunData }) {
       {entries.map(([sym, bars]) => (
         <div key={sym}>
           <h3 className="text-sm font-medium mb-1">{sym}</h3>
-          <CandlestickChart data={bars} markers={run.trade_markers?.filter(m => m.code === sym)} indicators={run.indicator_series?.[sym]} height={500} />
+          <CandlestickChart data={bars} markers={run.trade_markers?.filter(m => m.code === sym)} indicators={run.indicator_series?.[sym]} height={500} symbol={sym} />
         </div>
       ))}
       {hasEquity && (

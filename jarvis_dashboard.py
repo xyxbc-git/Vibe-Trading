@@ -33,6 +33,7 @@ import jarvis_executor as jx
 import jarvis_journal as jj
 import jarvis_lessons as jl
 import jarvis_paper_trader as jpt
+import jarvis_price_alert as jpa
 import jarvis_wallet as jw
 from jarvis_factor_backtest import _build_series, event_study, fetch_fng_all, fetch_price_daily
 
@@ -1495,6 +1496,102 @@ def api_config_put(data: dict):
         return JSONResponse({"ok": True})
     except Exception as e:
         return JSONResponse({"ok": False, "reason": str(e)}, status_code=500)
+
+
+# ─────────────────────────── 价位邮件提醒 API ───────────────────────────
+
+
+@app.get("/api/alerts/config")
+def api_alerts_config_get():
+    """读取价位提醒全局配置（SMTP 脱敏、收件人、轮询、监控状态）。"""
+    try:
+        return JSONResponse(jpa.public_config())
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.put("/api/alerts/config")
+def api_alerts_config_put(data: dict):
+    """更新价位提醒全局配置：smtp / recipients / poll_interval_s（按需提供）。"""
+    try:
+        if isinstance(data.get("smtp"), dict):
+            jpa.update_smtp(data["smtp"])
+        if "recipients" in data:
+            jpa.set_recipients(data.get("recipients") or [])
+        if data.get("poll_interval_s") is not None:
+            jpa.set_poll_interval(int(data["poll_interval_s"]))
+        return JSONResponse({"ok": True, "config": jpa.public_config()})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "reason": str(e)}, status_code=500)
+
+
+@app.post("/api/alerts/test-email")
+def api_alerts_test_email(data: dict):
+    """发送一封测试邮件，校验 SMTP 配置是否可用。"""
+    recips = data.get("recipients")
+    if not recips:
+        recips = jpa.load_config().get("recipients", [])
+    out = jpa.send_email(
+        "【贾维斯价位提醒】测试邮件",
+        "这是一封测试邮件，收到说明 SMTP 配置正确，价位提醒可正常推送。",
+        recips,
+        dry_run=bool(data.get("dry_run")),
+    )
+    status = 200 if out.get("ok") else 400
+    return JSONResponse(out, status_code=status)
+
+
+@app.get("/api/alerts/plans")
+def api_alerts_plans_get():
+    try:
+        return JSONResponse(jpa.list_plans())
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/alerts/plans")
+def api_alerts_plans_create(data: dict):
+    out = jpa.add_plan(data)
+    return JSONResponse(out, status_code=200 if out.get("ok") else 400)
+
+
+@app.put("/api/alerts/plans/{plan_id}")
+def api_alerts_plans_update(plan_id: str, data: dict):
+    out = jpa.update_plan(plan_id, data)
+    return JSONResponse(out, status_code=200 if out.get("ok") else 404)
+
+
+@app.delete("/api/alerts/plans/{plan_id}")
+def api_alerts_plans_delete(plan_id: str):
+    out = jpa.delete_plan(plan_id)
+    return JSONResponse(out, status_code=200 if out.get("ok") else 404)
+
+
+@app.post("/api/alerts/check")
+def api_alerts_check(data: dict | None = None):
+    """立即执行一轮价位检查（dry_run 时只判定不发信）。"""
+    dry = bool((data or {}).get("dry_run"))
+    try:
+        return JSONResponse(jpa.evaluate_all(dry_run=dry))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/alerts/price")
+def api_alerts_price(symbol: str = "BTCUSDT"):
+    """取某币种现价，供前端设定目标价位时参考。"""
+    price = jpa.current_price(symbol)
+    return JSONResponse({"symbol": jpa._normalize_symbol(symbol), "price": price})
+
+
+@app.on_event("startup")
+def _start_price_alert_monitor():
+    """随 dashboard 启动后台价位轮询线程。"""
+    try:
+        jpa.start_monitor()
+        _log_emit("价位提醒后台监控已启动", level="info", source="price-alert")
+    except Exception as e:  # noqa: BLE001
+        _log_emit(f"价位提醒监控启动失败: {e}", level="error", source="price-alert")
 
 
 # ─────────────────────────── QD 网关配置 API ───────────────────────────
