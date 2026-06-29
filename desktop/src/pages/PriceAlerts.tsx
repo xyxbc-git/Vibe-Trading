@@ -44,15 +44,20 @@ function SmtpCard({
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [msg, setMsg] = useState("");
+  // dirty=用户已编辑；编辑后不再被后台 refetch 的 config 覆盖输入框
+  const [dirty, setDirty] = useState(false);
+
+  const seed = useCallback((c: AlertConfig) => {
+    setHost(c.smtp.host);
+    setPort(c.smtp.port);
+    setUseSsl(c.smtp.use_ssl);
+    setUsername(c.smtp.username);
+    setFromName(c.smtp.from_name || "贾维斯价位提醒");
+  }, []);
 
   useEffect(() => {
-    if (!config) return;
-    setHost(config.smtp.host);
-    setPort(config.smtp.port);
-    setUseSsl(config.smtp.use_ssl);
-    setUsername(config.smtp.username);
-    setFromName(config.smtp.from_name || "贾维斯价位提醒");
-  }, [config]);
+    if (config && !dirty) seed(config);
+  }, [config, dirty, seed]);
 
   const save = async () => {
     setSaving(true);
@@ -70,6 +75,8 @@ function SmtpCard({
       if (res.ok) {
         setMsg("保存成功 ✓");
         setPassword("");
+        setDirty(false);
+        if (res.config) seed(res.config); // 用返回的权威配置回填，避免刷新空窗
         onSaved();
       } else {
         setMsg(`保存失败: ${res.reason ?? "未知错误"}`);
@@ -120,7 +127,10 @@ function SmtpCard({
           <input
             className={inputCls}
             value={host}
-            onChange={(e) => setHost(e.target.value)}
+            onChange={(e) => {
+              setHost(e.target.value);
+              setDirty(true);
+            }}
             placeholder="smtp.qq.com"
           />
         </div>
@@ -130,7 +140,10 @@ function SmtpCard({
             type="number"
             className={inputCls}
             value={port}
-            onChange={(e) => setPort(Number(e.target.value))}
+            onChange={(e) => {
+              setPort(Number(e.target.value));
+              setDirty(true);
+            }}
             placeholder="465"
           />
         </div>
@@ -142,7 +155,10 @@ function SmtpCard({
           <input
             className={inputCls}
             value={username}
-            onChange={(e) => setUsername(e.target.value)}
+            onChange={(e) => {
+              setUsername(e.target.value);
+              setDirty(true);
+            }}
             placeholder="you@qq.com"
             autoComplete="off"
           />
@@ -160,7 +176,10 @@ function SmtpCard({
             type="password"
             className={inputCls}
             value={password}
-            onChange={(e) => setPassword(e.target.value)}
+            onChange={(e) => {
+              setPassword(e.target.value);
+              setDirty(true);
+            }}
             placeholder={config?.smtp.has_password ? "留空表示不修改" : "粘贴授权码"}
             autoComplete="new-password"
           />
@@ -173,7 +192,10 @@ function SmtpCard({
           <input
             className={inputCls}
             value={fromName}
-            onChange={(e) => setFromName(e.target.value)}
+            onChange={(e) => {
+              setFromName(e.target.value);
+              setDirty(true);
+            }}
             placeholder="贾维斯价位提醒"
           />
         </div>
@@ -181,7 +203,10 @@ function SmtpCard({
           <input
             type="checkbox"
             checked={useSsl}
-            onChange={(e) => setUseSsl(e.target.checked)}
+            onChange={(e) => {
+              setUseSsl(e.target.checked);
+              setDirty(true);
+            }}
             className="accent-jarvis-blue w-4 h-4"
           />
           <span className="text-sm text-jarvis-text">使用 SSL（465 端口常用）</span>
@@ -227,18 +252,21 @@ function RecipientsCard({
   const [input, setInput] = useState("");
   const [interval, setIntervalS] = useState(60);
   const [msg, setMsg] = useState("");
+  const [dirty, setDirty] = useState(false);
 
   useEffect(() => {
-    if (!config) return;
-    setEmails(config.recipients);
-    setIntervalS(config.poll_interval_s);
-  }, [config]);
+    if (config && !dirty) {
+      setEmails(config.recipients);
+      setIntervalS(config.poll_interval_s);
+    }
+  }, [config, dirty]);
 
   const addEmail = () => {
     const e = input.trim();
     if (e && e.includes("@") && !emails.includes(e)) {
       setEmails([...emails, e]);
       setInput("");
+      setDirty(true);
     }
   };
 
@@ -250,7 +278,10 @@ function RecipientsCard({
         poll_interval_s: interval,
       });
       setMsg(res.ok ? "保存成功 ✓" : `保存失败: ${res.reason ?? "未知错误"}`);
-      if (res.ok) onSaved();
+      if (res.ok) {
+        setDirty(false);
+        onSaved();
+      }
     } catch (e) {
       setMsg(`保存失败: ${e instanceof Error ? e.message : "网络错误"}`);
     } finally {
@@ -279,7 +310,10 @@ function RecipientsCard({
           >
             {e}
             <button
-              onClick={() => setEmails(emails.filter((x) => x !== e))}
+              onClick={() => {
+                setEmails(emails.filter((x) => x !== e));
+                setDirty(true);
+              }}
               className="text-jarvis-text-secondary hover:text-jarvis-red"
             >
               <X size={12} />
@@ -314,7 +348,10 @@ function RecipientsCard({
           type="number"
           min={10}
           value={interval}
-          onChange={(e) => setIntervalS(Number(e.target.value))}
+          onChange={(e) => {
+            setIntervalS(Number(e.target.value));
+            setDirty(true);
+          }}
           className="w-24 px-2 py-1 text-sm font-mono text-right bg-jarvis-bg border border-jarvis-border rounded-md text-jarvis-text focus:outline-none focus:border-jarvis-blue"
         />
       </div>

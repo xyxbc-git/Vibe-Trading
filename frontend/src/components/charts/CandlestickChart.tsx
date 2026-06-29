@@ -8,7 +8,7 @@ import { abbreviateNum } from "@/lib/formatters";
 import { echarts, CHART_GROUP, connectCharts } from "@/lib/echarts";
 import { useDarkMode } from "@/hooks/useDarkMode";
 import { computeDrawings, gridSearchParams, scoreDrawings, DEFAULT_PARAMS, type DrawMode, type DrawParams } from "@/lib/drawings";
-import { appendLog, loadLog, clearLog, summarize, type DrawingSample } from "@/lib/drawingLog";
+import { appendLog, loadLog, clearLog, summarize, blendReliability, type DrawingSample } from "@/lib/drawingLog";
 
 type Sub = "vol" | "macd" | "rsi" | "kdj";
 type Range = "1M" | "3M" | "6M" | "1Y" | "ALL";
@@ -233,6 +233,19 @@ export function CandlestickChart({ data, markers, indicators, height = 500, symb
     return summarize(loadLog(symbol));
   }, [symbol, logVersion]);
 
+  // Phase D · 在线学习: blend each mode's live snapshot reliability with the
+  // accumulated cross-session average from the log, so emphasis converges to the
+  // historically-validated mean as samples grow ("越用越准"). Falls back to the
+  // raw live map when there is no symbol/history.
+  const learnedReliability = useMemo(() => {
+    if (!reliability) return undefined;
+    const map: Partial<Record<DrawMode, number>> = {};
+    for (const mode of draws) {
+      map[mode] = blendReliability(reliability[mode] ?? 0, logSummary?.perMode[mode]);
+    }
+    return map;
+  }, [reliability, logSummary, draws]);
+
   // Auto-drawings (trend/SR/fib/channel/rect) — recompute when bars grow, theme,
   // or self-tuned params change, so the lines stay in sync with live data.
   const drawingOverlay = useMemo(() => {
@@ -245,9 +258,9 @@ export function CandlestickChart({ data, markers, indicators, height = 500, symb
       channel: t.infoColor,
       rect: t.infoColor,
       rectFill: t.infoColor + "1f",
-    }, tuneInfo.params, reliability);
+    }, tuneInfo.params, learnedReliability);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [draws, baseData, dark, tuneInfo, reliability]);
+  }, [draws, baseData, dark, tuneInfo, learnedReliability]);
 
   // Init chart instance — only on mount/unmount and dark mode change
   useEffect(() => {

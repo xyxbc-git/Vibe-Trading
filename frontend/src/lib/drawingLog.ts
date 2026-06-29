@@ -84,6 +84,36 @@ export function summarize(samples: DrawingSample[]): LogSummary {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Phase D · online learning — blend the current snapshot's hit rate with the
+// accumulated cross-session average for the same mode, weighting the historical
+// average more as evidence (sample count) grows. With no history it is just the
+// live rate; with lots of history it converges to the validated mean. So the
+// reliability that drives line emphasis "越用越准" across sessions instead of
+// reacting to one noisy snapshot. This is the first increment that actually
+// *learns* from the growing training set the results log accumulates.
+// ---------------------------------------------------------------------------
+
+export const LEARN_PRIOR_STRENGTH = 5;
+
+function clamp01(x: number): number {
+  if (!Number.isFinite(x)) return 0;
+  return x < 0 ? 0 : x > 1 ? 1 : x;
+}
+
+export function blendReliability(
+  live: number,
+  modeSummary: ModeSummary | undefined,
+  priorStrength = LEARN_PRIOR_STRENGTH,
+): number {
+  const liveC = clamp01(live);
+  if (!modeSummary || modeSummary.samples <= 0) return liveC;
+  const n = modeSummary.samples;
+  // history weight grows toward 1 as samples accumulate (n/(n+k))
+  const w = n / (n + Math.max(priorStrength, 0));
+  return clamp01(w * clamp01(modeSummary.avgHitRate) + (1 - w) * liveC);
+}
+
 // --- localStorage wrappers (thin; tolerate private mode / quota) ----------
 
 export function loadLog(symbol: string): DrawingSample[] {
