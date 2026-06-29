@@ -7,7 +7,6 @@ import {
   Save,
   Send,
   RefreshCw,
-  X,
   TrendingUp,
   TrendingDown,
   Power,
@@ -16,6 +15,7 @@ import {
 import {
   api,
   type AlertConfig,
+  type AlertContact,
   type AlertPlan,
   type AlertDirection,
 } from "@/api/client";
@@ -241,41 +241,53 @@ function SmtpCard({
   );
 }
 
-/* ─────────────────── 全局收件人卡片 ─────────────────── */
-function RecipientsCard({
+/* ─────────────────── 收件邮箱通讯录卡片 ─────────────────── */
+function ContactsCard({
   config,
   onSaved,
 }: {
   config: AlertConfig | null;
   onSaved: () => void;
 }) {
-  const [emails, setEmails] = useState<string[]>([]);
-  const [input, setInput] = useState("");
+  const [contacts, setContacts] = useState<AlertContact[]>([]);
+  const [newEmail, setNewEmail] = useState("");
+  const [newLabel, setNewLabel] = useState("");
   const [interval, setIntervalS] = useState(60);
   const [msg, setMsg] = useState("");
   const [dirty, setDirty] = useState(false);
 
   useEffect(() => {
     if (config && !dirty) {
-      setEmails(config.recipients);
+      setContacts(config.contacts ?? []);
       setIntervalS(config.poll_interval_s);
     }
   }, [config, dirty]);
 
-  const addEmail = () => {
-    const e = input.trim();
-    if (e && e.includes("@") && !emails.includes(e)) {
-      setEmails([...emails, e]);
-      setInput("");
+  const addContact = () => {
+    const e = newEmail.trim();
+    if (e && e.includes("@") && !contacts.some((c) => c.email === e)) {
+      setContacts([...contacts, { email: e, label: newLabel.trim() }]);
+      setNewEmail("");
+      setNewLabel("");
       setDirty(true);
     }
+  };
+
+  const updateLabel = (email: string, label: string) => {
+    setContacts(contacts.map((c) => (c.email === email ? { ...c, label } : c)));
+    setDirty(true);
+  };
+
+  const removeContact = (email: string) => {
+    setContacts(contacts.filter((c) => c.email !== email));
+    setDirty(true);
   };
 
   const save = async () => {
     setMsg("");
     try {
       const res = await api.updateAlertConfig({
-        recipients: emails,
+        contacts,
         poll_interval_s: interval,
       });
       setMsg(res.ok ? "保存成功 ✓" : `保存失败: ${res.reason ?? "未知错误"}`);
@@ -290,50 +302,67 @@ function RecipientsCard({
     }
   };
 
+  const inputCls =
+    "px-2 py-1.5 text-sm bg-jarvis-bg border border-jarvis-border rounded-md text-jarvis-text focus:outline-none focus:border-jarvis-blue";
+
   return (
     <div className="card">
       <h3 className="text-sm font-semibold text-jarvis-text mb-3 flex items-center gap-2">
         <Bell size={14} />
-        默认收件邮箱
+        收件邮箱通讯录
       </h3>
       <p className="text-xs text-jarvis-text-secondary mb-3">
-        计划未单独指定收件人时，提醒将发送到这些邮箱。可配置多个。
+        在此维护所有收件邮箱并备注是谁的。新建/编辑计划时从这里勾选收件人；计划未选时默认发给全部。
       </p>
 
-      <div className="flex flex-wrap gap-2 mb-3">
-        {emails.length === 0 && (
-          <span className="text-xs text-jarvis-text-secondary">暂无收件邮箱</span>
+      <div className="space-y-2 mb-3">
+        {contacts.length === 0 && (
+          <p className="text-xs text-jarvis-text-secondary">暂无邮箱，下面添加。</p>
         )}
-        {emails.map((e) => (
-          <span
-            key={e}
-            className="flex items-center gap-1.5 px-2.5 py-1 text-xs bg-jarvis-bg border border-jarvis-border rounded-full text-jarvis-text"
-          >
-            {e}
+        {contacts.map((c) => (
+          <div key={c.email} className="flex items-center gap-2">
+            <input
+              className={`${inputCls} w-24 shrink-0`}
+              value={c.label}
+              onChange={(e) => updateLabel(c.email, e.target.value)}
+              placeholder="备注名"
+            />
+            <span className="flex-1 px-2 py-1.5 text-sm bg-jarvis-bg/50 border border-jarvis-border/50 rounded-md text-jarvis-text font-mono truncate">
+              {c.email}
+            </span>
             <button
-              onClick={() => {
-                setEmails(emails.filter((x) => x !== e));
-                setDirty(true);
-              }}
-              className="text-jarvis-text-secondary hover:text-jarvis-red"
+              onClick={() => removeContact(c.email)}
+              title="删除"
+              className="p-2 rounded-md border border-jarvis-border text-jarvis-text-secondary hover:text-jarvis-red hover:border-jarvis-red/40 transition-colors shrink-0"
             >
-              <X size={12} />
+              <Trash2 size={14} />
             </button>
-          </span>
+          </div>
         ))}
       </div>
 
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-2 pt-3 border-t border-jarvis-border/50">
         <input
-          className="flex-1 px-2 py-1.5 text-sm bg-jarvis-bg border border-jarvis-border rounded-md text-jarvis-text focus:outline-none focus:border-jarvis-blue"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && addEmail()}
-          placeholder="输入邮箱后回车添加"
+          className={`${inputCls} w-24 shrink-0`}
+          value={newLabel}
+          onChange={(e) => setNewLabel(e.target.value)}
+          placeholder="备注名"
+        />
+        <input
+          className={`${inputCls} flex-1`}
+          value={newEmail}
+          onChange={(e) => setNewEmail(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              addContact();
+            }
+          }}
+          placeholder="邮箱地址，回车添加"
         />
         <button
-          onClick={addEmail}
-          className="btn-primary flex items-center gap-1 !bg-jarvis-card border border-jarvis-border"
+          onClick={addContact}
+          className="btn-primary flex items-center gap-1 !bg-jarvis-card border border-jarvis-border shrink-0"
         >
           <Plus size={14} />
           添加
@@ -360,7 +389,7 @@ function RecipientsCard({
       <div className="flex items-center gap-3 mt-4">
         <button onClick={save} className="btn-primary flex items-center gap-2">
           <Save size={14} />
-          保存收件人
+          保存通讯录
         </button>
         {msg && (
           <span className={`text-sm ${msg.includes("成功") ? "text-jarvis-green" : "text-jarvis-red"}`}>
@@ -372,65 +401,54 @@ function RecipientsCard({
   );
 }
 
-/* ─────────────────── 邮箱标签输入（可复用） ─────────────────── */
-function EmailChips({
+/* ─────────────────── 收件人选择器（从通讯录勾选） ─────────────────── */
+function RecipientPicker({
+  contacts,
   value,
   onChange,
-  placeholder = "输入邮箱后回车添加",
 }: {
+  contacts: AlertContact[];
   value: string[];
   onChange: (v: string[]) => void;
-  placeholder?: string;
 }) {
-  const [input, setInput] = useState("");
-  const add = () => {
-    const e = input.trim();
-    if (e && e.includes("@") && !value.includes(e)) {
-      onChange([...value, e]);
-      setInput("");
-    }
+  if (!contacts || contacts.length === 0) {
+    return (
+      <p className="text-xs text-jarvis-yellow">
+        通讯录为空，请先在「收件邮箱通讯录」里添加邮箱。
+      </p>
+    );
+  }
+  const toggle = (email: string) => {
+    onChange(
+      value.includes(email) ? value.filter((e) => e !== email) : [...value, email],
+    );
   };
   return (
-    <div>
-      {value.length > 0 && (
-        <div className="flex flex-wrap gap-1.5 mb-1.5">
-          {value.map((e) => (
+    <div className="flex flex-wrap gap-2">
+      {contacts.map((c) => {
+        const on = value.includes(c.email);
+        return (
+          <button
+            key={c.email}
+            onClick={() => toggle(c.email)}
+            className={`flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-full border transition-colors ${
+              on
+                ? "bg-jarvis-blue/15 border-jarvis-blue text-jarvis-blue"
+                : "bg-jarvis-bg border-jarvis-border text-jarvis-text-secondary hover:text-jarvis-text"
+            }`}
+            title={c.email}
+          >
             <span
-              key={e}
-              className="flex items-center gap-1 px-2 py-0.5 text-xs bg-jarvis-bg border border-jarvis-border rounded-full text-jarvis-text"
+              className={`w-3 h-3 rounded-sm border flex items-center justify-center text-[8px] ${
+                on ? "bg-jarvis-blue border-jarvis-blue text-white" : "border-jarvis-border"
+              }`}
             >
-              {e}
-              <button
-                onClick={() => onChange(value.filter((x) => x !== e))}
-                className="text-jarvis-text-secondary hover:text-jarvis-red"
-              >
-                <X size={11} />
-              </button>
+              {on ? "✓" : ""}
             </span>
-          ))}
-        </div>
-      )}
-      <div className="flex gap-2">
-        <input
-          className="flex-1 px-2 py-1.5 text-sm bg-jarvis-bg border border-jarvis-border rounded-md text-jarvis-text focus:outline-none focus:border-jarvis-blue"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
-              add();
-            }
-          }}
-          placeholder={placeholder}
-        />
-        <button
-          onClick={add}
-          className="btn-primary flex items-center gap-1 !bg-jarvis-card border border-jarvis-border shrink-0"
-        >
-          <Plus size={13} />
-          添加
-        </button>
-      </div>
+            {c.label ? `${c.label}（${c.email}）` : c.email}
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -445,7 +463,13 @@ const emptyPlan = {
   recipients: [] as string[],
 };
 
-function NewPlanForm({ onCreated }: { onCreated: () => void }) {
+function NewPlanForm({
+  contacts,
+  onCreated,
+}: {
+  contacts: AlertContact[];
+  onCreated: () => void;
+}) {
   const [form, setForm] = useState({ ...emptyPlan });
   const [livePrice, setLivePrice] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
@@ -573,12 +597,12 @@ function NewPlanForm({ onCreated }: { onCreated: () => void }) {
       <div className="mt-3">
         <p className="text-sm text-jarvis-text mb-1.5">
           收件人
-          <span className="text-jarvis-text-secondary ml-1">（留空 = 使用默认收件邮箱）</span>
+          <span className="text-jarvis-text-secondary ml-1">（从通讯录勾选，留空 = 默认全部）</span>
         </p>
-        <EmailChips
+        <RecipientPicker
+          contacts={contacts}
           value={form.recipients}
           onChange={(v) => setForm({ ...form, recipients: v })}
-          placeholder="为该计划单独指定收件人，回车添加"
         />
       </div>
 
@@ -606,10 +630,12 @@ function NewPlanForm({ onCreated }: { onCreated: () => void }) {
 /* ─────────────────── 计划列表项（可查看 + 编辑） ─────────────────── */
 function PlanRow({
   plan,
+  contacts,
   defaultRecipients,
   onChanged,
 }: {
   plan: AlertPlan;
+  contacts: AlertContact[];
   defaultRecipients: string[];
   onChanged: () => void;
 }) {
@@ -689,6 +715,11 @@ function PlanRow({
   const inputCls =
     "w-full px-2 py-1.5 text-sm bg-jarvis-bg border border-jarvis-border rounded-md text-jarvis-text focus:outline-none focus:border-jarvis-blue";
 
+  const labelOf = (email: string) => {
+    const c = contacts.find((x) => x.email === email);
+    return c?.label ? `${c.label}（${email}）` : email;
+  };
+
   if (editing) {
     return (
       <div className="py-3 px-3 border-b border-jarvis-border/50 last:border-0 bg-jarvis-bg/30">
@@ -753,9 +784,10 @@ function PlanRow({
 
         <div className="mt-3">
           <p className="text-xs text-jarvis-text-secondary mb-1">
-            收件人（留空 = 使用默认收件邮箱）
+            收件人（从通讯录勾选，留空 = 默认全部）
           </p>
-          <EmailChips
+          <RecipientPicker
+            contacts={contacts}
             value={form.recipients}
             onChange={(v) => setForm({ ...form, recipients: v })}
           />
@@ -814,9 +846,11 @@ function PlanRow({
           <p className="text-xs text-jarvis-text-secondary">
             收件人：
             {plan.recipients.length > 0 ? (
-              <span className="text-jarvis-text">{plan.recipients.join(", ")}</span>
+              <span className="text-jarvis-text">
+                {plan.recipients.map(labelOf).join("、")}
+              </span>
             ) : defaultRecipients.length > 0 ? (
-              <span>默认（{defaultRecipients.join(", ")}）</span>
+              <span>默认全部（{defaultRecipients.map(labelOf).join("、")}）</span>
             ) : (
               <span className="text-jarvis-yellow">未设置收件人</span>
             )}
@@ -925,11 +959,11 @@ export default function PriceAlertsPage() {
 
       <div className="grid grid-cols-2 gap-4 mb-4">
         <SmtpCard config={config} onSaved={refetchConfig} />
-        <RecipientsCard config={config} onSaved={refetchConfig} />
+        <ContactsCard config={config} onSaved={refetchConfig} />
       </div>
 
       <div className="grid grid-cols-2 gap-4 items-start">
-        <NewPlanForm onCreated={refetchPlans} />
+        <NewPlanForm contacts={config?.contacts ?? []} onCreated={refetchPlans} />
 
         <div className="card">
           <h3 className="text-sm font-semibold text-jarvis-text mb-1 flex items-center gap-2">
@@ -946,6 +980,7 @@ export default function PriceAlertsPage() {
               <PlanRow
                 key={p.id}
                 plan={p}
+                contacts={config?.contacts ?? []}
                 defaultRecipients={config?.recipients ?? []}
                 onChanged={refetchPlans}
               />

@@ -283,6 +283,7 @@ export interface AlertConfig {
     has_password: boolean;
   };
   recipients: string[];
+  contacts: AlertContact[];
   poll_interval_s: number;
   monitor: {
     running: boolean;
@@ -290,6 +291,11 @@ export interface AlertConfig {
     last_summary: { checked: number; triggered: number } | null;
     last_error: string | null;
   };
+}
+
+export interface AlertContact {
+  email: string;
+  label: string;
 }
 
 export interface AlertConfigUpdate {
@@ -302,6 +308,7 @@ export interface AlertConfigUpdate {
     password?: string;
   };
   recipients?: string[];
+  contacts?: AlertContact[];
   poll_interval_s?: number;
 }
 

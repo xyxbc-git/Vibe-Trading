@@ -1516,7 +1516,9 @@ def api_alerts_config_put(data: dict):
     try:
         if isinstance(data.get("smtp"), dict):
             jpa.update_smtp(data["smtp"])
-        if "recipients" in data:
+        if "contacts" in data:
+            jpa.set_contacts(data.get("contacts") or [])
+        elif "recipients" in data:
             jpa.set_recipients(data.get("recipients") or [])
         if data.get("poll_interval_s") is not None:
             jpa.set_poll_interval(int(data["poll_interval_s"]))

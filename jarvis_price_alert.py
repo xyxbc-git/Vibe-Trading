@@ -60,7 +60,9 @@ DEFAULTS: dict = {
         "password": "",
         "from_name": "贾维斯价位提醒",
     },
+    # recipients：默认收件邮箱（也是通讯录里的全部邮箱）；contact_labels：邮箱→备注名
     "recipients": [],
+    "contact_labels": {},
     "poll_interval_s": 60,
     "plans": [],
 }
@@ -125,9 +127,43 @@ def public_config() -> dict:
             "has_password": bool(smtp.get("password")),
         },
         "recipients": list(cfg.get("recipients", [])),
+        "contacts": _build_contacts(cfg),
         "poll_interval_s": int(cfg.get("poll_interval_s", 60)),
         "monitor": monitor_status(),
     }
+
+
+def _build_contacts(cfg: dict) -> list:
+    """把 recipients(邮箱列表) + contact_labels(备注映射) 合成通讯录给前端展示。"""
+    labels = cfg.get("contact_labels", {}) or {}
+    return [{"email": e, "label": str(labels.get(e, "") or "")}
+            for e in cfg.get("recipients", [])]
+
+
+def set_contacts(contacts: list) -> dict:
+    """整体覆盖通讯录。contacts=[{email,label}]；email 去重，保留备注。"""
+    emails: list[str] = []
+    labels: dict[str, str] = {}
+    for c in contacts or []:
+        if isinstance(c, dict):
+            email = str(c.get("email", "")).strip()
+            label = str(c.get("label", "") or "").strip()
+        else:
+            email = str(c).strip()
+            label = ""
+        if email and "@" in email and email not in emails:
+            emails.append(email)
+            if label:
+                labels[email] = label
+    with _LOCK:
+        cfg = load_config()
+        cfg["recipients"] = emails
+        cfg["contact_labels"] = labels
+        # 清理已不在通讯录中的计划收件人，避免悬挂引用
+        for plan in cfg.get("plans", []):
+            plan["recipients"] = [r for r in plan.get("recipients", []) if r in emails]
+        _save(cfg)
+    return public_config()
 
 
 def update_smtp(data: dict) -> dict:
