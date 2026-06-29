@@ -575,7 +575,39 @@ function aggregate(perMode: Record<DrawMode, ScoreResult>): number {
   return wSum > 0 ? acc / wSum : 0;
 }
 
-export function gridSearchParams(base: BaseData, ratios: number[] = WALK_FORWARD_RATIOS): TuneResult {
+export interface TuneOptions {
+  ratios?: number[];
+  // Phase D-2 · warm start: a remembered "best so far" param set (e.g. what
+  // worked for this symbol in the past). It is evaluated as a guaranteed
+  // candidate so the returned result is never worse than the remembered params
+  // on the current data — memory can only help, never regress.
+  seed?: DrawParams;
+}
+
+// Score one specific param set against the walk-forward folds, exposing the
+// default-params baseline + uplift just like gridSearchParams. Used for the
+// cheap warm-start fast path: validate remembered params on fresh data without
+// re-running the whole grid.
+export function evaluateParams(
+  base: BaseData,
+  params: DrawParams,
+  ratios: number[] = WALK_FORWARD_RATIOS,
+): TuneResult {
+  const basePerMode = walkForwardScore(base, DEFAULT_PARAMS, ratios);
+  const baselineScore = aggregate(basePerMode);
+  const perMode = walkForwardScore(base, params, ratios);
+  const score = aggregate(perMode);
+  return {
+    params,
+    score,
+    perMode,
+    baseline: { score: baselineScore, perMode: basePerMode },
+    uplift: score - baselineScore,
+  };
+}
+
+export function gridSearchParams(base: BaseData, opts: TuneOptions = {}): TuneResult {
+  const ratios = opts.ratios ?? WALK_FORWARD_RATIOS;
   // The default-params score is the baseline every tuned result is measured
   // against — computed once up front (walk-forward), then carried through.
   const basePerMode = walkForwardScore(base, DEFAULT_PARAMS, ratios);
@@ -590,7 +622,17 @@ export function gridSearchParams(base: BaseData, ratios: number[] = WALK_FORWARD
     uplift: 0,
   };
 
-  // Too few bars to validate meaningfully — keep defaults (uplift stays 0).
+  // Warm start: a remembered param set is honoured as a guaranteed candidate, so
+  // the result is monotonically non-worse than past memory even before the grid.
+  if (opts.seed) {
+    const seedPerMode = walkForwardScore(base, opts.seed, ratios);
+    const seedScore = aggregate(seedPerMode);
+    if (seedScore > best.score) {
+      best = { params: opts.seed, score: seedScore, perMode: seedPerMode, baseline, uplift: seedScore - baselineScore };
+    }
+  }
+
+  // Too few bars to validate meaningfully — keep current best (default or seed).
   if (base.closes.length < 40) return best;
 
   for (const swingLookback of GRID.swingLookback) {

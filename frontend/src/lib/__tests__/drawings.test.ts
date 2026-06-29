@@ -1,11 +1,13 @@
 import { describe, it, expect } from "vitest";
 import {
   gridSearchParams,
+  evaluateParams,
   scoreDrawings,
   walkForwardScore,
   WALK_FORWARD_RATIOS,
   DEFAULT_PARAMS,
   type BaseData,
+  type DrawParams,
 } from "../drawings";
 
 const MODES = ["trend", "sr", "fib", "channel", "rect"] as const;
@@ -91,5 +93,38 @@ describe("walkForwardScore pooling", () => {
       expect(wf[m].touches).toBe(single[m].touches);
       expect(wf[m].hits).toBe(single[m].hits);
     }
+  });
+});
+
+describe("evaluateParams + warm start (Phase D-2)", () => {
+  it("evaluateParams exposes baseline + uplift; default seed has ~zero uplift", () => {
+    const bars = makeBars(220);
+    const ev = evaluateParams(bars, DEFAULT_PARAMS);
+    const refBaseline = walkForwardScore(bars, DEFAULT_PARAMS);
+    for (const m of MODES) {
+      expect(ev.baseline.perMode[m].hitRate).toBeCloseTo(refBaseline[m].hitRate, 6);
+    }
+    // Same params as the baseline → score equals baseline, uplift ≈ 0.
+    expect(ev.score).toBeCloseTo(ev.baseline.score, 9);
+    expect(ev.uplift).toBeCloseTo(0, 9);
+  });
+
+  it("a warm seed is honoured so the result is never worse than the seed", () => {
+    const bars = makeBars(240);
+    // Use the previous full-search winner as the remembered seed.
+    const remembered = gridSearchParams(bars).params;
+    const seedScore = evaluateParams(bars, remembered).score;
+
+    const seeded = gridSearchParams(bars, { seed: remembered });
+    expect(seeded.score).toBeGreaterThanOrEqual(seedScore - 1e-9);
+    // And still never worse than the default baseline.
+    expect(seeded.score).toBeGreaterThanOrEqual(seeded.baseline.score - 1e-9);
+  });
+
+  it("an obviously bad seed cannot drag the result below the default baseline", () => {
+    const bars = makeBars(200);
+    const badSeed: DrawParams = { swingLookback: 2, fibWindow: 8, channelWindow: 5, rectWindow: 5, srTolPct: 0.001 };
+    const res = gridSearchParams(bars, { seed: badSeed });
+    expect(res.score).toBeGreaterThanOrEqual(res.baseline.score - 1e-9);
   });
 });

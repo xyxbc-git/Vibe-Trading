@@ -7,7 +7,7 @@ import { getChartTheme } from "@/lib/chart-theme";
 import { abbreviateNum } from "@/lib/formatters";
 import { echarts, CHART_GROUP, connectCharts } from "@/lib/echarts";
 import { useDarkMode } from "@/hooks/useDarkMode";
-import { computeDrawings, gridSearchParams, scoreDrawings, DEFAULT_PARAMS, type DrawMode, type DrawParams } from "@/lib/drawings";
+import { computeDrawings, gridSearchParams, evaluateParams, scoreDrawings, DEFAULT_PARAMS, type DrawMode, type DrawParams } from "@/lib/drawings";
 import { appendLog, loadLog, clearLog, summarize, blendReliability, type DrawingSample } from "@/lib/drawingLog";
 
 type Sub = "vol" | "macd" | "rsi" | "kdj";
@@ -55,6 +55,29 @@ function loadTunedParams(sym: string, bars: number): DrawParams | null {
     return cached.bars === bars ? cached.params : null;
   } catch {
     return null;
+  }
+}
+
+// Phase D-2 · warm start: remember the best params per symbol *independent of
+// bar count*, so the knowledge survives streaming (the bars-keyed cache above
+// invalidates on every new bar). On a cache miss we validate these remembered
+// params on the fresh data cheaply and only re-run the full grid if they degraded.
+const WARM_KEY = (sym: string) => `vibe.draw.warm.${sym}`;
+
+function loadWarmParams(sym: string): DrawParams | null {
+  try {
+    const raw = localStorage.getItem(WARM_KEY(sym));
+    return raw ? (JSON.parse(raw) as DrawParams) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveWarmParams(sym: string, params: DrawParams): void {
+  try {
+    localStorage.setItem(WARM_KEY(sym), JSON.stringify(params));
+  } catch {
+    /* storage unavailable — warm start simply won't persist */
   }
 }
 
@@ -137,12 +160,32 @@ export function CandlestickChart({ data, markers, indicators, height = 500, symb
       return { params: DEFAULT_PARAMS, score: 0, tuned: false };
     }
     const slim = { dates: baseData.dates, closes: baseData.closes, highs: baseData.highs, lows: baseData.lows };
+    const bars = baseData.closes.length;
     if (symbol) {
-      const cached = loadTunedParams(symbol, baseData.closes.length);
+      const cached = loadTunedParams(symbol, bars);
       if (cached) return { params: cached, score: 0, tuned: true };
+
+      // Warm start: reuse remembered params if they still beat default on the
+      // fresh data (cheap: 2 walk-forward scorings vs. a full grid). Only when
+      // they've degraded do we re-search — seeded by the memory so we never regress.
+      const warm = loadWarmParams(symbol);
+      if (warm) {
+        const ev = evaluateParams(slim, warm);
+        if (ev.uplift > 0) {
+          saveTunedParams(symbol, warm, ev.score, bars);
+          return { params: warm, score: ev.score, tuned: true };
+        }
+        const res = gridSearchParams(slim, { seed: warm });
+        saveWarmParams(symbol, res.params);
+        saveTunedParams(symbol, res.params, res.score, bars);
+        return { params: res.params, score: res.score, tuned: true };
+      }
     }
     const res = gridSearchParams(slim);
-    if (symbol) saveTunedParams(symbol, res.params, res.score, baseData.closes.length);
+    if (symbol) {
+      saveWarmParams(symbol, res.params);
+      saveTunedParams(symbol, res.params, res.score, bars);
+    }
     return { params: res.params, score: res.score, tuned: true };
   }, [autoTune, draws.size, baseData, symbol]);
 

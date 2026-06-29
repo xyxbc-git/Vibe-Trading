@@ -1527,18 +1527,25 @@ def api_alerts_config_put(data: dict):
 
 @app.post("/api/alerts/test-email")
 def api_alerts_test_email(data: dict):
-    """发送一封测试邮件，校验 SMTP 配置是否可用。"""
-    recips = data.get("recipients")
+    """发送一封测试邮件，校验 SMTP 配置是否可用。
+
+    收件人优先级：请求显式指定 > 全局默认收件人 > SMTP 账号本人（便于配完即自测）。
+    始终返回 HTTP 200，失败原因放在 body.reason，避免前端只看到笼统的 400。
+    """
+    cfg = jpa.load_config()
+    recips = data.get("recipients") or cfg.get("recipients") or []
     if not recips:
-        recips = jpa.load_config().get("recipients", [])
+        self_addr = cfg.get("smtp", {}).get("username")
+        if self_addr:
+            recips = [self_addr]  # 没配收件人时默认发给自己
     out = jpa.send_email(
         "【贾维斯价位提醒】测试邮件",
         "这是一封测试邮件，收到说明 SMTP 配置正确，价位提醒可正常推送。",
         recips,
+        cfg=cfg,
         dry_run=bool(data.get("dry_run")),
     )
-    status = 200 if out.get("ok") else 400
-    return JSONResponse(out, status_code=status)
+    return JSONResponse(out)
 
 
 @app.get("/api/alerts/plans")

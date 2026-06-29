@@ -186,12 +186,35 @@ export const api = {
       "/alerts/config",
       data,
     ),
-  testAlertEmail: (recipients?: string[]) =>
-    request<{ ok: boolean; reason?: string; to?: string[] }>(
-      "/alerts/test-email",
-      { method: "POST", body: JSON.stringify({ recipients }) },
-      25_000,
-    ),
+  // 测试邮件单独处理：无论 HTTP 状态码如何都解析 body，把后端真实失败原因带回前端
+  testAlertEmail: async (
+    recipients?: string[],
+  ): Promise<{ ok: boolean; reason?: string; to?: string[] }> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 25_000);
+    try {
+      const res = await fetch(`${BASE_URL}/alerts/test-email`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ recipients }),
+        signal: controller.signal,
+      });
+      const body = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        reason?: string;
+        to?: string[];
+      };
+      if (body && typeof body.ok === "boolean") return body as { ok: boolean };
+      return { ok: res.ok, reason: body?.reason ?? `HTTP ${res.status}` };
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") {
+        return { ok: false, reason: "请求超时（SMTP 服务器可能不可达）" };
+      }
+      return { ok: false, reason: e instanceof Error ? e.message : "网络错误" };
+    } finally {
+      clearTimeout(timer);
+    }
+  },
   alertPlans: () => api.get<AlertPlan[]>("/alerts/plans"),
   createAlertPlan: (data: AlertPlanInput) =>
     api.post<{ ok: boolean; reason?: string; plan?: AlertPlan }>(
