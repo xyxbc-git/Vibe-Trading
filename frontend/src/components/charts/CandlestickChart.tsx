@@ -36,6 +36,12 @@ const OVERLAY_OPTIONS: { id: Overlay; label: string; group: string }[] = [
 const RANGE_BARS: Record<Range, number> = { "1M": 22, "3M": 63, "6M": 126, "1Y": 252, ALL: Infinity };
 const OVERLAY_COLORS = ["#f59e0b", "#8b5cf6", "#3b82f6", "#ec4899", "#10b981", "#f97316", "#6366f1"];
 
+// Phase D-3: only let the structured model influence reliability once it has
+// seen enough featured samples, and then only with a modest weight, so it
+// augments the D-1 historical blend rather than overriding it.
+const MODEL_MIN_SAMPLES = 15;
+const MODEL_BLEND = 0.25;
+
 interface Props {
   data: PriceBar[];
   markers?: TradeMarker[];
@@ -216,6 +222,9 @@ export function CandlestickChart({ data, markers, indicators, height = 500, symb
     return map;
   }, [modeScores, draws]);
 
+  // Helper to keep blended reliability values within [0,1].
+  const clampRel = useCallback((x: number) => (x < 0 ? 0 : x > 1 ? 1 : x), []);
+
   // Evidence-weighted average hit rate over the active modes, for a given scores
   // map. Shared by the tuned badge and the default-params baseline so both are
   // computed identically (same weighting, same modes).
@@ -272,25 +281,44 @@ export function CandlestickChart({ data, markers, indicators, height = 500, symb
 
   // Rolling summary of the accumulated log (sample count + avg uplift), shown in
   // the badge tooltip so "越画越准" is backed by a growing, visible track record.
-  const logSummary = useMemo(() => {
-    if (!symbol) return null;
-    // logVersion in deps so the summary refreshes right after a new append.
+  // Load the accumulated per-symbol log once; both the rolling summary (D-1) and
+  // the structured model (D-3) derive from it. logVersion in deps so it refreshes
+  // right after a new append.
+  const logSamples = useMemo(() => {
     void logVersion;
-    return summarize(loadLog(symbol));
+    return symbol ? loadLog(symbol) : [];
   }, [symbol, logVersion]);
 
+  const logSummary = useMemo(() => (symbol ? summarize(logSamples) : null), [symbol, logSamples]);
+
+  // Phase D-3: train a structured-feature logistic model on the featured samples
+  // (market context → was the line respected?). Null until enough evidence.
+  const contextModel = useMemo(() => {
+    const data: TrainSample[] = [];
+    for (const s of logSamples) {
+      if (s.features && s.features.length) data.push({ x: s.features, y: s.hitRate >= 0.5 ? 1 : 0 });
+    }
+    if (data.length < MODEL_MIN_SAMPLES) return null;
+    return trainModel(data);
+  }, [logSamples]);
+
   // Phase D · 在线学习: blend each mode's live snapshot reliability with the
-  // accumulated cross-session average from the log, so emphasis converges to the
-  // historically-validated mean as samples grow ("越用越准"). Falls back to the
-  // raw live map when there is no symbol/history.
+  // accumulated cross-session average (D-1), then nudge by the structured model's
+  // context prediction (D-3, gated + modest weight). Emphasis converges to what
+  // history validated and what the current regime predicts ("越用越准").
   const learnedReliability = useMemo(() => {
     if (!reliability) return undefined;
     const map: Partial<Record<DrawMode, number>> = {};
     for (const mode of draws) {
-      map[mode] = blendReliability(reliability[mode] ?? 0, logSummary?.perMode[mode]);
+      let r = blendReliability(reliability[mode] ?? 0, logSummary?.perMode[mode]);
+      if (contextModel && modeScores) {
+        const p = predictProba(contextModel, extractFeatures(baseData, modeScores[mode].touches));
+        r = (1 - MODEL_BLEND) * r + MODEL_BLEND * p;
+      }
+      map[mode] = clampRel(r);
     }
     return map;
-  }, [reliability, logSummary, draws]);
+  }, [reliability, logSummary, draws, contextModel, modeScores, baseData, clampRel]);
 
   // Auto-drawings (trend/SR/fib/channel/rect) — recompute when bars grow, theme,
   // or self-tuned params change, so the lines stay in sync with live data.

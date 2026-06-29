@@ -11,6 +11,7 @@ import {
   TrendingUp,
   TrendingDown,
   Power,
+  Pencil,
 } from "lucide-react";
 import {
   api,
@@ -371,6 +372,69 @@ function RecipientsCard({
   );
 }
 
+/* ─────────────────── 邮箱标签输入（可复用） ─────────────────── */
+function EmailChips({
+  value,
+  onChange,
+  placeholder = "输入邮箱后回车添加",
+}: {
+  value: string[];
+  onChange: (v: string[]) => void;
+  placeholder?: string;
+}) {
+  const [input, setInput] = useState("");
+  const add = () => {
+    const e = input.trim();
+    if (e && e.includes("@") && !value.includes(e)) {
+      onChange([...value, e]);
+      setInput("");
+    }
+  };
+  return (
+    <div>
+      {value.length > 0 && (
+        <div className="flex flex-wrap gap-1.5 mb-1.5">
+          {value.map((e) => (
+            <span
+              key={e}
+              className="flex items-center gap-1 px-2 py-0.5 text-xs bg-jarvis-bg border border-jarvis-border rounded-full text-jarvis-text"
+            >
+              {e}
+              <button
+                onClick={() => onChange(value.filter((x) => x !== e))}
+                className="text-jarvis-text-secondary hover:text-jarvis-red"
+              >
+                <X size={11} />
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
+      <div className="flex gap-2">
+        <input
+          className="flex-1 px-2 py-1.5 text-sm bg-jarvis-bg border border-jarvis-border rounded-md text-jarvis-text focus:outline-none focus:border-jarvis-blue"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              add();
+            }
+          }}
+          placeholder={placeholder}
+        />
+        <button
+          onClick={add}
+          className="btn-primary flex items-center gap-1 !bg-jarvis-card border border-jarvis-border shrink-0"
+        >
+          <Plus size={13} />
+          添加
+        </button>
+      </div>
+    </div>
+  );
+}
+
 /* ─────────────────── 新增计划表单 ─────────────────── */
 const emptyPlan = {
   name: "",
@@ -378,6 +442,7 @@ const emptyPlan = {
   target_price: 0,
   direction: "above" as AlertDirection,
   repeat: false,
+  recipients: [] as string[],
 };
 
 function NewPlanForm({ onCreated }: { onCreated: () => void }) {
@@ -505,6 +570,18 @@ function NewPlanForm({ onCreated }: { onCreated: () => void }) {
         </div>
       </div>
 
+      <div className="mt-3">
+        <p className="text-sm text-jarvis-text mb-1.5">
+          收件人
+          <span className="text-jarvis-text-secondary ml-1">（留空 = 使用默认收件邮箱）</span>
+        </p>
+        <EmailChips
+          value={form.recipients}
+          onChange={(v) => setForm({ ...form, recipients: v })}
+          placeholder="为该计划单独指定收件人，回车添加"
+        />
+      </div>
+
       <label className="flex items-center gap-2 mt-3 cursor-pointer select-none">
         <input
           type="checkbox"
@@ -526,15 +603,40 @@ function NewPlanForm({ onCreated }: { onCreated: () => void }) {
   );
 }
 
-/* ─────────────────── 计划列表项 ─────────────────── */
+/* ─────────────────── 计划列表项（可查看 + 编辑） ─────────────────── */
 function PlanRow({
   plan,
+  defaultRecipients,
   onChanged,
 }: {
   plan: AlertPlan;
+  defaultRecipients: string[];
   onChanged: () => void;
 }) {
   const [busy, setBusy] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [form, setForm] = useState({
+    name: plan.name,
+    symbol: plan.symbol,
+    target_price: plan.target_price,
+    direction: plan.direction,
+    repeat: plan.repeat,
+    recipients: plan.recipients,
+  });
+  const [msg, setMsg] = useState("");
+
+  const startEdit = () => {
+    setForm({
+      name: plan.name,
+      symbol: plan.symbol,
+      target_price: plan.target_price,
+      direction: plan.direction,
+      repeat: plan.repeat,
+      recipients: plan.recipients,
+    });
+    setMsg("");
+    setEditing(true);
+  };
 
   const toggle = async () => {
     setBusy(true);
@@ -547,6 +649,7 @@ function PlanRow({
   };
 
   const remove = async () => {
+    if (!window.confirm(`确定删除提醒计划「${plan.name}」吗？`)) return;
     setBusy(true);
     try {
       await api.deleteAlertPlan(plan.id);
@@ -556,11 +659,138 @@ function PlanRow({
     }
   };
 
+  const saveEdit = async () => {
+    if (!form.name.trim()) {
+      setMsg("请填写名称");
+      return;
+    }
+    if (!form.target_price || form.target_price <= 0) {
+      setMsg("请填写有效目标价位");
+      return;
+    }
+    setBusy(true);
+    setMsg("");
+    try {
+      const res = await api.updateAlertPlan(plan.id, form);
+      if (res.ok) {
+        setEditing(false);
+        onChanged();
+      } else {
+        setMsg(`保存失败: ${res.reason ?? "未知错误"}`);
+      }
+    } catch (e) {
+      setMsg(`保存失败: ${e instanceof Error ? e.message : "网络错误"}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const dirAbove = plan.direction === "above";
+  const inputCls =
+    "w-full px-2 py-1.5 text-sm bg-jarvis-bg border border-jarvis-border rounded-md text-jarvis-text focus:outline-none focus:border-jarvis-blue";
+
+  if (editing) {
+    return (
+      <div className="py-3 px-3 border-b border-jarvis-border/50 last:border-0 bg-jarvis-bg/30">
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <p className="text-xs text-jarvis-text-secondary mb-1">名称</p>
+            <input
+              className={inputCls}
+              value={form.name}
+              onChange={(e) => setForm({ ...form, name: e.target.value })}
+            />
+          </div>
+          <div>
+            <p className="text-xs text-jarvis-text-secondary mb-1">币种</p>
+            <select
+              className={inputCls}
+              value={form.symbol}
+              onChange={(e) => setForm({ ...form, symbol: e.target.value })}
+            >
+              {SYMBOLS.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <p className="text-xs text-jarvis-text-secondary mb-1">目标价位</p>
+            <input
+              type="number"
+              className={inputCls}
+              value={form.target_price || ""}
+              onChange={(e) => setForm({ ...form, target_price: Number(e.target.value) })}
+            />
+          </div>
+          <div>
+            <p className="text-xs text-jarvis-text-secondary mb-1">触发方向</p>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setForm({ ...form, direction: "above" })}
+                className={`flex-1 flex items-center justify-center gap-1 py-1.5 rounded-md text-sm border ${
+                  form.direction === "above"
+                    ? "bg-jarvis-green/15 border-jarvis-green text-jarvis-green"
+                    : "bg-jarvis-bg border-jarvis-border text-jarvis-text-secondary"
+                }`}
+              >
+                <TrendingUp size={13} /> 涨破
+              </button>
+              <button
+                onClick={() => setForm({ ...form, direction: "below" })}
+                className={`flex-1 flex items-center justify-center gap-1 py-1.5 rounded-md text-sm border ${
+                  form.direction === "below"
+                    ? "bg-jarvis-red/15 border-jarvis-red text-jarvis-red"
+                    : "bg-jarvis-bg border-jarvis-border text-jarvis-text-secondary"
+                }`}
+              >
+                <TrendingDown size={13} /> 跌破
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-3">
+          <p className="text-xs text-jarvis-text-secondary mb-1">
+            收件人（留空 = 使用默认收件邮箱）
+          </p>
+          <EmailChips
+            value={form.recipients}
+            onChange={(v) => setForm({ ...form, recipients: v })}
+          />
+        </div>
+
+        <label className="flex items-center gap-2 mt-3 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={form.repeat}
+            onChange={(e) => setForm({ ...form, repeat: e.target.checked })}
+            className="accent-jarvis-blue w-4 h-4"
+          />
+          <span className="text-sm text-jarvis-text">重复提醒</span>
+        </label>
+
+        <div className="flex items-center gap-2 mt-3">
+          <button onClick={saveEdit} disabled={busy} className="btn-primary flex items-center gap-1.5">
+            <Save size={13} />
+            {busy ? "保存中..." : "保存"}
+          </button>
+          <button
+            onClick={() => setEditing(false)}
+            className="btn-primary flex items-center gap-1.5 !bg-jarvis-card border border-jarvis-border"
+          >
+            取消
+          </button>
+          {msg && <span className="text-sm text-jarvis-red">{msg}</span>}
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div className="flex items-center justify-between py-3 px-3 border-b border-jarvis-border/50 last:border-0">
-      <div className="flex items-center gap-3 min-w-0">
+    <div className="flex items-start justify-between py-3 px-3 border-b border-jarvis-border/50 last:border-0">
+      <div className="flex items-start gap-3 min-w-0">
         <span
           className={`flex items-center justify-center w-9 h-9 rounded-lg shrink-0 ${
             dirAbove ? "bg-jarvis-green/15 text-jarvis-green" : "bg-jarvis-red/15 text-jarvis-red"
@@ -569,36 +799,47 @@ function PlanRow({
           {dirAbove ? <TrendingUp size={18} /> : <TrendingDown size={18} />}
         </span>
         <div className="min-w-0">
-          <p className="text-sm text-jarvis-text font-medium truncate">
+          <p className="text-sm text-jarvis-text font-medium">
             {plan.name}
             {!plan.enabled && (
               <span className="ml-2 text-xs text-jarvis-text-secondary">（已停用）</span>
             )}
-            {plan.repeat && (
-              <span className="ml-2 text-xs text-jarvis-blue">重复</span>
-            )}
+            {plan.repeat && <span className="ml-2 text-xs text-jarvis-blue">重复</span>}
           </p>
-          <p className="text-xs text-jarvis-text-secondary truncate">
+          <p className="text-xs text-jarvis-text-secondary">
             {plan.symbol} · {dirAbove ? "涨破" : "跌破"}{" "}
             <span className="font-mono text-jarvis-text">{plan.target_price}</span>
             {plan.last_price != null && <> · 最近价 {plan.last_price}</>}
-            {plan.triggered_count > 0 && (
-              <> · 已触发 {plan.triggered_count} 次 @ {fmtTs(plan.last_triggered_at)}</>
+          </p>
+          <p className="text-xs text-jarvis-text-secondary">
+            收件人：
+            {plan.recipients.length > 0 ? (
+              <span className="text-jarvis-text">{plan.recipients.join(", ")}</span>
+            ) : defaultRecipients.length > 0 ? (
+              <span>默认（{defaultRecipients.join(", ")}）</span>
+            ) : (
+              <span className="text-jarvis-yellow">未设置收件人</span>
             )}
           </p>
-          {plan.recipients.length > 0 && (
-            <p className="text-xs text-jarvis-text-secondary truncate">
-              收件人：{plan.recipients.join(", ")}
+          {plan.triggered_count > 0 && (
+            <p className="text-xs text-jarvis-text-secondary">
+              已触发 {plan.triggered_count} 次 @ {fmtTs(plan.last_triggered_at)}
             </p>
           )}
           {plan.last_send_result && plan.last_send_result !== "ok" && (
-            <p className="text-xs text-jarvis-red truncate">
-              上次发送失败：{plan.last_send_result}
-            </p>
+            <p className="text-xs text-jarvis-red">上次发送失败：{plan.last_send_result}</p>
           )}
         </div>
       </div>
       <div className="flex items-center gap-2 shrink-0">
+        <button
+          onClick={startEdit}
+          disabled={busy}
+          title="编辑"
+          className="p-2 rounded-md border border-jarvis-border text-jarvis-text-secondary hover:text-jarvis-blue hover:border-jarvis-blue/40 transition-colors"
+        >
+          <Pencil size={15} />
+        </button>
         <button
           onClick={toggle}
           disabled={busy}
@@ -702,7 +943,12 @@ export default function PriceAlertsPage() {
           )}
           <div>
             {plans?.map((p) => (
-              <PlanRow key={p.id} plan={p} onChanged={refetchPlans} />
+              <PlanRow
+                key={p.id}
+                plan={p}
+                defaultRecipients={config?.recipients ?? []}
+                onChanged={refetchPlans}
+              />
             ))}
           </div>
         </div>
