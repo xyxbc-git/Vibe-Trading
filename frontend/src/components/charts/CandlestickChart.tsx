@@ -42,6 +42,11 @@ const OVERLAY_COLORS = ["#f59e0b", "#8b5cf6", "#3b82f6", "#ec4899", "#10b981", "
 const MODEL_MIN_SAMPLES = 15;
 const MODEL_BLEND = 0.25;
 
+// Above this bar count the exhaustive grid (324×4 walk-forward scorings) gets
+// expensive enough to risk jank, so fall back to the cheap coordinate-descent
+// search (~32×4) for the cold compute. Smaller sets still use the full grid.
+const COORDINATE_BARS = 800;
+
 interface Props {
   data: PriceBar[];
   markers?: TradeMarker[];
@@ -168,6 +173,7 @@ export function CandlestickChart({ data, markers, indicators, height = 500, symb
     }
     const slim = { dates: baseData.dates, closes: baseData.closes, highs: baseData.highs, lows: baseData.lows };
     const bars = baseData.closes.length;
+    const strategy: "full" | "coordinate" = bars > COORDINATE_BARS ? "coordinate" : "full";
     if (symbol) {
       const cached = loadTunedParams(symbol, bars);
       if (cached) return { params: cached, score: 0, tuned: true };
@@ -182,13 +188,13 @@ export function CandlestickChart({ data, markers, indicators, height = 500, symb
           saveTunedParams(symbol, warm, ev.score, bars);
           return { params: warm, score: ev.score, tuned: true };
         }
-        const res = gridSearchParams(slim, { seed: warm });
+        const res = gridSearchParams(slim, { seed: warm, strategy });
         saveWarmParams(symbol, res.params);
         saveTunedParams(symbol, res.params, res.score, bars);
         return { params: res.params, score: res.score, tuned: true };
       }
     }
-    const res = gridSearchParams(slim);
+    const res = gridSearchParams(slim, { strategy });
     if (symbol) {
       saveWarmParams(symbol, res.params);
       saveTunedParams(symbol, res.params, res.score, bars);

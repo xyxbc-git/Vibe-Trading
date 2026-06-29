@@ -2862,6 +2862,8 @@ function drawChart(){
   }
   // key 未变时不在这里更新蜡烛——由 WebSocket 实时 update()，避免 REST 旧值覆盖更新
   drawTrendlines();
+  drawFib();
+  drawChannel();
   drawPattern();
   drawOverlay();
 }
@@ -2887,8 +2889,10 @@ function drawVolMA(rows){
 }
 
 // ───────── 斜趋势线（连真实摆动高/低点，形成上下轨通道，对标 trendiq）─────────
-let trendSeries=[];
+let trendSeries=[], fibSeries=[], chanSeries=[];
 function clearTrend(){ trendSeries.forEach(s=>{ try{chart.removeSeries(s);}catch(e){} }); trendSeries=[]; }
+function clearFib(){ fibSeries.forEach(s=>{ try{chart.removeSeries(s);}catch(e){} }); fibSeries=[]; }
+function clearChan(){ chanSeries.forEach(s=>{ try{chart.removeSeries(s);}catch(e){} }); chanSeries=[]; }
 function pivots(rows,k,type){
   const out=[];
   for(let i=k;i<rows.length-k;i++){
@@ -2922,6 +2926,56 @@ function drawTrendlines(){
   const hs=pivots(win,k,'high'), ls=pivots(win,k,'low');
   if(hs.length>=2) addTrend(hs[hs.length-2],hs[hs.length-1],'rgba(214,184,92,0.78)');    // 上轨/阻力趋势线（雅致金，1px）
   if(ls.length>=2) addTrend(ls[ls.length-2],ls[ls.length-1],'rgba(64,196,160,0.78)');    // 下轨/支撑趋势线（雅致青，1px）
+}
+
+// ───────── 斐波那契回撤（近窗高低点定波段 · 黄金档 0.5/0.618 加粗，淡紫不抢戏）─────────
+const FIBS=[0.236,0.382,0.5,0.618,0.786];
+function drawFib(){
+  if(!chart||!lastKline) return;
+  clearFib();
+  const rows=lastKline.rows||[]; if(rows.length<30) return;
+  const win=rows.slice(-Math.min(rows.length,120));
+  let hi=-Infinity,lo=Infinity,hiI=0,loI=0;
+  for(let i=0;i<win.length;i++){ if(win[i].h>hi){hi=win[i].h;hiI=i;} if(win[i].l<lo){lo=win[i].l;loI=i;} }
+  if(hi<=lo) return;
+  const up=hiI>loI;                                   // 高点在低点之后=上涨波，回撤档从高往低
+  const t0=barTime(win[Math.min(hiI,loI)]), t1=barTime(rows[rows.length-1]);
+  const LS=LightweightCharts.LineStyle;
+  FIBS.forEach(r=>{
+    const lv = up ? hi-(hi-lo)*r : lo+(hi-lo)*r;
+    const gold = (r===0.5||r===0.618);
+    const s=chart.addSeries(LightweightCharts.LineSeries,{
+      color: gold?'rgba(168,85,247,0.85)':'rgba(168,85,247,0.34)', lineWidth:1,
+      lineStyle: gold?LS.Solid:LS.Dotted,
+      lastValueVisible:false, priceLineVisible:false, crosshairMarkerVisible:false, pointMarkersVisible:false
+    });
+    s.setData([{time:t0,value:+lv.toFixed(2)},{time:t1,value:+lv.toFixed(2)}]);
+    fibSeries.push(s);
+  });
+}
+
+// ───────── 回归通道（近窗收盘价最小二乘中轴 + 最大残差上下轨 · 中性石板色）─────────
+function drawChannel(){
+  if(!chart||!lastKline) return;
+  clearChan();
+  const rows=lastKline.rows||[]; if(rows.length<30) return;
+  const win=rows.slice(-Math.min(rows.length,100)); const n=win.length;
+  let sx=0,sy=0,sxx=0,sxy=0;
+  for(let i=0;i<n;i++){ const y=win[i].c; sx+=i; sy+=y; sxx+=i*i; sxy+=i*y; }
+  const denom=n*sxx-sx*sx, slope=denom===0?0:(n*sxy-sx*sy)/denom, intc=(sy-slope*sx)/n;
+  let mxP=-Infinity,mxN=Infinity;
+  for(let i=0;i<n;i++){ const res=win[i].c-(slope*i+intc); if(res>mxP)mxP=res; if(res<mxN)mxN=res; }
+  const t0=barTime(win[0]), t1=barTime(win[n-1]);
+  const y0=intc, y1=slope*(n-1)+intc;
+  const LS=LightweightCharts.LineStyle;
+  const mk=(a,b,col,st)=>{
+    const s=chart.addSeries(LightweightCharts.LineSeries,{color:col,lineWidth:1,lineStyle:st,
+      lastValueVisible:false,priceLineVisible:false,crosshairMarkerVisible:false,pointMarkersVisible:false});
+    s.setData([{time:t0,value:+a.toFixed(2)},{time:t1,value:+b.toFixed(2)}]); chanSeries.push(s);
+  };
+  mk(y0+mxP,y1+mxP,'rgba(148,163,184,0.42)',LS.Dashed);   // 上轨
+  mk(y0,y1,'rgba(148,163,184,0.78)',LS.Solid);            // 回归中轴
+  mk(y0+mxN,y1+mxN,'rgba(148,163,184,0.42)',LS.Dashed);   // 下轨
 }
 
 // ───────── V 形反转顶 形态（左低点→顶→右低点 阴影三角 · 自绘 canvas 图元）─────────
@@ -3028,9 +3082,9 @@ function drawOverlay(){
   const rows=lastKline.rows||[];
   const LS=LightweightCharts.LineStyle;
   priceLines.forEach(pl=>{ try{candleSeries.removePriceLine(pl);}catch(e){} }); priceLines=[];
-  function addPL(price,color,title,style){
+  function addPL(price,color,title,style,w){
     if(price==null||isNaN(+price)) return;
-    priceLines.push(candleSeries.createPriceLine({price:+price,color,lineWidth:(style===LS.Dotted?1:2),lineStyle:style,axisLabelVisible:true,title}));
+    priceLines.push(candleSeries.createPriceLine({price:+price,color,lineWidth:(w||(style===LS.Dotted?1:2)),lineStyle:style,axisLabelVisible:true,title}));
   }
   const d=lastDec||{}, fac=lastFac||{}, e=entryMid(d), pos=(d.suggested_position_pct||0)>0;
   if(pos){
@@ -3039,11 +3093,25 @@ function drawOverlay(){
     addPL(d.take_profit_ref,'#16c784','止盈',LS.Solid);
   }
   if(fac.price) addPL(+fac.price,'#9aa7b6','现价',LS.Dotted);
-  // 自动支撑/阻力（近窗摆动高低 · 细虚线，不抢戏）
-  const win=rows.slice(-60);
-  if(win.length>5){
-    addPL(Math.max(...win.map(r=>r.h)),'rgba(246,70,93,0.35)','阻力',LS.Dashed);
-    addPL(Math.min(...win.map(r=>r.l)),'rgba(14,203,129,0.35)','支撑',LS.Dashed);
+  // 自动支撑/阻力（摆动点聚类成多档 · 触碰越多线越粗越亮 = 越画越准）
+  const win=rows.slice(-Math.min(rows.length,120));
+  if(win.length>10){
+    const k=Math.max(2,Math.round(win.length/24));
+    const piv=[...pivots(win,k,'high'),...pivots(win,k,'low')].map(p=>p.v).sort((a,b)=>a-b);
+    const span=(Math.max(...win.map(r=>r.h))-Math.min(...win.map(r=>r.l)))||1;
+    const tol=span*0.012;
+    const cl=[];
+    for(const p of piv){ const tail=cl[cl.length-1];
+      if(tail&&Math.abs(p-tail.level)<=tol){ tail.sum+=p; tail.cnt++; tail.level=tail.sum/tail.cnt; }
+      else cl.push({sum:p,cnt:1,level:p}); }
+    const cur=(fac.price!=null?+fac.price:rows[rows.length-1].c);
+    cl.filter(c=>c.cnt>=2).sort((a,b)=>b.cnt-a.cnt).slice(0,4).forEach(c=>{
+      const isRes=c.level>=cur;
+      const strong=Math.min(c.cnt,5)/5;                                   // 触碰强度 0..1
+      const base=isRes?'246,70,93':'14,203,129';
+      addPL(+c.level.toFixed(2), 'rgba('+base+','+(0.3+0.5*strong).toFixed(2)+')',
+            (isRes?'阻力':'支撑')+'·'+c.cnt+'触', LS.Dashed, 1+Math.round(2*strong));
+    });
   }
   // 模拟买卖点 ▲▼
   const mks=[];

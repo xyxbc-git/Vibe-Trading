@@ -575,6 +575,8 @@ function aggregate(perMode: Record<DrawMode, ScoreResult>): number {
   return wSum > 0 ? acc / wSum : 0;
 }
 
+export type TuneStrategy = "full" | "coordinate";
+
 export interface TuneOptions {
   ratios?: number[];
   // Phase D-2 · warm start: a remembered "best so far" param set (e.g. what
@@ -582,7 +584,20 @@ export interface TuneOptions {
   // candidate so the returned result is never worse than the remembered params
   // on the current data — memory can only help, never regress.
   seed?: DrawParams;
+  // Search strategy. "full" is the exhaustive Cartesian grid (324 combos).
+  // "coordinate" is coordinate descent: optimise one axis at a time around the
+  // running best (~32 evals over 2 passes), the cheap cold-start path for very
+  // large bar counts where the full grid would block the render thread.
+  strategy?: TuneStrategy;
 }
+
+const GRID_AXES: (keyof DrawParams)[] = [
+  "swingLookback",
+  "srTolPct",
+  "fibWindow",
+  "channelWindow",
+  "rectWindow",
+];
 
 // Score one specific param set against the walk-forward folds, exposing the
 // default-params baseline + uplift just like gridSearchParams. Used for the
@@ -608,6 +623,7 @@ export function evaluateParams(
 
 export function gridSearchParams(base: BaseData, opts: TuneOptions = {}): TuneResult {
   const ratios = opts.ratios ?? WALK_FORWARD_RATIOS;
+  const strategy: TuneStrategy = opts.strategy ?? "full";
   // The default-params score is the baseline every tuned result is measured
   // against — computed once up front (walk-forward), then carried through.
   const basePerMode = walkForwardScore(base, DEFAULT_PARAMS, ratios);
@@ -622,28 +638,39 @@ export function gridSearchParams(base: BaseData, opts: TuneOptions = {}): TuneRe
     uplift: 0,
   };
 
+  // Evaluate a candidate and keep it if it strictly improves the running best.
+  const consider = (params: DrawParams) => {
+    const perMode = walkForwardScore(base, params, ratios);
+    const score = aggregate(perMode);
+    if (score > best.score) best = { params, score, perMode, baseline, uplift: score - baselineScore };
+  };
+
   // Warm start: a remembered param set is honoured as a guaranteed candidate, so
   // the result is monotonically non-worse than past memory even before the grid.
-  if (opts.seed) {
-    const seedPerMode = walkForwardScore(base, opts.seed, ratios);
-    const seedScore = aggregate(seedPerMode);
-    if (seedScore > best.score) {
-      best = { params: opts.seed, score: seedScore, perMode: seedPerMode, baseline, uplift: seedScore - baselineScore };
-    }
-  }
+  if (opts.seed) consider(opts.seed);
 
   // Too few bars to validate meaningfully — keep current best (default or seed).
   if (base.closes.length < 40) return best;
+
+  if (strategy === "coordinate") {
+    // Coordinate descent: optimise one axis at a time around the running best.
+    // Two passes give the axes a chance to settle. Every axis range includes the
+    // current value implicitly via `best`, so the result never regresses.
+    for (let pass = 0; pass < 2; pass++) {
+      for (const axis of GRID_AXES) {
+        const anchor = best.params;
+        for (const v of GRID[axis]) consider({ ...anchor, [axis]: v });
+      }
+    }
+    return best;
+  }
 
   for (const swingLookback of GRID.swingLookback) {
     for (const srTolPct of GRID.srTolPct) {
       for (const fibWindow of GRID.fibWindow) {
         for (const channelWindow of GRID.channelWindow) {
           for (const rectWindow of GRID.rectWindow) {
-            const params: DrawParams = { swingLookback, fibWindow, channelWindow, rectWindow, srTolPct };
-            const perMode = walkForwardScore(base, params, ratios);
-            const score = aggregate(perMode);
-            if (score > best.score) best = { params, score, perMode, baseline, uplift: score - baselineScore };
+            consider({ swingLookback, fibWindow, channelWindow, rectWindow, srTolPct });
           }
         }
       }

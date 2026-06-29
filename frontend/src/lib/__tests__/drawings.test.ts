@@ -128,3 +128,29 @@ describe("evaluateParams + warm start (Phase D-2)", () => {
     expect(res.score).toBeGreaterThanOrEqual(res.baseline.score - 1e-9);
   });
 });
+
+describe("coordinate-descent search strategy", () => {
+  it("is deterministic and never worse than the default baseline", () => {
+    const bars = makeBars(260);
+    const a = gridSearchParams(bars, { strategy: "coordinate" });
+    const b = gridSearchParams(bars, { strategy: "coordinate" });
+    expect(a.params).toEqual(b.params);
+    expect(a.score).toBeCloseTo(b.score, 9);
+    expect(a.score).toBeGreaterThanOrEqual(a.baseline.score - 1e-9);
+    expect(a.uplift).toBeGreaterThanOrEqual(-1e-9);
+  });
+
+  it("honours a warm seed (result never worse than the seed)", () => {
+    const bars = makeBars(240);
+    const seed = gridSearchParams(bars).params; // full-grid winner as memory
+    const seedScore = evaluateParams(bars, seed).score;
+    const res = gridSearchParams(bars, { strategy: "coordinate", seed });
+    expect(res.score).toBeGreaterThanOrEqual(seedScore - 1e-9);
+  });
+
+  it("keeps defaults on too-few bars regardless of strategy", () => {
+    const res = gridSearchParams(makeBars(20), { strategy: "coordinate" });
+    expect(res.params).toEqual(DEFAULT_PARAMS);
+    expect(res.uplift).toBe(0);
+  });
+});
