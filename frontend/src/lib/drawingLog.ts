@@ -23,6 +23,9 @@ export interface DrawingSample {
   hitRate: number;        // hits / touches (tuned params), 0..1
   baselineHitRate: number; // same mode under DEFAULT_PARAMS, 0..1
   uplift: number;         // hitRate - baselineHitRate
+  // Phase D-3: market-context feature vector captured at sample time (optional
+  // so older stored samples without it still load). Fed to the structured model.
+  features?: number[];
 }
 
 export interface ModeSummary {

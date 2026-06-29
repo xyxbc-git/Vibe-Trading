@@ -9,6 +9,7 @@ import { echarts, CHART_GROUP, connectCharts } from "@/lib/echarts";
 import { useDarkMode } from "@/hooks/useDarkMode";
 import { computeDrawings, gridSearchParams, evaluateParams, scoreDrawings, DEFAULT_PARAMS, type DrawMode, type DrawParams } from "@/lib/drawings";
 import { appendLog, loadLog, clearLog, summarize, blendReliability, type DrawingSample } from "@/lib/drawingLog";
+import { extractFeatures, trainModel, predictProba, type TrainSample } from "@/lib/drawingModel";
 
 type Sub = "vol" | "macd" | "rsi" | "kdj";
 type Range = "1M" | "3M" | "6M" | "1Y" | "ALL";
@@ -261,6 +262,8 @@ export function CandlestickChart({ data, markers, indicators, height = 500, symb
         hitRate: s.hitRate,
         baselineHitRate: b.hitRate,
         uplift: s.hitRate - b.hitRate,
+        // Phase D-3: capture market context so the structured model has features.
+        features: extractFeatures(baseData, s.touches),
       });
     }
     appendLog(symbol, samples);
