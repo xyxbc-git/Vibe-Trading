@@ -7,7 +7,7 @@ import { getChartTheme } from "@/lib/chart-theme";
 import { abbreviateNum } from "@/lib/formatters";
 import { echarts, CHART_GROUP, connectCharts } from "@/lib/echarts";
 import { useDarkMode } from "@/hooks/useDarkMode";
-import { computeDrawings, gridSearchParams, evaluateParams, scoreDrawings, DEFAULT_PARAMS, type DrawMode, type DrawParams } from "@/lib/drawings";
+import { computeDrawings, computeSmartLevels, computeBias, gridSearchParams, evaluateParams, scoreDrawings, DEFAULT_PARAMS, type DrawMode, type DrawParams } from "@/lib/drawings";
 import { appendLog, loadLog, clearLog, summarize, blendReliability, type DrawingSample } from "@/lib/drawingLog";
 import { extractFeatures, trainModel, predictProba, buildTrainingSet } from "@/lib/drawingModel";
 
@@ -110,6 +110,10 @@ export function CandlestickChart({ data, markers, indicators, height = 500, symb
   const [draws, setDraws] = useState<Set<DrawMode>>(new Set());
   const [showMenu, setShowMenu] = useState(false);
   const [autoTune, setAutoTune] = useState(true);
+  // Beginner-friendly "smart" view: just the nearest support/resistance zones +
+  // the current price, in plain Chinese. On by default so the chart is readable
+  // out of the box; the 5 pro line types stay available as advanced toggles.
+  const [smart, setSmart] = useState(true);
   const { dark } = useDarkMode();
 
   const toggleOverlay = useCallback((id: Overlay) => {
@@ -339,6 +343,62 @@ export function CandlestickChart({ data, markers, indicators, height = 500, symb
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [draws, baseData, dark, tuneInfo, learnedReliability]);
 
+  // Smart levels (nearest support/resistance zones + current price), computed
+  // from the same tuned params. This is the "傻子都看得懂" layer: at most two
+  // zones, plain-language labels, drawn as bands not razor-thin lines.
+  const smartLevels = useMemo(() => {
+    if (!smart || baseData.closes.length < 20) return null;
+    return computeSmartLevels(
+      { dates: baseData.dates, closes: baseData.closes, highs: baseData.highs, lows: baseData.lows },
+      tuneInfo.params,
+    );
+  }, [smart, baseData, tuneInfo.params]);
+
+  // Directional read (偏多/偏空/观望) derived from where 现价 sits vs the smart
+  // zones — gives an explicit short hint, not just long. Bidirectional.
+  const smartBias = useMemo(() => (smartLevels ? computeBias(smartLevels) : null), [smartLevels]);
+
+  const smartOverlay = useMemo(() => {
+    const t = getChartTheme();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const lines: any[] = [];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const areas: any[] = [];
+    if (!smartLevels) return { lines, areas };
+
+    const fmt = (v: number) => v.toLocaleString("en-US", { maximumFractionDigits: 2 });
+
+    if (smartLevels.resistance) {
+      const z = smartLevels.resistance;
+      areas.push([
+        {
+          yAxis: z.lower,
+          itemStyle: { color: t.downColor + "22" },
+          label: { show: true, formatter: `压力位 ${fmt(z.level)} · 碰过${z.touches}次`, position: "insideStartTop", color: t.downColor, fontSize: 11, fontWeight: "bold" },
+        },
+        { yAxis: z.upper },
+      ]);
+    }
+    if (smartLevels.support) {
+      const z = smartLevels.support;
+      areas.push([
+        {
+          yAxis: z.lower,
+          itemStyle: { color: t.upColor + "22" },
+          label: { show: true, formatter: `支撑位 ${fmt(z.level)} · 碰过${z.touches}次`, position: "insideStartBottom", color: t.upColor, fontSize: 11, fontWeight: "bold" },
+        },
+        { yAxis: z.upper },
+      ]);
+    }
+    lines.push({
+      yAxis: smartLevels.price,
+      lineStyle: { color: t.textColor, width: 1.5 },
+      label: { show: true, formatter: `现价 ${fmt(smartLevels.price)}`, position: "insideEndTop", color: "#fff", fontSize: 11, fontWeight: "bold", backgroundColor: t.textColor, padding: [2, 5], borderRadius: 3 },
+    });
+    return { lines, areas };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [smartLevels, dark]);
+
   // Init chart instance — only on mount/unmount and dark mode change
   useEffect(() => {
     if (!containerRef.current || data.length === 0) return;
@@ -449,6 +509,11 @@ export function CandlestickChart({ data, markers, indicators, height = 500, symb
     const maxBars = RANGE_BARS[range];
     const defaultStart = maxBars >= data.length ? 0 : Math.max(0, 100 - (maxBars / data.length) * 100);
 
+    // Merge the advanced (5-type) drawings with the beginner-friendly smart
+    // zones into one markLine/markArea payload.
+    const allLines = [...drawingOverlay.lines, ...smartOverlay.lines];
+    const allAreas = [...drawingOverlay.areas, ...smartOverlay.areas];
+
     chart.setOption({
       backgroundColor: "transparent",
       tooltip: {
@@ -502,15 +567,15 @@ export function CandlestickChart({ data, markers, indicators, height = 500, symb
           name: "K", type: "candlestick", data: candle, xAxisIndex: 0, yAxisIndex: 0,
           itemStyle: { color: t.upColor, color0: t.downColor, borderColor: t.upColor, borderColor0: t.downColor },
           markPoint: marks.length > 0 ? { data: marks, symbolSize: 28, tooltip: { formatter: (p: { name?: string; value?: string }) => p.name || p.value || "" } } : undefined,
-          markLine: drawingOverlay.lines.length > 0 ? { silent: true, symbol: ["none", "none"], animation: false, data: drawingOverlay.lines } : undefined,
-          markArea: drawingOverlay.areas.length > 0 ? { silent: true, data: drawingOverlay.areas } : undefined,
+          markLine: allLines.length > 0 ? { silent: true, symbol: ["none", "none"], animation: false, data: allLines } : undefined,
+          markArea: allAreas.length > 0 ? { silent: true, data: allAreas } : undefined,
         },
         ...overlaySeries,
         ...extraSeries,
         ...subSeries,
       ],
     }, true);
-  }, [data, markers, baseData, indicatorCache, extraIndicators, drawingOverlay, sub, range, overlays, dark]);
+  }, [data, markers, baseData, indicatorCache, extraIndicators, drawingOverlay, smartOverlay, sub, range, overlays, dark]);
 
   if (data.length === 0) {
     return <div className="text-muted-foreground text-sm p-4">No price data</div>;
@@ -566,6 +631,35 @@ export function CandlestickChart({ data, markers, indicators, height = 500, symb
             <button key={id} onClick={() => setSub(id)} className={cn("px-1.5 py-0.5 rounded text-[10px] font-mono uppercase transition-colors", sub === id ? "bg-primary/15 text-primary font-medium" : "text-muted-foreground/50 hover:text-muted-foreground")}>{id}</button>
           ))}
         </div>
+
+        <div className="w-px h-3 bg-border/40" />
+
+        {/* Smart view — beginner-friendly: nearest support/resistance zones + 现价 */}
+        <button
+          onClick={() => setSmart(v => !v)}
+          title="智能：只标注离现价最近的压力位、支撑位（区域带）和现价，一眼看懂"
+          className={cn("px-1.5 py-0.5 rounded text-[10px] transition-colors", smart ? "bg-primary/15 text-primary font-medium" : "text-muted-foreground/50 hover:text-muted-foreground")}
+        >
+          智能{smart ? "·开" : "·关"}
+        </button>
+
+        {/* Directional read — explicit 偏多/偏空/观望 (bidirectional short hint) */}
+        {smart && smartBias && (
+          <span
+            title={smartBias.detail}
+            className={cn(
+              "px-1.5 py-0.5 rounded text-[10px] font-medium",
+              smartBias.dir === "short"
+                ? "bg-danger/15 text-danger"
+                : smartBias.dir === "long"
+                ? "bg-success/15 text-success"
+                : "bg-muted/40 text-muted-foreground",
+            )}
+          >
+            {smartBias.dir === "short" ? "▼ " : smartBias.dir === "long" ? "▲ " : "= "}
+            {smartBias.label} · {smartBias.detail}
+          </span>
+        )}
 
         <div className="w-px h-3 bg-border/40" />
 

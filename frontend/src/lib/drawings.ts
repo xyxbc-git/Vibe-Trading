@@ -280,6 +280,101 @@ function rectAreas(base: BaseData, c: DrawColors, p: DrawParams, rel?: number) {
   ]];
 }
 
+// ---------------------------------------------------------------------------
+// Smart levels — the beginner-friendly "professional" view. Instead of stacking
+// five overlapping line types with cryptic labels, surface only the two levels
+// that actually matter right now: the nearest strong resistance ABOVE the
+// current price and the nearest strong support BELOW it, each drawn as a *zone*
+// (a band, not a razor-thin line) because price overshoots in real markets.
+// This mirrors the TradingView 2026 best practice: mark fewer levels, think in
+// zones, label them in plain language.
+// ---------------------------------------------------------------------------
+
+export interface SmartZone {
+  kind: "support" | "resistance";
+  level: number; // cluster centre price
+  lower: number; // band bottom
+  upper: number; // band top
+  touches: number; // how many swing pivots formed the cluster (conviction)
+}
+
+export interface SmartLevels {
+  price: number; // current price (last close)
+  resistance: SmartZone | null; // nearest strong zone above price
+  support: SmartZone | null; // nearest strong zone below price
+}
+
+// Half-width of a zone band as a fraction of price (≈0.4% each side). Markets
+// react across an area, so a band reads far clearer than a 1px line.
+export const SMART_BAND_PCT = 0.004;
+
+export function computeSmartLevels(
+  base: BaseData,
+  params: DrawParams = DEFAULT_PARAMS,
+  bandPct: number = SMART_BAND_PCT,
+): SmartLevels {
+  const { closes, highs, lows } = base;
+  const n = closes.length;
+  if (n === 0) return { price: 0, resistance: null, support: null };
+
+  const price = closes[n - 1];
+  const swings = detectSwings(highs, lows, params.swingLookback);
+  const min = Math.min(...lows);
+  const max = Math.max(...highs);
+  const tol = (max - min || 1) * params.srTolPct;
+  const clusters = clusterLevels(swings, tol); // count >= 2, sorted by count desc
+
+  const toZone = (level: number, touches: number): SmartZone => ({
+    kind: level >= price ? "resistance" : "support",
+    level: +level.toFixed(2),
+    lower: +(level * (1 - bandPct)).toFixed(2),
+    upper: +(level * (1 + bandPct)).toFixed(2),
+    touches,
+  });
+
+  let resistance: SmartZone | null = null; // nearest above price
+  let support: SmartZone | null = null; // nearest below price
+  for (const cl of clusters) {
+    if (cl.level >= price) {
+      if (!resistance || cl.level < resistance.level) resistance = toZone(cl.level, cl.count);
+    } else {
+      if (!support || cl.level > support.level) support = toZone(cl.level, cl.count);
+    }
+  }
+  return { price: +price.toFixed(2), resistance, support };
+}
+
+// ---------------------------------------------------------------------------
+// Directional read — turn the neutral support/resistance zones into a plain
+// "偏多 / 偏空 / 观望" call, so beginners get an explicit *short* hint (not just
+// long). Pure geometry: where the current price sits relative to the nearest
+// zones. Bidirectional by construction.
+// ---------------------------------------------------------------------------
+
+export type BiasDir = "long" | "short" | "neutral";
+
+export interface SmartBias {
+  dir: BiasDir;
+  label: string; // 偏多 / 偏空 / 观望
+  detail: string; // plain-language reason
+}
+
+// Within this fraction of price a level counts as "贴近" (about to react).
+export const BIAS_NEAR_PCT = 0.015;
+
+export function computeBias(levels: SmartLevels, nearPct: number = BIAS_NEAR_PCT): SmartBias {
+  const { price, resistance: R, support: S } = levels;
+  if (!price) return { dir: "neutral", label: "观望", detail: "数据不足" };
+  // Breakouts first — a clean break flips the bias.
+  if (R && price > R.upper) return { dir: "long", label: "偏多", detail: "突破压力 · 转多" };
+  if (S && price < S.lower) return { dir: "short", label: "偏空", detail: "跌破支撑 · 转空" };
+  const dR = R ? (R.level - price) / price : Infinity; // distance up to resistance
+  const dS = S ? (price - S.level) / price : Infinity; // distance down to support
+  if (dR <= nearPct && dR <= dS) return { dir: "short", label: "偏空", detail: "贴近压力 · 可考虑做空 / 减仓" };
+  if (dS <= nearPct && dS < dR) return { dir: "long", label: "偏多", detail: "贴近支撑 · 可考虑做多" };
+  return { dir: "neutral", label: "观望", detail: "区间中部 · 等突破方向" };
+}
+
 // Aggregate all active modes into a single markLine/markArea payload.
 export function computeDrawings(
   modes: Set<DrawMode>,

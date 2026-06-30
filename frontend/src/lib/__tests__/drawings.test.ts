@@ -4,6 +4,8 @@ import {
   evaluateParams,
   scoreDrawings,
   walkForwardScore,
+  computeSmartLevels,
+  SMART_BAND_PCT,
   WALK_FORWARD_RATIOS,
   DEFAULT_PARAMS,
   type BaseData,
@@ -152,5 +154,60 @@ describe("coordinate-descent search strategy", () => {
     const res = gridSearchParams(makeBars(20), { strategy: "coordinate" });
     expect(res.params).toEqual(DEFAULT_PARAMS);
     expect(res.uplift).toBe(0);
+  });
+});
+
+describe("computeSmartLevels", () => {
+  it("returns the current price and at most one support below + one resistance above", () => {
+    const bars = makeBars(220);
+    const sl = computeSmartLevels(bars);
+
+    expect(sl.price).toBeCloseTo(bars.closes[bars.closes.length - 1], 2);
+    if (sl.resistance) {
+      expect(sl.resistance.kind).toBe("resistance");
+      expect(sl.resistance.level).toBeGreaterThanOrEqual(sl.price);
+      expect(sl.resistance.touches).toBeGreaterThanOrEqual(2);
+    }
+    if (sl.support) {
+      expect(sl.support.kind).toBe("support");
+      expect(sl.support.level).toBeLessThan(sl.price);
+      expect(sl.support.touches).toBeGreaterThanOrEqual(2);
+    }
+  });
+
+  it("builds each level as a band around its centre (lower < level < upper)", () => {
+    const bars = makeBars(220);
+    const sl = computeSmartLevels(bars, DEFAULT_PARAMS, SMART_BAND_PCT);
+    for (const z of [sl.support, sl.resistance]) {
+      if (!z) continue;
+      expect(z.lower).toBeLessThan(z.level);
+      expect(z.upper).toBeGreaterThan(z.level);
+      // Band half-width is ≈ SMART_BAND_PCT of the level on each side.
+      expect((z.level - z.lower) / z.level).toBeCloseTo(SMART_BAND_PCT, 2);
+      expect((z.upper - z.level) / z.level).toBeCloseTo(SMART_BAND_PCT, 2);
+    }
+  });
+
+  it("picks the NEAREST level on each side, not just the strongest", () => {
+    const bars = makeBars(220);
+    const sl = computeSmartLevels(bars);
+    // No other qualifying cluster should sit strictly between price and the
+    // chosen level on either side (i.e. the chosen ones are the closest).
+    if (sl.resistance && sl.support) {
+      expect(sl.support.level).toBeLessThan(sl.price);
+      expect(sl.resistance.level).toBeGreaterThanOrEqual(sl.price);
+      expect(sl.support.level).toBeLessThan(sl.resistance.level);
+    }
+  });
+
+  it("degrades safely on empty / tiny inputs", () => {
+    const empty = computeSmartLevels({ dates: [], closes: [], highs: [], lows: [] });
+    expect(empty).toEqual({ price: 0, resistance: null, support: null });
+
+    const tiny = computeSmartLevels(makeBars(3));
+    expect(tiny.price).toBeGreaterThan(0);
+    // Too few bars to cluster two pivots → no zones, but never throws.
+    expect(tiny.resistance).toBeNull();
+    expect(tiny.support).toBeNull();
   });
 });

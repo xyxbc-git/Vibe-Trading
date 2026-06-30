@@ -1,8 +1,9 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import { usePolling } from "@/hooks/useApi";
 import { useSymbol } from "@/hooks/useSymbol";
 import { api } from "@/api/client";
 import KlineChart from "@/components/charts/KlineChart";
+import { computeSmartLevels, computeBias, type SmartBias } from "@/lib/smartLevels";
 import { CandlestickChart } from "lucide-react";
 import { clsx } from "clsx";
 import type {
@@ -25,6 +26,7 @@ const LIMITS: Record<Timeframe, number> = {
 
 export default function Chart() {
   const [tf, setTf] = useState<Timeframe>("15m");
+  const [smart, setSmart] = useState(true);
   const { symbol } = useSymbol();
 
   const { data: rawKline, loading, error } = usePolling(
@@ -63,6 +65,72 @@ export default function Chart() {
 
   const lastCandle = candles.length > 0 ? candles[candles.length - 1] : null;
 
+  // A · 纯几何方向：现价相对支撑/压力的位置 → 偏多/偏空/观望（双向）
+  const smartBias = useMemo<SmartBias | null>(() => {
+    if (!smart || candles.length < 20) return null;
+    const highs = candles.map((c) => c.high);
+    const lows = candles.map((c) => c.low);
+    const closes = candles.map((c) => c.close);
+    return computeBias(computeSmartLevels(highs, lows, closes));
+  }, [smart, candles]);
+
+  // B · AI 决策方向：拉 /actions/brief 的 偏多/偏空/中性（含信心分、建议仓位）
+  type AiDir = { label: string; dir: "long" | "short" | "neutral"; score: number; pos: number };
+  const [aiDir, setAiDir] = useState<AiDir | null>(null);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiErr, setAiErr] = useState<string | null>(null);
+
+  // Stale once the symbol changes — clear the previous symbol's decision.
+  useEffect(() => {
+    setAiDir(null);
+    setAiErr(null);
+  }, [symbol]);
+
+  const loadBrief = async () => {
+    setAiLoading(true);
+    setAiErr(null);
+    try {
+      const res = (await api.actionBrief(symbol)) as {
+        ok?: boolean;
+        data?: { decision?: Record<string, unknown> };
+        error?: string;
+      };
+      const dec = res?.data?.decision;
+      if (!dec) {
+        setAiErr(res?.error ?? "无决策数据");
+        setAiDir(null);
+        return;
+      }
+      const direction = String(dec.direction ?? "");
+      const dir: AiDir["dir"] = direction.startsWith("偏多")
+        ? "long"
+        : direction.startsWith("偏空")
+          ? "short"
+          : "neutral";
+      setAiDir({
+        label: direction || "中性观望",
+        dir,
+        score: Number(dec.conviction_score ?? 0),
+        pos: Number(dec.suggested_position_pct ?? 0),
+      });
+    } catch (e) {
+      setAiErr(e instanceof Error ? e.message : String(e));
+      setAiDir(null);
+    } finally {
+      setAiLoading(false);
+    }
+  };
+
+  const biasCls = (dir: string) =>
+    clsx(
+      "px-2 py-1 rounded text-sm font-medium border",
+      dir === "short"
+        ? "text-jarvis-red border-jarvis-red"
+        : dir === "long"
+          ? "text-jarvis-green border-jarvis-green"
+          : "text-jarvis-text-secondary border-jarvis-border",
+    );
+
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
@@ -70,21 +138,69 @@ export default function Chart() {
           <CandlestickChart size={22} />
           {symbol.replace("USDT", "/USDT")}
         </h1>
-        <div className="flex gap-1 bg-jarvis-card border border-jarvis-border rounded-lg p-1">
-          {TIMEFRAMES.map((t) => (
-            <button
-              key={t}
-              onClick={() => setTf(t)}
-              className={clsx(
-                "px-3 py-1 text-sm rounded-md transition-colors",
-                t === tf
-                  ? "bg-jarvis-blue text-white"
-                  : "text-jarvis-text-secondary hover:text-jarvis-text",
-              )}
-            >
-              {t}
-            </button>
-          ))}
+        <div className="flex items-center gap-2 flex-wrap justify-end">
+          <button
+            onClick={() => setSmart((v) => !v)}
+            title="智能：在图上标注离现价最近的压力位、支撑位和现价，一眼看懂"
+            className={clsx(
+              "px-3 py-1 text-sm rounded-md border transition-colors",
+              smart
+                ? "bg-jarvis-blue/15 border-jarvis-blue text-jarvis-blue"
+                : "bg-jarvis-card border-jarvis-border text-jarvis-text-secondary hover:text-jarvis-text",
+            )}
+          >
+            智能 {smart ? "·开" : "·关"}
+          </button>
+
+          {/* A · 几何方向（双向，含明确做空提示），随智能视图自动出 */}
+          {smart && smartBias && (
+            <span className={biasCls(smartBias.dir)} title={smartBias.detail}>
+              {smartBias.dir === "short" ? "▼ " : smartBias.dir === "long" ? "▲ " : "= "}
+              {smartBias.label} · {smartBias.detail}
+            </span>
+          )}
+
+          {/* B · AI 决策方向（按需拉 brief，含偏空） */}
+          <button
+            onClick={loadBrief}
+            disabled={aiLoading}
+            title="拉取 AI 决策简报：偏多 / 偏空 / 中性观望（含信心分与建议仓位）"
+            className={clsx(
+              "px-3 py-1 text-sm rounded-md border transition-colors",
+              "bg-jarvis-card border-jarvis-border text-jarvis-text-secondary hover:text-jarvis-text",
+              aiLoading && "opacity-60 cursor-wait",
+            )}
+          >
+            {aiLoading ? "AI 决策…" : "AI 决策"}
+          </button>
+          {aiDir && (
+            <span className={biasCls(aiDir.dir)} title={`AI 决策：${aiDir.label}`}>
+              {aiDir.dir === "short" ? "▼ " : aiDir.dir === "long" ? "▲ " : "= "}
+              {aiDir.label} · 信心 {aiDir.score} · 仓位 {aiDir.pos}%
+            </span>
+          )}
+          {aiErr && (
+            <span className="px-2 py-1 rounded text-sm text-jarvis-yellow" title={aiErr}>
+              AI 决策失败
+            </span>
+          )}
+
+          <div className="flex gap-1 bg-jarvis-card border border-jarvis-border rounded-lg p-1">
+            {TIMEFRAMES.map((t) => (
+              <button
+                key={t}
+                onClick={() => setTf(t)}
+                className={clsx(
+                  "px-3 py-1 text-sm rounded-md transition-colors",
+                  t === tf
+                    ? "bg-jarvis-blue text-white"
+                    : "text-jarvis-text-secondary hover:text-jarvis-text",
+                )}
+              >
+                {t}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
@@ -94,6 +210,7 @@ export default function Chart() {
             data={candles}
             volumeData={volumes}
             height={Math.max(400, window.innerHeight - 280)}
+            showSmart={smart}
           />
         ) : (
           <div
