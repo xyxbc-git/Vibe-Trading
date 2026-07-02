@@ -31,7 +31,9 @@ from typing import Any, Optional
 
 from jarvis_ml_predict import (
     _HAS_NUMPY,
-    _fit_predict_classifier,
+    attribution_text,
+    fit_predict_explain,
+    humanize_attribution,
     walk_forward_classify,
 )
 
@@ -52,6 +54,20 @@ FEATURE_NAMES_4H = [
     "hour_sin", "hour_cos",        # bar 开盘 UTC 小时周期编码
     "funding",                      # 当期资金费率（缺则 0）
 ]
+
+# 归因人话模板（hour_sin/cos 编码维度单看无意义，不入话）
+WHY_TEMPLATES_4H = {
+    "ret_1": lambda v: f"上根4h {v:+.2%}",
+    "ret_6": lambda v: f"24小时动量 {v:+.2%}",
+    "ret_42": lambda v: f"7天动量 {v:+.2%}",
+    "vol_30": lambda v: f"短期波动率 {v:.2%}",
+    "dist_ma50": lambda v: f"价{'高于' if v >= 0 else '低于'}50均线 {abs(v):.2%}",
+    "dist_ma200": lambda v: f"价{'高于' if v >= 0 else '低于'}200均线 {abs(v):.2%}",
+    "rsi_14": lambda v: f"RSI {v * 100:.0f}{'（超买）' if v > 0.7 else ('（超卖）' if v < 0.3 else '')}",
+    "vol_zscore": lambda v: f"量能{'放大' if v > 0 else '萎缩'} {abs(v):.1f}σ",
+    "atr_pct": lambda v: f"ATR波动 {v:.2%}",
+    "funding": lambda v: f"资金费率 {v:+.4%}",
+}
 
 
 def _pct(a: float, b: float) -> float:
@@ -308,7 +324,7 @@ def predict_latest(symbol: str = "BTCUSDT", n_splits: int = 5,
         latest = ds["latest_features"]
         if latest is None:
             return {"symbol": symbol, "tradeable": False, "reason": "最新 bar 特征缺失"}
-        preds, proba = _fit_predict_classifier(ds["X"], ds["y_class"], [latest])
+        preds, proba, contribs = fit_predict_explain(ds["X"], ds["y_class"], [latest])
         cls = int(preds[0])
         name = {0: "跌", 1: "震荡", 2: "涨"}
         prob = None
@@ -316,6 +332,9 @@ def predict_latest(symbol: str = "BTCUSDT", n_splits: int = 5,
             classes = sorted(set(ds["y_class"]))
             idx = classes.index(cls) if cls in classes else None
             prob = round(float(proba[0][idx]), 4) if idx is not None else None
+        why = humanize_attribution(FEATURE_NAMES_4H, latest, contribs[0],
+                                   WHY_TEMPLATES_4H)
+        why_text = attribution_text(name[cls], why)
 
         price = ds["latest_close"]
         atr_pct = ds["latest_atr_pct"] or 0.0
@@ -339,6 +358,8 @@ def predict_latest(symbol: str = "BTCUSDT", n_splits: int = 5,
             "oos_hit_rate": gate["oos_hit_rate"],
             "p_value": gate["p_value"],
             "n_samples": gate["n_samples"],
+            "why": why,
+            "why_text": why_text,
             **({"reason": gate["reason"]} if not gate["tradeable"] else {}),
         }
     except Exception as e:  # noqa: BLE001 — 预测失败绝不拖垮交易心跳

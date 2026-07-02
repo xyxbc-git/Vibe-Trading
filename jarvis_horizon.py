@@ -27,8 +27,11 @@ from typing import Optional
 from jarvis_ml_predict import (
     _HAS_NUMPY,
     _HAS_SKLEARN,
-    _fit_predict_classifier,
+    FEATURE_NAMES,
+    attribution_text,
     build_dataset,
+    fit_predict_explain,
+    humanize_attribution,
 )
 from jarvis_intraday_predict import (
     GATE_MAX_P,
@@ -38,6 +41,20 @@ from jarvis_intraday_predict import (
 
 # 支持的周期（天）；驾驶舱三周期 = 4h（盘中引擎）+ 这里的 15/30
 HORIZONS = (15, 30)
+
+# 归因人话模板（日线特征，与 jarvis_ml_predict.FEATURE_NAMES 对齐）
+WHY_TEMPLATES_DAILY = {
+    "ret_1": lambda v: f"昨日 {v:+.2%}",
+    "ret_7": lambda v: f"7天动量 {v:+.2%}",
+    "ret_30": lambda v: f"30天动量 {v:+.2%}",
+    "vol_30": lambda v: f"30日波动率 {v:.2%}",
+    "dist_ma50": lambda v: f"价{'高于' if v >= 0 else '低于'}50日线 {abs(v):.2%}",
+    "dist_ma200": lambda v: f"价{'高于' if v >= 0 else '低于'}200日线 {abs(v):.2%}",
+    "drawdown": lambda v: f"距历史高点回撤 {abs(v):.1%}",
+    "fng": lambda v: f"恐慌贪婪指数 {v:.0f}{'（极恐）' if v < 20 else ('（极贪）' if v > 80 else '')}",
+    "fng_chg_7": lambda v: f"情绪7日{'回暖' if v >= 0 else '转冷'} {abs(v):.0f} 点",
+    "funding": lambda v: f"资金费率 {v:+.4%}",
+}
 
 
 def _range_thresh(horizon_days: int) -> float:
@@ -138,13 +155,17 @@ def predict_horizon(symbol: str = "BTCUSDT", horizon_days: int = 15,
         if latest is None:
             return {"symbol": symbol, "horizon_days": horizon_days,
                     "tradeable": False, "reason": "最新特征缺失"}
-        preds, proba = _fit_predict_classifier(ds["X"], ds["y_class"], [latest])
+        preds, proba, contribs = fit_predict_explain(ds["X"], ds["y_class"], [latest])
         cls = int(preds[0])
         prob = None
         if proba is not None:
             classes = sorted(set(ds["y_class"]))
             if cls in classes:
                 prob = round(float(proba[0][classes.index(cls)]), 4)
+        direction = {0: "跌", 1: "震荡", 2: "涨"}[cls]
+        why = humanize_attribution(FEATURE_NAMES, latest, contribs[0],
+                                   WHY_TEMPLATES_DAILY)
+        why_text = attribution_text(direction, why)
 
         # 点位：分位回归 → 目标价（p50）与区间（p10~p90）
         price = prices[dates[-1]]
@@ -159,8 +180,10 @@ def predict_horizon(symbol: str = "BTCUSDT", horizon_days: int = 15,
             "symbol": symbol,
             "horizon_days": horizon_days,
             "as_of_date": dates[-1],
-            "direction": {0: "跌", 1: "震荡", 2: "涨"}[cls],
+            "direction": direction,
             "prob": prob,
+            "why": why,
+            "why_text": why_text,
             "entry": price,
             "target": target,
             "target_lo": target_lo,

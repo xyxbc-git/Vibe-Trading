@@ -1860,6 +1860,120 @@ def api_horizons(symbol: str = "BTCUSDT"):
     return JSONResponse(out)
 
 
+def _why_local_summary(sym: str, ip: dict | None, hz: dict, dec: dict) -> str:
+    """无 LLM 时的本地多维总结：把三周期归因 + 30天决策理由拼成通顺中文。"""
+    parts = []
+    if ip and ip.get("direction"):
+        seg = f"4小时看{ip['direction']}"
+        if ip.get("prob") is not None:
+            seg += f"（{round(ip['prob'] * 100)}%）"
+        if ip.get("why_text"):
+            seg += f"：{ip['why_text']}"
+        if not ip.get("tradeable"):
+            seg += "。未过精准度门禁，仅观察不下单"
+        parts.append(seg)
+    for h in ("15", "30"):
+        p = hz.get(h)
+        if p and p.get("direction"):
+            seg = f"{h}天看{p['direction']}"
+            if p.get("prob") is not None:
+                seg += f"（{round(p['prob'] * 100)}%）"
+            if p.get("target"):
+                seg += f"，目标 {p['target']}"
+            if p.get("why_text"):
+                seg += f"：{p['why_text']}"
+            parts.append(seg)
+    reasons = (dec or {}).get("reasons") or []
+    if reasons:
+        parts.append("长线因子面：" + "；".join(str(r) for r in reasons[:3]))
+    if not parts:
+        return "暂无足够数据生成分析（预测计算中或数据源不可达）。"
+    return "。\n".join(parts) + "。\n（模拟盘研究，不构成投资建议）"
+
+
+@app.get("/api/why")
+def api_why(symbol: str = "BTCUSDT"):
+    """多周期「为什么」聚合：4h/15天/30天归因 + 30天决策理由 → AI/本地总结。
+
+    整体结果缓存 5 分钟（含 LLM 调用），防止前端轮询烧 token。
+    """
+    sym = symbol.upper().replace("-", "").replace("/", "")
+    if not sym.endswith(("USDT", "USDC")):
+        sym += "USDT"
+    return JSONResponse(_cached(f"why:{sym}", 300, lambda: _why_compute(sym)))
+
+
+def _why_compute(sym: str) -> dict:
+    ip = None
+    try:
+        import jarvis_intraday_trader as jit
+        for p in jit.stats().get("recent_predictions", []):
+            if p.get("symbol") == sym:
+                ip = p
+                break
+    except Exception:  # noqa: BLE001
+        pass
+    hz = {}
+    try:
+        cache = _horizon_disk_load()
+        for h in ("15", "30"):
+            hit = cache.get(f"{sym}:{h}")
+            if hit:
+                hz[h] = hit.get("data") or {}
+    except Exception:  # noqa: BLE001
+        pass
+    dec = {}
+    try:
+        snap = _cached(f"snap:{sym}", 300, lambda: jb.build(sym))
+        dec = (snap or {}).get("decision", {}) or {}
+    except Exception:  # noqa: BLE001
+        pass
+    local = _why_local_summary(sym, ip, hz, dec)
+
+    ans = None
+    cfg = _llm_config()
+    if cfg:
+        context = {
+            "symbol": sym,
+            "pred_4h": {k: ip.get(k) for k in ("direction", "prob", "tradeable",
+                                               "why_text", "reason", "entry",
+                                               "stop", "take")} if ip else None,
+            "pred_15d": hz.get("15"),
+            "pred_30d": hz.get("30"),
+            "decision_30d_reasons": (dec or {}).get("reasons", [])[:5],
+        }
+        system = (
+            "你是『贾维斯』加密交易助手。基于给定的多周期量化预测（4小时/15天/30天，"
+            "每条含方向、概率、目标点位、特征归因 why_text、精准度门禁状态），"
+            "写一段 150 字以内的多维度行情解读：① 三个周期的结论是否一致；"
+            "② 关键驱动因素（引用归因里的具体数字）；③ 门禁未过的周期明确提示仅供参考。"
+            "不得编造数据，缺失就说缺失。简体中文，最后一句注明模拟盘研究不构成投资建议。"
+        )
+        payload = json.dumps({
+            "model": cfg["model"],
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
+            ],
+            "temperature": 0.4,
+            "max_tokens": 400,
+        }, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            cfg["base"] + "/chat/completions", data=payload, method="POST",
+            headers={"Authorization": f"Bearer {cfg['key']}",
+                     "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            ans = (body.get("choices") or [{}])[0].get("message", {}) \
+                .get("content", "").strip() or None
+        except Exception:  # noqa: BLE001
+            ans = None
+    return {"symbol": sym, "summary": ans or local,
+            "engine": "llm" if ans else "local",
+            "pred_4h": ip, "horizons": hz}
+
+
 @app.get("/api/watchlist")
 def api_watchlist_get():
     import jarvis_config as jc_mod
@@ -2726,14 +2840,14 @@ COCKPIT_HTML = r"""<!doctype html>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
   :root{
-    --bg:#080b11;--card:rgba(20,27,38,0.62);--card2:rgba(13,18,26,0.66);--glass:rgba(22,30,44,0.55);
-    --bd:rgba(255,255,255,0.08);--bd2:rgba(255,255,255,0.14);
-    --fg:#eef3f9;--fg2:#c4cfdd;--mut:#8794a6;
-    --up:#16c784;--down:#ea3943;--accent:#3b82f6;--accent2:#60a5fa;--warn:#f0b90b;
-    --r:14px;--r2:10px;--r3:999px;
+    --bg:#0b0e11;--card:#141920;--card2:#0f1317;--glass:#141920;
+    --bd:rgba(255,255,255,0.06);--bd2:rgba(255,255,255,0.13);
+    --fg:#eef3f9;--fg2:#c4cfdd;--mut:#848e9c;
+    --up:#0ecb81;--down:#f6465d;--accent:#3b82f6;--accent2:#60a5fa;--warn:#f0b90b;
+    --r:10px;--r2:8px;--r3:999px;
     --sp1:6px;--sp2:10px;--sp3:14px;--sp4:18px;
-    --sh:0 8px 30px rgba(0,0,0,0.38);--sh2:0 2px 10px rgba(0,0,0,0.25);
-    --blur:saturate(160%) blur(14px);
+    --sh:0 1px 0 rgba(255,255,255,0.02);--sh2:0 2px 10px rgba(0,0,0,0.25);
+    --blur:none;
     --font:"Inter",-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
     --mono:"JetBrains Mono","Inter",ui-monospace,SFMono-Regular,Menlo,monospace;
     --ease:cubic-bezier(.22,.61,.36,1);
@@ -2743,20 +2857,19 @@ COCKPIT_HTML = r"""<!doctype html>
   body{
     background:var(--bg);color:var(--fg);font-family:var(--font);height:100vh;
     display:flex;flex-direction:column;overflow:hidden;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
-    background-image:radial-gradient(900px 520px at 18% -8%,rgba(59,130,246,0.16),transparent 60%),radial-gradient(760px 480px at 100% 0%,rgba(22,199,132,0.10),transparent 55%),radial-gradient(700px 600px at 60% 120%,rgba(124,92,214,0.10),transparent 60%);
-    background-attachment:fixed;
   }
   @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
-  .hdr{display:flex;align-items:center;gap:12px;padding:11px 18px;border-bottom:1px solid var(--bd);flex-wrap:wrap;background:rgba(10,14,20,0.5);backdrop-filter:var(--blur);-webkit-backdrop-filter:var(--blur)}
+  .hdr{display:flex;align-items:center;gap:12px;padding:11px 18px;border-bottom:1px solid var(--bd);flex-wrap:wrap;background:var(--card2)}
   .logo{font-size:16px;font-weight:800;letter-spacing:-.3px;display:flex;align-items:center;gap:7px}
   .chips{display:flex;gap:6px}
   .chip{background:var(--card);border:1px solid var(--bd);border-radius:var(--r3);padding:5px 14px;font-size:13px;font-weight:600;cursor:pointer;color:var(--mut);transition:all .22s var(--ease);backdrop-filter:var(--blur);-webkit-backdrop-filter:var(--blur)}
   .chip:hover{color:var(--fg);border-color:var(--bd2);transform:translateY(-1px)}
-  .chip.on{background:linear-gradient(135deg,var(--accent),var(--accent2));border-color:transparent;color:#fff;font-weight:700;box-shadow:0 4px 14px rgba(59,130,246,0.4)}
+  .chip.on{background:rgba(240,185,11,0.12);border-color:rgba(240,185,11,0.55);color:var(--warn);font-weight:700}
   .symin{background:var(--card2);color:var(--fg);border:1px solid var(--bd);border-radius:var(--r2);padding:6px 11px;font-size:13px;width:124px;transition:border-color .22s var(--ease)}
   .symin:focus{outline:none;border-color:var(--accent)}
   .price{font-size:18px;font-weight:800;margin-left:4px}
-  .price #px{font-family:var(--mono);font-variant-numeric:tabular-nums;letter-spacing:-.4px}
+  .price #px{font-family:var(--mono);font-variant-numeric:tabular-nums;letter-spacing:-.4px;transition:color .25s var(--ease)}
+  .price #px.tick-up{color:var(--up)} .price #px.tick-down{color:var(--down)}
   .price small{font-size:12px;color:var(--mut);font-weight:500;font-family:var(--font)}
   .spacer{flex:1}
   .live{color:var(--mut);font-size:12px;text-align:right;line-height:1.4}
@@ -2767,13 +2880,12 @@ COCKPIT_HTML = r"""<!doctype html>
   .ivbar{display:flex;gap:6px;align-items:center}
   .ivbar button{background:var(--card);color:var(--mut);border:1px solid var(--bd);border-radius:8px;padding:5px 13px;font-size:13px;font-weight:600;cursor:pointer;transition:all .2s var(--ease)}
   .ivbar button:hover{color:var(--fg);border-color:var(--bd2)}
-  .ivbar button.on{background:linear-gradient(135deg,var(--accent),var(--accent2));border-color:transparent;color:#fff;font-weight:700;box-shadow:0 3px 12px rgba(59,130,246,0.35)}
+  .ivbar button.on{background:rgba(59,130,246,0.14);border-color:rgba(59,130,246,0.55);color:var(--accent2);font-weight:700}
   .ivbar .hint{color:var(--mut);font-size:12px;margin-left:auto}
   #kline{flex:1;background:var(--card2);border:1px solid var(--bd);border-radius:var(--r);min-height:0;box-shadow:var(--sh);overflow:hidden}
   .sidecol{display:flex;flex-direction:column;gap:12px;min-height:0;overflow:hidden}
   .card{background:var(--card);border:1px solid var(--bd);border-radius:var(--r);padding:15px;box-shadow:var(--sh);backdrop-filter:var(--blur);-webkit-backdrop-filter:var(--blur);animation:fadeUp .4s var(--ease) both}
-  .copilot{position:relative;overflow:hidden}
-  .copilot::before{content:"";position:absolute;inset:0;background:radial-gradient(420px 160px at 100% 0%,rgba(59,130,246,0.12),transparent 70%);pointer-events:none}
+  .copilot{position:relative;overflow:hidden;border-top:2px solid rgba(59,130,246,0.45)}
   .copilot .vd{font-size:24px;font-weight:800;letter-spacing:-.4px}
   .copilot .vsub{color:var(--mut);font-size:12px;margin-top:5px}
   .conf{display:inline-block;padding:1px 9px;border-radius:var(--r3);font-size:12px;font-weight:700;margin-left:4px}
@@ -2800,18 +2912,33 @@ COCKPIT_HTML = r"""<!doctype html>
   .askbar{display:flex;gap:7px;margin-top:9px}
   .askbar input{flex:1;background:var(--card2);color:var(--fg);border:1px solid var(--bd);border-radius:var(--r2);padding:9px 11px;font-size:13px;transition:border-color .22s var(--ease)}
   .askbar input:focus{outline:none;border-color:var(--accent)}
-  .askbar button{background:linear-gradient(135deg,var(--accent),var(--accent2));border:none;border-radius:var(--r2);color:#fff;padding:0 16px;font-weight:700;cursor:pointer;transition:filter .2s var(--ease),transform .2s var(--ease)}
+  .askbar button{background:var(--accent);border:none;border-radius:var(--r2);color:#fff;padding:0 16px;font-weight:700;cursor:pointer;transition:filter .2s var(--ease),transform .2s var(--ease)}
   .askbar button:hover{filter:brightness(1.1);transform:translateY(-1px)}
   .qsugg{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
   .qsugg span{background:var(--card2);border:1px solid var(--bd);border-radius:var(--r3);padding:4px 11px;font-size:11px;color:var(--mut);cursor:pointer;transition:all .2s var(--ease)}
   .qsugg span:hover{color:var(--fg);border-color:var(--bd2)}
-  .strip{display:flex;align-items:stretch;gap:10px;padding:11px 14px;border-top:1px solid var(--bd);overflow-x:auto;background:rgba(10,14,20,0.45);backdrop-filter:var(--blur);-webkit-backdrop-filter:var(--blur)}
+  .strip{display:flex;align-items:stretch;gap:10px;padding:11px 14px;border-top:1px solid var(--bd);overflow-x:auto;background:var(--card2)}
   .stat{background:var(--card);border:1px solid var(--bd);border-radius:var(--r2);padding:8px 14px;min-width:98px;text-align:center;flex-shrink:0;transition:border-color .2s var(--ease)}
   .stat:hover{border-color:var(--bd2)}
   .stat .k{color:var(--mut);font-size:11px} .stat .v{font-size:16px;font-weight:700;margin-top:4px;font-family:var(--mono);font-variant-numeric:tabular-nums;letter-spacing:-.2px}
   .pos{color:var(--up)} .neg{color:var(--down)} .mut{color:var(--mut)}
+  /* 多周期预测卡（4h / 15天 / 30天 + 归因 + AI 解读） */
+  .mhz .row{display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--bd);font-size:12px}
+  .mhz .row:last-of-type{border-bottom:none}
+  .mhz .hz{width:40px;color:var(--mut);font-weight:700;font-family:var(--mono);flex-shrink:0}
+  .mhz .tgt{margin-left:auto;font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--fg2);white-space:nowrap}
+  .dirchip{padding:2px 9px;border-radius:4px;font-weight:700;font-size:12px;flex-shrink:0}
+  .dir-up{background:rgba(14,203,129,0.12);color:var(--up)}
+  .dir-down{background:rgba(246,70,93,0.12);color:var(--down)}
+  .dir-flat{background:rgba(132,142,156,0.14);color:var(--mut)}
+  .gate{font-size:10px;padding:1px 6px;border-radius:4px;border:1px solid var(--bd2);color:var(--mut);flex-shrink:0;cursor:help}
+  .gate.ok{color:var(--up);border-color:rgba(14,203,129,0.45)}
+  .mhz .whyline{font-size:11px;color:var(--mut);line-height:1.6;padding:2px 0 7px 48px;border-bottom:1px solid var(--bd)}
+  .mhz .whyline:last-child{border-bottom:none}
+  .aiwhy{margin-top:10px;font-size:12px;line-height:1.75;color:var(--fg2);background:var(--card2);border:1px solid var(--bd);border-radius:var(--r2);padding:10px 12px;white-space:pre-wrap;max-height:150px;overflow:auto}
+  .aiwhy .tag{display:inline-block;font-size:10px;color:var(--warn);border:1px solid rgba(240,185,11,0.4);border-radius:4px;padding:0 5px;margin-right:6px}
   .actbtn{margin-left:auto;display:flex;gap:8px;align-items:center;flex-shrink:0}
-  .actbtn button{background:linear-gradient(135deg,var(--accent),var(--accent2));border:none;border-radius:var(--r2);color:#fff;padding:9px 16px;font-weight:700;cursor:pointer;font-size:13px;transition:filter .2s var(--ease),transform .2s var(--ease)}
+  .actbtn button{background:var(--accent);border:none;border-radius:var(--r2);color:#fff;padding:9px 16px;font-weight:700;cursor:pointer;font-size:13px;transition:filter .2s var(--ease),transform .2s var(--ease)}
   .actbtn button.ghost{background:var(--card);border:1px solid var(--bd);color:var(--fg)}
   .actbtn button:hover{filter:brightness(1.12);transform:translateY(-1px)}
   .holds{font-size:11px;color:var(--mut);align-self:center;flex-shrink:0;max-width:300px}
@@ -2850,6 +2977,12 @@ COCKPIT_HTML = r"""<!doctype html>
 
     <div class="sidecol">
       <div class="card copilot" id="copilot"><div class="vd">加载中…</div></div>
+
+      <div class="card mhz">
+        <div class="panelhd">🎯 多周期预测 <span class="mut" style="font-weight:400;text-transform:none;letter-spacing:0">方向 · 点位 · 为什么</span></div>
+        <div id="mhzRows"><div class="empty">加载中…</div></div>
+        <div class="aiwhy" id="aiwhy" style="display:none"></div>
+      </div>
 
       <div class="card events">
         <div class="panelhd">📡 实时事件流 <span class="mut" style="font-weight:400">（真实行情 + 模拟盘）</span></div>
@@ -2947,9 +3080,9 @@ function setIv(x){ iv=x; document.querySelectorAll('#ivbar button[data-iv]').for
 function verdictOf(d){
   const s=d.conviction_score??0, a=Math.abs(s);
   const conf=a>=1.2?'高':(a>=0.6?'中':'低');
-  if(s>=0.6)  return {txt:'可小仓试多 📈',color:'#16c784',conf,s};
-  if(s<=-0.6) return {txt:'偏空·别追多 📉',color:'#ea3943',conf,s};
-  return {txt:'先观望 ⏸',color:'#8b98a9',conf:'低',s};
+  if(s>=0.6)  return {txt:'可小仓试多 📈',color:'#0ecb81',conf,s};
+  if(s<=-0.6) return {txt:'偏空·别追多 📉',color:'#f6465d',conf,s};
+  return {txt:'先观望 ⏸',color:'#848e9c',conf:'低',s};
 }
 function rr(d){
   const sl=+d.stop_loss, tp=+d.take_profit_ref; let e=null;
@@ -3001,10 +3134,10 @@ function drawChart(){
   if(!chart){
     chart = LightweightCharts.createChart($('kline'), {
       autoSize:true,
-      layout:{ background:{type:'solid',color:'#0b0f16'}, textColor:'#9aa7b6', fontSize:11, fontFamily:'Inter,-apple-system,PingFang SC,Microsoft YaHei,sans-serif', attributionLogo:false },
-      grid:{ vertLines:{color:'rgba(42,54,69,0.35)'}, horzLines:{color:'rgba(42,54,69,0.35)'} },
-      rightPriceScale:{ borderColor:'#2a3645', scaleMargins:{top:0.12,bottom:0.12} },
-      timeScale:{ borderColor:'#2a3645', timeVisible:true, secondsVisible:false, rightOffset:8, barSpacing:9, minBarSpacing:3 },
+      layout:{ background:{type:'solid',color:'#0f1317'}, textColor:'#848e9c', fontSize:11, fontFamily:'Inter,-apple-system,PingFang SC,Microsoft YaHei,sans-serif', attributionLogo:false },
+      grid:{ vertLines:{color:'rgba(132,142,156,0.08)'}, horzLines:{color:'rgba(132,142,156,0.08)'} },
+      rightPriceScale:{ borderColor:'rgba(132,142,156,0.22)', scaleMargins:{top:0.12,bottom:0.12} },
+      timeScale:{ borderColor:'rgba(132,142,156,0.22)', timeVisible:true, secondsVisible:false, rightOffset:8, barSpacing:9, minBarSpacing:3 },
       crosshair:{ mode:1, vertLine:{color:'#3b82f6',width:1,style:LightweightCharts.LineStyle.Dotted,labelBackgroundColor:'#3b82f6'}, horzLine:{color:'#3b82f6',labelBackgroundColor:'#3b82f6'} },
       localization:{ locale:'zh-CN', priceFormatter:p=>fmt(p) }
     });
@@ -3235,7 +3368,9 @@ function openWS(){
     const bar={time:t, open:+k.o, high:+k.h, low:+k.l, close:+k.c};
     try{ candleSeries.update(bar); }catch(e){}  // 逐 tick 更新当前蜡烛，丝滑不重画
     try{ if(volSeries) volSeries.update({time:t, value:+k.v||0, color:(+k.c>=+k.o)?'rgba(14,203,129,0.45)':'rgba(246,70,93,0.45)'}); }catch(e){}
-    $('px').textContent=fmt(+k.c);
+    const pxEl=$('px'), prev=parseFloat((pxEl.textContent||'').replace(/,/g,''));
+    pxEl.textContent=fmt(+k.c);
+    if(!isNaN(prev)&&+k.c!==prev){ pxEl.classList.toggle('tick-up',+k.c>prev); pxEl.classList.toggle('tick-down',+k.c<prev); }
     $('upAt').textContent='实时 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
   };
   sock.onerror=()=>{ try{ sock.close(); }catch(e){} };
@@ -3263,15 +3398,15 @@ function drawOverlay(){
   if(VIS.core){
     if(pos){
       if(e) addPL(+e.toFixed(2),'#3b82f6','入 '+fmt(e),LS.Dashed);
-      addPL(d.stop_loss,'#ea3943','损 '+fmt(d.stop_loss),LS.Solid);
-      addPL(d.take_profit_ref,'#16c784','盈 '+fmt(d.take_profit_ref),LS.Solid);
+      addPL(d.stop_loss,'#f6465d','损 '+fmt(d.stop_loss),LS.Solid);
+      addPL(d.take_profit_ref,'#0ecb81','盈 '+fmt(d.take_profit_ref),LS.Solid);
     }
     // 4h 盘中引擎最新预测：达标画彩色实点位；未达标画灰色参考线（观察模式，不开仓）
     const ip=intradayPredOf(sym);
     if(ip){
       if(ip.tradeable&&ip.stop&&ip.take){
-        addPL(ip.stop,'rgba(234,57,67,0.75)','4h损 '+fmt(ip.stop),LS.Dotted,1);
-        addPL(ip.take,'rgba(22,199,132,0.75)','4h盈 '+fmt(ip.take),LS.Dotted,1);
+        addPL(ip.stop,'rgba(246,70,93,0.75)','4h损 '+fmt(ip.stop),LS.Dotted,1);
+        addPL(ip.take,'rgba(14,203,129,0.75)','4h盈 '+fmt(ip.take),LS.Dotted,1);
       }else if(ip.stop&&ip.take){
         addPL(ip.stop,'rgba(135,148,166,0.6)','4h损·参考 '+fmt(ip.stop),LS.Dotted,1);
         addPL(ip.take,'rgba(135,148,166,0.6)','4h盈·参考 '+fmt(ip.take),LS.Dotted,1);
@@ -3288,12 +3423,12 @@ function drawOverlay(){
       const p=hz[h];
       if(!p||p.target==null) continue;
       const col=p.tradeable
-        ?(p.direction==='涨'?'rgba(22,199,132,0.8)':(p.direction==='跌'?'rgba(234,57,67,0.8)':'rgba(135,148,166,0.7)'))
-        :'rgba(135,148,166,0.5)';
+        ?(p.direction==='涨'?'rgba(14,203,129,0.8)':(p.direction==='跌'?'rgba(246,70,93,0.8)':'rgba(132,142,156,0.7)'))
+        :'rgba(132,142,156,0.5)';
       addPL(p.target,col,h+'天目标'+(p.tradeable?'':'·参考')+' '+fmt(p.target),LS.Dashed,1);
     }
   }
-  if(fac.price) addPL(+fac.price,'#9aa7b6','现价',LS.Dotted,1);
+  if(fac.price) addPL(+fac.price,'#848e9c','现价',LS.Dotted,1);
   // 自动支撑/阻力（摆动点聚类 · 只留触碰最多的 3 档，避免糊成一团）
   if(VIS.sr){
   const win=rows.slice(-Math.min(rows.length,120));
@@ -3320,8 +3455,8 @@ function drawOverlay(){
   let mks=[];
   if(VIS.marks){
   (lastPositions||[]).forEach(p=>{
-    if(p.opened_ts&&p.entry_price){ const r=nearestRow(p.opened_ts*1000); if(r) mks.push({time:barTime(r),position:'belowBar',color:'#16c784',shape:'arrowUp',text:'买'}); }
-    if(p.status==='closed'&&p.closed_ts&&p.exit_price){ const r=nearestRow(p.closed_ts*1000); if(r){ const isWin=(p.realized_pnl_usdt||0)>=0; mks.push({time:barTime(r),position:'aboveBar',color:isWin?'#16c784':'#ea3943',shape:'arrowDown',text:'卖'}); } }
+    if(p.opened_ts&&p.entry_price){ const r=nearestRow(p.opened_ts*1000); if(r) mks.push({time:barTime(r),position:'belowBar',color:'#0ecb81',shape:'arrowUp',text:'买'}); }
+    if(p.status==='closed'&&p.closed_ts&&p.exit_price){ const r=nearestRow(p.closed_ts*1000); if(r){ const isWin=(p.realized_pnl_usdt||0)>=0; mks.push({time:barTime(r),position:'aboveBar',color:isWin?'#0ecb81':'#f6465d',shape:'arrowDown',text:'卖'}); } }
   });
   mks.sort((a,b)=>a.time-b.time);
   mks=mks.slice(-20);
@@ -3336,7 +3471,7 @@ function intradayPredOf(s){
 }
 function renderPredBadge(){
   const el=$('predBadge'); if(!el) return;
-  const dirColor=d=>d==='涨'?'#16c784':(d==='跌'?'#ea3943':'#8794a6');
+  const dirColor=d=>d==='涨'?'#0ecb81':(d==='跌'?'#f6465d':'#848e9c');
   const seg=[];
   const ip=intradayPredOf(sym);
   if(ip){
@@ -3353,7 +3488,7 @@ function renderPredBadge(){
         (p.target!=null?` ➜${fmt(p.target)}`:'')+
         (p.tradeable?'':` <span title="${(p.reason||'')} — 未过门禁，目标线仅灰色参考">👁</span>`));
     }else if(lastHorizons&&(lastHorizons.computing||[]).includes(h)){
-      seg.push(`${h}天: <span style="color:#8794a6">计算中…</span>`);
+      seg.push(`${h}天: <span style="color:#848e9c">计算中…</span>`);
     }
   }
   el.innerHTML=seg.join(' <span style="color:var(--bd2)">|</span> ');
@@ -3361,17 +3496,51 @@ function renderPredBadge(){
 async function loadIntraday(){
   try{
     lastIntraday=await (await fetch('/api/intraday/stats')).json();
-    renderPredBadge();
+    renderPredBadge(); renderMhz();
     if(chart) drawOverlay();
   }catch(e){}
 }
 async function loadHorizons(){
   try{
     lastHorizons=await (await fetch('/api/horizons?symbol='+sym)).json();
-    renderPredBadge();
+    renderPredBadge(); renderMhz();
     if(chart) drawOverlay();
     // 计算中则 30s 后再拉一次（后台线程算完即有缓存）
     if((lastHorizons.computing||[]).length){ setTimeout(loadHorizons, 30000); }
+  }catch(e){}
+}
+// ── 多周期预测卡：三行（4h/15天/30天）+ 每行归因 + AI 解读 ──
+function mhzRow(label, p, tgt){
+  if(!p||!p.direction){
+    return `<div class="row"><span class="hz">${label}</span><span class="mut">计算中…</span></div>`;
+  }
+  const cls=p.direction==='涨'?'dir-up':(p.direction==='跌'?'dir-down':'dir-flat');
+  const gate=p.tradeable
+    ?'<span class="gate ok" title="通过精准度门禁：样本外命中率与置换检验双达标，引擎可自动模拟下单">已达标</span>'
+    :`<span class="gate" title="${(p.reason||'')} — 未过精准度门禁，点位仅供参考，引擎不开仓">观察</span>`;
+  const prob=p.prob!=null?`<span class="num" style="color:var(--fg2)">${Math.round(p.prob*100)}%</span>`:'';
+  const why=p.why_text?`<div class="whyline">${p.why_text}</div>`:'';
+  return `<div class="row"><span class="hz">${label}</span>`+
+    `<span class="dirchip ${cls}">${p.direction}</span>${prob}${gate}`+
+    (tgt!=null?`<span class="tgt">➜ ${fmt(tgt)}</span>`:'')+`</div>${why}`;
+}
+function renderMhz(){
+  const el=$('mhzRows'); if(!el) return;
+  const ip=intradayPredOf(sym);
+  const hz=(lastHorizons&&lastHorizons.symbol===sym&&lastHorizons.horizons)||{};
+  el.innerHTML =
+    mhzRow('4h', ip, ip&&(ip.take||null)) +
+    mhzRow('15天', hz['15'], hz['15']&&hz['15'].target) +
+    mhzRow('30天', hz['30'], hz['30']&&hz['30'].target);
+}
+async function loadWhy(){
+  try{
+    const want=sym;
+    const d=await (await fetch('/api/why?symbol='+sym)).json();
+    if(want!==sym) return;
+    const el=$('aiwhy'); if(!el) return;
+    el.style.display='block';
+    el.innerHTML=`<span class="tag">${d.engine==='llm'?'AI 解读':'本地解读'}</span>${(d.summary||'').replace(/</g,'&lt;')}`;
   }catch(e){}
 }
 
@@ -3437,7 +3606,7 @@ async function loadSnapshot(){
 
 // 侧栏（决策/事件/战绩）走 60s 轮询；K 线蜡烛由 WebSocket 实时推送，二者解耦。
 // loadKline 在此仅用于刷新趋势线/档位（key 未变不会重画蜡烛、不扰动 WS）。
-function refreshSide(){ loadSnapshot(); loadEvents(); loadIntraday(); loadHorizons(); loadStats(); loadKline(); }
+function refreshSide(){ loadSnapshot(); loadEvents(); loadIntraday(); loadHorizons(); loadStats(); loadKline(); loadWhy(); }
 function loadAll(){ countdown=REFRESH; loadKline(); refreshSide(); }   // 切币/切周期/首次：重拉历史 K 线并重连 WS
 function startTimer(){ if(tick)clearInterval(tick); tick=setInterval(()=>{ countdown--; renderLive(); if(countdown<=0){ countdown=REFRESH; refreshSide(); } },1000); }
 

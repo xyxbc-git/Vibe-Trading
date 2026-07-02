@@ -223,6 +223,90 @@ def _fit_predict_classifier(Xtr, ytr, Xte):
     return preds, P
 
 
+def fit_predict_explain(Xtr, ytr, Xte) -> tuple:
+    """训练分类器并返回 (pred_labels, pred_proba, contribs)。
+
+    contribs[i][j] = 第 i 条测试样本第 j 个特征对「预测类别」logit 的贡献
+    （标准化特征值 × 该类权重），正=把预测往该类推，负=往反方向拉。
+    仅线性模型（LogisticRegression / numpy 兜底）有解析归因；
+    单一类退化场景返回全零贡献。
+    """
+    classes = sorted(set(ytr))
+    if not _HAS_NUMPY:
+        preds, proba = _fit_predict_classifier(Xtr, ytr, Xte)
+        return preds, proba, [[0.0] * len(Xte[0]) for _ in Xte]
+    if len(classes) < 2:
+        const = ytr[0]
+        return [const] * len(Xte), None, [[0.0] * len(Xte[0]) for _ in Xte]
+    Xtr_a = np.asarray(Xtr, float)
+    Xte_a = np.asarray(Xte, float)
+    if _HAS_SKLEARN:
+        scaler = StandardScaler().fit(Xtr_a)
+        clf = LogisticRegression(max_iter=1000, C=1.0)
+        clf.fit(scaler.transform(Xtr_a), ytr)
+        Xte_s = scaler.transform(Xte_a)
+        preds = list(clf.predict(Xte_s))
+        proba = clf.predict_proba(Xte_s)
+        coef = clf.coef_  # 二分类时 shape=(1,d)：正向=classes_[1]
+        cls_list = list(clf.classes_)
+        contribs = []
+        for i, p in enumerate(preds):
+            if coef.shape[0] == 1:
+                sign = 1.0 if p == cls_list[1] else -1.0
+                w = coef[0] * sign
+            else:
+                w = coef[cls_list.index(p)]
+            contribs.append((w * Xte_s[i]).tolist())
+        return preds, proba, contribs
+    mu = Xtr_a.mean(axis=0)
+    sd = Xtr_a.std(axis=0) + 1e-9
+    Xtr_s = (Xtr_a - mu) / sd
+    Xte_s = (Xte_a - mu) / sd
+    remap = {c: k for k, c in enumerate(classes)}
+    inv = {k: c for c, k in remap.items()}
+    y_idx = np.array([remap[v] for v in ytr])
+    W, b = _np_logreg_fit(Xtr_s, y_idx, len(classes))
+    P = _np_softmax(Xte_s @ W + b)
+    preds = [inv[int(k)] for k in P.argmax(axis=1)]
+    contribs = [(W[:, remap[p]] * Xte_s[i]).tolist() for i, p in enumerate(preds)]
+    return preds, P, contribs
+
+
+def humanize_attribution(feature_names: list, values: list, contrib: list,
+                         templates: dict, top_k: int = 3) -> dict:
+    """把线性归因贡献转成人话：支持本次判断的前 top_k 因素 + 最强反向因素。
+
+    templates: {feature_name: callable(value)->str}，未登记的特征跳过
+    （如 hour_sin/cos 这类单看无意义的编码维度）。
+    """
+    items = []
+    for n, v, c in zip(feature_names, values, contrib):
+        fmt = templates.get(n)
+        if fmt is None:
+            continue
+        try:
+            items.append({"factor": fmt(v), "weight": round(float(c), 3)})
+        except Exception:  # noqa: BLE001 — 单个因素格式化失败不拖垮整体
+            continue
+    support = sorted([it for it in items if it["weight"] > 0],
+                     key=lambda x: -x["weight"])[:top_k]
+    oppose = sorted([it for it in items if it["weight"] < 0],
+                    key=lambda x: x["weight"])[:1]
+    return {"support": support, "oppose": oppose}
+
+
+def attribution_text(direction: str, why: dict) -> str:
+    """归因 → 一句中文总结，如「看涨主因：7天动量+5.2%、RSI 31 …；反向信号：…」。"""
+    sup = "、".join(it["factor"] for it in why.get("support", []))
+    opp = "、".join(it["factor"] for it in why.get("oppose", []))
+    label = {"涨": "看涨", "跌": "看跌", "震荡": "判震荡",
+             "up": "看涨", "down": "看跌", "range": "判震荡"}.get(direction, direction)
+    txt = f"{label}主因：{sup or '各因素均弱'}"
+    if opp:
+        txt += f"；反向信号：{opp}"
+    return txt
+
+
 def walk_forward_classify(X: list, y: list, n_splits: int = 5) -> dict:
     """时间序列 walk-forward 样本外分类评估。
 

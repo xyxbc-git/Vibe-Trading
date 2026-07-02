@@ -83,6 +83,10 @@ def ensure_db(db_path: Optional[str] = None) -> None:
                 oos_hit_rate REAL, p_value REAL, reason TEXT,
                 outcome_ret REAL, hit INTEGER,
                 UNIQUE(symbol, bar_ts))""")
+        try:  # 归因人话列（老库迁移；已存在则忽略）
+            conn.execute("ALTER TABLE intraday_predictions ADD COLUMN why_text TEXT")
+        except sqlite3.OperationalError:
+            pass
 
 
 # ── 行情 / 预测（可注入，供离线测试）────────────────────────────────────────
@@ -266,15 +270,15 @@ def _record_prediction(conn: sqlite3.Connection, pred: dict) -> None:
     conn.execute(
         "INSERT OR REPLACE INTO intraday_predictions "
         "(symbol, bar_ts, direction, prob, tradeable, entry, stop, take, atr_pct, "
-        "oos_hit_rate, p_value, reason, outcome_ret, hit) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?, "
+        "oos_hit_rate, p_value, reason, why_text, outcome_ret, hit) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, "
         " (SELECT outcome_ret FROM intraday_predictions WHERE symbol=? AND bar_ts=?),"
         " (SELECT hit FROM intraday_predictions WHERE symbol=? AND bar_ts=?))",
         (pred["symbol"], pred["as_of_bar_ts"], pred.get("direction"),
          pred.get("prob"), 1 if pred.get("tradeable") else 0,
          pred.get("entry"), pred.get("stop"), pred.get("take"),
          pred.get("atr_pct"), pred.get("oos_hit_rate"), pred.get("p_value"),
-         pred.get("reason"),
+         pred.get("reason"), pred.get("why_text"),
          pred["symbol"], pred["as_of_bar_ts"],
          pred["symbol"], pred["as_of_bar_ts"]))
 
@@ -445,7 +449,7 @@ def stats(db_path: Optional[str] = None) -> dict:
             return round((r["h"] or 0) / r["c"], 4) if r["c"] else None
         recent = [dict(r) for r in conn.execute(
             "SELECT symbol, bar_ts, direction, prob, tradeable, entry, stop, take, "
-            "atr_pct, outcome_ret, hit, reason FROM intraday_predictions "
+            "atr_pct, outcome_ret, hit, reason, why_text FROM intraday_predictions "
             "ORDER BY bar_ts DESC LIMIT 30").fetchall()]
         st = status(db_path)
     return {
