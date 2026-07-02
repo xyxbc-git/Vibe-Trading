@@ -173,20 +173,51 @@ def morning_step(symbols: list[str], *, notify: bool = True, dry_run: bool = Fal
     return res
 
 
+def intraday_step(symbols: list[str]) -> dict:
+    """跑一轮 4h 盘中引擎（预测→模拟下单）。永不抛出，失败只记日志。"""
+    try:
+        import jarvis_intraday_trader as jit
+        res = jit.cycle(symbols)
+        _log(f"⚡ 4h 轮：预测 {len(res.get('predictions', {}))} 币 / "
+             f"开仓 {len(res.get('opened', []))} / 平仓 {len(res.get('closed', []))} / "
+             f"回填 {res.get('backfilled', 0)} / 熔断 {'是' if res.get('halted') else '否'}"
+             + (f" / 错误 {res['error']}" if res.get("error") else ""))
+        return res
+    except Exception as e:  # noqa: BLE001 — 盘中引擎失败绝不拖垮主心跳
+        _log("⚡ 4h 轮 ❌ 异常（已兜底）: " + repr(e)[:300])
+        return {"error": repr(e)[:300]}
+
+
+def _seconds_to_next_4h_close(now: float | None = None, buffer_s: int = 120) -> float:
+    """距下一个 4h K 线收盘（UTC 0/4/8/12/16/20 点）+ 缓冲的秒数。"""
+    t = now if now is not None else time.time()
+    next_boundary = (int(t // 14400) + 1) * 14400
+    return max(60.0, next_boundary + buffer_s - t)
+
+
 def loop(symbols: list[str], interval_hours: float, paper_trade: bool = False,
          *, auto_grow: bool = False, grow_every: int = 30, auto_retrain_apply: bool = False,
-         auto_morning: bool = False, morning_dry_run: bool = False) -> int:
+         auto_morning: bool = False, morning_dry_run: bool = False,
+         intraday: bool = False) -> int:
     interval = max(60.0, interval_hours * 3600.0)
     _log(f"🤖 贾维斯定时引擎启动：symbols={symbols} 周期={interval_hours}h "
          f"自动跟盘={'开' if paper_trade else '关'} "
+         f"4h盘中={'开（对齐 4h 收盘）' if intraday else '关'} "
          f"自进化={'开（每'+str(grow_every)+'轮，重训'+('采纳' if auto_retrain_apply else '仅建议')+'）' if auto_grow else '关'}")
     cycle_count = 0
     last_morning_date = None
+    last_daily_date = None
     while True:
-        try:
-            run_cycle(symbols, paper_trade=paper_trade)
-        except Exception:  # noqa: BLE001 — 兜底，确保循环不死
-            _log("本轮异常（已兜底，继续运行）:\n" + traceback.format_exc())
+        # intraday 模式下：日线 record/evaluate 只在日历日切换时跑一次（幂等，防高频打点）
+        today = time.strftime("%Y-%m-%d")
+        if not intraday or today != last_daily_date:
+            last_daily_date = today
+            try:
+                run_cycle(symbols, paper_trade=paper_trade)
+            except Exception:  # noqa: BLE001 — 兜底，确保循环不死
+                _log("本轮异常（已兜底，继续运行）:\n" + traceback.format_exc())
+        if intraday:
+            intraday_step(symbols)
         cycle_count += 1
         # [T-14] 每日晨报：日历日切换即触发一次（避免高频；首轮也会发一封）。
         if auto_morning:
@@ -204,17 +235,26 @@ def loop(symbols: list[str], interval_hours: float, paper_trade: bool = False,
                 grow_step(symbols, apply_retrain=auto_retrain_apply)
             except Exception:  # noqa: BLE001 — 自进化失败绝不拖垮主心跳
                 _log("自进化异常（已兜底，继续运行）:\n" + traceback.format_exc())
-        _log(f"😴 休眠 {interval_hours}h，下轮 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time() + interval))}")
-        time.sleep(interval)
+        if intraday:
+            wait = _seconds_to_next_4h_close()
+            _log(f"😴 对齐 4h 收盘，休眠 {round(wait / 3600, 2)}h，下轮 "
+                 f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time() + wait))}")
+            time.sleep(wait)
+        else:
+            _log(f"😴 休眠 {interval_hours}h，下轮 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time() + interval))}")
+            time.sleep(interval)
 
 
-def install_launchd(symbols: list[str], interval_hours: float, paper_trade: bool = False) -> str:
+def install_launchd(symbols: list[str], interval_hours: float, paper_trade: bool = False,
+                    intraday: bool = False) -> str:
     """生成 macOS launchd plist（KeepAlive 常驻），返回写入路径。"""
     py = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".venv", "bin", "python")
     if not os.path.exists(py):
         py = sys.executable
     script = os.path.abspath(__file__)
     pt_arg = "\n    <string>--paper-trade</string>" if paper_trade else ""
+    if intraday:
+        pt_arg += "\n    <string>--intraday</string>"
     plist = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -250,6 +290,8 @@ def main() -> int:
     ap.add_argument("--once", action="store_true", help="只跑一轮就退出（cron/launchd 友好）")
     ap.add_argument("--paper-trade", action="store_true",
                     help="每轮额外跑一次模拟跟盘（撮合+盯平仓+按决策开仓）；默认关闭")
+    ap.add_argument("--intraday", action="store_true",
+                    help="开启 4h 盘中引擎：对齐 4h K 线收盘跑 预测→模拟下单；默认关闭")
     ap.add_argument("--auto-grow", action="store_true",
                     help="开启自进化：每 N 轮自动总结不足（+可选重训）；默认关闭")
     ap.add_argument("--grow-every", type=int, default=30,
@@ -272,7 +314,8 @@ def main() -> int:
         symbols = ["BTCUSDT"]
 
     if args.install_launchd:
-        path = install_launchd(symbols, args.interval_hours, paper_trade=args.paper_trade)
+        path = install_launchd(symbols, args.interval_hours, paper_trade=args.paper_trade,
+                               intraday=args.intraday)
         print(f"✅ 已生成 launchd 配置: {path}")
         print("加载/启动：")
         print(f"  launchctl load {path}")
@@ -293,6 +336,8 @@ def main() -> int:
 
     if args.once:
         cycle = run_cycle(symbols, paper_trade=args.paper_trade)
+        if args.intraday:
+            intraday_step(symbols)
         ok = all(v.get("record", {}) and v["record"].get("ok") for v in cycle["symbols"].values())
         _log("单轮完成" + ("（全部成功）" if ok else "（含失败，见日志）"))
         return 0
@@ -300,7 +345,8 @@ def main() -> int:
     return loop(symbols, args.interval_hours, paper_trade=args.paper_trade,
                 auto_grow=args.auto_grow, grow_every=args.grow_every,
                 auto_retrain_apply=args.auto_retrain_apply,
-                auto_morning=args.auto_morning, morning_dry_run=args.morning_dry_run)
+                auto_morning=args.auto_morning, morning_dry_run=args.morning_dry_run,
+                intraday=args.intraday)
 
 
 if __name__ == "__main__":

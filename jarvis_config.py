@@ -60,6 +60,16 @@ DEFAULTS: dict = {
     # sizing（T-11 动态仓位）
     "sizing_method": "fixed",         # fixed=固定比例（默认，零回归）| kelly=分数凯利
     "kelly_fraction": 0.5,            # 分数凯利系数（0~1，越小越保守）
+    # ── 4h 盘中引擎（jarvis_intraday_trader，扁平键便于 clamp 护栏）──────────
+    "intraday_enabled": True,             # 总开关（关=心跳里跳过 4h 轮）
+    "intraday_min_prob": 0.60,            # 开仓最低预测概率
+    "intraday_risk_pct_per_trade": 1.0,   # 单笔风险占权益%（按止损距离反推仓位）
+    "intraday_max_open_positions": 3,     # 同时最多持仓数
+    "intraday_stop_atr_mult": 1.2,        # 止损 = 入场 ∓ 1.2×ATR
+    "intraday_take_atr_mult": 1.8,        # 止盈 = 入场 ± 1.8×ATR
+    "intraday_time_stop_bars": 6,         # 时间止损（6 根 4h = 24h）
+    "intraday_cooldown_bars": 1,          # 平仓后同币冷却根数
+    "intraday_max_consecutive_losses": 3, # 连亏 N 笔熔断停开仓
 }
 
 # 关键风控旋钮的安全区间（写入时夹紧；未列的键不夹）。
@@ -75,6 +85,14 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "entry_band_below_pct": (0.0, 50.0),
     "entry_band_above_pct": (0.0, 50.0),
     "kelly_fraction": (0.0, 1.0),
+    "intraday_min_prob": (0.5, 0.99),
+    "intraday_risk_pct_per_trade": (0.1, 5.0),
+    "intraday_max_open_positions": (1, 10),
+    "intraday_stop_atr_mult": (0.3, 5.0),
+    "intraday_take_atr_mult": (0.3, 10.0),
+    "intraday_time_stop_bars": (1, 42),
+    "intraday_cooldown_bars": (0, 12),
+    "intraday_max_consecutive_losses": (1, 20),
 }
 
 # 允许的枚举键。
@@ -95,6 +113,8 @@ def _coerce(key: str, value):
     dv = DEFAULTS.get(key)
     try:
         if isinstance(dv, bool):
+            if isinstance(value, str):
+                return value.strip().lower() in ("1", "true", "yes", "on", "开")
             return bool(value)
         if isinstance(dv, int) and not isinstance(dv, bool):
             return int(value)

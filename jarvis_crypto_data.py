@@ -279,6 +279,57 @@ def fetch_daily_closes(symbol: str, days: int = 30) -> list[float]:
     return []
 
 
+_KLINE_INTERVAL_MS = {
+    "1m": 60_000, "5m": 300_000, "15m": 900_000,
+    "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000,
+}
+
+
+def fetch_kline(symbol: str, interval: str = "4h", total: int = 1500) -> list[dict]:
+    """Binance Spot K 线分页拉取（单次上限 1000，用 endTime 往前翻页凑够 total 根）。
+
+    返回升序 [{"ts": 开盘毫秒, "open", "high", "low", "close", "volume"}, ...]。
+    复用 _get（自带限流退避 + 缓存降级）；彻底失败返回 []，绝不抛出。
+    注意：返回包含「进行中的最后一根」，预测侧需自行丢弃未收盘 bar。
+    """
+    iv_ms = _KLINE_INTERVAL_MS.get(interval)
+    if iv_ms is None:
+        return []
+    sym = (symbol or "").upper().replace("-", "").replace("/", "")
+    if not sym.endswith(("USDT", "USDC", "USD")):
+        sym += "USDT"
+    total = max(2, min(int(total), 5000))
+    out: list[dict] = []
+    end_time: Optional[int] = None
+    while len(out) < total:
+        want = min(1000, total - len(out))
+        params: dict = {"symbol": sym, "interval": interval, "limit": want}
+        if end_time is not None:
+            params["endTime"] = end_time
+        raw = _get(SPOT_API + "/api/v3/klines", params)
+        if not isinstance(raw, list) or not raw:
+            break
+        try:
+            page = [{"ts": int(r[0]), "open": float(r[1]), "high": float(r[2]),
+                     "low": float(r[3]), "close": float(r[4]), "volume": float(r[5])}
+                    for r in raw]
+        except (ValueError, IndexError, TypeError):
+            break
+        out = page + out
+        if len(raw) < want:  # 历史到头了
+            break
+        end_time = page[0]["ts"] - 1  # 再往前翻一页
+    # 去重（分页边界可能重叠）+ 升序
+    seen: set = set()
+    dedup = []
+    for row in out:
+        if row["ts"] not in seen:
+            seen.add(row["ts"])
+            dedup.append(row)
+    dedup.sort(key=lambda r: r["ts"])
+    return dedup
+
+
 def fetch_funding(symbol: str) -> dict:
     """当前资金费率 + 标记价 + 近 7 日资金费率历史。"""
     out: dict = {}

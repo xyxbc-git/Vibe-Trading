@@ -1780,6 +1780,58 @@ def api_market_overview():
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@app.get("/api/intraday/stats")
+def api_intraday_stats():
+    """4h 引擎看板：前向命中率 + 持仓 + 最新预测 + 熔断状态。"""
+    try:
+        import jarvis_intraday_trader as jit
+        return JSONResponse(jit.stats())
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": repr(e)[:300]}, status_code=500)
+
+
+@app.get("/api/watchlist")
+def api_watchlist_get():
+    import jarvis_config as jc_mod
+    return JSONResponse({"symbols": jc_mod.get("watchlist")})
+
+
+@app.post("/api/watchlist")
+def api_watchlist_post(data: dict):
+    """增删自选币：{"action":"add"|"remove","symbol":"PEPEUSDT"}。add 先校验交易对存在。"""
+    import jarvis_config as jc_mod
+    action = str((data or {}).get("action", "")).lower()
+    sym = str((data or {}).get("symbol", "")).upper().replace("-", "").replace("/", "").strip()
+    if action not in ("add", "remove") or not sym:
+        return JSONResponse({"ok": False, "error": "参数错误：action 须为 add/remove，symbol 必填"},
+                            status_code=400)
+    if not sym.endswith(("USDT", "USDC")):
+        sym += "USDT"
+    wl = list(jc_mod.get("watchlist") or [])
+    if action == "add":
+        if sym in wl:
+            return JSONResponse({"ok": True, "symbols": wl, "note": "已在自选中"})
+        if len(wl) >= 15:
+            return JSONResponse({"ok": False, "error": "自选上限 15 个，请先删除再添加"},
+                                status_code=400)
+        info = jcd._get(jcd.SPOT_API + "/api/v3/exchangeInfo", {"symbol": sym})
+        ok = isinstance(info, dict) and any(
+            s.get("symbol") == sym and s.get("status") == "TRADING"
+            for s in (info.get("symbols") or []))
+        if not ok:
+            return JSONResponse({"ok": False, "error": f"币安不存在可交易的 {sym}，请检查代码"},
+                                status_code=400)
+        wl.append(sym)
+    else:
+        if sym not in wl:
+            return JSONResponse({"ok": False, "error": f"{sym} 不在自选中"}, status_code=400)
+        if len(wl) <= 1:
+            return JSONResponse({"ok": False, "error": "至少保留 1 个币种"}, status_code=400)
+        wl.remove(sym)
+    jc_mod.save({"watchlist": wl}, source="cockpit", note=f"{action} {sym}")
+    return JSONResponse({"ok": True, "symbols": wl})
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTML
@@ -2702,7 +2754,7 @@ COCKPIT_HTML = r"""<!doctype html>
   <div class="hdr">
     <div class="logo">🤖 贾维斯驾驶舱</div>
     <div class="chips" id="chips"></div>
-    <input class="symin" id="symin" placeholder="看其它币 如 DOGE" onkeydown="if(event.key==='Enter')pickInput()"/>
+    <input class="symin" id="symin" placeholder="＋添加币种 如 DOGE" onkeydown="if(event.key==='Enter')pickInput()"/>
     <div class="price"><span id="px">—</span> <small id="pxsub"></small></div>
     <div class="spacer"></div>
     <div class="live"><span class="pulse"></span><span id="upAt">加载中…</span><br><span id="nextIn"></span></div>
@@ -2712,10 +2764,16 @@ COCKPIT_HTML = r"""<!doctype html>
     <div class="chartcol">
       <div class="ivbar" id="ivbar">
         <button data-iv="15m" onclick="setIv('15m')">15分</button>
-        <button data-iv="1h" class="on" onclick="setIv('1h')">1时</button>
-        <button data-iv="4h" onclick="setIv('4h')">4时</button>
+        <button data-iv="1h" onclick="setIv('1h')">1时</button>
+        <button data-iv="4h" class="on" onclick="setIv('4h')">4时</button>
         <button data-iv="1d" onclick="setIv('1d')">日线</button>
-        <span class="hint">蓝=入场 红=止损 绿=止盈 ▲▼=买卖点 · 黄=MA7 蓝=MA25 · 底部柱=成交量</span>
+        <span style="width:1px;height:16px;background:var(--bd2);margin:0 2px"></span>
+        <button data-vis="core" onclick="toggleVis('core')">核心线</button>
+        <button data-vis="sr" onclick="toggleVis('sr')">支撑阻力</button>
+        <button data-vis="trend" onclick="toggleVis('trend')">趋势通道</button>
+        <button data-vis="marks" onclick="toggleVis('marks')">买卖点</button>
+        <span class="hint" title="蓝虚线=入场 红=止损 绿=止盈 ▲▼=买卖点 · 黄=MA7 蓝=MA25 · 底部柱=成交量 · 「4h预测」为盘中引擎最新判断">?</span>
+        <span class="hint" id="predBadge"></span>
       </div>
       <div id="kline"></div>
     </div>
@@ -2751,24 +2809,70 @@ COCKPIT_HTML = r"""<!doctype html>
 <script>
 const $ = id => document.getElementById(id);
 const REFRESH = 60;
-const SYMS = ['BTCUSDT','ETHUSDT','SOLUSDT'];
-let sym = 'BTCUSDT', iv = '1h';
+let SYMS = ['BTCUSDT','ETHUSDT','SOLUSDT'];   // 启动后由 /api/watchlist 覆盖
+let sym = 'BTCUSDT', iv = '4h';
 let chart, candleSeries=null, volSeries=null, maSeries={}, markersPrim=null, priceLines=[], chartKey='';
-let lastDec=null, lastFac=null, lastKline=null, lastPositions=[];
+let lastDec=null, lastFac=null, lastKline=null, lastPositions=[], lastIntraday=null;
 let countdown = REFRESH, tick=null;
 const TZ = new Date().getTimezoneOffset()*60;   // 秒：让 X 轴显示本地时间
 const barTime = r => Math.floor(r.ts/1000) - TZ;
+
+// 画线分组开关（localStorage 持久化）：core=入场/止损/止盈+4h预测 sr=支撑阻力 trend=趋势/斐波/通道/形态 marks=买卖点
+let VIS = {core:true, sr:true, trend:false, marks:true};
+try{ const v=JSON.parse(localStorage.getItem('cockpitVis')||'null'); if(v&&typeof v==='object') VIS={...VIS,...v}; }catch(e){}
+function renderVisBtns(){
+  document.querySelectorAll('#ivbar button[data-vis]').forEach(b=>{
+    b.className = VIS[b.getAttribute('data-vis')] ? 'on' : '';
+  });
+}
+function toggleVis(k){
+  VIS[k]=!VIS[k];
+  try{ localStorage.setItem('cockpitVis', JSON.stringify(VIS)); }catch(e){}
+  renderVisBtns(); drawChart();
+}
 
 function fmt(n){ if(n==null||isNaN(n)) return '—'; n=+n; const d=Math.abs(n)>=100?2:(Math.abs(n)>=1?3:6); return n.toLocaleString('en-US',{maximumFractionDigits:d}); }
 function pct(x){ return x==null?'—':((x>0?'+':'')+x+'%'); }
 
 function renderChips(){
-  $('chips').innerHTML = SYMS.map(s=>`<div class="chip ${s===sym?'on':''}" onclick="pick('${s}')">${s.replace('USDT','')}</div>`).join('')
+  $('chips').innerHTML = SYMS.map(s=>
+    `<div class="chip ${s===sym?'on':''}" onclick="pick('${s}')">${s.replace('USDT','')}`+
+    `<span onclick="event.stopPropagation();rmSym('${s}')" title="移出自选" style="margin-left:6px;opacity:.55;font-weight:400">×</span></div>`
+  ).join('')
     + (SYMS.includes(sym)?'':`<div class="chip on">${sym.replace('USDT','')}</div>`);
 }
+async function loadWatchlist(){
+  try{ const d=await (await fetch('/api/watchlist')).json();
+    if(Array.isArray(d.symbols)&&d.symbols.length){ SYMS=d.symbols; if(!SYMS.includes(sym)) sym=SYMS[0]; }
+  }catch(e){}
+  renderChips();
+}
+async function addSym(v){
+  try{
+    const r=await fetch('/api/watchlist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'add',symbol:v})});
+    const d=await r.json();
+    if(!r.ok){ alert(d.error||'添加失败'); return false; }
+    SYMS=d.symbols||SYMS; renderChips(); return true;
+  }catch(e){ return false; }
+}
+async function rmSym(s){
+  try{
+    const r=await fetch('/api/watchlist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'remove',symbol:s})});
+    const d=await r.json();
+    if(!r.ok){ alert(d.error||'删除失败'); return; }
+    SYMS=d.symbols||SYMS;
+    if(sym===s){ sym=SYMS[0]; loadAll(); }
+    renderChips();
+  }catch(e){}
+}
 function pick(s){ sym=s; renderChips(); loadAll(); }
-function pickInput(){ let v=$('symin').value.trim().toUpperCase().replace(/[-/]/g,''); if(!v) return; if(!v.endsWith('USDT')) v+='USDT'; $('symin').value=''; sym=v; renderChips(); loadAll(); }
-function setIv(x){ iv=x; document.querySelectorAll('#ivbar button').forEach(b=>b.className=(b.getAttribute('data-iv')===x?'on':'')); loadKline(); }
+async function pickInput(){
+  let v=$('symin').value.trim().toUpperCase().replace(/[-/]/g,''); if(!v) return;
+  if(!v.endsWith('USDT')) v+='USDT'; $('symin').value='';
+  const ok=await addSym(v);            // 输入即加入自选（校验币安存在），失败只看不加
+  sym=v; renderChips(); loadAll();
+}
+function setIv(x){ iv=x; document.querySelectorAll('#ivbar button[data-iv]').forEach(b=>b.className=(b.getAttribute('data-iv')===x?'on':'')); loadKline(); }
 
 function verdictOf(d){
   const s=d.conviction_score??0, a=Math.abs(s);
@@ -2861,10 +2965,8 @@ function drawChart(){
     openWS();                 // 历史就位后，切到 Binance WebSocket 逐 tick 实时推送
   }
   // key 未变时不在这里更新蜡烛——由 WebSocket 实时 update()，避免 REST 旧值覆盖更新
-  drawTrendlines();
-  drawFib();
-  drawChannel();
-  drawPattern();
+  if(VIS.trend){ drawTrendlines(); drawFib(); drawChannel(); drawPattern(); }
+  else { clearTrend(); clearFib(); clearChan(); if(vtopPrim) vtopPrim.setPts(null); }
   drawOverlay();
 }
 
@@ -3087,13 +3189,24 @@ function drawOverlay(){
     priceLines.push(candleSeries.createPriceLine({price:+price,color,lineWidth:(w||(style===LS.Dotted?1:2)),lineStyle:style,axisLabelVisible:true,title}));
   }
   const d=lastDec||{}, fac=lastFac||{}, e=entryMid(d), pos=(d.suggested_position_pct||0)>0;
-  if(pos){
-    if(e) addPL(+e.toFixed(2),'#3b82f6','入场',LS.Dashed);
-    addPL(d.stop_loss,'#ea3943','止损',LS.Solid);
-    addPL(d.take_profit_ref,'#16c784','止盈',LS.Solid);
+  // 核心 3 线：只画当前有效决策的 入场/止损/止盈（历史线不画，保持清爽）
+  if(VIS.core){
+    if(pos){
+      if(e) addPL(+e.toFixed(2),'#3b82f6','入 '+fmt(e),LS.Dashed);
+      addPL(d.stop_loss,'#ea3943','损 '+fmt(d.stop_loss),LS.Solid);
+      addPL(d.take_profit_ref,'#16c784','盈 '+fmt(d.take_profit_ref),LS.Solid);
+    }
+    // 4h 盘中引擎最新预测（tradeable 才画，方向随色）
+    const ip=intradayPredOf(sym);
+    if(ip&&ip.tradeable&&ip.stop&&ip.take){
+      const c=ip.direction==='涨'?'#16c784':'#ea3943';
+      addPL(ip.stop,'rgba(234,57,67,0.75)','4h损 '+fmt(ip.stop),LS.Dotted,1);
+      addPL(ip.take,'rgba(22,199,132,0.75)','4h盈 '+fmt(ip.take),LS.Dotted,1);
+    }
   }
-  if(fac.price) addPL(+fac.price,'#9aa7b6','现价',LS.Dotted);
-  // 自动支撑/阻力（摆动点聚类成多档 · 触碰越多线越粗越亮 = 越画越准）
+  if(fac.price) addPL(+fac.price,'#9aa7b6','现价',LS.Dotted,1);
+  // 自动支撑/阻力（摆动点聚类 · 只留触碰最多的 3 档，避免糊成一团）
+  if(VIS.sr){
   const win=rows.slice(-Math.min(rows.length,120));
   if(win.length>10){
     const k=Math.max(2,Math.round(win.length/24));
@@ -3105,7 +3218,7 @@ function drawOverlay(){
       if(tail&&Math.abs(p-tail.level)<=tol){ tail.sum+=p; tail.cnt++; tail.level=tail.sum/tail.cnt; }
       else cl.push({sum:p,cnt:1,level:p}); }
     const cur=(fac.price!=null?+fac.price:rows[rows.length-1].c);
-    cl.filter(c=>c.cnt>=2).sort((a,b)=>b.cnt-a.cnt).slice(0,4).forEach(c=>{
+    cl.filter(c=>c.cnt>=2).sort((a,b)=>b.cnt-a.cnt).slice(0,3).forEach(c=>{
       const isRes=c.level>=cur;
       const strong=Math.min(c.cnt,5)/5;                                   // 触碰强度 0..1
       const base=isRes?'246,70,93':'14,203,129';
@@ -3113,14 +3226,39 @@ function drawOverlay(){
             (isRes?'阻力':'支撑')+'·'+c.cnt+'触', LS.Dashed, 1+Math.round(2*strong));
     });
   }
-  // 模拟买卖点 ▲▼
-  const mks=[];
+  }
+  // 模拟买卖点 ▲▼（只留最近 20 个）
+  let mks=[];
+  if(VIS.marks){
   (lastPositions||[]).forEach(p=>{
     if(p.opened_ts&&p.entry_price){ const r=nearestRow(p.opened_ts*1000); if(r) mks.push({time:barTime(r),position:'belowBar',color:'#16c784',shape:'arrowUp',text:'买'}); }
     if(p.status==='closed'&&p.closed_ts&&p.exit_price){ const r=nearestRow(p.closed_ts*1000); if(r){ const isWin=(p.realized_pnl_usdt||0)>=0; mks.push({time:barTime(r),position:'aboveBar',color:isWin?'#16c784':'#ea3943',shape:'arrowDown',text:'卖'}); } }
   });
   mks.sort((a,b)=>a.time-b.time);
+  mks=mks.slice(-20);
+  }
   if(markersPrim) markersPrim.setMarkers(mks);
+}
+
+// ───────── 4h 盘中引擎：最新预测徽标 + K 线叠加 ─────────
+function intradayPredOf(s){
+  const ps=(lastIntraday&&lastIntraday.recent_predictions)||[];
+  return ps.find(p=>p.symbol===s)||null;
+}
+async function loadIntraday(){
+  try{
+    lastIntraday=await (await fetch('/api/intraday/stats')).json();
+    const ip=intradayPredOf(sym), el=$('predBadge');
+    if(el){
+      if(ip){
+        const c=ip.direction==='涨'?'#16c784':(ip.direction==='跌'?'#ea3943':'#8794a6');
+        el.innerHTML=`4h预测: <b style="color:${c}">${ip.direction}</b>`+
+          (ip.prob!=null?` ${Math.round(ip.prob*100)}%`:'')+
+          (ip.tradeable?'':' <span title="'+(ip.reason||'')+'">🚫未达标</span>');
+      } else el.textContent='';
+    }
+    if(chart) drawOverlay();
+  }catch(e){}
 }
 
 async function loadEvents(){
@@ -3138,13 +3276,16 @@ async function loadStats(){
     const st=await (await fetch('/api/trader/status?symbol=')).json();
     lastPositions=await (await fetch('/api/positions?status=all')).json();
     const tp=st.total_pnl_usdt, eq=st.equity_change_pct;
+    const it=lastIntraday||{};
+    const hr=it.hit_rate_7d==null?'—':Math.round(it.hit_rate_7d*100)+'%';
+    const halted=!!it.halted;
     $('strip').innerHTML=
       `<div class="stat"><div class="k">账户权益</div><div class="v">${fmt(st.equity_usdt)}U</div></div>`+
       `<div class="stat"><div class="k">总盈亏</div><div class="v ${tp>0?'pos':(tp<0?'neg':'')}">${tp>0?'+':''}${fmt(tp)}U</div></div>`+
-      `<div class="stat"><div class="k">较起始</div><div class="v ${eq>0?'pos':(eq<0?'neg':'')}">${pct(eq)}</div></div>`+
       `<div class="stat"><div class="k">胜率</div><div class="v">${st.win_rate_pct==null?'—':st.win_rate_pct+'%'}</div></div>`+
-      `<div class="stat"><div class="k">盈亏比</div><div class="v">${st.profit_factor??'—'}</div></div>`+
+      `<div class="stat"><div class="k">4h命中·7天</div><div class="v">${hr}</div></div>`+
       `<div class="stat"><div class="k">持仓/已平</div><div class="v">${st.open_positions}/${st.closed_trades}</div></div>`+
+      `<div class="stat"><div class="k">4h引擎</div><div class="v ${halted?'neg':'pos'}">${halted?'🛑熔断':'🛡️正常'}</div></div>`+
       `<div class="holds">${(st.open_detail||[]).length?('持仓：'+st.open_detail.map(o=>o.symbol.replace('USDT','')+' @'+fmt(o.entry)+(o.unrealized_usdt!=null?(' '+(o.unrealized_usdt>=0?'+':'')+fmt(o.unrealized_usdt)+'U'):'')).join('，')):'当前无持仓'}</div>`+
       `<div class="actbtn"><button class="ghost" onclick="loadAll()">刷新</button><button onclick="runCycle()" id="cycBtn">▶ 自动跟盘一轮</button></div>`;
     if(chart) drawOverlay();
@@ -3182,13 +3323,14 @@ async function loadSnapshot(){
 
 // 侧栏（决策/事件/战绩）走 60s 轮询；K 线蜡烛由 WebSocket 实时推送，二者解耦。
 // loadKline 在此仅用于刷新趋势线/档位（key 未变不会重画蜡烛、不扰动 WS）。
-function refreshSide(){ loadSnapshot(); loadEvents(); loadStats(); loadKline(); }
+function refreshSide(){ loadSnapshot(); loadEvents(); loadIntraday(); loadStats(); loadKline(); }
 function loadAll(){ countdown=REFRESH; loadKline(); refreshSide(); }   // 切币/切周期/首次：重拉历史 K 线并重连 WS
 function startTimer(){ if(tick)clearInterval(tick); tick=setInterval(()=>{ countdown--; renderLive(); if(countdown<=0){ countdown=REFRESH; refreshSide(); } },1000); }
 
 renderChips();
+renderVisBtns();
 addMsg('你好！我是贾维斯。问我「现在该买什么」「卖多少」「为什么这么判断」，或直接点下面的快捷问题。','a');
-loadAll();
+loadWatchlist().then(()=>{ loadAll(); });
 startTimer();
 </script>
 </body>
