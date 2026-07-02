@@ -251,11 +251,13 @@ def walk_forward_classify(X: list, y: list, n_splits: int = 5) -> dict:
 
     all_true: list[int] = []
     all_pred: list[int] = []
+    all_te_idx: list[int] = []
     for tr_idx, te_idx in folds:
         preds, _ = _fit_predict_classifier(
             Xa[tr_idx].tolist(), ya[tr_idx].tolist(), Xa[te_idx].tolist())
         all_true.extend(ya[te_idx].tolist())
         all_pred.extend(preds)
+        all_te_idx.extend(int(i) for i in te_idx)
 
     if not all_true:
         return {"_error": "无 OOS 预测"}
@@ -289,7 +291,8 @@ def walk_forward_classify(X: list, y: list, n_splits: int = 5) -> dict:
         "majority_baseline_acc": round(majority_acc, 4),
         "skill_vs_baseline": round(acc - majority_acc, 4),
         "per_class": per_class,
-        "_true": all_true, "_pred": all_pred,  # 供蒙卡复用，markdown 不展示
+        # 供蒙卡/方向命中率复用，markdown 不展示；_te_idx 与 _true/_pred 逐位对齐
+        "_true": all_true, "_pred": all_pred, "_te_idx": all_te_idx,
     }
 
 

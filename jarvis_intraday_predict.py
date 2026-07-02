@@ -32,13 +32,12 @@ from typing import Any, Optional
 from jarvis_ml_predict import (
     _HAS_NUMPY,
     _fit_predict_classifier,
-    monte_carlo_pvalue,
     walk_forward_classify,
 )
 
 # ── 门禁常量（改这里 = 改交易准入口径，须走 code-audit）──────────────────────
-GATE_MIN_HIT = 0.52     # 样本外方向命中率下限（排除震荡样本后）
-GATE_MAX_P = 0.10       # 置换检验 p 值上限
+GATE_MIN_HIT = 0.52     # 样本外方向命中率下限（喊方向后下根收盘同向即命中）
+GATE_MAX_P = 0.10       # 置换检验 p 值上限（与命中率同口径，含市场漂移基线）
 LABEL_ATR_MULT = 0.5    # 标签阈值 = 0.5 × ATR%（4h 尺度的"显著"波动）
 WARMUP_BARS = 200       # 200 根均线暖机
 MIN_SAMPLES = 120       # 有效样本下限（约 20 天 4h bar）
@@ -177,32 +176,84 @@ def build_dataset_4h(bars: list[dict], funding: Optional[dict] = None) -> dict:
     }
 
 
-def directional_hit_rate(y_true: list[int], y_pred: list[int]) -> dict:
-    """方向命中率：只统计模型敢喊方向（预测≠震荡）的样本。
+def directional_hit_rate(y_fwd: list[float], y_pred: list[int]) -> dict:
+    """方向命中率（交易语义）：只统计模型敢喊方向（预测≠震荡）的样本。
 
-    hit = 预测涨且实际涨 或 预测跌且实际跌；实际震荡时预测方向记 miss
-    （喊了方向没走出来 = 白冒险，交易语义下就是错）。
+    hit = 喊涨且下根实际收涨(fwd>0) 或 喊跌且下根实际收跌(fwd<0)。
+    与 jarvis_intraday_trader._backfill 的前向回填口径完全一致——
+    旧版曾要求「实际也越过 ±0.5×ATR 阈值」才算命中，导致随机基线仅
+    ≈17%~33%，门禁 0.52 按 50% 基线设定根本够不着（口径错配 bug）。
     """
-    calls = [(t, p) for t, p in zip(y_true, y_pred) if p != 1]
+    calls = [(f, p) for f, p in zip(y_fwd, y_pred) if p != 1]
     if not calls:
         return {"n_calls": 0, "hit_rate": 0.0}
-    hits = sum(1 for t, p in calls if t == p)
+    hits = sum(1 for f, p in calls
+               if (p == 2 and f > 0) or (p == 0 and f < 0))
     return {"n_calls": len(calls), "hit_rate": round(hits / len(calls), 4)}
 
 
+def monte_carlo_hit_pvalue(X: list, y_class: list, y_fwd: list,
+                           n_splits: int = 5, n_iter: int = 200,
+                           seed: int = 42) -> dict:
+    """置换检验（与门禁同口径）：打乱训练标签重做 walk-forward，
+    统计「方向命中率 ≥ 真实值」的比例作为 p 值。
+
+    直接在 directional_hit_rate 指标上做置换，而非三分类准确率——
+    市场有漂移（上涨 bar 占比≠50%）时，瞎猜同一方向也能拿到漂移收益，
+    置换分布会如实反映这一点，比固定 50% 基线诚实。
+    置换后模型不喊方向（n_calls=0）按「与真实打平」计（保守，抬高 p）。
+    """
+    if not _HAS_NUMPY:
+        return {"_error": "需要 numpy"}
+    import numpy as np
+    real_wf = walk_forward_classify(X, y_class, n_splits=n_splits)
+    if "_error" in real_wf:
+        return real_wf
+    fwd_oos = [y_fwd[i] for i in real_wf["_te_idx"]]
+    real = directional_hit_rate(fwd_oos, real_wf["_pred"])
+    rng = np.random.default_rng(seed)
+    ya = np.asarray(y_class, int)
+    ge = 0
+    perm_hits = []
+    for _ in range(n_iter):
+        yp = ya.copy()
+        rng.shuffle(yp)
+        wf = walk_forward_classify(X, yp.tolist(), n_splits=n_splits)
+        if "_error" in wf:
+            ge += 1
+            continue
+        fwd_p = [y_fwd[i] for i in wf["_te_idx"]]
+        d = directional_hit_rate(fwd_p, wf["_pred"])
+        if d["n_calls"] == 0:
+            ge += 1  # 无方向调用视为打平（保守）
+            continue
+        perm_hits.append(d["hit_rate"])
+        if d["hit_rate"] >= real["hit_rate"]:
+            ge += 1
+    p = (ge + 1) / (n_iter + 1)
+    return {
+        "real_hit_rate": real["hit_rate"],
+        "n_calls": real["n_calls"],
+        "n_iter": n_iter,
+        "perm_hit_mean": round(float(np.mean(perm_hits)), 4) if perm_hits else None,
+        "p_value": round(p, 4),
+        "_wf": real_wf,
+    }
+
+
 def validate(dataset: dict, n_splits: int = 5, mc_iter: int = 200) -> dict:
-    """walk-forward OOS + 方向命中率 + 置换检验 → 可交易门禁判定。"""
+    """walk-forward OOS + 方向命中率 + 同口径置换检验 → 可交易门禁判定。"""
     if "_error" in dataset:
         return {"_error": dataset["_error"]}
     if not _HAS_NUMPY:
         return {"_error": "缺 numpy"}
-    X, y = dataset["X"], dataset["y_class"]
-    wf = walk_forward_classify(X, y, n_splits=n_splits)
-    if "_error" in wf:
-        return {"_error": wf["_error"]}
-    dhr = directional_hit_rate(wf["_true"], wf["_pred"])
-    mc = monte_carlo_pvalue(X, y, n_splits=n_splits, n_iter=mc_iter)
-    p = mc.get("p_value", 1.0)
+    X, y, y_fwd = dataset["X"], dataset["y_class"], dataset["y_fwd"]
+    mc = monte_carlo_hit_pvalue(X, y, y_fwd, n_splits=n_splits, n_iter=mc_iter)
+    if "_error" in mc:
+        return {"_error": mc["_error"]}
+    wf = mc["_wf"]
+    dhr = {"hit_rate": mc["real_hit_rate"], "n_calls": mc["n_calls"]}
+    p = mc["p_value"]
     tradeable = bool(dhr["hit_rate"] > GATE_MIN_HIT and p < GATE_MAX_P
                      and dhr["n_calls"] >= 30)
     out = {

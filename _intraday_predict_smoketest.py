@@ -70,11 +70,19 @@ if "_error" not in ds:
 # ── 2. 样本不足优雅降级 ─────────────────────────────────────────────────
 check("bar 太少返回 _error", "_error" in jip.build_dataset_4h(synth_bars(100)))
 
-# ── 3. directional_hit_rate 语义 ─────────────────────────────────────────
-d = jip.directional_hit_rate([2, 0, 1, 2], [2, 0, 2, 0])
-# 4 次预测里 3 次喊方向？逐个: p=2(对,t=2) p=0(对,t=0) p=2(错,t=1震荡) p=0(错,t=2)
+# ── 3. directional_hit_rate 语义（交易口径：喊方向后下根收盘同向即命中）──
+# 逐个: p=2(fwd=+2%对) p=0(fwd=-1%对) p=2(fwd=-0.1%错) p=0(fwd=+3%错)
+d = jip.directional_hit_rate([0.02, -0.01, -0.001, 0.03], [2, 0, 2, 0])
 check("方向命中率计算", d["n_calls"] == 4 and abs(d["hit_rate"] - 0.5) < 1e-9, str(d))
-check("全震荡预测 n_calls=0", jip.directional_hit_rate([2, 0], [1, 1])["n_calls"] == 0)
+check("全震荡预测 n_calls=0", jip.directional_hit_rate([0.02, -0.01], [1, 1])["n_calls"] == 0)
+check("小幅同向也算命中",
+      jip.directional_hit_rate([0.0001], [2])["hit_rate"] == 1.0)
+# 置换检验与命中率同口径
+mh = jip.monte_carlo_hit_pvalue([[float(i), float(i % 3)] for i in range(60)],
+                                [i % 3 for i in range(60)],
+                                [(1 if i % 3 == 2 else -1) * 0.01 for i in range(60)],
+                                n_splits=3, n_iter=10)
+check("monte_carlo_hit_pvalue 有 p 值", "p_value" in mh and 0 < mh["p_value"] <= 1, str(mh))
 
 # ── 4. validate 门禁：纯噪声必须拒绝 ─────────────────────────────────────
 noise = jip.build_dataset_4h(synth_bars(500, seed=99))

@@ -1790,6 +1790,76 @@ def api_intraday_stats():
         return JSONResponse({"error": repr(e)[:300]}, status_code=500)
 
 
+# ── 中长线多周期预测（15/30 天）：后台线程计算 + 内存/磁盘双缓存 ────────────
+# 单次计算含 walk-forward + 置换检验，量级分钟；同步阻塞会拖死接口，故：
+# 命中缓存直接返回；未命中返回 computing 并后台起线程算，前端轮询到齐。
+_HORIZON_TTL = 6 * 3600
+_HORIZON_FAIL_TTL = 600      # 失败结果（数据源不可达等）只缓存 10 分钟，便于网络恢复后重算
+_HORIZON_CACHE_PATH = os.path.expanduser("~/.vibe-trading/horizon_cache.json")
+_HORIZON_LOCK = _threading.Lock()
+_HORIZON_JOBS: set[str] = set()
+
+
+def _horizon_disk_load() -> dict:
+    try:
+        with open(_HORIZON_CACHE_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _horizon_disk_save(cache: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(_HORIZON_CACHE_PATH), exist_ok=True)
+        with open(_HORIZON_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _horizon_compute(sym: str, h: int) -> None:
+    key = f"{sym}:{h}"
+    try:
+        import jarvis_horizon as jh
+        r = jh.predict_horizon(sym, h)
+        with _HORIZON_LOCK:
+            cache = _horizon_disk_load()
+            cache[key] = {"ts": time.time(), "data": r}
+            _horizon_disk_save(cache)
+    finally:
+        with _HORIZON_LOCK:
+            _HORIZON_JOBS.discard(key)
+
+
+@app.get("/api/horizons")
+def api_horizons(symbol: str = "BTCUSDT"):
+    """15/30 天预测点位：{horizons:{"15":{...}|null,"30":...}, computing:[...]}。"""
+    import jarvis_horizon as jh
+    sym = symbol.upper().replace("-", "").replace("/", "")
+    if not sym.endswith(("USDT", "USDC")):
+        sym += "USDT"
+    out: dict = {"symbol": sym, "horizons": {}, "computing": []}
+    now = time.time()
+    with _HORIZON_LOCK:
+        cache = _horizon_disk_load()
+        for h in jh.HORIZONS:
+            key = f"{sym}:{h}"
+            hit = cache.get(key)
+            # direction 为空视为失败结果（数据不足/异常），用短 TTL 尽快重试
+            ttl = (_HORIZON_TTL if hit and hit.get("data", {}).get("direction")
+                   else _HORIZON_FAIL_TTL)
+            if hit and now - hit.get("ts", 0) < ttl:
+                out["horizons"][str(h)] = hit["data"]
+                continue
+            out["horizons"][str(h)] = hit["data"] if hit else None  # 过期先给旧值
+            if key not in _HORIZON_JOBS:
+                _HORIZON_JOBS.add(key)
+                _threading.Thread(target=_horizon_compute, args=(sym, h),
+                                  daemon=True).start()
+            out["computing"].append(str(h))
+    return JSONResponse(out)
+
+
 @app.get("/api/watchlist")
 def api_watchlist_get():
     import jarvis_config as jc_mod
@@ -1842,7 +1912,7 @@ def lite():
     """小白模式单页：只看结论 + 操作 + K线信号 + 模拟战绩，自动刷新。"""
     return LITE_HTML
 
-
+# 驾驶舱
 @app.get("/cockpit", response_class=HTMLResponse)
 def cockpit():
     """小白驾驶舱：左 K 线(画线提示点位) + 右 AI 面板/事件流/问答，自动跟盘。"""
@@ -2772,7 +2842,7 @@ COCKPIT_HTML = r"""<!doctype html>
         <button data-vis="sr" onclick="toggleVis('sr')">支撑阻力</button>
         <button data-vis="trend" onclick="toggleVis('trend')">趋势通道</button>
         <button data-vis="marks" onclick="toggleVis('marks')">买卖点</button>
-        <span class="hint" title="蓝虚线=入场 红=止损 绿=止盈 ▲▼=买卖点 · 黄=MA7 蓝=MA25 · 底部柱=成交量 · 「4h预测」为盘中引擎最新判断">?</span>
+        <span class="hint" title="蓝虚线=入场 红=止损 绿=止盈 ▲▼=买卖点 · 黄=MA7 蓝=MA25 · 底部柱=成交量 · 徽标依次为 4h/15天/30天 三周期预测；「15天目标/30天目标」虚线=分位回归 p50 目标价；灰虚线/👁=观察模式参考点位（未过精准度门禁，引擎不开仓）">?</span>
         <span class="hint" id="predBadge"></span>
       </div>
       <div id="kline"></div>
@@ -2812,7 +2882,7 @@ const REFRESH = 60;
 let SYMS = ['BTCUSDT','ETHUSDT','SOLUSDT'];   // 启动后由 /api/watchlist 覆盖
 let sym = 'BTCUSDT', iv = '4h';
 let chart, candleSeries=null, volSeries=null, maSeries={}, markersPrim=null, priceLines=[], chartKey='';
-let lastDec=null, lastFac=null, lastKline=null, lastPositions=[], lastIntraday=null;
+let lastDec=null, lastFac=null, lastKline=null, lastPositions=[], lastIntraday=null, lastHorizons=null;
 let countdown = REFRESH, tick=null;
 const TZ = new Date().getTimezoneOffset()*60;   // 秒：让 X 轴显示本地时间
 const barTime = r => Math.floor(r.ts/1000) - TZ;
@@ -3196,12 +3266,31 @@ function drawOverlay(){
       addPL(d.stop_loss,'#ea3943','损 '+fmt(d.stop_loss),LS.Solid);
       addPL(d.take_profit_ref,'#16c784','盈 '+fmt(d.take_profit_ref),LS.Solid);
     }
-    // 4h 盘中引擎最新预测（tradeable 才画，方向随色）
+    // 4h 盘中引擎最新预测：达标画彩色实点位；未达标画灰色参考线（观察模式，不开仓）
     const ip=intradayPredOf(sym);
-    if(ip&&ip.tradeable&&ip.stop&&ip.take){
-      const c=ip.direction==='涨'?'#16c784':'#ea3943';
-      addPL(ip.stop,'rgba(234,57,67,0.75)','4h损 '+fmt(ip.stop),LS.Dotted,1);
-      addPL(ip.take,'rgba(22,199,132,0.75)','4h盈 '+fmt(ip.take),LS.Dotted,1);
+    if(ip){
+      if(ip.tradeable&&ip.stop&&ip.take){
+        addPL(ip.stop,'rgba(234,57,67,0.75)','4h损 '+fmt(ip.stop),LS.Dotted,1);
+        addPL(ip.take,'rgba(22,199,132,0.75)','4h盈 '+fmt(ip.take),LS.Dotted,1);
+      }else if(ip.stop&&ip.take){
+        addPL(ip.stop,'rgba(135,148,166,0.6)','4h损·参考 '+fmt(ip.stop),LS.Dotted,1);
+        addPL(ip.take,'rgba(135,148,166,0.6)','4h盈·参考 '+fmt(ip.take),LS.Dotted,1);
+      }else if(ip.direction==='震荡'&&ip.entry&&ip.atr_pct){
+        // 震荡无方向点位：画 ±0.5×ATR 预计波动区间（与标签阈值同口径），灰色仅参考
+        const half=ip.entry*(ip.atr_pct/100)*0.5;
+        addPL(ip.entry+half,'rgba(135,148,166,0.55)','4h区间上·参考 '+fmt(ip.entry+half),LS.Dotted,1);
+        addPL(ip.entry-half,'rgba(135,148,166,0.55)','4h区间下·参考 '+fmt(ip.entry-half),LS.Dotted,1);
+      }
+    }
+    // 15/30 天中线目标：达标按方向着色，未达标灰色参考（分位回归 p50）
+    const hz=(lastHorizons&&lastHorizons.symbol===sym&&lastHorizons.horizons)||{};
+    for(const h of ['15','30']){
+      const p=hz[h];
+      if(!p||p.target==null) continue;
+      const col=p.tradeable
+        ?(p.direction==='涨'?'rgba(22,199,132,0.8)':(p.direction==='跌'?'rgba(234,57,67,0.8)':'rgba(135,148,166,0.7)'))
+        :'rgba(135,148,166,0.5)';
+      addPL(p.target,col,h+'天目标'+(p.tradeable?'':'·参考')+' '+fmt(p.target),LS.Dashed,1);
     }
   }
   if(fac.price) addPL(+fac.price,'#9aa7b6','现价',LS.Dotted,1);
@@ -3245,19 +3334,44 @@ function intradayPredOf(s){
   const ps=(lastIntraday&&lastIntraday.recent_predictions)||[];
   return ps.find(p=>p.symbol===s)||null;
 }
+function renderPredBadge(){
+  const el=$('predBadge'); if(!el) return;
+  const dirColor=d=>d==='涨'?'#16c784':(d==='跌'?'#ea3943':'#8794a6');
+  const seg=[];
+  const ip=intradayPredOf(sym);
+  if(ip){
+    seg.push(`4h: <b style="color:${dirColor(ip.direction)}">${ip.direction}</b>`+
+      (ip.prob!=null?` ${Math.round(ip.prob*100)}%`:'')+
+      (ip.tradeable?'':` <span title="${(ip.reason||'')} — 模型未过精准度门禁，灰线仅参考、引擎不开仓">👁</span>`));
+  }
+  const hz=(lastHorizons&&lastHorizons.symbol===sym&&lastHorizons.horizons)||{};
+  for(const h of ['15','30']){
+    const p=hz[h];
+    if(p&&p.direction){
+      seg.push(`${h}天: <b style="color:${dirColor(p.direction)}">${p.direction}</b>`+
+        (p.prob!=null?` ${Math.round(p.prob*100)}%`:'')+
+        (p.target!=null?` ➜${fmt(p.target)}`:'')+
+        (p.tradeable?'':` <span title="${(p.reason||'')} — 未过门禁，目标线仅灰色参考">👁</span>`));
+    }else if(lastHorizons&&(lastHorizons.computing||[]).includes(h)){
+      seg.push(`${h}天: <span style="color:#8794a6">计算中…</span>`);
+    }
+  }
+  el.innerHTML=seg.join(' <span style="color:var(--bd2)">|</span> ');
+}
 async function loadIntraday(){
   try{
     lastIntraday=await (await fetch('/api/intraday/stats')).json();
-    const ip=intradayPredOf(sym), el=$('predBadge');
-    if(el){
-      if(ip){
-        const c=ip.direction==='涨'?'#16c784':(ip.direction==='跌'?'#ea3943':'#8794a6');
-        el.innerHTML=`4h预测: <b style="color:${c}">${ip.direction}</b>`+
-          (ip.prob!=null?` ${Math.round(ip.prob*100)}%`:'')+
-          (ip.tradeable?'':' <span title="'+(ip.reason||'')+'">🚫未达标</span>');
-      } else el.textContent='';
-    }
+    renderPredBadge();
     if(chart) drawOverlay();
+  }catch(e){}
+}
+async function loadHorizons(){
+  try{
+    lastHorizons=await (await fetch('/api/horizons?symbol='+sym)).json();
+    renderPredBadge();
+    if(chart) drawOverlay();
+    // 计算中则 30s 后再拉一次（后台线程算完即有缓存）
+    if((lastHorizons.computing||[]).length){ setTimeout(loadHorizons, 30000); }
   }catch(e){}
 }
 
@@ -3323,7 +3437,7 @@ async function loadSnapshot(){
 
 // 侧栏（决策/事件/战绩）走 60s 轮询；K 线蜡烛由 WebSocket 实时推送，二者解耦。
 // loadKline 在此仅用于刷新趋势线/档位（key 未变不会重画蜡烛、不扰动 WS）。
-function refreshSide(){ loadSnapshot(); loadEvents(); loadIntraday(); loadStats(); loadKline(); }
+function refreshSide(){ loadSnapshot(); loadEvents(); loadIntraday(); loadHorizons(); loadStats(); loadKline(); }
 function loadAll(){ countdown=REFRESH; loadKline(); refreshSide(); }   // 切币/切周期/首次：重拉历史 K 线并重连 WS
 function startTimer(){ if(tick)clearInterval(tick); tick=setInterval(()=>{ countdown--; renderLive(); if(countdown<=0){ countdown=REFRESH; refreshSide(); } },1000); }
 
