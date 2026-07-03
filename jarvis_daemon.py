@@ -30,6 +30,9 @@ import time
 import traceback
 
 import jarvis_journal as jj
+import jarvis_net
+
+jarvis_net.ensure_proxy()   # 大陆网络：探测本地代理，Binance 等出网自动走代理
 
 LOG_DIR = os.path.expanduser("~/.vibe-trading")
 LOG_PATH = os.path.join(LOG_DIR, "jarvis_daemon.log")

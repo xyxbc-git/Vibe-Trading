@@ -30,6 +30,8 @@ from typing import Any, Optional
 
 import requests
 
+import jarvis_net
+
 SPOT_API = "https://api.binance.com"
 FAPI = "https://fapi.binance.com"
 FNG_API = "https://api.alternative.me/fng/"
@@ -40,6 +42,7 @@ _HEADERS = {"User-Agent": "jarvis-factor-backtest/1.0"}
 def _get(url: str, params: Optional[dict] = None, retries: int = 4) -> Any:
     delay = 1.5
     last_err = None
+    jarvis_net.ensure_proxy()
     for _ in range(retries):
         try:
             r = requests.get(url, params=params, headers=_HEADERS, timeout=TIMEOUT)
@@ -51,6 +54,7 @@ def _get(url: str, params: Optional[dict] = None, retries: int = 4) -> Any:
             return r.json()
         except Exception as e:  # noqa: BLE001
             last_err = repr(e)[:200]
+            jarvis_net.ensure_proxy(force=True)
             time.sleep(delay)
             delay *= 2
     return {"_error": last_err}

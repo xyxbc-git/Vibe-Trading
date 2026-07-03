@@ -27,6 +27,8 @@ from typing import Any, Optional
 
 import requests
 
+import jarvis_net
+
 FAPI = "https://fapi.binance.com"
 SPOT_API = "https://api.binance.com"
 FNG_API = "https://api.alternative.me/fng/"
@@ -118,6 +120,7 @@ def _get(url: str, params: Optional[dict] = None, retries: int = 4) -> Any:
     key = _cache_key(url, params)
     delay = 1.5
     last_err = None
+    jarvis_net.ensure_proxy()
     for attempt in range(retries):
         try:
             r = requests.get(url, params=params, headers=_HEADERS, timeout=TIMEOUT)
@@ -137,6 +140,8 @@ def _get(url: str, params: Optional[dict] = None, retries: int = 4) -> Any:
             return data
         except Exception as e:  # noqa: BLE001
             last_err = repr(e)[:200]
+            # 连接类失败可能是代理进程启停造成的，强制重探本地代理后再试
+            jarvis_net.ensure_proxy(force=True)
             time.sleep(delay)
             delay *= 2
     cached = _cache_read(key)

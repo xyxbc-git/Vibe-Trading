@@ -70,6 +70,10 @@ DEFAULTS: dict = {
     "intraday_time_stop_bars": 6,         # 时间止损（6 根 4h = 24h）
     "intraday_cooldown_bars": 1,          # 平仓后同币冷却根数
     "intraday_max_consecutive_losses": 3, # 连亏 N 笔熔断停开仓
+    # ── T-18 TradingAgents 辩论增强层（jarvis_debate，默认关=零回归）──────────
+    "debate_enabled": False,              # 总开关（关=executor 完全跳过辩论层）
+    "debate_mode": "warn",                # warn=只警示不拦单 | veto=反向结论否决下单
+    "debate_timeout_sec": 300,            # 单次辩论子进程超时（LLM 多轮，量级分钟）
 }
 
 # 关键风控旋钮的安全区间（写入时夹紧；未列的键不夹）。
@@ -93,11 +97,13 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "intraday_time_stop_bars": (1, 42),
     "intraday_cooldown_bars": (0, 12),
     "intraday_max_consecutive_losses": (1, 20),
+    "debate_timeout_sec": (30, 1800),
 }
 
 # 允许的枚举键。
 ENUMS: dict[str, tuple[str, ...]] = {
     "sizing_method": ("fixed", "kelly"),
+    "debate_mode": ("warn", "veto"),
 }
 
 

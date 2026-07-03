@@ -29,6 +29,9 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 import jarvis_brief as jb
 import jarvis_crypto_data as jcd
+import jarvis_net as _jnet
+
+_jnet.ensure_proxy()   # 大陆网络：探测本地代理，Binance 等出网自动走代理
 import jarvis_executor as jx
 import jarvis_journal as jj
 import jarvis_lessons as jl
@@ -1790,6 +1793,50 @@ def api_intraday_stats():
         return JSONResponse({"error": repr(e)[:300]}, status_code=500)
 
 
+@app.get("/api/intraday/hits")
+def api_intraday_hits(symbol: str = "BTCUSDT", limit: int = 120):
+    """4h 引擎逐 bar 预测命中历史（驾驶舱多周期卡展开的命中曲线数据源）。
+
+    返回按时间升序的 [{bar_ts, direction, prob, hit, outcome_ret}]，
+    并附滚动 20 次命中率序列 rolling（hit 未回填的条目不参与分母）。
+    """
+    sym = symbol.upper()
+    limit = max(10, min(int(limit), 500))
+    try:
+        import jarvis_intraday_trader as jit
+        jit.ensure_db()
+        with jit._conn() as conn:  # noqa: SLF001
+            rows = [dict(r) for r in conn.execute(
+                "SELECT bar_ts, direction, prob, tradeable, hit, outcome_ret "
+                "FROM intraday_predictions WHERE symbol=? "
+                "ORDER BY bar_ts DESC LIMIT ?", (sym, limit)).fetchall()]
+        rows.reverse()
+        window: list[int] = []
+        rolling: list[dict] = []
+        for r in rows:
+            if r.get("hit") is not None:
+                window.append(int(r["hit"]))
+                if len(window) > 20:
+                    window.pop(0)
+                rolling.append({
+                    "bar_ts": r["bar_ts"],
+                    "rate": round(sum(window) / len(window), 4),
+                    "n": len(window),
+                })
+        evaluated = [r for r in rows if r.get("hit") is not None]
+        n_eval = len(evaluated)
+        n_hit = sum(1 for r in evaluated if r["hit"] == 1)
+        return JSONResponse({
+            "symbol": sym,
+            "predictions": rows,
+            "rolling": rolling,
+            "n_evaluated": n_eval,
+            "hit_rate": round(n_hit / n_eval, 4) if n_eval else None,
+        })
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": repr(e)[:300]}, status_code=500)
+
+
 # ── 中长线多周期预测（15/30 天）：后台线程计算 + 内存/磁盘双缓存 ────────────
 # 单次计算含 walk-forward + 置换检验，量级分钟；同步阻塞会拖死接口，故：
 # 命中缓存直接返回；未命中返回 computing 并后台起线程算，前端轮询到齐。
@@ -2041,38 +2088,75 @@ HTML = r"""<!doctype html>
 <title>贾维斯 JARVIS · 加密决策仪表盘</title>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
 <script src="https://s3.tradingview.com/tv.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
-  :root{--bg:#0b0e14;--card:#141a24;--bd:#222c3a;--fg:#e6edf3;--mut:#8b98a9;--up:#16c784;--down:#ea3943;--accent:#3b82f6;--warn:#f0b90b;}
+  :root{
+    --bg:#07090d;--card:#12161d;--card2:#0d1117;
+    --bd:rgba(148,163,184,0.09);--bd2:rgba(148,163,184,0.22);
+    --fg:#f1f5fb;--fg2:#c6d0de;--mut:#8b95a7;
+    --up:#10d68c;--down:#ff5570;--accent:#4f8cff;--accent2:#7aa8ff;--warn:#f5c00e;
+    --r:14px;--r2:9px;--r3:999px;
+    --sh:0 1px 0 rgba(255,255,255,0.03),0 6px 18px -8px rgba(0,0,0,0.5);
+    --blur:blur(14px) saturate(1.3);
+    --font:"Inter",-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+    --mono:"JetBrains Mono","Inter",ui-monospace,SFMono-Regular,Menlo,monospace;
+    --ease:cubic-bezier(.22,.61,.36,1);
+  }
   *{box-sizing:border-box;margin:0;padding:0}
-  body{background:var(--bg);color:var(--fg);font-family:-apple-system,"PingFang SC","Microsoft YaHei",Inter,sans-serif;padding:20px;}
-  h1{font-size:20px;font-weight:700;display:flex;align-items:center;gap:10px}
+  ::selection{background:rgba(79,140,255,0.35)}
+  ::-webkit-scrollbar{width:8px;height:8px}
+  ::-webkit-scrollbar-thumb{background:rgba(148,163,184,0.18);border-radius:99px}
+  ::-webkit-scrollbar-thumb:hover{background:rgba(148,163,184,0.32)}
+  ::-webkit-scrollbar-track{background:transparent}
+  body{
+    background:
+      radial-gradient(1100px 520px at 82% -10%, rgba(79,140,255,0.09), transparent 60%),
+      radial-gradient(900px 480px at -8% 108%, rgba(16,214,140,0.05), transparent 55%),
+      var(--bg);
+    color:var(--fg);font-family:var(--font);padding:20px;
+    -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
+  }
+  @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+  h1{font-size:20px;font-weight:800;letter-spacing:-.3px;display:flex;align-items:center;gap:10px;
+    background:linear-gradient(100deg,#fff 20%,#9fc0ff 80%);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
   .sub{color:var(--mut);font-size:12px;margin-top:4px}
-  .bar{display:flex;gap:10px;align-items:center;margin:16px 0;flex-wrap:wrap}
-  select,button{background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:8px;padding:8px 12px;font-size:14px;cursor:pointer}
-  .inp{background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:8px;padding:8px;font-size:14px;width:110px}
-  button.primary{background:var(--accent);border-color:var(--accent)}
-  button:hover{filter:brightness(1.15)}
+  .bar{position:sticky;top:0;z-index:20;display:flex;gap:10px;align-items:center;margin:16px -20px;padding:10px 20px;flex-wrap:wrap;
+    background:rgba(13,17,23,0.72);backdrop-filter:var(--blur);-webkit-backdrop-filter:var(--blur);border-top:1px solid var(--bd);border-bottom:1px solid var(--bd)}
+  select,button{background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:var(--r2);padding:8px 12px;font-size:14px;cursor:pointer;font-family:var(--font);font-weight:600;transition:all .2s var(--ease)}
+  select:hover,button:hover{border-color:var(--bd2)}
+  .inp{background:var(--card2);color:var(--fg);border:1px solid var(--bd);border-radius:var(--r2);padding:8px;font-size:14px;width:110px;font-family:var(--font);transition:border-color .22s var(--ease)}
+  .inp:focus{outline:none;border-color:var(--accent)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button:hover{filter:brightness(1.12);transform:translateY(-1px)}
   .grid{display:grid;gap:14px}
   .cards{grid-template-columns:repeat(auto-fill,minmax(190px,1fr))}
-  .card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:14px 16px}
+  .card{background:linear-gradient(180deg,rgba(255,255,255,0.02),transparent 42%),var(--card);border:1px solid var(--bd);border-radius:var(--r);padding:14px 16px;box-shadow:var(--sh);animation:fadeUp .4s var(--ease) both;transition:border-color .25s var(--ease)}
+  .card:hover{border-color:var(--bd2)}
   .card .k{color:var(--mut);font-size:12px}
-  .card .v{font-size:22px;font-weight:700;margin-top:6px}
-  .card .v small{font-size:12px;color:var(--mut);font-weight:400}
+  .card .v{font-size:22px;font-weight:700;margin-top:6px;font-family:var(--mono);font-variant-numeric:tabular-nums;letter-spacing:-.3px}
+  .card .v small{font-size:12px;color:var(--mut);font-weight:400;font-family:var(--font)}
   .decision{display:grid;grid-template-columns:200px 1fr;gap:18px;margin-bottom:14px}
-  .gauge{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:6px}
-  .plan{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px}
+  .gauge{background:linear-gradient(180deg,rgba(255,255,255,0.02),transparent 42%),var(--card);border:1px solid var(--bd);border-radius:var(--r);padding:6px;box-shadow:var(--sh)}
+  .plan{position:relative;overflow:hidden;background:linear-gradient(180deg,rgba(255,255,255,0.02),transparent 42%),var(--card);border:1px solid var(--bd);border-top:2px solid rgba(79,140,255,0.55);border-radius:var(--r);padding:16px;box-shadow:var(--sh)}
+  .plan::before{content:"";position:absolute;inset:0;background:radial-gradient(420px 130px at 18% 0%,rgba(79,140,255,0.10),transparent 70%);pointer-events:none}
   .plan h3{font-size:15px;margin-bottom:10px}
-  .pill{display:inline-block;padding:3px 10px;border-radius:999px;font-size:13px;font-weight:600}
+  .pill{display:inline-block;padding:3px 10px;border-radius:var(--r3);font-size:13px;font-weight:700}
   .reasons{margin-top:10px;color:var(--mut);font-size:13px;line-height:1.9}
   .charts{grid-template-columns:1fr 1fr}
-  .chart{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:12px;height:300px}
+  .chart{background:var(--card2);border:1px solid var(--bd);border-radius:var(--r);padding:12px;height:300px;box-shadow:var(--sh);transition:border-color .25s var(--ease)}
+  .chart:hover{border-color:var(--bd2)}
   table{width:100%;border-collapse:collapse;font-size:13px}
   th,td{padding:8px 10px;text-align:right;border-bottom:1px solid var(--bd)}
-  th:first-child,td:first-child{text-align:left}
+  td{font-family:var(--mono);font-variant-numeric:tabular-nums;letter-spacing:-.2px}
+  th:first-child,td:first-child{text-align:left;font-family:var(--font)}
+  th{color:var(--mut);font-weight:600}
   .pos{color:var(--up)} .neg{color:var(--down)} .warnc{color:var(--warn)}
-  .sec{margin:18px 0 8px;font-size:15px;font-weight:600}
+  .sec{margin:18px 0 8px;font-size:13px;font-weight:700;color:var(--mut);text-transform:uppercase;letter-spacing:.6px}
   .loading{color:var(--mut)}
   .foot{color:var(--mut);font-size:11px;margin-top:18px;line-height:1.7}
+  .foot a{color:var(--accent)}
   @media(max-width:820px){.charts{grid-template-columns:1fr}.decision{grid-template-columns:1fr}}
 </style>
 </head>
@@ -2219,8 +2303,8 @@ function renderTV(sym){
     hide_side_toolbar: false,
     allow_symbol_change: true,
     studies: ['Volume@tv-basicstudies'],
-    backgroundColor: '#141a24',
-    gridColor: '#222c3a'
+    backgroundColor: '#0d1117',
+    gridColor: '#1a212c'
   });
 }
 
@@ -2248,29 +2332,29 @@ function renderKline(d){
   const dates=rows.map(r=>r.t);
   const ohlc=rows.map(r=>[r.o,r.c,r.l,r.h]);  // echarts: [open,close,low,high]
   const vol=rows.map(r=>r.v);
-  const ax={axisLine:{lineStyle:{color:'#8b98a9'}},splitLine:{lineStyle:{color:'#1c2530'}}};
+  const ax={axisLine:{lineStyle:{color:'#8b95a7'}},splitLine:{lineStyle:{color:'#1a212c'}}};
   // 叠加决策信号线
   const ml=[];
   const dec=lastDecision||{};
   if(dec.suggested_position_pct>0){
-    if(dec.stop_loss) ml.push({yAxis:dec.stop_loss,name:'硬止损',lineStyle:{color:'#ea3943'},label:{formatter:'止损 '+dec.stop_loss,color:'#ea3943',position:'insideEndTop'}});
-    if(dec.take_profit_ref) ml.push({yAxis:dec.take_profit_ref,name:'参考止盈',lineStyle:{color:'#16c784'},label:{formatter:'止盈 '+dec.take_profit_ref,color:'#16c784',position:'insideEndTop'}});
+    if(dec.stop_loss) ml.push({yAxis:dec.stop_loss,name:'硬止损',lineStyle:{color:'#ff5570'},label:{formatter:'止损 '+dec.stop_loss,color:'#ff5570',position:'insideEndTop'}});
+    if(dec.take_profit_ref) ml.push({yAxis:dec.take_profit_ref,name:'参考止盈',lineStyle:{color:'#10d68c'},label:{formatter:'止盈 '+dec.take_profit_ref,color:'#10d68c',position:'insideEndTop'}});
     if(dec.entry_zone){const parts=(''+dec.entry_zone).split('~').map(s=>parseFloat(s.trim())).filter(x=>!isNaN(x));
-      parts.forEach((p,i)=>ml.push({yAxis:p,name:'入场',lineStyle:{color:'#3b82f6',type:'dashed'},label:{formatter:'入场 '+p,color:'#3b82f6',position:'insideEndTop'}}));}
+      parts.forEach((p,i)=>ml.push({yAxis:p,name:'入场',lineStyle:{color:'#4f8cff',type:'dashed'},label:{formatter:'入场 '+p,color:'#4f8cff',position:'insideEndTop'}}));}
   }
   cKline.setOption({
     tooltip:{trigger:'axis',axisPointer:{type:'cross'}},
-    legend:{data:['K线','成交量'],textStyle:{color:'#8b98a9'},top:0},
+    legend:{data:['K线','成交量'],textStyle:{color:'#8b95a7'},top:0},
     grid:[{left:55,right:20,top:30,height:'62%'},{left:55,right:20,top:'74%',height:'16%'}],
-    xAxis:[{type:'category',data:dates,...ax,axisLabel:{color:'#8b98a9'},boundaryGap:true},
+    xAxis:[{type:'category',data:dates,...ax,axisLabel:{color:'#8b95a7'},boundaryGap:true},
            {type:'category',gridIndex:1,data:dates,axisLabel:{show:false},axisLine:{show:false}}],
-    yAxis:[{scale:true,...ax,axisLabel:{color:'#8b98a9'}},
+    yAxis:[{scale:true,...ax,axisLabel:{color:'#8b95a7'}},
            {gridIndex:1,...ax,axisLabel:{show:false},splitLine:{show:false}}],
-    dataZoom:[{type:'inside',xAxisIndex:[0,1],start:55,end:100},{type:'slider',xAxisIndex:[0,1],bottom:0,height:14,start:55,end:100,textStyle:{color:'#8b98a9'}}],
+    dataZoom:[{type:'inside',xAxisIndex:[0,1],start:55,end:100},{type:'slider',xAxisIndex:[0,1],bottom:0,height:14,start:55,end:100,textStyle:{color:'#8b95a7'}}],
     series:[
-      {name:'K线',type:'candlestick',data:ohlc,itemStyle:{color:'#16c784',color0:'#ea3943',borderColor:'#16c784',borderColor0:'#ea3943'},
+      {name:'K线',type:'candlestick',data:ohlc,itemStyle:{color:'#10d68c',color0:'#ff5570',borderColor:'#10d68c',borderColor0:'#ff5570'},
        markLine:{symbol:'none',data:ml,silent:true}},
-      {name:'成交量',type:'bar',xAxisIndex:1,yAxisIndex:1,data:vol,itemStyle:{color:'#3b82f680'}}
+      {name:'成交量',type:'bar',xAxisIndex:1,yAxisIndex:1,data:vol,itemStyle:{color:'#4f8cff80'}}
     ]
   });
 }
@@ -2427,17 +2511,17 @@ function renderCalib(c){
   const bk=c.buckets||[];
   // 可靠性曲线：x=预测兑现率, y=实际兑现率；对角线=完美校准
   const pts=bk.map(b=>[b.pred_pct,b.actual_pct,b.n]);
-  const ax={axisLine:{lineStyle:{color:'#8b98a9'}},splitLine:{lineStyle:{color:'#1c2530'}}};
+  const ax={axisLine:{lineStyle:{color:'#8b95a7'}},splitLine:{lineStyle:{color:'#1a212c'}}};
   cCalib.setOption({
-    title:{text:'可靠性曲线（贴对角线=越准）',textStyle:{color:'#e6edf3',fontSize:13}},
+    title:{text:'可靠性曲线（贴对角线=越准）',textStyle:{color:'#f1f5fb',fontSize:13}},
     tooltip:{formatter:p=>p.seriesName==='理想'?'完美校准线':`预测兑现 ${p.data[0]}%<br>实际兑现 ${p.data[1]}%<br>样本 ${p.data[2]} 条`},
     grid:{left:50,right:25,top:50,bottom:40},
-    xAxis:{type:'value',name:'贾维斯预测兑现率%',min:40,max:100,...ax,axisLabel:{color:'#8b98a9'}},
-    yAxis:{type:'value',name:'实际兑现率%',min:0,max:100,...ax,axisLabel:{color:'#8b98a9'}},
+    xAxis:{type:'value',name:'贾维斯预测兑现率%',min:40,max:100,...ax,axisLabel:{color:'#8b95a7'}},
+    yAxis:{type:'value',name:'实际兑现率%',min:0,max:100,...ax,axisLabel:{color:'#8b95a7'}},
     series:[
-      {name:'理想',type:'line',data:[[50,50],[100,100]],showSymbol:false,lineStyle:{color:'#8b98a9',type:'dashed'},silent:true},
+      {name:'理想',type:'line',data:[[50,50],[100,100]],showSymbol:false,lineStyle:{color:'#8b95a7',type:'dashed'},silent:true},
       {name:'贾维斯',type:'scatter',data:pts,symbolSize:p=>Math.min(40,12+p[2]),
-       itemStyle:{color:'#3b82f6'},label:{show:true,position:'top',color:'#8b98a9',formatter:p=>'n='+p.data[2]}}
+       itemStyle:{color:'#4f8cff'},label:{show:true,position:'top',color:'#8b95a7',formatter:p=>'n='+p.data[2]}}
     ]
   });
   // 统计卡
@@ -2476,15 +2560,15 @@ function renderTrack(t){
   if(!cTrack) cTrack=echarts.init($('chartTrack'));
   const horizons = Object.keys(bh);
   const dirs = ['偏多（战术）','中性观望'];
-  const ax={axisLine:{lineStyle:{color:'#8b98a9'}},splitLine:{lineStyle:{color:'#1c2530'}}};
+  const ax={axisLine:{lineStyle:{color:'#8b95a7'}},splitLine:{lineStyle:{color:'#1a212c'}}};
   const series = dirs.map(d=>({name:d,type:'bar',
     data:horizons.map(h=>{const a=(bh[h].by_direction||{})[d]; return a&&a.n?a.avg_ret_pct:0;}),
-    label:{show:true,position:'top',color:'#8b98a9',formatter:'{c}%'}}));
-  cTrack.setOption({title:{text:'平均前向收益：偏多信号 vs 中性基线',textStyle:{color:'#e6edf3',fontSize:13}},
-    tooltip:{trigger:'axis'},legend:{textStyle:{color:'#8b98a9'},top:22},grid:{left:45,right:20,top:55,bottom:30},
-    xAxis:{type:'category',data:horizons,...ax,axisLabel:{color:'#8b98a9'}},
-    yAxis:{type:'value',name:'收益%',...ax,axisLabel:{color:'#8b98a9'}},
-    color:['#16c784','#8b98a9'], series});
+    label:{show:true,position:'top',color:'#8b95a7',formatter:'{c}%'}}));
+  cTrack.setOption({title:{text:'平均前向收益：偏多信号 vs 中性基线',textStyle:{color:'#f1f5fb',fontSize:13}},
+    tooltip:{trigger:'axis'},legend:{textStyle:{color:'#8b95a7'},top:22},grid:{left:45,right:20,top:55,bottom:30},
+    xAxis:{type:'category',data:horizons,...ax,axisLabel:{color:'#8b95a7'}},
+    yAxis:{type:'value',name:'收益%',...ax,axisLabel:{color:'#8b95a7'}},
+    color:['#10d68c','#8b95a7'], series});
   // 统计卡
   let st=`<div style="font-size:13px;line-height:2">累计快照 <b>${rep.total_snapshots??0}</b> 条 · 已评估 <b>${rep.evaluated_outcomes??0}</b> 条<br>`;
   for(const h in bh){const ov=bh[h].overall; if(!ov.n)continue;
@@ -2507,18 +2591,18 @@ function renderTrack(t){
 function renderAttr(d){
   if(!cAttr) cAttr=echarts.init($('cAttr'));
   const attr=(d.attribution||[]).slice().sort((a,b)=>a.contribution-b.contribution);
-  const ax={axisLine:{lineStyle:{color:'#8b98a9'}},splitLine:{lineStyle:{color:'#1c2530'}}};
+  const ax={axisLine:{lineStyle:{color:'#8b95a7'}},splitLine:{lineStyle:{color:'#1a212c'}}};
   if(!attr.length){
-    cAttr.setOption({title:{text:'本次无显式因子贡献（中性）',textStyle:{color:'#8b98a9',fontSize:13},left:'center',top:'center'}},true);
+    cAttr.setOption({title:{text:'本次无显式因子贡献（中性）',textStyle:{color:'#8b95a7',fontSize:13},left:'center',top:'center'}},true);
     return;
   }
   cAttr.setOption({
-    tooltip:{trigger:'axis',axisPointer:{type:'shadow'},formatter:p=>{const it=p[0];const a=attr[it.dataIndex];return `<b>${a.factor}</b>: ${a.contribution>0?'+':''}${a.contribution}<br><span style="color:#8b98a9">${a.note}</span>`;}},
+    tooltip:{trigger:'axis',axisPointer:{type:'shadow'},formatter:p=>{const it=p[0];const a=attr[it.dataIndex];return `<b>${a.factor}</b>: ${a.contribution>0?'+':''}${a.contribution}<br><span style="color:#8b95a7">${a.note}</span>`;}},
     grid:{left:120,right:40,top:20,bottom:25},
-    xAxis:{type:'value',...ax,axisLabel:{color:'#8b98a9'},name:'对信心分的贡献'},
-    yAxis:{type:'category',data:attr.map(a=>a.factor),...ax,axisLabel:{color:'#e6edf3'}},
-    series:[{type:'bar',data:attr.map(a=>({value:a.contribution,itemStyle:{color:a.contribution>=0?'#16c784':'#ea3943'}})),
-      label:{show:true,position:'right',color:'#8b98a9',formatter:p=>(p.value>0?'+':'')+p.value}}]
+    xAxis:{type:'value',...ax,axisLabel:{color:'#8b95a7'},name:'对信心分的贡献'},
+    yAxis:{type:'category',data:attr.map(a=>a.factor),...ax,axisLabel:{color:'#f1f5fb'}},
+    series:[{type:'bar',data:attr.map(a=>({value:a.contribution,itemStyle:{color:a.contribution>=0?'#10d68c':'#ff5570'}})),
+      label:{show:true,position:'right',color:'#8b95a7',formatter:p=>(p.value>0?'+':'')+p.value}}]
   },true);
 }
 
@@ -2531,15 +2615,15 @@ function renderDecision(s){
   if(!gauge) gauge = echarts.init($('gauge'));
   gauge.setOption({
     series:[{type:'gauge',min:-2,max:2,splitNumber:4,radius:'92%',
-      axisLine:{lineStyle:{width:14,color:[[0.4,'#ea3943'],[0.6,'#8b98a9'],[1,'#16c784']]}},
+      axisLine:{lineStyle:{width:14,color:[[0.4,'#ff5570'],[0.6,'#8b95a7'],[1,'#10d68c']]}},
       pointer:{width:5}, progress:{show:false},
-      axisLabel:{distance:-6,fontSize:9,color:'#8b98a9'}, axisTick:{show:false}, splitLine:{length:10},
-      detail:{valueAnimation:true,fontSize:26,offsetCenter:[0,'58%'],formatter:'{value}',color:'#e6edf3'},
-      title:{offsetCenter:[0,'82%'],fontSize:12,color:'#8b98a9'},
+      axisLabel:{distance:-6,fontSize:9,color:'#8b95a7'}, axisTick:{show:false}, splitLine:{length:10},
+      detail:{valueAnimation:true,fontSize:26,offsetCenter:[0,'58%'],formatter:'{value}',color:'#f1f5fb'},
+      title:{offsetCenter:[0,'82%'],fontSize:12,color:'#8b95a7'},
       data:[{value:score,name:'信心分'}]}]
   });
   const dir = d.direction||'-';
-  const color = score>=0.8?'#16c784':(score<=-0.8?'#ea3943':'#8b98a9');
+  const color = score>=0.8?'#10d68c':(score<=-0.8?'#ff5570':'#8b95a7');
   let html = `<h3>决策：<span class="pill" style="background:${color}22;color:${color}">${dir}</span> &nbsp; 建议仓位 <b>${d.suggested_position_pct??0}%</b></h3>`;
   if(d.suggested_position_pct>0){
     html += `<table style="margin-top:6px">
@@ -2570,25 +2654,26 @@ function renderCards(s){
   if(oc.hashrate_eh_s) h+=card('全网算力', oc.hashrate_eh_s+' EH/s', '内存池 '+(oc.mempool_tx_count??'-'));
   $('cards').innerHTML=h;
   $('foot').innerHTML='数据来源：Binance Futures/Spot、CoinGecko、alternative.me、blockchain.info/mempool.space（真实拉取，非估算）。'+
-    '<br>因子 edge 经样本外验证偏弱，本仪表盘刻意以小仓位+硬止损+时间止损控制风险。不构成交易建议。';
+    '<br>因子 edge 经样本外验证偏弱，本仪表盘刻意以小仓位+硬止损+时间止损控制风险。不构成交易建议。'+
+    '<br><a href="/cockpit">驾驶舱</a> · <a href="/lite">小白单页</a>';
 }
 
 function renderCharts(d){
   if(!cPrice) cPrice=echarts.init($('chartPrice'));
   if(!cFng) cFng=echarts.init($('chartFng'));
-  const ax={axisLine:{lineStyle:{color:'#8b98a9'}},splitLine:{lineStyle:{color:'#1c2530'}}};
-  cPrice.setOption({title:{text:'价格 & 距高点回撤',textStyle:{color:'#e6edf3',fontSize:13}},
-    tooltip:{trigger:'axis'},legend:{textStyle:{color:'#8b98a9'},top:22},grid:{left:55,right:55,top:55,bottom:30},
-    xAxis:{type:'category',data:d.dates,...ax,axisLabel:{color:'#8b98a9'}},
-    yAxis:[{type:'value',name:'价',...ax,axisLabel:{color:'#8b98a9'},scale:true},
-           {type:'value',name:'回撤%',...ax,axisLabel:{color:'#8b98a9'},max:0}],
-    series:[{name:'收盘价',type:'line',data:d.close,showSymbol:false,lineStyle:{color:'#3b82f6'}},
-            {name:'回撤%',type:'line',yAxisIndex:1,data:d.drawdown_pct,showSymbol:false,areaStyle:{color:'#ea394322'},lineStyle:{color:'#ea3943'}}]});
-  cFng.setOption({title:{text:'恐慌贪婪指数',textStyle:{color:'#e6edf3',fontSize:13}},
+  const ax={axisLine:{lineStyle:{color:'#8b95a7'}},splitLine:{lineStyle:{color:'#1a212c'}}};
+  cPrice.setOption({title:{text:'价格 & 距高点回撤',textStyle:{color:'#f1f5fb',fontSize:13}},
+    tooltip:{trigger:'axis'},legend:{textStyle:{color:'#8b95a7'},top:22},grid:{left:55,right:55,top:55,bottom:30},
+    xAxis:{type:'category',data:d.dates,...ax,axisLabel:{color:'#8b95a7'}},
+    yAxis:[{type:'value',name:'价',...ax,axisLabel:{color:'#8b95a7'},scale:true},
+           {type:'value',name:'回撤%',...ax,axisLabel:{color:'#8b95a7'},max:0}],
+    series:[{name:'收盘价',type:'line',data:d.close,showSymbol:false,lineStyle:{color:'#4f8cff'}},
+            {name:'回撤%',type:'line',yAxisIndex:1,data:d.drawdown_pct,showSymbol:false,areaStyle:{color:'#ff557022'},lineStyle:{color:'#ff5570'}}]});
+  cFng.setOption({title:{text:'恐慌贪婪指数',textStyle:{color:'#f1f5fb',fontSize:13}},
     tooltip:{trigger:'axis'},grid:{left:45,right:20,top:45,bottom:30},
-    xAxis:{type:'category',data:d.dates,...ax,axisLabel:{color:'#8b98a9'}},
-    yAxis:{type:'value',min:0,max:100,...ax,axisLabel:{color:'#8b98a9'}},
-    visualMap:{show:false,pieces:[{lte:25,color:'#ea3943'},{gt:25,lte:45,color:'#f0b90b'},{gt:45,lte:55,color:'#8b98a9'},{gt:55,lte:75,color:'#7ac74f'},{gt:75,color:'#16c784'}]},
+    xAxis:{type:'category',data:d.dates,...ax,axisLabel:{color:'#8b95a7'}},
+    yAxis:{type:'value',min:0,max:100,...ax,axisLabel:{color:'#8b95a7'}},
+    visualMap:{show:false,pieces:[{lte:25,color:'#ff5570'},{gt:25,lte:45,color:'#f5c00e'},{gt:45,lte:55,color:'#8b95a7'},{gt:55,lte:75,color:'#7ac74f'},{gt:75,color:'#10d68c'}]},
     series:[{name:'F&G',type:'line',data:d.fng,showSymbol:false}]});
 }
 
@@ -2619,34 +2704,66 @@ LITE_HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>贾维斯 · 小白模式</title>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
-  :root{--bg:#0b0e14;--card:#141a24;--bd:#222c3a;--fg:#e6edf3;--mut:#8b98a9;--up:#16c784;--down:#ea3943;--accent:#3b82f6;--warn:#f0b90b;}
+  :root{
+    --bg:#07090d;--card:#12161d;--card2:#0d1117;
+    --bd:rgba(148,163,184,0.09);--bd2:rgba(148,163,184,0.22);
+    --fg:#f1f5fb;--fg2:#c6d0de;--mut:#8b95a7;
+    --up:#10d68c;--down:#ff5570;--accent:#4f8cff;--accent2:#7aa8ff;--warn:#f5c00e;
+    --r:14px;--r2:9px;--r3:999px;
+    --sh:0 1px 0 rgba(255,255,255,0.03),0 6px 18px -8px rgba(0,0,0,0.5);
+    --blur:blur(14px) saturate(1.3);
+    --font:"Inter",-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+    --mono:"JetBrains Mono","Inter",ui-monospace,SFMono-Regular,Menlo,monospace;
+    --ease:cubic-bezier(.22,.61,.36,1);
+  }
   *{box-sizing:border-box;margin:0;padding:0}
-  body{background:var(--bg);color:var(--fg);font-family:-apple-system,"PingFang SC","Microsoft YaHei",Inter,sans-serif;padding:16px;max-width:760px;margin:0 auto;}
+  ::selection{background:rgba(79,140,255,0.35)}
+  ::-webkit-scrollbar{width:8px;height:8px}
+  ::-webkit-scrollbar-thumb{background:rgba(148,163,184,0.18);border-radius:99px}
+  ::-webkit-scrollbar-track{background:transparent}
+  body{
+    background:
+      radial-gradient(900px 420px at 82% -10%, rgba(79,140,255,0.09), transparent 60%),
+      radial-gradient(760px 400px at -8% 108%, rgba(16,214,140,0.05), transparent 55%),
+      var(--bg);
+    color:var(--fg);font-family:var(--font);padding:16px;max-width:760px;margin:0 auto;
+    -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
+  }
+  @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
   .top{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px}
-  h1{font-size:19px;font-weight:700}
-  select,button{background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:8px;padding:7px 12px;font-size:14px;cursor:pointer}
-  button.primary{background:var(--accent);border-color:var(--accent)}
-  button:hover{filter:brightness(1.15)}
+  h1{font-size:19px;font-weight:800;letter-spacing:-.3px;
+    background:linear-gradient(100deg,#fff 20%,#9fc0ff 80%);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+  select,button{background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:var(--r2);padding:7px 12px;font-size:14px;cursor:pointer;font-family:var(--font);font-weight:600;transition:all .2s var(--ease)}
+  select:hover,button:hover{border-color:var(--bd2)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button:hover{filter:brightness(1.12);transform:translateY(-1px)}
   .refresh{margin-left:auto;color:var(--mut);font-size:12px;text-align:right;line-height:1.5}
-  .verdict{background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:20px;margin:12px 0;text-align:center}
-  .verdict .big{font-size:34px;font-weight:800;letter-spacing:1px}
+  .verdict{position:relative;overflow:hidden;background:linear-gradient(180deg,rgba(255,255,255,0.02),transparent 42%),var(--card);border:1px solid var(--bd);border-top:2px solid rgba(79,140,255,0.55);border-radius:var(--r);padding:20px;margin:12px 0;text-align:center;box-shadow:var(--sh);animation:fadeUp .4s var(--ease) both}
+  .verdict::before{content:"";position:absolute;inset:0;background:radial-gradient(420px 130px at 50% 0%,rgba(79,140,255,0.10),transparent 70%);pointer-events:none}
+  .verdict .big{font-size:34px;font-weight:800;letter-spacing:-.4px}
   .verdict .sub{color:var(--mut);font-size:14px;margin-top:8px}
-  .conf{display:inline-block;padding:2px 12px;border-radius:999px;font-size:13px;font-weight:700;margin-left:6px}
+  .conf{display:inline-block;padding:2px 12px;border-radius:var(--r3);font-size:13px;font-weight:700;margin-left:6px}
   .ops{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin:12px 0}
-  .op{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:12px 14px}
+  .op{background:linear-gradient(180deg,rgba(255,255,255,0.02),transparent 42%),var(--card);border:1px solid var(--bd);border-radius:var(--r);padding:12px 14px;box-shadow:var(--sh);animation:fadeUp .4s var(--ease) both;transition:border-color .2s var(--ease),transform .2s var(--ease)}
+  .op:hover{border-color:var(--bd2);transform:translateY(-1px)}
   .op .k{color:var(--mut);font-size:12px}
-  .op .v{font-size:19px;font-weight:700;margin-top:5px}
-  .why{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:14px 16px;margin:12px 0;font-size:14px;line-height:1.95}
+  .op .v{font-size:19px;font-weight:700;margin-top:5px;font-family:var(--mono);font-variant-numeric:tabular-nums;letter-spacing:-.2px}
+  .why{background:linear-gradient(180deg,rgba(255,255,255,0.02),transparent 42%),var(--card);border:1px solid var(--bd);border-radius:var(--r);padding:14px 16px;margin:12px 0;font-size:14px;line-height:1.95;box-shadow:var(--sh);animation:fadeUp .4s var(--ease) both}
   .why b{color:var(--fg)} .why .li{color:var(--mut)}
-  .sec{margin:16px 0 8px;font-size:14px;font-weight:600;color:var(--mut)}
-  .chart{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:10px;height:340px}
+  .sec{margin:16px 0 8px;font-size:12px;font-weight:700;color:var(--mut);text-transform:uppercase;letter-spacing:.6px}
+  .chart{background:var(--card2);border:1px solid var(--bd);border-radius:var(--r);padding:10px;height:340px;box-shadow:var(--sh);transition:border-color .25s var(--ease)}
+  .chart:hover{border-color:var(--bd2)}
   .ivbar{display:flex;gap:6px;margin-bottom:8px}
   .ivbar button{padding:5px 12px;font-size:13px}
   .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px}
-  .stat{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:12px;text-align:center}
+  .stat{background:linear-gradient(180deg,rgba(255,255,255,0.02),transparent 42%),var(--card);border:1px solid var(--bd);border-radius:var(--r);padding:12px;text-align:center;box-shadow:var(--sh);animation:fadeUp .4s var(--ease) both;transition:border-color .2s var(--ease)}
+  .stat:hover{border-color:var(--bd2)}
   .stat .k{color:var(--mut);font-size:12px}
-  .stat .v{font-size:20px;font-weight:700;margin-top:5px}
+  .stat .v{font-size:20px;font-weight:700;margin-top:5px;font-family:var(--mono);font-variant-numeric:tabular-nums;letter-spacing:-.2px}
   .pos{color:var(--up)} .neg{color:var(--down)}
   .foot{color:var(--mut);font-size:11px;margin-top:18px;line-height:1.7;text-align:center}
   .foot a{color:var(--accent)}
@@ -2686,7 +2803,7 @@ LITE_HTML = r"""<!doctype html>
 
   <div class="foot" id="foot">
     数据来源：Binance / CoinGecko / alternative.me / 链上（真实拉取）。本页每 60 秒自动刷新一次。<br>
-    想看完整专业版（因子归因 / 置信度校准 / 挂单台账）？打开 <a href="/">完整仪表盘</a>。
+    <a href="/cockpit">驾驶舱</a> · 想看完整专业版（因子归因 / 置信度校准 / 挂单台账）？打开 <a href="/">完整仪表盘</a>。
   </div>
 
 <script>
@@ -2700,9 +2817,9 @@ function cls(x){return x>0?'pos':(x<0?'neg':'');}
 function verdictOf(d){
   const s = d.conviction_score ?? 0, abs = Math.abs(s);
   const conf = abs>=1.2?'高':(abs>=0.6?'中':'低');
-  if(s>=0.6)  return {txt:'可小仓试多 📈', color:'#16c784', conf, score:s};
-  if(s<=-0.6) return {txt:'偏空 · 别追多 📉', color:'#ea3943', conf, score:s};
-  return {txt:'先观望 ⏸', color:'#8b98a9', conf:'低', score:s};
+  if(s>=0.6)  return {txt:'可小仓试多 📈', color:'#10d68c', conf, score:s};
+  if(s<=-0.6) return {txt:'偏空 · 别追多 📉', color:'#ff5570', conf, score:s};
+  return {txt:'先观望 ⏸', color:'#8b95a7', conf:'低', score:s};
 }
 
 function renderVerdict(s){
@@ -2762,21 +2879,21 @@ function renderKlineOverlay(){
   const rows = lastKline.rows || [];
   const dates = rows.map(r=>r.t);
   const ohlc = rows.map(r=>[r.o,r.c,r.l,r.h]);
-  const ax = {axisLine:{lineStyle:{color:'#8b98a9'}},splitLine:{lineStyle:{color:'#1c2530'}}};
+  const ax = {axisLine:{lineStyle:{color:'#8b95a7'}},splitLine:{lineStyle:{color:'#1a212c'}}};
   const ml = []; const dec = lastDec || {};
   if(dec.suggested_position_pct>0){
-    if(dec.stop_loss) ml.push({yAxis:dec.stop_loss,lineStyle:{color:'#ea3943'},label:{formatter:'止损 '+dec.stop_loss,color:'#ea3943',position:'insideEndTop'}});
-    if(dec.take_profit_ref) ml.push({yAxis:dec.take_profit_ref,lineStyle:{color:'#16c784'},label:{formatter:'止盈 '+dec.take_profit_ref,color:'#16c784',position:'insideEndTop'}});
+    if(dec.stop_loss) ml.push({yAxis:dec.stop_loss,lineStyle:{color:'#ff5570'},label:{formatter:'止损 '+dec.stop_loss,color:'#ff5570',position:'insideEndTop'}});
+    if(dec.take_profit_ref) ml.push({yAxis:dec.take_profit_ref,lineStyle:{color:'#10d68c'},label:{formatter:'止盈 '+dec.take_profit_ref,color:'#10d68c',position:'insideEndTop'}});
     if(dec.entry_zone){(''+dec.entry_zone).split('~').map(s=>parseFloat(s.trim())).filter(x=>!isNaN(x))
-      .forEach(p=>ml.push({yAxis:p,lineStyle:{color:'#3b82f6',type:'dashed'},label:{formatter:'入场 '+p,color:'#3b82f6',position:'insideEndTop'}}));}
+      .forEach(p=>ml.push({yAxis:p,lineStyle:{color:'#4f8cff',type:'dashed'},label:{formatter:'入场 '+p,color:'#4f8cff',position:'insideEndTop'}}));}
   }
   kline.setOption({
     tooltip:{trigger:'axis',axisPointer:{type:'cross'}},
     grid:{left:55,right:18,top:14,bottom:48},
-    xAxis:{type:'category',data:dates,...ax,axisLabel:{color:'#8b98a9'},boundaryGap:true},
-    yAxis:{scale:true,...ax,axisLabel:{color:'#8b98a9'}},
-    dataZoom:[{type:'inside',start:50,end:100},{type:'slider',bottom:8,height:14,start:50,end:100,textStyle:{color:'#8b98a9'}}],
-    series:[{type:'candlestick',data:ohlc,itemStyle:{color:'#16c784',color0:'#ea3943',borderColor:'#16c784',borderColor0:'#ea3943'},
+    xAxis:{type:'category',data:dates,...ax,axisLabel:{color:'#8b95a7'},boundaryGap:true},
+    yAxis:{scale:true,...ax,axisLabel:{color:'#8b95a7'}},
+    dataZoom:[{type:'inside',start:50,end:100},{type:'slider',bottom:8,height:14,start:50,end:100,textStyle:{color:'#8b95a7'}}],
+    series:[{type:'candlestick',data:ohlc,itemStyle:{color:'#10d68c',color0:'#ff5570',borderColor:'#10d68c',borderColor0:'#ff5570'},
       markLine:{symbol:'none',data:ml,silent:true}}]
   });
 }
@@ -2840,31 +2957,41 @@ COCKPIT_HTML = r"""<!doctype html>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
   :root{
-    --bg:#0b0e11;--card:#141920;--card2:#0f1317;--glass:#141920;
-    --bd:rgba(255,255,255,0.06);--bd2:rgba(255,255,255,0.13);
-    --fg:#eef3f9;--fg2:#c4cfdd;--mut:#848e9c;
-    --up:#0ecb81;--down:#f6465d;--accent:#3b82f6;--accent2:#60a5fa;--warn:#f0b90b;
-    --r:10px;--r2:8px;--r3:999px;
+    --bg:#07090d;--card:#12161d;--card2:#0d1117;--glass:#12161d;
+    --bd:rgba(148,163,184,0.09);--bd2:rgba(148,163,184,0.22);
+    --fg:#f1f5fb;--fg2:#c6d0de;--mut:#8b95a7;
+    --up:#10d68c;--down:#ff5570;--accent:#4f8cff;--accent2:#7aa8ff;--warn:#f5c00e;
+    --r:14px;--r2:9px;--r3:999px;
     --sp1:6px;--sp2:10px;--sp3:14px;--sp4:18px;
-    --sh:0 1px 0 rgba(255,255,255,0.02);--sh2:0 2px 10px rgba(0,0,0,0.25);
-    --blur:none;
+    --sh:0 1px 0 rgba(255,255,255,0.03),0 6px 18px -8px rgba(0,0,0,0.5);
+    --sh2:0 2px 10px rgba(0,0,0,0.25);
+    --blur:blur(14px) saturate(1.3);
     --font:"Inter",-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
     --mono:"JetBrains Mono","Inter",ui-monospace,SFMono-Regular,Menlo,monospace;
     --ease:cubic-bezier(.22,.61,.36,1);
   }
   *{box-sizing:border-box;margin:0;padding:0}
+  ::selection{background:rgba(79,140,255,0.35)}
+  ::-webkit-scrollbar{width:8px;height:8px}
+  ::-webkit-scrollbar-thumb{background:rgba(148,163,184,0.18);border-radius:99px}
+  ::-webkit-scrollbar-thumb:hover{background:rgba(148,163,184,0.32)}
+  ::-webkit-scrollbar-track{background:transparent}
   .num{font-family:var(--mono);font-feature-settings:"tnum" 1;font-variant-numeric:tabular-nums;letter-spacing:-.2px}
   body{
-    background:var(--bg);color:var(--fg);font-family:var(--font);height:100vh;
+    background:
+      radial-gradient(1100px 520px at 82% -10%, rgba(79,140,255,0.09), transparent 60%),
+      radial-gradient(900px 480px at -8% 108%, rgba(16,214,140,0.05), transparent 55%),
+      var(--bg);
+    color:var(--fg);font-family:var(--font);height:100vh;
     display:flex;flex-direction:column;overflow:hidden;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
   }
   @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
-  .hdr{display:flex;align-items:center;gap:12px;padding:11px 18px;border-bottom:1px solid var(--bd);flex-wrap:wrap;background:var(--card2)}
-  .logo{font-size:16px;font-weight:800;letter-spacing:-.3px;display:flex;align-items:center;gap:7px}
+  .hdr{display:flex;align-items:center;gap:12px;padding:11px 18px;border-bottom:1px solid var(--bd);flex-wrap:wrap;background:rgba(13,17,23,0.72);backdrop-filter:var(--blur);-webkit-backdrop-filter:var(--blur)}
+  .logo{font-size:16px;font-weight:800;letter-spacing:-.3px;display:flex;align-items:center;gap:7px;background:linear-gradient(100deg,#fff 20%,#9fc0ff 80%);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
   .chips{display:flex;gap:6px}
   .chip{background:var(--card);border:1px solid var(--bd);border-radius:var(--r3);padding:5px 14px;font-size:13px;font-weight:600;cursor:pointer;color:var(--mut);transition:all .22s var(--ease);backdrop-filter:var(--blur);-webkit-backdrop-filter:var(--blur)}
   .chip:hover{color:var(--fg);border-color:var(--bd2);transform:translateY(-1px)}
-  .chip.on{background:rgba(240,185,11,0.12);border-color:rgba(240,185,11,0.55);color:var(--warn);font-weight:700}
+  .chip.on{background:rgba(245,192,14,0.12);border-color:rgba(245,192,14,0.55);color:var(--warn);font-weight:700}
   .symin{background:var(--card2);color:var(--fg);border:1px solid var(--bd);border-radius:var(--r2);padding:6px 11px;font-size:13px;width:124px;transition:border-color .22s var(--ease)}
   .symin:focus{outline:none;border-color:var(--accent)}
   .price{font-size:18px;font-weight:800;margin-left:4px}
@@ -2880,12 +3007,14 @@ COCKPIT_HTML = r"""<!doctype html>
   .ivbar{display:flex;gap:6px;align-items:center}
   .ivbar button{background:var(--card);color:var(--mut);border:1px solid var(--bd);border-radius:8px;padding:5px 13px;font-size:13px;font-weight:600;cursor:pointer;transition:all .2s var(--ease)}
   .ivbar button:hover{color:var(--fg);border-color:var(--bd2)}
-  .ivbar button.on{background:rgba(59,130,246,0.14);border-color:rgba(59,130,246,0.55);color:var(--accent2);font-weight:700}
+  .ivbar button.on{background:rgba(79,140,255,0.14);border-color:rgba(79,140,255,0.55);color:var(--accent2);font-weight:700}
   .ivbar .hint{color:var(--mut);font-size:12px;margin-left:auto}
   #kline{flex:1;background:var(--card2);border:1px solid var(--bd);border-radius:var(--r);min-height:0;box-shadow:var(--sh);overflow:hidden}
   .sidecol{display:flex;flex-direction:column;gap:12px;min-height:0;overflow:hidden}
-  .card{background:var(--card);border:1px solid var(--bd);border-radius:var(--r);padding:15px;box-shadow:var(--sh);backdrop-filter:var(--blur);-webkit-backdrop-filter:var(--blur);animation:fadeUp .4s var(--ease) both}
-  .copilot{position:relative;overflow:hidden;border-top:2px solid rgba(59,130,246,0.45)}
+  .card{background:linear-gradient(180deg,rgba(255,255,255,0.02),transparent 42%),var(--card);border:1px solid var(--bd);border-radius:var(--r);padding:15px;box-shadow:var(--sh);animation:fadeUp .4s var(--ease) both;transition:border-color .25s var(--ease)}
+  .card:hover{border-color:var(--bd2)}
+  .copilot{position:relative;overflow:hidden;border-top:2px solid rgba(79,140,255,0.55)}
+  .copilot::before{content:"";position:absolute;inset:0;background:radial-gradient(420px 130px at 18% 0%,rgba(79,140,255,0.10),transparent 70%);pointer-events:none}
   .copilot .vd{font-size:24px;font-weight:800;letter-spacing:-.4px}
   .copilot .vsub{color:var(--mut);font-size:12px;margin-top:5px}
   .conf{display:inline-block;padding:1px 9px;border-radius:var(--r3);font-size:12px;font-weight:700;margin-left:4px}
@@ -2923,20 +3052,41 @@ COCKPIT_HTML = r"""<!doctype html>
   .stat .k{color:var(--mut);font-size:11px} .stat .v{font-size:16px;font-weight:700;margin-top:4px;font-family:var(--mono);font-variant-numeric:tabular-nums;letter-spacing:-.2px}
   .pos{color:var(--up)} .neg{color:var(--down)} .mut{color:var(--mut)}
   /* 多周期预测卡（4h / 15天 / 30天 + 归因 + AI 解读） */
-  .mhz .row{display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--bd);font-size:12px}
-  .mhz .row:last-of-type{border-bottom:none}
-  .mhz .hz{width:40px;color:var(--mut);font-weight:700;font-family:var(--mono);flex-shrink:0}
-  .mhz .tgt{margin-left:auto;font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--fg2);white-space:nowrap}
-  .dirchip{padding:2px 9px;border-radius:4px;font-weight:700;font-size:12px;flex-shrink:0}
-  .dir-up{background:rgba(14,203,129,0.12);color:var(--up)}
-  .dir-down{background:rgba(246,70,93,0.12);color:var(--down)}
-  .dir-flat{background:rgba(132,142,156,0.14);color:var(--mut)}
-  .gate{font-size:10px;padding:1px 6px;border-radius:4px;border:1px solid var(--bd2);color:var(--mut);flex-shrink:0;cursor:help}
-  .gate.ok{color:var(--up);border-color:rgba(14,203,129,0.45)}
-  .mhz .whyline{font-size:11px;color:var(--mut);line-height:1.6;padding:2px 0 7px 48px;border-bottom:1px solid var(--bd)}
-  .mhz .whyline:last-child{border-bottom:none}
+  .mhz .hzitem{background:var(--card2);border:1px solid var(--bd);border-radius:var(--r2);padding:9px 11px;margin-bottom:8px;transition:border-color .2s var(--ease),opacity .2s var(--ease);cursor:pointer;user-select:none}
+  .mhz .hzitem:hover{border-color:var(--bd2)}
+  .mhz .hzitem:last-of-type{margin-bottom:0}
+  .mhz .hzitem.off{opacity:.42}
+  .mhz .hzeye{margin-left:6px;font-size:11px;color:var(--mut);flex-shrink:0}
+  .mhz .bandline{font-size:10.5px;color:var(--mut);margin-top:6px;font-family:var(--mono)}
+  .mhz .bandline b{color:var(--fg2);font-weight:600}
+  .mhz .row{display:flex;align-items:center;gap:8px;font-size:12px}
+  .mhz .hz{min-width:44px;color:var(--fg2);font-weight:700;font-family:var(--mono);flex-shrink:0;font-size:12px}
+  .mhz .hz small{display:block;font-size:9px;color:var(--mut);font-weight:500;letter-spacing:.4px}
+  .mhz .tgt{margin-left:auto;font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--fg);font-weight:700;white-space:nowrap;font-size:12.5px}
+  .mhz .tgt small{color:var(--mut);font-weight:500;font-size:10px;margin-right:3px}
+  .dirchip{padding:2.5px 10px;border-radius:var(--r3);font-weight:700;font-size:12px;flex-shrink:0}
+  .dir-up{background:rgba(16,214,140,0.14);color:var(--up);box-shadow:inset 0 0 0 1px rgba(16,214,140,0.28)}
+  .dir-down{background:rgba(255,85,112,0.13);color:var(--down);box-shadow:inset 0 0 0 1px rgba(255,85,112,0.28)}
+  .dir-flat{background:rgba(139,149,167,0.13);color:var(--mut);box-shadow:inset 0 0 0 1px rgba(139,149,167,0.25)}
+  .gate{font-size:10px;padding:1.5px 7px;border-radius:var(--r3);border:1px solid var(--bd2);color:var(--mut);flex-shrink:0;cursor:help;background:rgba(139,149,167,0.06)}
+  .gate.ok{color:var(--up);border-color:rgba(16,214,140,0.45);background:rgba(16,214,140,0.07)}
+  .mhz .probwrap{display:flex;align-items:center;gap:6px;flex-shrink:0}
+  .mhz .probbar{width:46px;height:4px;border-radius:99px;background:rgba(139,149,167,0.18);overflow:hidden}
+  .mhz .probbar i{display:block;height:100%;border-radius:99px;transition:width .5s var(--ease)}
+  .mhz .probtxt{font-size:11px;color:var(--fg2);font-weight:600}
+  .mhz .whyline{font-size:11px;color:var(--mut);line-height:1.65;margin-top:7px;padding-top:7px;border-top:1px dashed var(--bd)}
+  .mhz .calcing{display:flex;align-items:center;gap:8px;color:var(--mut);font-size:12px}
+  .mhz .spin{width:12px;height:12px;border-radius:50%;border:2px solid rgba(139,149,167,0.25);border-top-color:var(--accent2);animation:spin 0.9s linear infinite;flex-shrink:0}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .mhz .histbtn{margin-left:4px;font-size:10px;padding:1.5px 7px;border-radius:var(--r3);border:1px solid var(--bd2);color:var(--mut);background:rgba(139,149,167,0.06);cursor:pointer;flex-shrink:0;transition:all .2s var(--ease)}
+  .mhz .histbtn:hover{color:var(--fg)}
+  .mhz .histbtn.on{color:var(--accent2);border-color:rgba(79,140,255,0.5);background:rgba(79,140,255,0.08)}
+  .mhz .hzhist{margin-top:8px;padding-top:8px;border-top:1px dashed var(--bd);cursor:default}
+  .mhz .hzhist canvas{width:100%;height:56px;display:block}
+  .mhz .hzhist .hsum{font-size:10.5px;color:var(--mut);margin-top:5px;font-family:var(--mono)}
+  .mhz .hzhist .hsum b{color:var(--fg2)}
   .aiwhy{margin-top:10px;font-size:12px;line-height:1.75;color:var(--fg2);background:var(--card2);border:1px solid var(--bd);border-radius:var(--r2);padding:10px 12px;white-space:pre-wrap;max-height:150px;overflow:auto}
-  .aiwhy .tag{display:inline-block;font-size:10px;color:var(--warn);border:1px solid rgba(240,185,11,0.4);border-radius:4px;padding:0 5px;margin-right:6px}
+  .aiwhy .tag{display:inline-block;font-size:10px;color:var(--warn);border:1px solid rgba(245,192,14,0.4);border-radius:4px;padding:0 5px;margin-right:6px}
   .actbtn{margin-left:auto;display:flex;gap:8px;align-items:center;flex-shrink:0}
   .actbtn button{background:var(--accent);border:none;border-radius:var(--r2);color:#fff;padding:9px 16px;font-weight:700;cursor:pointer;font-size:13px;transition:filter .2s var(--ease),transform .2s var(--ease)}
   .actbtn button.ghost{background:var(--card);border:1px solid var(--bd);color:var(--fg)}
@@ -3023,6 +3173,14 @@ const barTime = r => Math.floor(r.ts/1000) - TZ;
 // 画线分组开关（localStorage 持久化）：core=入场/止损/止盈+4h预测 sr=支撑阻力 trend=趋势/斐波/通道/形态 marks=买卖点
 let VIS = {core:true, sr:true, trend:false, marks:true};
 try{ const v=JSON.parse(localStorage.getItem('cockpitVis')||'null'); if(v&&typeof v==='object') VIS={...VIS,...v}; }catch(e){}
+// 多周期卡开关（点卡片开/关该周期在 K 线上的预测线；localStorage 持久化）
+let HZVIS = {'4h':true,'15':true,'30':true};
+try{ const v=JSON.parse(localStorage.getItem('cockpitHzVis')||'null'); if(v&&typeof v==='object') HZVIS={...HZVIS,...v}; }catch(e){}
+function toggleHz(k){
+  HZVIS[k]=!HZVIS[k];
+  try{ localStorage.setItem('cockpitHzVis',JSON.stringify(HZVIS)); }catch(e){}
+  renderMhz(); if(chart) drawOverlay();
+}
 function renderVisBtns(){
   document.querySelectorAll('#ivbar button[data-vis]').forEach(b=>{
     b.className = VIS[b.getAttribute('data-vis')] ? 'on' : '';
@@ -3080,9 +3238,9 @@ function setIv(x){ iv=x; document.querySelectorAll('#ivbar button[data-iv]').for
 function verdictOf(d){
   const s=d.conviction_score??0, a=Math.abs(s);
   const conf=a>=1.2?'高':(a>=0.6?'中':'低');
-  if(s>=0.6)  return {txt:'可小仓试多 📈',color:'#0ecb81',conf,s};
-  if(s<=-0.6) return {txt:'偏空·别追多 📉',color:'#f6465d',conf,s};
-  return {txt:'先观望 ⏸',color:'#848e9c',conf:'低',s};
+  if(s>=0.6)  return {txt:'可小仓试多 📈',color:'#10d68c',conf,s};
+  if(s<=-0.6) return {txt:'偏空·别追多 📉',color:'#ff5570',conf,s};
+  return {txt:'先观望 ⏸',color:'#8b95a7',conf:'低',s};
 }
 function rr(d){
   const sl=+d.stop_loss, tp=+d.take_profit_ref; let e=null;
@@ -3134,17 +3292,17 @@ function drawChart(){
   if(!chart){
     chart = LightweightCharts.createChart($('kline'), {
       autoSize:true,
-      layout:{ background:{type:'solid',color:'#0f1317'}, textColor:'#848e9c', fontSize:11, fontFamily:'Inter,-apple-system,PingFang SC,Microsoft YaHei,sans-serif', attributionLogo:false },
-      grid:{ vertLines:{color:'rgba(132,142,156,0.08)'}, horzLines:{color:'rgba(132,142,156,0.08)'} },
-      rightPriceScale:{ borderColor:'rgba(132,142,156,0.22)', scaleMargins:{top:0.12,bottom:0.12} },
-      timeScale:{ borderColor:'rgba(132,142,156,0.22)', timeVisible:true, secondsVisible:false, rightOffset:8, barSpacing:9, minBarSpacing:3 },
-      crosshair:{ mode:1, vertLine:{color:'#3b82f6',width:1,style:LightweightCharts.LineStyle.Dotted,labelBackgroundColor:'#3b82f6'}, horzLine:{color:'#3b82f6',labelBackgroundColor:'#3b82f6'} },
+      layout:{ background:{type:'solid',color:'#0d1117'}, textColor:'#8b95a7', fontSize:11, fontFamily:'Inter,-apple-system,PingFang SC,Microsoft YaHei,sans-serif', attributionLogo:false },
+      grid:{ vertLines:{color:'rgba(139,149,167,0.07)'}, horzLines:{color:'rgba(139,149,167,0.07)'} },
+      rightPriceScale:{ borderColor:'rgba(139,149,167,0.2)', scaleMargins:{top:0.12,bottom:0.12} },
+      timeScale:{ borderColor:'rgba(139,149,167,0.2)', timeVisible:true, secondsVisible:false, rightOffset:8, barSpacing:9, minBarSpacing:3 },
+      crosshair:{ mode:1, vertLine:{color:'#4f8cff',width:1,style:LightweightCharts.LineStyle.Dotted,labelBackgroundColor:'#4f8cff'}, horzLine:{color:'#4f8cff',labelBackgroundColor:'#4f8cff'} },
       localization:{ locale:'zh-CN', priceFormatter:p=>fmt(p) }
     });
     candleSeries = chart.addSeries(LightweightCharts.CandlestickSeries, {
-      upColor:'#0ecb81', downColor:'#f6465d', borderVisible:true,
-      borderUpColor:'#0ecb81', borderDownColor:'#f6465d',
-      wickUpColor:'#0ecb81', wickDownColor:'#f6465d'
+      upColor:'#10d68c', downColor:'#ff5570', borderVisible:true,
+      borderUpColor:'#10d68c', borderDownColor:'#ff5570',
+      wickUpColor:'#10d68c', wickDownColor:'#ff5570'
     });
     // 成交量副图（底部 ~18%，独立价格轴，对标 trendiq）
     volSeries = chart.addSeries(LightweightCharts.HistogramSeries, {
@@ -3336,6 +3494,64 @@ function makeVtopPrimitive(){
   };
 }
 
+// ───────── 预测区间色带（target_lo~target_hi 画成 K 线右侧半透明色带 · 自绘图元）─────────
+function makeBandPrimitive(){
+  return {
+    bands:null, chart:null, series:null, req:null,
+    attached(p){ this.chart=p.chart; this.series=p.series; this.req=p.requestUpdate; },
+    detached(){ this.chart=this.series=this.req=null; },
+    setBands(bands){ this.bands=bands&&bands.length?bands:null; if(this.req) this.req(); },
+    paneViews(){
+      const self=this;
+      return [{ renderer(){ return { draw(target){
+        const bands=self.bands; if(!bands) return;
+        target.useBitmapCoordinateSpace(scope=>{
+          const ctx=scope.context, hr=scope.horizontalPixelRatio, vr=scope.verticalPixelRatio;
+          const W=scope.bitmapSize.width;
+          for(const b of bands){
+            const yLo=self.series.priceToCoordinate(b.lo), yHi=self.series.priceToCoordinate(b.hi);
+            if(yLo==null||yHi==null) continue;
+            let x0=null;
+            if(b.fromTime!=null){ const c=self.chart.timeScale().timeToCoordinate(b.fromTime); if(c!=null) x0=c*hr; }
+            if(x0==null) x0=W*0.62;              // 起点兜底：画在图表右侧 38% 区域
+            const top=Math.min(yHi,yLo)*vr, hgt=Math.abs(yLo-yHi)*vr;
+            ctx.fillStyle=b.fill; ctx.fillRect(x0, top, W-x0, hgt);
+            ctx.strokeStyle=b.edge; ctx.lineWidth=1*hr; ctx.setLineDash([4*hr,4*hr]);
+            ctx.strokeRect(x0, top, W-x0, hgt); ctx.setLineDash([]);
+            if(b.label){
+              ctx.font='600 '+(10*vr)+'px Inter,-apple-system,PingFang SC,sans-serif';
+              ctx.textAlign='left'; ctx.fillStyle=b.edge;
+              ctx.fillText(b.label, x0+4*hr, top+11*vr);
+            }
+          }
+        });
+      } }; } }];
+    }
+  };
+}
+let bandPrim=null;
+function drawBands(){
+  if(!chart||!candleSeries) return;
+  if(!bandPrim){ bandPrim=makeBandPrimitive(); try{ candleSeries.attachPrimitive(bandPrim); }catch(e){ bandPrim=null; return; } }
+  const bands=[];
+  const rows=(lastKline&&lastKline.rows)||[];
+  // 起点=倒数第 12 根 bar，让色带盖住最近走势的右侧延伸区
+  const fromTime=rows.length>12?barTime(rows[rows.length-12]):null;
+  if(VIS.core){
+    const hz=(lastHorizons&&lastHorizons.symbol===sym&&lastHorizons.horizons)||{};
+    for(const h of ['15','30']){
+      const p=hz[h];
+      if(!p||!HZVIS[h]||p.target_lo==null||p.target_hi==null) continue;
+      const up=p.direction==='涨', down=p.direction==='跌';
+      const rgb=p.tradeable?(up?'16,214,140':(down?'255,85,112':'139,149,167')):'139,149,167';
+      bands.push({lo:+p.target_lo, hi:+p.target_hi, fromTime,
+        fill:`rgba(${rgb},0.07)`, edge:`rgba(${rgb},0.4)`,
+        label:h+'天 p10~p90'+(p.tradeable?'':'·参考')});
+    }
+  }
+  bandPrim.setBands(bands);
+}
+
 let vtopPrim=null;
 function drawPattern(){
   if(!chart||!candleSeries||!lastKline) return;
@@ -3397,13 +3613,13 @@ function drawOverlay(){
   // 核心 3 线：只画当前有效决策的 入场/止损/止盈（历史线不画，保持清爽）
   if(VIS.core){
     if(pos){
-      if(e) addPL(+e.toFixed(2),'#3b82f6','入 '+fmt(e),LS.Dashed);
-      addPL(d.stop_loss,'#f6465d','损 '+fmt(d.stop_loss),LS.Solid);
-      addPL(d.take_profit_ref,'#0ecb81','盈 '+fmt(d.take_profit_ref),LS.Solid);
+      if(e) addPL(+e.toFixed(2),'#4f8cff','入 '+fmt(e),LS.Dashed);
+      addPL(d.stop_loss,'#ff5570','损 '+fmt(d.stop_loss),LS.Solid);
+      addPL(d.take_profit_ref,'#10d68c','盈 '+fmt(d.take_profit_ref),LS.Solid);
     }
     // 4h 盘中引擎最新预测：达标画彩色实点位；未达标画灰色参考线（观察模式，不开仓）
     const ip=intradayPredOf(sym);
-    if(ip){
+    if(ip&&HZVIS['4h']){
       if(ip.tradeable&&ip.stop&&ip.take){
         addPL(ip.stop,'rgba(246,70,93,0.75)','4h损 '+fmt(ip.stop),LS.Dotted,1);
         addPL(ip.take,'rgba(14,203,129,0.75)','4h盈 '+fmt(ip.take),LS.Dotted,1);
@@ -3417,18 +3633,22 @@ function drawOverlay(){
         addPL(ip.entry-half,'rgba(135,148,166,0.55)','4h区间下·参考 '+fmt(ip.entry-half),LS.Dotted,1);
       }
     }
-    // 15/30 天中线目标：达标按方向着色，未达标灰色参考（分位回归 p50）
+    // 15/30 天中线目标：达标按方向着色，未达标灰色参考（分位回归 p50 + p10~p90 区间）
     const hz=(lastHorizons&&lastHorizons.symbol===sym&&lastHorizons.horizons)||{};
     for(const h of ['15','30']){
       const p=hz[h];
-      if(!p||p.target==null) continue;
+      if(!p||p.target==null||!HZVIS[h]) continue;
       const col=p.tradeable
         ?(p.direction==='涨'?'rgba(14,203,129,0.8)':(p.direction==='跌'?'rgba(246,70,93,0.8)':'rgba(132,142,156,0.7)'))
         :'rgba(132,142,156,0.5)';
       addPL(p.target,col,h+'天目标'+(p.tradeable?'':'·参考')+' '+fmt(p.target),LS.Dashed,1);
+      // p10~p90 分位区间边界：更淡的虚点线，展示预测的不确定幅度
+      const bandCol=p.tradeable?col.replace(/0\.[78]\)$/,'0.35)'):'rgba(132,142,156,0.28)';
+      if(p.target_hi!=null) addPL(p.target_hi,bandCol,h+'天区间上 '+fmt(p.target_hi),LS.Dotted,1);
+      if(p.target_lo!=null) addPL(p.target_lo,bandCol,h+'天区间下 '+fmt(p.target_lo),LS.Dotted,1);
     }
   }
-  if(fac.price) addPL(+fac.price,'#848e9c','现价',LS.Dotted,1);
+  if(fac.price) addPL(+fac.price,'#8b95a7','现价',LS.Dotted,1);
   // 自动支撑/阻力（摆动点聚类 · 只留触碰最多的 3 档，避免糊成一团）
   if(VIS.sr){
   const win=rows.slice(-Math.min(rows.length,120));
@@ -3455,13 +3675,14 @@ function drawOverlay(){
   let mks=[];
   if(VIS.marks){
   (lastPositions||[]).forEach(p=>{
-    if(p.opened_ts&&p.entry_price){ const r=nearestRow(p.opened_ts*1000); if(r) mks.push({time:barTime(r),position:'belowBar',color:'#0ecb81',shape:'arrowUp',text:'买'}); }
-    if(p.status==='closed'&&p.closed_ts&&p.exit_price){ const r=nearestRow(p.closed_ts*1000); if(r){ const isWin=(p.realized_pnl_usdt||0)>=0; mks.push({time:barTime(r),position:'aboveBar',color:isWin?'#0ecb81':'#f6465d',shape:'arrowDown',text:'卖'}); } }
+    if(p.opened_ts&&p.entry_price){ const r=nearestRow(p.opened_ts*1000); if(r) mks.push({time:barTime(r),position:'belowBar',color:'#10d68c',shape:'arrowUp',text:'买'}); }
+    if(p.status==='closed'&&p.closed_ts&&p.exit_price){ const r=nearestRow(p.closed_ts*1000); if(r){ const isWin=(p.realized_pnl_usdt||0)>=0; mks.push({time:barTime(r),position:'aboveBar',color:isWin?'#10d68c':'#ff5570',shape:'arrowDown',text:'卖'}); } }
   });
   mks.sort((a,b)=>a.time-b.time);
   mks=mks.slice(-20);
   }
   if(markersPrim) markersPrim.setMarkers(mks);
+  drawBands();
 }
 
 // ───────── 4h 盘中引擎：最新预测徽标 + K 线叠加 ─────────
@@ -3471,7 +3692,7 @@ function intradayPredOf(s){
 }
 function renderPredBadge(){
   const el=$('predBadge'); if(!el) return;
-  const dirColor=d=>d==='涨'?'#0ecb81':(d==='跌'?'#f6465d':'#848e9c');
+  const dirColor=d=>d==='涨'?'#10d68c':(d==='跌'?'#ff5570':'#8b95a7');
   const seg=[];
   const ip=intradayPredOf(sym);
   if(ip){
@@ -3488,7 +3709,7 @@ function renderPredBadge(){
         (p.target!=null?` ➜${fmt(p.target)}`:'')+
         (p.tradeable?'':` <span title="${(p.reason||'')} — 未过门禁，目标线仅灰色参考">👁</span>`));
     }else if(lastHorizons&&(lastHorizons.computing||[]).includes(h)){
-      seg.push(`${h}天: <span style="color:#848e9c">计算中…</span>`);
+      seg.push(`${h}天: <span style="color:#8b95a7">计算中…</span>`);
     }
   }
   el.innerHTML=seg.join(' <span style="color:var(--bd2)">|</span> ');
@@ -3509,29 +3730,105 @@ async function loadHorizons(){
     if((lastHorizons.computing||[]).length){ setTimeout(loadHorizons, 30000); }
   }catch(e){}
 }
-// ── 多周期预测卡：三行（4h/15天/30天）+ 每行归因 + AI 解读 ──
-function mhzRow(label, p, tgt){
+// ── 多周期预测卡：三行（4h/15天/30天）+ 每行归因 + AI 解读；点卡片开关该周期 K 线预测线 ──
+// 「命中」按钮展开该周期的历史命中面板：4h=逐 bar 命中曲线（真实回填），15/30=OOS 验证摘要。
+let HZHIST={};                       // key -> true 展开
+let hitHistCache={sym:null,data:null,at:0};
+function toggleHzHist(key){
+  HZHIST[key]=!HZHIST[key];
+  renderMhz();
+  if(HZHIST[key] && key==='4h') loadHitHist();
+}
+async function loadHitHist(){
+  const want=sym;
+  if(hitHistCache.sym===want && Date.now()-hitHistCache.at<60000){ drawHitCanvas(); return; }
+  try{
+    const d=await (await fetch('/api/intraday/hits?symbol='+want+'&limit=120')).json();
+    if(want!==sym || d.error) return;
+    hitHistCache={sym:want,data:d,at:Date.now()};
+    renderMhz();
+  }catch(e){}
+}
+function drawHitCanvas(){
+  const cv=$('hitcv'); if(!cv) return;
+  const d=(hitHistCache.sym===sym&&hitHistCache.data)||null; if(!d) return;
+  const dpr=window.devicePixelRatio||1, W=cv.clientWidth||300, H=cv.clientHeight||56;
+  cv.width=W*dpr; cv.height=H*dpr;
+  const ctx=cv.getContext('2d'); ctx.scale(dpr,dpr); ctx.clearRect(0,0,W,H);
+  const roll=d.rolling||[], preds=(d.predictions||[]).filter(p=>p.hit!=null);
+  if(!roll.length){ ctx.fillStyle='#8b95a7'; ctx.font='11px Inter,sans-serif'; ctx.fillText('暂无已回填的命中样本',8,H/2+4); return; }
+  const padL=4,padR=4,padT=6,padB=12, iw=W-padL-padR, ih=H-padT-padB;
+  const x=i=>padL+iw*(roll.length<=1?0.5:i/(roll.length-1));
+  const y=r=>padT+ih*(1-r);
+  // 50% 基准线
+  ctx.strokeStyle='rgba(139,149,167,0.25)'; ctx.setLineDash([3,3]); ctx.beginPath();
+  ctx.moveTo(padL,y(0.5)); ctx.lineTo(W-padR,y(0.5)); ctx.stroke(); ctx.setLineDash([]);
+  // 滚动命中率曲线（近 20 次窗口）
+  ctx.strokeStyle='#4f8cff'; ctx.lineWidth=1.5; ctx.beginPath();
+  roll.forEach((r,i)=>{ i?ctx.lineTo(x(i),y(r.rate)):ctx.moveTo(x(i),y(r.rate)); });
+  ctx.stroke();
+  // 逐 bar 命中点：底部一排 绿=中 红=错
+  const n=preds.length;
+  preds.forEach((p,i)=>{
+    const px=padL+iw*(n<=1?0.5:i/(n-1));
+    ctx.fillStyle=p.hit===1?'#10d68c':'#ff5570';
+    ctx.beginPath(); ctx.arc(px,H-5,2,0,Math.PI*2); ctx.fill();
+  });
+}
+function hzHistPanel(key,p){
+  if(!HZHIST[key]) return '';
+  const stop='onclick="event.stopPropagation()"';
+  if(key==='4h'){
+    const d=(hitHistCache.sym===sym&&hitHistCache.data)||null;
+    const sum=d&&d.n_evaluated
+      ?`已回填 <b>${d.n_evaluated}</b> 次 · 总命中 <b>${d.hit_rate==null?'—':Math.round(d.hit_rate*100)+'%'}</b> · 蓝线=近20次滚动命中率 · 底部点=逐bar对错`
+      :'加载中…';
+    return `<div class="hzhist" ${stop}><canvas id="hitcv"></canvas><div class="hsum">${sum}</div></div>`;
+  }
+  // 15/30 天：无逐 bar 历史，展示 walk-forward 样本外验证摘要
+  const hitTxt=(p&&p.oos_hit_rate!=null)?Math.round(p.oos_hit_rate*100)+'%':'—';
+  const pTxt=(p&&p.p_value!=null)?p.p_value:'—';
+  return `<div class="hzhist" ${stop}><div class="hsum" style="margin-top:0;line-height:1.8">`+
+    `walk-forward 样本外命中率 <b>${hitTxt}</b> · 置换检验 p 值 <b>${pTxt}</b><br>`+
+    `${(p&&p.tradeable)?'双指标达标，预测线按方向着色':'未达门禁（需命中率&gt;基线且 p&lt;0.05），K 线上只画灰色参考线'}</div></div>`;
+}
+function mhzRow(key, label, sub, p, tgt, calcHint){
+  const on=HZVIS[key]!==false;
+  const wrap=(inner)=>`<div class="hzitem${on?'':' off'}" onclick="toggleHz('${key}')" `+
+    `title="点击${on?'隐藏':'显示'}该周期在 K 线上的预测线">${inner}</div>`;
+  const hz=`<span class="hz">${label}<small>${sub}</small></span>`;
+  const eye=`<span class="hzeye">${on?'👁':'—'}</span>`;
   if(!p||!p.direction){
-    return `<div class="row"><span class="hz">${label}</span><span class="mut">计算中…</span></div>`;
+    const hint=(p&&p.reason)?p.reason:(calcHint||'计算中，首次约需 1-2 分钟…');
+    return wrap(`<div class="row">${hz}<span class="calcing"><span class="spin"></span>${hint}</span></div>`);
   }
   const cls=p.direction==='涨'?'dir-up':(p.direction==='跌'?'dir-down':'dir-flat');
+  const clr=p.direction==='涨'?'var(--up)':(p.direction==='跌'?'var(--down)':'var(--mut)');
   const gate=p.tradeable
     ?'<span class="gate ok" title="通过精准度门禁：样本外命中率与置换检验双达标，引擎可自动模拟下单">已达标</span>'
     :`<span class="gate" title="${(p.reason||'')} — 未过精准度门禁，点位仅供参考，引擎不开仓">观察</span>`;
-  const prob=p.prob!=null?`<span class="num" style="color:var(--fg2)">${Math.round(p.prob*100)}%</span>`:'';
+  const hist=`<span class="histbtn${HZHIST[key]?' on':''}" onclick="event.stopPropagation();toggleHzHist('${key}')" `+
+    `title="展开/收起该周期的历史命中记录">命中</span>`;
+  const prob=p.prob!=null
+    ?`<span class="probwrap"><span class="probbar"><i style="width:${Math.round(p.prob*100)}%;background:${clr}"></i></span>`+
+     `<span class="probtxt num">${Math.round(p.prob*100)}%</span></span>`:'';
+  const band=(p.target_lo!=null&&p.target_hi!=null)
+    ?`<div class="bandline">区间 <b class="num">${fmt(p.target_lo)}</b> ~ <b class="num">${fmt(p.target_hi)}</b>（p10~p90）</div>`:'';
   const why=p.why_text?`<div class="whyline">${p.why_text}</div>`:'';
-  return `<div class="row"><span class="hz">${label}</span>`+
-    `<span class="dirchip ${cls}">${p.direction}</span>${prob}${gate}`+
-    (tgt!=null?`<span class="tgt">➜ ${fmt(tgt)}</span>`:'')+`</div>${why}`;
+  return wrap(`<div class="row">${hz}`+
+    `<span class="dirchip ${cls}">${p.direction}</span>${prob}${gate}${hist}`+
+    (tgt!=null?`<span class="tgt"><small>目标</small>${fmt(tgt)}</span>`:'')+eye+`</div>${band}${why}${hzHistPanel(key,p)}`);
 }
 function renderMhz(){
   const el=$('mhzRows'); if(!el) return;
   const ip=intradayPredOf(sym);
   const hz=(lastHorizons&&lastHorizons.symbol===sym&&lastHorizons.horizons)||{};
+  const computing=(lastHorizons&&lastHorizons.computing)||[];
   el.innerHTML =
-    mhzRow('4h', ip, ip&&(ip.take||null)) +
-    mhzRow('15天', hz['15'], hz['15']&&hz['15'].target) +
-    mhzRow('30天', hz['30'], hz['30']&&hz['30'].target);
+    mhzRow('4h','4h','盘中', ip, ip&&(ip.take||null), '等待 4h 引擎出预测（每根 4h K 线收盘后更新）') +
+    mhzRow('15','15天','中线', hz['15'], hz['15']&&hz['15'].target, computing.includes('15')?undefined:'待计算') +
+    mhzRow('30','30天','长线', hz['30'], hz['30']&&hz['30'].target, computing.includes('30')?undefined:'待计算');
+  if(HZHIST['4h']) requestAnimationFrame(drawHitCanvas);
 }
 async function loadWhy(){
   try{
@@ -3607,7 +3904,8 @@ async function loadSnapshot(){
 // 侧栏（决策/事件/战绩）走 60s 轮询；K 线蜡烛由 WebSocket 实时推送，二者解耦。
 // loadKline 在此仅用于刷新趋势线/档位（key 未变不会重画蜡烛、不扰动 WS）。
 function refreshSide(){ loadSnapshot(); loadEvents(); loadIntraday(); loadHorizons(); loadStats(); loadKline(); loadWhy(); }
-function loadAll(){ countdown=REFRESH; loadKline(); refreshSide(); }   // 切币/切周期/首次：重拉历史 K 线并重连 WS
+function loadAll(){ countdown=REFRESH; loadKline(); refreshSide(); if(HZHIST['4h']) loadHitHist(); }   // 切币/切周期/首次：重拉历史 K 线并重连 WS
+window.addEventListener('resize',()=>{ if(HZHIST['4h']) requestAnimationFrame(drawHitCanvas); });
 function startTimer(){ if(tick)clearInterval(tick); tick=setInterval(()=>{ countdown--; renderLive(); if(countdown<=0){ countdown=REFRESH; refreshSide(); } },1000); }
 
 renderChips();

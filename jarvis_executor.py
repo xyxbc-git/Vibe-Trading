@@ -348,6 +348,24 @@ def execute(symbol: str, cfg: dict, dry_run: bool = False) -> dict:
         f"风险 {guard['projected_risk_pct']}%{' [已缩仓]' if guard['clamped'] else ''})"
     )
 
+    # T-18 可选辩论二次评审（默认关）：仅否决/警示，不改仓位；不可用自动放行。
+    try:
+        import jarvis_debate as _jd
+        _dg = _jd.gate(symbol, decision)
+        _rev = _dg.get("review", {})
+        if _rev.get("enabled"):
+            result["debate"] = _rev
+            if not _dg.get("allow"):
+                result["placed"] = False
+                result["note"] = "辩论层否决：" + str(_rev.get("summary"))
+                _log(f"🗳️ {symbol} {result['note']}")
+                _write_status(result)
+                return result
+            if _rev.get("verdict") == "warn":
+                _log(f"🗳️ {symbol} 辩论警示（放行）：{_rev.get('summary')}")
+    except Exception as _exc:  # noqa: BLE001
+        _log("辩论层异常（放行）：" + repr(_exc)[:160])
+
     if dry_run:
         result["placed"] = False
         result["note"] = "dry-run：护栏通过但未真实下单"
