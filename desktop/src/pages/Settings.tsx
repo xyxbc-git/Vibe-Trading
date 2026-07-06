@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
-import { Settings as SettingsIcon, Save, RefreshCw, Wifi, Key, Palette, Server, Plug, Download } from "lucide-react";
-import { api, type QdConfig, type QdConfigTest } from "@/api/client";
+import { Settings as SettingsIcon, Save, RefreshCw, Wifi, Key, Palette, Server, Plug, Download, ShieldAlert, OctagonX } from "lucide-react";
+import { api, type QdConfig, type QdConfigTest, type TradingConfig, type CircuitBreakerStatus } from "@/api/client";
 import { useApi } from "@/hooks/useApi";
 
 interface ScalperConfig {
@@ -370,6 +370,173 @@ function QdGatewayCard() {
   );
 }
 
+function PaperTradingSafetyCard() {
+  const [cfg, setCfg] = useState<TradingConfig>({});
+  const [cb, setCb] = useState<CircuitBreakerStatus | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [busy, setBusy] = useState("");
+  const [msg, setMsg] = useState("");
+
+  const load = useCallback(async () => {
+    try {
+      const [tc, cbr] = await Promise.all([
+        api.tradingConfig(),
+        api.circuitBreaker(),
+      ]);
+      setCfg(tc);
+      setCb(cbr);
+    } catch {
+      /* 静默 */
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const flash = (text: string, ok = true) => {
+    setMsg(text);
+    setTimeout(() => setMsg(""), 4000);
+    if (ok) load();
+  };
+
+  const saveLimits = async () => {
+    setSaving(true);
+    try {
+      const res = await api.updateTradingConfig(cfg);
+      flash(res.ok ? "限额已保存 ✓" : `保存失败: ${res.reason ?? ""}`, res.ok);
+    } catch (e) {
+      flash(e instanceof Error ? e.message : "保存失败", false);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleKillSwitch = async () => {
+    if (!window.confirm("确认急停？将撤销 QD 模拟挂单并取消本地 pending 订单。")) return;
+    setBusy("kill");
+    try {
+      const res = await api.killSwitch();
+      flash(res.ok ? "急停已执行 ✓" : `急停失败: ${res.error ?? ""}`, res.ok);
+    } catch (e) {
+      flash(e instanceof Error ? e.message : "急停失败", false);
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const handleResetCb = async () => {
+    if (!window.confirm("确认解除熔断？仅在人工复核风险后操作。")) return;
+    setBusy("cb");
+    try {
+      const res = await api.resetCircuitBreaker();
+      flash(res.ok ? "熔断已复位 ✓" : `复位失败: ${res.error ?? ""}`, res.ok);
+    } catch (e) {
+      flash(e instanceof Error ? e.message : "复位失败", false);
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const tripped = cb?.state?.tripped ?? cb?.evaluation?.already_tripped;
+
+  return (
+    <div className="card mb-4">
+      <h3 className="text-sm font-semibold text-jarvis-text mb-3 flex items-center gap-2">
+        <ShieldAlert size={14} />
+        Paper 模拟盘安全
+      </h3>
+      <p className="text-xs text-jarvis-text-secondary mb-3">
+        写入 jarvis_config.json，影响 brief/executor/paper 跟盘护栏。
+      </p>
+
+      <div className="grid grid-cols-2 gap-3 mb-3">
+        <NumberInput
+          label="单笔仓位上限 (%)"
+          value={cfg.max_position_pct}
+          onChange={(v) => setCfg((c) => ({ ...c, max_position_pct: v }))}
+          min={1}
+          max={100}
+        />
+        <NumberInput
+          label="组合风险红线 (%)"
+          value={cfg.max_portfolio_risk_pct}
+          onChange={(v) => setCfg((c) => ({ ...c, max_portfolio_risk_pct: v }))}
+          step={0.1}
+          min={0.1}
+          max={10}
+        />
+        <NumberInput
+          label="账户权益 (USDT)"
+          value={cfg.account_equity_usdt}
+          onChange={(v) => setCfg((c) => ({ ...c, account_equity_usdt: v }))}
+          min={100}
+        />
+        <NumberInput
+          label="4h 最大持仓数"
+          value={cfg.intraday_max_open_positions}
+          onChange={(v) => setCfg((c) => ({ ...c, intraday_max_open_positions: v }))}
+          min={1}
+          max={10}
+        />
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2 mb-3">
+        <button
+          onClick={saveLimits}
+          disabled={saving}
+          className="btn-primary text-xs py-1.5 px-3 flex items-center gap-1"
+        >
+          <Save size={12} />
+          {saving ? "保存中…" : "保存限额"}
+        </button>
+        <button
+          onClick={handleKillSwitch}
+          disabled={busy === "kill"}
+          className="text-xs py-1.5 px-3 rounded-md border border-jarvis-red/50 text-jarvis-red hover:bg-jarvis-red/10 flex items-center gap-1"
+        >
+          <OctagonX size={12} />
+          {busy === "kill" ? "执行中…" : "一键急停"}
+        </button>
+        {tripped && (
+          <button
+            onClick={handleResetCb}
+            disabled={busy === "cb"}
+            className="text-xs py-1.5 px-3 rounded-md border border-jarvis-yellow/50 text-jarvis-yellow hover:bg-jarvis-yellow/10"
+          >
+            {busy === "cb" ? "复位中…" : "解除熔断"}
+          </button>
+        )}
+      </div>
+
+      <div className="text-xs space-y-1 bg-jarvis-bg rounded-md p-2">
+        <div className="flex justify-between">
+          <span className="text-jarvis-text-secondary">熔断状态</span>
+          <span className={tripped ? "text-jarvis-red" : "text-jarvis-green"}>
+            {tripped ? `已熔断 · ${cb?.state?.reason ?? "—"}` : "正常"}
+          </span>
+        </div>
+        {cb?.evaluation?.drawdown_pct != null && (
+          <div className="flex justify-between">
+            <span className="text-jarvis-text-secondary">组合回撤</span>
+            <span className="font-mono text-jarvis-text">
+              {String(cb.evaluation.drawdown_pct)}%
+            </span>
+          </div>
+        )}
+      </div>
+
+      {msg && (
+        <p
+          className={`text-xs mt-2 ${msg.includes("失败") ? "text-jarvis-red" : "text-jarvis-green"}`}
+        >
+          {msg}
+        </p>
+      )}
+    </div>
+  );
+}
+
 export default function SettingsPage() {
   const { data: rawConfig, refetch } = useApi<ScalperConfig>(
     () => api.config() as Promise<ScalperConfig>,
@@ -445,6 +612,8 @@ export default function SettingsPage() {
           </span>
         )}
       </div>
+
+      <PaperTradingSafetyCard />
 
       <div className="grid grid-cols-2 gap-4 mb-4">
         {/* 风控参数 */}

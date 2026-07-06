@@ -121,6 +121,13 @@ export default function Terminal() {
     });
   }, [lines, level, keyword]);
 
+  const errorCount = useMemo(
+    () => lines.filter((l) => l.level === "error").length,
+    [lines],
+  );
+
+  const recentPreview = useMemo(() => lines.slice(-3).reverse(), [lines]);
+
   const handleClear = async () => {
     setLines([]);
     lastSeqRef.current = 0;
@@ -147,8 +154,13 @@ export default function Terminal() {
             }`}
           />
           <span className="text-jarvis-text-secondary">
-            {connected ? "实时连接中" : "已断开（轮询兜底）"}
+            {connected ? "SSE 实时" : "SSE 断开 · 轮询兜底"}
           </span>
+          {errorCount > 0 && (
+            <span className="text-xs px-1.5 py-0.5 rounded bg-jarvis-red/15 text-jarvis-red">
+              {errorCount} 错误
+            </span>
+          )}
         </span>
 
         <div className="flex items-center gap-1 ml-2">
@@ -223,12 +235,31 @@ export default function Terminal() {
         className="card flex-1 min-h-0 overflow-y-auto font-mono text-xs leading-5 bg-jarvis-bg"
       >
         {filtered.length === 0 ? (
-          <p className="text-jarvis-text-secondary text-center py-8">
-            暂无日志。操作前端功能或等待后端输出后会在此实时显示。
-          </p>
+          <div className="text-center py-8 space-y-3">
+            <p className="text-jarvis-text-secondary text-sm">
+              {lines.length === 0
+                ? "暂无日志。操作前端功能或等待后端输出后会在此实时显示。"
+                : "当前筛选条件下无匹配日志。"}
+            </p>
+            {lines.length > 0 && recentPreview.length > 0 && (
+              <div className="text-left max-w-xl mx-auto bg-jarvis-card/50 rounded-md p-3 border border-jarvis-border/50">
+                <p className="text-xs text-jarvis-text-secondary mb-2">最近活动</p>
+                {recentPreview.map((l) => (
+                  <div key={l.seq} className="text-xs text-jarvis-text-secondary truncate">
+                    [{l.ts}] {l.source}: {l.text.slice(0, 120)}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         ) : (
           filtered.map((l) => (
-            <div key={l.seq} className="flex gap-2 whitespace-pre-wrap break-all">
+            <div
+              key={l.seq}
+              className={`flex gap-2 whitespace-pre-wrap break-all rounded px-1 ${
+                l.level === "error" ? "bg-jarvis-red/10" : l.level === "warn" ? "bg-amber-500/5" : ""
+              }`}
+            >
               <span className="text-jarvis-text-secondary/60 shrink-0">{l.ts}</span>
               <span className="text-jarvis-blue/70 shrink-0 w-16 truncate" title={l.source}>
                 {l.source}

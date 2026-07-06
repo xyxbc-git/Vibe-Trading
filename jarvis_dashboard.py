@@ -17,11 +17,13 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import time
 import urllib.error
 import urllib.request
+import zipfile
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -265,6 +267,307 @@ def api_logs_stream():
             "Connection": "keep-alive",
         },
     )
+
+
+_DAEMON_STATUS_PATH = os.path.join(os.path.expanduser("~/.vibe-trading"), "jarvis_daemon_status.json")
+_VIBE_TRADING_DIR = os.path.expanduser("~/.vibe-trading")
+
+_BACKUP_FILES = (
+    "jarvis_config.json",
+    "jarvis_weights.json",
+    "executor_config.json",
+    "notify_config.json",
+    "data_keys.json",
+    "scalper_backtest_config.json",
+    "circuit_breaker.json",
+    "horizon_cache.json",
+    "scalper_graveyard.json",
+    "scalper_hall_of_fame.json",
+    "structured_lessons.json",
+    "combo_hall_of_fame.json",
+    "intraday_halt.json",
+    "intraday_resume.json",
+    "jarvis_daemon_status.json",
+    "jarvis_executor_status.json",
+    "jarvis_journal.db",
+    "price_alert_config.json.bak",
+)
+
+
+def _read_daemon_status() -> dict:
+    if not os.path.exists(_DAEMON_STATUS_PATH):
+        return {"available": False, "reason": "尚无 daemon 运行记录"}
+    try:
+        with open(_DAEMON_STATUS_PATH, encoding="utf-8") as f:
+            data = json.load(f) or {}
+        return {"available": True, **data}
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "reason": repr(exc)[:200]}
+
+
+@app.get("/api/health")
+def api_health():
+    """聚合健康检查：daemon / journal / 价位监控 / QD 网关可达性。"""
+    checks: dict = {}
+    try:
+        jj.init_db()
+        with jj._conn() as conn:
+            snaps = conn.execute("SELECT COUNT(*) AS n FROM snapshots").fetchone()["n"]
+            outs = conn.execute("SELECT COUNT(*) AS n FROM outcomes").fetchone()["n"]
+        checks["journal"] = {
+            "ok": os.path.exists(jj.DB_PATH),
+            "reachable": True,
+            "db": jj.DB_PATH,
+            "snapshots": snaps,
+            "outcomes": outs,
+        }
+    except Exception as exc:  # noqa: BLE001
+        checks["journal"] = {"ok": False, "reachable": False, "error": repr(exc)[:200]}
+
+    try:
+        jpa.init_price_alert_db()
+        mon = jpa.monitor_status()
+        pub = jpa.public_config()
+        with jj._conn() as conn:
+            plans = conn.execute("SELECT COUNT(*) AS n FROM price_alert_plans").fetchone()["n"]
+        checks["price_alert_monitor"] = {
+            "ok": True,
+            "reachable": True,
+            "running": bool(mon.get("running")),
+            "last_run": mon.get("last_run"),
+            "last_error": mon.get("last_error"),
+            "plans": plans,
+            "has_smtp_password": pub.get("smtp", {}).get("has_password"),
+        }
+    except Exception as exc:  # noqa: BLE001
+        checks["price_alert_monitor"] = {"ok": False, "reachable": False, "error": repr(exc)[:200]}
+
+    daemon = _read_daemon_status()
+    age_h = None
+    finished = daemon.get("finished_at") or daemon.get("started_at") or ""
+    if finished:
+        try:
+            ts = time.mktime(time.strptime(finished, "%Y-%m-%d %H:%M:%S"))
+            age_h = round((time.time() - ts) / 3600, 2)
+        except ValueError:
+            pass
+    daemon_ok = daemon.get("available", False) and (age_h is None or age_h <= 48)
+    checks["daemon"] = {
+        "ok": daemon_ok,
+        "reachable": daemon.get("available", False),
+        "age_hours": age_h,
+        "last_finished_at": finished,
+        "paper_trade": daemon.get("paper_trade"),
+        "symbols": list((daemon.get("symbols") or {}).keys()),
+        **{k: v for k, v in daemon.items() if k not in ("available",)},
+    }
+
+    try:
+        import jarvis_scalper_backtest as jbt
+        qd_h = jbt.check_qd_health()
+        qd_t = jbt.check_token()
+        healthy = bool(qd_h.get("healthy"))
+        valid = bool(qd_t.get("valid"))
+        checks["qd_gateway"] = {
+            "ok": healthy and valid,
+            "reachable": healthy,
+            "healthy": healthy,
+            "token_valid": valid,
+            "health_error": qd_h.get("error"),
+            "token_error": qd_t.get("error"),
+        }
+    except Exception as exc:  # noqa: BLE001
+        checks["qd_gateway"] = {"ok": False, "reachable": False, "error": repr(exc)[:200]}
+
+    core_ok = all(
+        checks.get(k, {}).get("ok")
+        for k in ("journal", "price_alert_monitor", "daemon")
+    )
+    return JSONResponse({
+        "ok": core_ok,
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "checks": checks,
+        "log_buffer_size": len(_LOG_BUFFER),
+    })
+
+
+@app.get("/api/health/migrations")
+def api_health_migrations():
+    """价位提醒 SQLite 迁移验收：表存在性 + 元数据 + smoketest 命令。"""
+    try:
+        jpa.init_price_alert_db()
+        tables = (
+            "price_alert_smtp",
+            "price_alert_settings",
+            "price_alert_contacts",
+            "price_alert_plans",
+            "price_alert_meta",
+        )
+        status: dict[str, dict] = {}
+        with jj._conn() as conn:
+            for name in tables:
+                try:
+                    n = conn.execute(f"SELECT COUNT(*) AS n FROM {name}").fetchone()["n"]
+                    status[name] = {"ok": True, "rows": n}
+                except Exception as exc:  # noqa: BLE001
+                    status[name] = {"ok": False, "error": str(exc)}
+            meta = {
+                r["key"]: r["value"]
+                for r in conn.execute("SELECT key, value FROM price_alert_meta").fetchall()
+            }
+        return JSONResponse({
+            "ok": all(v.get("ok") for v in status.values()),
+            "tables": status,
+            "meta": meta,
+            "smoketest_cmd": "cd Vibe-Trading && python _price_alert_db_smoketest.py",
+        })
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "reason": str(e)}, status_code=500)
+
+
+@app.get("/api/config/backup")
+def api_config_backup():
+    """打包 ~/.vibe-trading 关键配置与数据库为 zip 下载。"""
+    buf = io.BytesIO()
+    included: list[str] = []
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name in _BACKUP_FILES:
+            path = os.path.join(_VIBE_TRADING_DIR, name)
+            if os.path.isfile(path):
+                zf.write(path, arcname=name)
+                included.append(name)
+        try:
+            cfg = jpa.load_config()
+            smtp = dict(cfg.get("smtp") or {})
+            if smtp.get("password"):
+                smtp["password"] = "***"
+            export_cfg = {**cfg, "smtp": smtp}
+            zf.writestr(
+                "price_alert_export.json",
+                json.dumps(export_cfg, ensure_ascii=False, indent=2),
+            )
+            included.append("price_alert_export.json")
+        except Exception:  # noqa: BLE001
+            pass
+        zf.writestr(
+            "backup_manifest.json",
+            json.dumps(
+                {
+                    "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "source_dir": _VIBE_TRADING_DIR,
+                    "included": included,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+    buf.seek(0)
+    fname = f"vibe-trading-backup-{time.strftime('%Y%m%d-%H%M%S')}.zip"
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@app.post("/api/trust/chain")
+def api_trust_chain(symbol: str = "BTCUSDT"):
+    """Brief → Journal record → Evaluate 一键链路，附 evaluate 命中率指标。"""
+    sym = symbol.upper().replace("-", "").replace("/", "")
+    spot = sym if sym.endswith("USDT") else sym + "USDT"
+    try:
+        brief = jb.build(sym)
+        rec = jj.record(spot)
+        ev = jj.evaluate(spot)
+        rep = jj.report(spot)
+        _CACHE.pop(f"track:{sym}", None)
+        hit_rates: dict[str, float | None] = {}
+        for hk, hv in (rep.get("by_horizon") or {}).items():
+            hit_rates[hk] = (hv.get("overall") or {}).get("hit_rate_pct")
+        dec = brief.get("decision") or {}
+        return JSONResponse({
+            "ok": bool(rec.get("ok")),
+            "symbol": spot,
+            "brief": {
+                "direction": dec.get("direction"),
+                "conviction_score": dec.get("conviction_score"),
+                "suggested_position_pct": dec.get("suggested_position_pct"),
+            },
+            "record": rec,
+            "evaluate": ev,
+            "hit_rates": hit_rates,
+            "report_summary": {
+                "total_snapshots": rep.get("total_snapshots"),
+                "evaluated_outcomes": rep.get("evaluated_outcomes"),
+                "by_horizon": rep.get("by_horizon"),
+            },
+        })
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "reason": str(e)}, status_code=500)
+
+
+@app.get("/api/circuit-breaker")
+def api_circuit_breaker_get():
+    try:
+        import jarvis_circuit_breaker as _cb
+        cfg = jx.load_config()
+        ev = _cb.evaluate(cfg)
+        st = _cb._read_state()  # noqa: SLF001 — dashboard 只读展示
+        return JSONResponse({"ok": True, "evaluation": ev, "state": st})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
+
+
+@app.post("/api/circuit-breaker/reset")
+def api_circuit_breaker_reset():
+    try:
+        import jarvis_circuit_breaker as _cb
+        out = _cb.reset()
+        _log_emit("熔断已手动复位", "warn", "circuit-breaker")
+        return JSONResponse({"ok": True, "result": out})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
+
+
+@app.post("/api/actions/kill-switch")
+def api_action_kill_switch():
+    """急停：撤 QD 模拟挂单 + 取消本地 pending 限价单。"""
+    cfg = jx.load_config()
+    try:
+        out = jx.kill_switch(cfg)
+        local_cancelled = []
+        for o in jw.pending_orders():
+            oid = o.get("id")
+            if oid is not None:
+                local_cancelled.append(jw.cancel_limit_order(int(oid)))
+        _log_emit("kill-switch 已触发", "warn", "executor")
+        return JSONResponse({"ok": True, "qd": out, "local_cancelled": local_cancelled})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
+
+
+@app.get("/api/trading-config")
+def api_trading_config_get():
+    import jarvis_config as jc_mod
+    keys = (
+        "max_position_pct", "max_portfolio_risk_pct", "account_equity_usdt",
+        "min_conviction", "intraday_enabled", "intraday_max_open_positions",
+    )
+    return JSONResponse({k: jc_mod.get(k) for k in keys})
+
+
+@app.put("/api/trading-config")
+def api_trading_config_put(data: dict):
+    import jarvis_config as jc_mod
+    allowed = {
+        "max_position_pct", "max_portfolio_risk_pct", "account_equity_usdt",
+        "min_conviction", "intraday_enabled", "intraday_max_open_positions",
+    }
+    patch = {k: v for k, v in (data or {}).items() if k in allowed}
+    if not patch:
+        return JSONResponse({"ok": False, "reason": "无有效字段"}, status_code=400)
+    jc_mod.save(patch, source="desktop-settings", note="trading-config UI")
+    return JSONResponse({"ok": True, "config": {k: jc_mod.get(k) for k in allowed}})
 
 
 @app.get("/api/snapshot")

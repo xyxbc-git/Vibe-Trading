@@ -155,6 +155,40 @@ export const api = {
       60_000,
     ),
 
+  health: () => api.get<HealthStatus>("/health"),
+
+  track: (symbol = "BTCUSDT") =>
+    api.get<TrackData>(`/track?symbol=${encodeURIComponent(symbol)}`),
+
+  trackRecord: (symbol = "BTCUSDT") =>
+    request<TrackRecordResult>(
+      `/track/record?symbol=${encodeURIComponent(symbol)}`,
+      { method: "POST" },
+      60_000,
+    ),
+
+  circuitBreaker: () => api.get<CircuitBreakerStatus>("/circuit-breaker"),
+
+  resetCircuitBreaker: () =>
+    api.post<{ ok: boolean; result?: Record<string, unknown>; error?: string }>(
+      "/circuit-breaker/reset",
+    ),
+
+  killSwitch: () =>
+    request<{ ok: boolean; qd?: unknown; local_cancelled?: unknown[]; error?: string }>(
+      "/actions/kill-switch",
+      { method: "POST" },
+      30_000,
+    ),
+
+  tradingConfig: () => api.get<TradingConfig>("/trading-config"),
+
+  updateTradingConfig: (data: Partial<TradingConfig>) =>
+    api.put<{ ok: boolean; config?: TradingConfig; reason?: string }>(
+      "/trading-config",
+      data,
+    ),
+
   logs: (limit = 500) =>
     api.get<{ lines: LogLine[]; total: number }>(`/logs?limit=${limit}`),
   clearLogs: () => api.post<{ ok: boolean }>("/logs/clear"),
@@ -402,4 +436,54 @@ export interface BacktestState {
   } | null;
   result: BacktestResult | null;
   error: string | null;
+}
+
+export interface HealthCheckItem {
+  ok?: boolean;
+  error?: string;
+  running?: boolean;
+  last_run?: string | null;
+  available?: boolean;
+  reason?: string;
+  started_at?: string;
+  finished_at?: string;
+  tripped?: boolean;
+  should_halt?: boolean;
+  drawdown_pct?: number;
+  equity_usdt?: number;
+  healthy?: boolean;
+  [k: string]: unknown;
+}
+
+export interface HealthStatus {
+  ok: boolean;
+  ts: string;
+  checks: Record<string, HealthCheckItem>;
+  log_buffer_size?: number;
+}
+
+export interface TrackRecordResult {
+  record: { ok?: boolean; as_of_date?: string; error?: string };
+  evaluate: { outcomes_filled?: number; not_due?: number };
+}
+
+export interface TrackData {
+  report: Record<string, unknown>;
+  recent: Record<string, unknown>[];
+}
+
+export interface CircuitBreakerStatus {
+  ok: boolean;
+  evaluation?: Record<string, unknown>;
+  state?: { tripped?: boolean; reason?: string; peak_equity?: number };
+  error?: string;
+}
+
+export interface TradingConfig {
+  max_position_pct?: number;
+  max_portfolio_risk_pct?: number;
+  account_equity_usdt?: number;
+  min_conviction?: number;
+  intraday_enabled?: boolean;
+  intraday_max_open_positions?: number;
 }

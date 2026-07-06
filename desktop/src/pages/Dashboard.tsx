@@ -3,14 +3,17 @@ import { useSymbol } from "@/hooks/useSymbol";
 import { api } from "@/api/client";
 import StatCard from "@/components/cards/StatCard";
 import PositionCard from "@/components/cards/PositionCard";
-import GaugeChart from "@/components/common/GaugeChart";
+import HealthStatusCard from "@/components/cards/HealthStatusCard";
 import {
   LayoutDashboard,
   Wallet,
   TrendingUp,
   BarChart3,
   Target,
+  BookMarked,
+  Loader2,
 } from "lucide-react";
+import { useState } from "react";
 import {
   ResponsiveContainer,
   AreaChart,
@@ -19,6 +22,7 @@ import {
   YAxis,
   Tooltip,
 } from "recharts";
+import GaugeChart from "@/components/common/GaugeChart";
 
 function fmtUsd(n: number) {
   return n.toLocaleString("en-US", {
@@ -30,7 +34,20 @@ function fmtUsd(n: number) {
 
 export default function Dashboard() {
   const { symbol } = useSymbol();
+  const [journalBusy, setJournalBusy] = useState(false);
+  const [journalMsg, setJournalMsg] = useState("");
+
   const { data: wallet } = usePolling(api.wallet, 30_000);
+  const {
+    data: health,
+    loading: healthLoading,
+    error: healthError,
+  } = usePolling(api.health, 15_000);
+  const { data: track, refetch: refetchTrack } = usePolling(
+    () => api.track(symbol),
+    60_000,
+    [symbol],
+  );
   const { data: snapshot } = usePolling(
     () => api.snapshot(symbol),
     60_000,
@@ -100,6 +117,33 @@ export default function Dashboard() {
     value: Number(closes[i] ?? 0),
   }));
 
+  const trackReport = (track?.report ?? {}) as Record<string, unknown>;
+  const totalSnapshots = Number(trackReport.total_snapshots ?? 0);
+  const hitRate = trackReport.overall_hit_pct;
+
+  const handleJournalCycle = async () => {
+    setJournalBusy(true);
+    setJournalMsg("");
+    try {
+      const res = await api.trackRecord(symbol);
+      const rec = res.record;
+      const filled = res.evaluate?.outcomes_filled ?? 0;
+      if (rec?.ok) {
+        setJournalMsg(
+          `已记录 ${rec.as_of_date ?? "今日"}，回填 ${filled} 条到期结果`,
+        );
+      } else {
+        setJournalMsg(`记录失败: ${rec?.error ?? "未知错误"}`);
+      }
+      refetchTrack();
+    } catch (e) {
+      setJournalMsg(e instanceof Error ? e.message : "请求失败");
+    } finally {
+      setJournalBusy(false);
+      setTimeout(() => setJournalMsg(""), 8000);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <h1 className="page-title flex items-center gap-2">
@@ -130,6 +174,62 @@ export default function Dashboard() {
           trend={pnlTrend as "up" | "down"}
           subtitle={`${pnlToday >= 0 ? "▲" : "▼"} ${pnlTrend === "up" ? "盈利" : "亏损"}`}
         />
+      </div>
+
+      <div className="grid grid-cols-3 gap-4">
+        <HealthStatusCard
+          health={health ?? null}
+          loading={healthLoading}
+          error={healthError}
+        />
+
+        <div className="card col-span-2">
+          <div className="flex items-center justify-between mb-3">
+            <p className="stat-label flex items-center gap-2 mb-0">
+              <BookMarked size={14} />
+              战绩追踪 · {symbol}
+            </p>
+            <button
+              onClick={handleJournalCycle}
+              disabled={journalBusy}
+              className="btn-primary text-xs py-1.5 px-3 flex items-center gap-1.5 disabled:opacity-50"
+            >
+              {journalBusy ? (
+                <Loader2 size={14} className="animate-spin" />
+              ) : null}
+              记录今日 + 回填
+            </button>
+          </div>
+          <div className="grid grid-cols-3 gap-3 text-sm mb-2">
+            <div>
+              <p className="text-jarvis-text-secondary text-xs">快照数</p>
+              <p className="font-mono text-jarvis-text">{totalSnapshots}</p>
+            </div>
+            <div>
+              <p className="text-jarvis-text-secondary text-xs">命中率</p>
+              <p className="font-mono text-jarvis-text">
+                {hitRate != null ? `${hitRate}%` : "—"}
+              </p>
+            </div>
+            <div>
+              <p className="text-jarvis-text-secondary text-xs">最近快照</p>
+              <p className="font-mono text-jarvis-text truncate">
+                {((track?.recent ?? [])[0] as Record<string, unknown> | undefined)
+                  ?.as_of_date ?? "—"}
+              </p>
+            </div>
+          </div>
+          {journalMsg && (
+            <p
+              className={`text-xs ${journalMsg.includes("失败") ? "text-jarvis-red" : "text-jarvis-green"}`}
+            >
+              {journalMsg}
+            </p>
+          )}
+          <p className="text-xs text-jarvis-text-secondary mt-2">
+            一键执行 Brief→Journal 落库 + Evaluate 回填，与 daemon 心跳同源逻辑。
+          </p>
+        </div>
       </div>
 
       <div className="grid grid-cols-3 gap-4">

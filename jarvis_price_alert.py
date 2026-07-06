@@ -7,7 +7,7 @@
   - 价位由用户手动设定（不做 AI 推荐）
   - 后台轮询实时价格，命中目标价位即向配置的邮箱发送提醒邮件
 
-配置存储：~/.vibe-trading/price_alert_config.json
+配置存储：~/.vibe-trading/jarvis_journal.db（price_alert_* 表；旧 JSON 首次启动自动导入并备份为 .bak）
 敏感信息（SMTP 授权码）只落本地配置文件，绝不回传明文给前端。
 
 价位判定采用「穿越」语义：先用一轮观测建立基线 last_price，之后当价格
@@ -40,6 +40,8 @@ from email.header import Header
 from email.mime.text import MIMEText
 from email.utils import formataddr
 
+import jarvis_journal as jj
+
 try:
     import jarvis_crypto_data as jcd
 except Exception:  # noqa: BLE001 — 单元/离线场景下允许缺失
@@ -68,9 +70,10 @@ DEFAULTS: dict = {
 }
 
 _LOCK = threading.RLock()
+_DB_INITIALIZED = False
 
 
-# ─────────────────────────── 配置读写 ───────────────────────────
+# ─────────────────────────── 配置读写（SQLite） ───────────────────────────
 
 def _deep_merge(base: dict, override: dict) -> dict:
     out = dict(base)
@@ -82,26 +85,308 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return out
 
 
+def init_price_alert_db() -> None:
+    """在 jarvis_journal.db 中建价位提醒相关表（幂等）。"""
+    global _DB_INITIALIZED
+    jj.init_db()
+    with jj._conn() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS price_alert_smtp (
+                id         INTEGER PRIMARY KEY CHECK (id = 1),
+                host       TEXT    NOT NULL DEFAULT '',
+                port       INTEGER NOT NULL DEFAULT 465,
+                use_ssl    INTEGER NOT NULL DEFAULT 1,
+                username   TEXT    NOT NULL DEFAULT '',
+                password   TEXT    NOT NULL DEFAULT '',
+                from_name  TEXT    NOT NULL DEFAULT '贾维斯价位提醒',
+                updated_at REAL    NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS price_alert_settings (
+                id              INTEGER PRIMARY KEY CHECK (id = 1),
+                poll_interval_s INTEGER NOT NULL DEFAULT 60,
+                updated_at      REAL    NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS price_alert_contacts (
+                email      TEXT PRIMARY KEY,
+                label      TEXT    NOT NULL DEFAULT '',
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at REAL    NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS price_alert_plans (
+                id                TEXT PRIMARY KEY,
+                name              TEXT    NOT NULL,
+                symbol            TEXT    NOT NULL,
+                target_price      REAL    NOT NULL,
+                direction         TEXT    NOT NULL DEFAULT 'above',
+                recipients_json   TEXT    NOT NULL DEFAULT '[]',
+                enabled           INTEGER NOT NULL DEFAULT 1,
+                is_repeat         INTEGER NOT NULL DEFAULT 0,
+                note              TEXT    NOT NULL DEFAULT '',
+                created_at        REAL    NOT NULL,
+                last_price        REAL,
+                last_triggered_at REAL,
+                triggered_count   INTEGER NOT NULL DEFAULT 0,
+                last_send_result  TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS price_alert_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+    if not _DB_INITIALIZED:
+        _maybe_import_json()
+        _DB_INITIALIZED = True
+
+
+def _db_has_any_config() -> bool:
+    with jj._conn() as conn:
+        if conn.execute("SELECT 1 FROM price_alert_smtp WHERE id = 1").fetchone():
+            return True
+        if conn.execute("SELECT 1 FROM price_alert_settings WHERE id = 1").fetchone():
+            return True
+        if conn.execute("SELECT 1 FROM price_alert_contacts LIMIT 1").fetchone():
+            return True
+        if conn.execute("SELECT 1 FROM price_alert_plans LIMIT 1").fetchone():
+            return True
+    return False
+
+
+def _backup_json_config() -> str | None:
+    if not os.path.exists(CONFIG_PATH):
+        return None
+    bak_path = CONFIG_PATH + ".bak"
+    if os.path.exists(bak_path):
+        bak_path = CONFIG_PATH + f".bak.{int(time.time())}"
+    os.replace(CONFIG_PATH, bak_path)
+    return bak_path
+
+
+def _maybe_import_json() -> None:
+    """DB 无数据且旧 JSON 存在时自动导入并备份。"""
+    if _db_has_any_config():
+        return
+    cfg = json.loads(json.dumps(DEFAULTS))
+    imported_from = "defaults"
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, encoding="utf-8") as f:
+                cfg = _deep_merge(cfg, json.load(f) or {})
+            imported_from = "json"
+        except Exception:  # noqa: BLE001
+            pass
+    _save_to_db(cfg)
+    with jj._conn() as conn:
+        conn.execute(
+            "INSERT INTO price_alert_meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            ("import_source", imported_from),
+        )
+        if imported_from == "json":
+            bak = _backup_json_config()
+            if bak:
+                conn.execute(
+                    "INSERT INTO price_alert_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    ("json_backup_path", bak),
+                )
+                conn.execute(
+                    "INSERT INTO price_alert_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    ("json_imported_at", str(time.time())),
+                )
+
+
+def _row_to_plan(row) -> dict:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "symbol": row["symbol"],
+        "target_price": float(row["target_price"]),
+        "direction": row["direction"],
+        "recipients": json.loads(row["recipients_json"] or "[]"),
+        "enabled": bool(row["enabled"]),
+        "repeat": bool(row["is_repeat"]),
+        "note": row["note"] or "",
+        "created_at": row["created_at"],
+        "last_price": row["last_price"],
+        "last_triggered_at": row["last_triggered_at"],
+        "triggered_count": int(row["triggered_count"] or 0),
+        "last_send_result": row["last_send_result"],
+    }
+
+
+def _load_from_db() -> dict:
+    cfg = json.loads(json.dumps(DEFAULTS))
+    with jj._conn() as conn:
+        smtp_row = conn.execute("SELECT * FROM price_alert_smtp WHERE id = 1").fetchone()
+        if smtp_row:
+            cfg["smtp"] = {
+                "host": smtp_row["host"],
+                "port": int(smtp_row["port"]),
+                "use_ssl": bool(smtp_row["use_ssl"]),
+                "username": smtp_row["username"],
+                "password": smtp_row["password"],
+                "from_name": smtp_row["from_name"],
+            }
+        settings_row = conn.execute(
+            "SELECT poll_interval_s FROM price_alert_settings WHERE id = 1"
+        ).fetchone()
+        if settings_row:
+            cfg["poll_interval_s"] = int(settings_row["poll_interval_s"])
+        contacts = conn.execute(
+            "SELECT email, label FROM price_alert_contacts ORDER BY sort_order, email"
+        ).fetchall()
+        cfg["recipients"] = [r["email"] for r in contacts]
+        cfg["contact_labels"] = {
+            r["email"]: r["label"] for r in contacts if r["label"]
+        }
+        plans = [
+            _row_to_plan(r)
+            for r in conn.execute(
+                "SELECT * FROM price_alert_plans ORDER BY created_at"
+            ).fetchall()
+        ]
+        cfg["plans"] = plans
+    return cfg
+
+
+def _save_to_db(cfg: dict) -> None:
+    now = time.time()
+    smtp = cfg.get("smtp", {}) or {}
+    poll = max(10, int(cfg.get("poll_interval_s", 60)))
+    recipients = list(cfg.get("recipients", []) or [])
+    labels = cfg.get("contact_labels", {}) or {}
+    plans = list(cfg.get("plans", []) or [])
+
+    with jj._conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO price_alert_smtp
+              (id, host, port, use_ssl, username, password, from_name, updated_at)
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              host = excluded.host,
+              port = excluded.port,
+              use_ssl = excluded.use_ssl,
+              username = excluded.username,
+              password = excluded.password,
+              from_name = excluded.from_name,
+              updated_at = excluded.updated_at
+            """,
+            (
+                str(smtp.get("host", "") or ""),
+                int(smtp.get("port") or 465),
+                1 if bool(smtp.get("use_ssl", True)) else 0,
+                str(smtp.get("username", "") or ""),
+                str(smtp.get("password", "") or ""),
+                str(smtp.get("from_name", "") or "贾维斯价位提醒"),
+                now,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO price_alert_settings (id, poll_interval_s, updated_at)
+            VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              poll_interval_s = excluded.poll_interval_s,
+              updated_at = excluded.updated_at
+            """,
+            (poll, now),
+        )
+        conn.execute("DELETE FROM price_alert_contacts")
+        for i, email in enumerate(recipients):
+            email = str(email).strip()
+            if not email:
+                continue
+            conn.execute(
+                """
+                INSERT INTO price_alert_contacts (email, label, sort_order, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (email, str(labels.get(email, "") or ""), i, now),
+            )
+        plan_ids = [p.get("id") for p in plans if p.get("id")]
+        if plan_ids:
+            placeholders = ",".join("?" * len(plan_ids))
+            conn.execute(
+                f"DELETE FROM price_alert_plans WHERE id NOT IN ({placeholders})",
+                plan_ids,
+            )
+        else:
+            conn.execute("DELETE FROM price_alert_plans")
+        for plan in plans:
+            pid = plan.get("id")
+            if not pid:
+                continue
+            conn.execute(
+                """
+                INSERT INTO price_alert_plans
+                  (id, name, symbol, target_price, direction, recipients_json,
+                   enabled, is_repeat, note, created_at, last_price,
+                   last_triggered_at, triggered_count, last_send_result)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  name = excluded.name,
+                  symbol = excluded.symbol,
+                  target_price = excluded.target_price,
+                  direction = excluded.direction,
+                  recipients_json = excluded.recipients_json,
+                  enabled = excluded.enabled,
+                  is_repeat = excluded.is_repeat,
+                  note = excluded.note,
+                  last_price = excluded.last_price,
+                  last_triggered_at = excluded.last_triggered_at,
+                  triggered_count = excluded.triggered_count,
+                  last_send_result = excluded.last_send_result
+                """,
+                (
+                    pid,
+                    str(plan.get("name") or ""),
+                    str(plan.get("symbol") or ""),
+                    float(plan.get("target_price") or 0),
+                    plan.get("direction", DIRECTION_ABOVE),
+                    json.dumps(plan.get("recipients") or [], ensure_ascii=False),
+                    1 if plan.get("enabled", True) else 0,
+                    1 if plan.get("repeat") else 0,
+                    str(plan.get("note") or ""),
+                    float(plan.get("created_at") or now),
+                    plan.get("last_price"),
+                    plan.get("last_triggered_at"),
+                    int(plan.get("triggered_count") or 0),
+                    plan.get("last_send_result"),
+                ),
+            )
+
+
 def load_config() -> dict:
     """读取完整配置（含 SMTP 明文密码，仅供后端内部发信使用）。"""
     with _LOCK:
-        cfg = json.loads(json.dumps(DEFAULTS))  # 深拷贝默认
-        if os.path.exists(CONFIG_PATH):
-            try:
-                with open(CONFIG_PATH, encoding="utf-8") as f:
-                    cfg = _deep_merge(cfg, json.load(f) or {})
-            except Exception:  # noqa: BLE001
-                pass
-        return cfg
+        init_price_alert_db()
+        return _load_from_db()
 
 
 def _save(cfg: dict) -> None:
     with _LOCK:
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        tmp = CONFIG_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, CONFIG_PATH)
+        init_price_alert_db()
+        _save_to_db(cfg)
 
 
 def _mask(secret: str) -> str:
