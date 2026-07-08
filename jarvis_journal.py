@@ -32,6 +32,7 @@ import sys
 import time
 
 import jarvis_brief as jb
+import jarvis_db as jdb
 import jarvis_weights as jw
 from jarvis_factor_backtest import _build_series, fetch_fng_all, fetch_price_daily
 
@@ -41,11 +42,10 @@ DB_PATH = os.path.join(DB_DIR, "jarvis_journal.db")
 HORIZONS = (7, 30)
 
 
-def _conn() -> sqlite3.Connection:
+def _conn():
+    """返回数据库连接：配置了 JARVIS_DB_URL 走 PostgreSQL，否则本地 SQLite（默认，零回归）。"""
     os.makedirs(DB_DIR, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return jdb.connect(DB_PATH)
 
 
 def init_db() -> None:

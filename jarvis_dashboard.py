@@ -3305,7 +3305,7 @@ COCKPIT_HTML = r"""<!doctype html>
   .live{color:var(--mut);font-size:12px;text-align:right;line-height:1.4}
   .pulse{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--up);margin-right:5px;animation:p 1.6s infinite}
   @keyframes p{0%{opacity:.3}50%{opacity:1}100%{opacity:.3}}
-  .cockpit{flex:1;display:grid;grid-template-columns:1fr 392px;gap:var(--sp3);padding:var(--sp3);min-height:0}
+  .cockpit{flex:1;display:grid;grid-template-columns:1fr 430px;gap:var(--sp3);padding:var(--sp3);min-height:0}
   .chartcol{display:flex;flex-direction:column;gap:var(--sp2);min-height:0}
   .ivbar{display:flex;gap:6px;align-items:center}
   .ivbar button{background:var(--card);color:var(--mut);border:1px solid var(--bd);border-radius:8px;padding:5px 13px;font-size:13px;font-weight:600;cursor:pointer;transition:all .2s var(--ease)}
@@ -3313,10 +3313,13 @@ COCKPIT_HTML = r"""<!doctype html>
   .ivbar button.on{background:rgba(79,140,255,0.14);border-color:rgba(79,140,255,0.55);color:var(--accent2);font-weight:700}
   .ivbar .hint{color:var(--mut);font-size:12px;margin-left:auto}
   #kline{flex:1;background:var(--card2);border:1px solid var(--bd);border-radius:var(--r);min-height:0;box-shadow:var(--sh);overflow:hidden}
-  .sidecol{display:flex;flex-direction:column;gap:12px;min-height:0;overflow:hidden}
+  .sidecol{display:flex;flex-direction:column;gap:12px;min-height:0;overflow-y:auto;overflow-x:hidden;padding-right:4px}
+  .sidecol::-webkit-scrollbar{width:6px}
+  .sidecol::-webkit-scrollbar-thumb{background:var(--bd2);border-radius:99px}
+  .sidecol::-webkit-scrollbar-track{background:transparent}
   .card{background:linear-gradient(180deg,rgba(255,255,255,0.02),transparent 42%),var(--card);border:1px solid var(--bd);border-radius:var(--r);padding:15px;box-shadow:var(--sh);animation:fadeUp .4s var(--ease) both;transition:border-color .25s var(--ease)}
   .card:hover{border-color:var(--bd2)}
-  .copilot{position:relative;overflow:hidden;border-top:2px solid rgba(79,140,255,0.55)}
+  .copilot{position:relative;overflow:hidden;flex-shrink:0;border-top:2px solid rgba(79,140,255,0.55)}
   .copilot::before{content:"";position:absolute;inset:0;background:radial-gradient(420px 130px at 18% 0%,rgba(79,140,255,0.10),transparent 70%);pointer-events:none}
   .copilot .vd{font-size:24px;font-weight:800;letter-spacing:-.4px}
   .copilot .vsub{color:var(--mut);font-size:12px;margin-top:5px}
@@ -3336,7 +3339,7 @@ COCKPIT_HTML = r"""<!doctype html>
   .ev .t{color:var(--mut);white-space:nowrap;font-size:11px}
   .ev .tt{font-weight:600} .ev .dd{color:var(--mut);margin-top:2px}
   .empty{color:var(--mut);font-size:12px;text-align:center;padding:18px 0}
-  .ask{display:flex;flex-direction:column;height:248px}
+  .ask{display:flex;flex-direction:column;height:248px;flex-shrink:0}
   .chat{flex:1;overflow:auto;display:flex;flex-direction:column;gap:9px;padding-right:2px}
   .msg{font-size:13px;line-height:1.6;max-width:92%;padding:8px 11px;border-radius:11px}
   .msg.u{align-self:flex-end;background:var(--accent);color:#fff;border-bottom-right-radius:3px}
@@ -3355,6 +3358,7 @@ COCKPIT_HTML = r"""<!doctype html>
   .stat .k{color:var(--mut);font-size:11px} .stat .v{font-size:16px;font-weight:700;margin-top:4px;font-family:var(--mono);font-variant-numeric:tabular-nums;letter-spacing:-.2px}
   .pos{color:var(--up)} .neg{color:var(--down)} .mut{color:var(--mut)}
   /* 多周期预测卡（4h / 15天 / 30天 + 归因 + AI 解读） */
+  .mhz{flex-shrink:0}
   .mhz .hzitem{background:var(--card2);border:1px solid var(--bd);border-radius:var(--r2);padding:9px 11px;margin-bottom:8px;transition:border-color .2s var(--ease),opacity .2s var(--ease);cursor:pointer;user-select:none}
   .mhz .hzitem:hover{border-color:var(--bd2)}
   .mhz .hzitem:last-of-type{margin-bottom:0}

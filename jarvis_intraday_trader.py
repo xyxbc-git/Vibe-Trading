@@ -55,11 +55,15 @@ def _log(msg: str) -> None:
         pass
 
 
-def _conn(db_path: Optional[str] = None) -> sqlite3.Connection:
+def _conn(db_path: Optional[str] = None):
+    """显式传 db_path（测试用临时库）时固定用 SQLite；否则按 jarvis_db 选后端（pg/SQLite）。"""
     os.makedirs(DB_DIR, exist_ok=True)
-    conn = sqlite3.connect(db_path or DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    if db_path is not None:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+    import jarvis_db as jdb
+    return jdb.connect(DB_PATH)
 
 
 def ensure_db(db_path: Optional[str] = None) -> None:
@@ -247,14 +251,14 @@ def _open(conn: sqlite3.Connection, pred: dict, cfg: dict, now_ms: int) -> Optio
     notional = min(risk_usdt / stop_dist, equity * float(cfg["max_position_pct"]) / 100.0)
     qty = notional / entry
     side = LONG if pred["direction"] == "涨" else SHORT
-    try:
-        conn.execute(
-            "INSERT INTO intraday_positions (symbol, side, opened_ts, entry, stop, "
-            "take, qty, notional_usdt, prob) VALUES (?,?,?,?,?,?,?,?,?)",
-            (sym, side, now_ms, entry, stop, take, qty, round(notional, 2),
-             pred.get("prob")))
-    except sqlite3.IntegrityError:
-        return None  # 同一时刻重复开仓（幂等兜底）
+    cur = conn.execute(
+        "INSERT INTO intraday_positions (symbol, side, opened_ts, entry, stop, "
+        "take, qty, notional_usdt, prob) VALUES (?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(symbol, opened_ts) DO NOTHING",
+        (sym, side, now_ms, entry, stop, take, qty, round(notional, 2),
+         pred.get("prob")))
+    if not cur.rowcount:
+        return None  # 同一时刻重复开仓（幂等兜底，两种后端通用）
     _log(f"📈 开仓 {sym} {side} @{entry} 止损{stop} 止盈{take} "
          f"名义{round(notional, 2)}U prob={pred.get('prob')}")
     _notify(f"📈 4h 模拟开仓 {sym} {'做多' if side == LONG else '做空'} @{entry}"
