@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from "react";
 import { Settings as SettingsIcon, Save, RefreshCw, Wifi, Key, Palette, Server, Plug, Download, ShieldAlert, OctagonX } from "lucide-react";
-import { api, type QdConfig, type QdConfigTest, type TradingConfig, type CircuitBreakerStatus } from "@/api/client";
+import { api, type QdConfig, type QdConfigTest, type TradingConfig, type CircuitBreakerStatus, type LlmConfig, type LlmTestResult } from "@/api/client";
 import { useApi } from "@/hooks/useApi";
+import { useSymbol } from "@/hooks/useSymbol";
 
 interface ScalperConfig {
   risk?: {
@@ -370,6 +371,318 @@ function QdGatewayCard() {
   );
 }
 
+const LLM_PROVIDERS = [
+  {
+    id: "deepseek",
+    label: "DeepSeek（推荐）",
+    base: "https://api.deepseek.com",
+    model: "deepseek-chat",
+    keyHint: "sk- 开头，platform.deepseek.com 获取",
+  },
+  {
+    id: "openai",
+    label: "OpenAI",
+    base: "https://api.openai.com/v1",
+    model: "gpt-4o-mini",
+    keyHint: "sk- 开头，platform.openai.com 获取",
+  },
+  {
+    id: "qwen",
+    label: "通义千问",
+    base: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    model: "qwen-plus",
+    keyHint: "sk- 开头，bailian.console.aliyun.com 获取",
+  },
+  {
+    id: "moonshot",
+    label: "Kimi",
+    base: "https://api.moonshot.cn/v1",
+    model: "moonshot-v1-8k",
+    keyHint: "sk- 开头，platform.moonshot.cn 获取",
+  },
+  {
+    id: "custom",
+    label: "自定义 / 兼容中转",
+    base: "",
+    model: "",
+    keyHint: "任意 OpenAI 兼容服务的 Key（含 Ollama）",
+  },
+] as const;
+
+function LlmConfigCard() {
+  const { data: cfg, refetch } = useApi<LlmConfig>(() => api.llmConfig());
+  const [provider, setProvider] = useState("deepseek");
+  const [baseUrl, setBaseUrl] = useState("");
+  const [model, setModel] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [temperature, setTemperature] = useState(0.5);
+  const [maxTokens, setMaxTokens] = useState(900);
+  const [promptExtra, setPromptExtra] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<LlmTestResult | null>(null);
+
+  useEffect(() => {
+    if (!cfg) return;
+    setProvider(cfg.provider || "deepseek");
+    setBaseUrl(cfg.base_url ?? "");
+    setModel(cfg.model ?? "");
+    if (typeof cfg.temperature === "number") setTemperature(cfg.temperature);
+    if (typeof cfg.max_tokens === "number") setMaxTokens(cfg.max_tokens);
+    setPromptExtra(cfg.system_prompt_extra ?? "");
+  }, [cfg]);
+
+  const preset = LLM_PROVIDERS.find((p) => p.id === provider) ?? LLM_PROVIDERS[0];
+
+  const handleProviderChange = (id: string) => {
+    setProvider(id);
+    const p = LLM_PROVIDERS.find((x) => x.id === id);
+    if (p && p.id !== "custom") {
+      setBaseUrl(p.base);
+      setModel(p.model);
+    }
+  };
+
+  const handleSave = async () => {
+    setSaving(true);
+    setMsg("");
+    try {
+      const payload: {
+        provider: string;
+        base_url: string;
+        model: string;
+        api_key?: string;
+        temperature: number;
+        max_tokens: number;
+        system_prompt_extra: string;
+      } = {
+        provider,
+        base_url: baseUrl.trim(),
+        model: model.trim(),
+        temperature,
+        max_tokens: maxTokens,
+        system_prompt_extra: promptExtra.trim(),
+      };
+      if (apiKey.trim()) payload.api_key = apiKey.trim();
+      const res = await api.updateLlmConfig(payload);
+      if (res.ok) {
+        setMsg("保存成功 ✓ 立即生效，无需重启");
+        setApiKey("");
+        refetch();
+      } else {
+        setMsg(`保存失败: ${res.reason ?? "未知错误"}`);
+      }
+    } catch (e) {
+      setMsg(`保存失败: ${e instanceof Error ? e.message : "网络错误"}`);
+    } finally {
+      setSaving(false);
+      setTimeout(() => setMsg(""), 4000);
+    }
+  };
+
+  const handleTest = async () => {
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const res = await api.testLlmConfig();
+      setTestResult(res);
+    } catch (e) {
+      setTestResult({
+        ok: false,
+        error: e instanceof Error ? e.message : "网络错误",
+      });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  return (
+    <div className="card">
+      <h3 className="text-sm font-semibold text-jarvis-text mb-1 flex items-center gap-2">
+        <Key size={14} />
+        大模型 (LLM)
+        {cfg?.configured ? (
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-jarvis-green/15 text-jarvis-green font-normal">
+            已配置{cfg.source === "env" ? "（来自环境变量）" : ""}
+          </span>
+        ) : (
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-jarvis-yellow/15 text-jarvis-yellow font-normal">
+            未配置
+          </span>
+        )}
+      </h3>
+      <p className="text-xs text-jarvis-text-secondary mb-3">
+        AI 策略工坊、策略进化、AI 问答共用此配置。填入 API Key 即可，保存立即生效。
+      </p>
+
+      <div className="py-2 border-b border-jarvis-border/50">
+        <p className="text-sm text-jarvis-text mb-1.5">服务商</p>
+        <div className="flex gap-2">
+          {LLM_PROVIDERS.map((p) => (
+            <button
+              key={p.id}
+              onClick={() => handleProviderChange(p.id)}
+              className={`flex-1 px-2 py-1.5 text-xs rounded-md border transition-colors ${
+                provider === p.id
+                  ? "border-jarvis-blue text-jarvis-blue bg-jarvis-blue/10"
+                  : "border-jarvis-border text-jarvis-text-secondary hover:text-jarvis-text"
+              }`}
+            >
+              {p.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="py-2 border-b border-jarvis-border/50">
+        <div className="flex items-center justify-between mb-1.5">
+          <p className="text-sm text-jarvis-text">API Key</p>
+          {cfg?.has_key && (
+            <span className="text-xs font-mono text-jarvis-text-secondary">
+              当前：{cfg.api_key_masked}
+            </span>
+          )}
+        </div>
+        <input
+          type="password"
+          value={apiKey}
+          onChange={(e) => setApiKey(e.target.value)}
+          placeholder={cfg?.has_key ? "留空表示不修改" : preset.keyHint}
+          autoComplete="off"
+          className="w-full px-2 py-1.5 text-sm font-mono bg-jarvis-bg border border-jarvis-border rounded-md text-jarvis-text focus:outline-none focus:border-jarvis-blue"
+        />
+        {cfg?.env_fallback_available && !cfg.has_key && (
+          <p className="text-xs text-jarvis-text-secondary mt-1">
+            当前正使用 .env / 环境变量里的 Key；在此保存后将优先使用这里的配置。
+          </p>
+        )}
+      </div>
+
+      <div className="grid grid-cols-2 gap-3 py-2">
+        <div>
+          <p className="text-sm text-jarvis-text mb-1.5">Base URL</p>
+          <input
+            type="text"
+            value={baseUrl}
+            onChange={(e) => setBaseUrl(e.target.value)}
+            placeholder={preset.base || "https://api.xxx.com/v1"}
+            className="w-full px-2 py-1.5 text-sm font-mono bg-jarvis-bg border border-jarvis-border rounded-md text-jarvis-text focus:outline-none focus:border-jarvis-blue"
+          />
+        </div>
+        <div>
+          <p className="text-sm text-jarvis-text mb-1.5">模型名</p>
+          <input
+            type="text"
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
+            placeholder={preset.model || "如 deepseek-chat"}
+            className="w-full px-2 py-1.5 text-sm font-mono bg-jarvis-bg border border-jarvis-border rounded-md text-jarvis-text focus:outline-none focus:border-jarvis-blue"
+          />
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3 py-2 border-t border-jarvis-border/50">
+        <div>
+          <p className="text-sm text-jarvis-text mb-1.5">
+            回答温度
+            <span className="text-xs text-jarvis-text-secondary ml-1.5">
+              0=严谨 · 2=发散
+            </span>
+          </p>
+          <input
+            type="number"
+            value={temperature}
+            onChange={(e) => setTemperature(Number(e.target.value))}
+            step={0.1}
+            min={0}
+            max={2}
+            className="w-full px-2 py-1.5 text-sm font-mono bg-jarvis-bg border border-jarvis-border rounded-md text-jarvis-text focus:outline-none focus:border-jarvis-blue"
+          />
+        </div>
+        <div>
+          <p className="text-sm text-jarvis-text mb-1.5">
+            回答长度上限
+            <span className="text-xs text-jarvis-text-secondary ml-1.5">tokens</span>
+          </p>
+          <input
+            type="number"
+            value={maxTokens}
+            onChange={(e) => setMaxTokens(Number(e.target.value))}
+            step={100}
+            min={100}
+            max={8000}
+            className="w-full px-2 py-1.5 text-sm font-mono bg-jarvis-bg border border-jarvis-border rounded-md text-jarvis-text focus:outline-none focus:border-jarvis-blue"
+          />
+        </div>
+      </div>
+
+      <div className="py-2 border-t border-jarvis-border/50">
+        <p className="text-sm text-jarvis-text mb-1.5">
+          助手人格补充
+          <span className="text-xs text-jarvis-text-secondary ml-1.5">
+            追加到内置提示词后，如「回答尽量简短」「多用表格」
+          </span>
+        </p>
+        <textarea
+          value={promptExtra}
+          onChange={(e) => setPromptExtra(e.target.value)}
+          rows={2}
+          maxLength={1000}
+          placeholder="留空使用默认人格"
+          className="w-full px-2 py-1.5 text-sm bg-jarvis-bg border border-jarvis-border rounded-md text-jarvis-text focus:outline-none focus:border-jarvis-blue resize-y"
+        />
+      </div>
+
+      <div className="flex items-center gap-3 mt-2">
+        <button
+          onClick={handleSave}
+          disabled={saving}
+          className="btn-primary flex items-center gap-2"
+        >
+          <Save size={14} />
+          {saving ? "保存中..." : "保存 LLM 配置"}
+        </button>
+        <button
+          onClick={handleTest}
+          disabled={testing}
+          className="btn-primary flex items-center gap-2 !bg-jarvis-card border border-jarvis-border"
+        >
+          <Plug size={14} />
+          {testing ? "测试中..." : "连接测试"}
+        </button>
+        {msg && (
+          <span className={`text-sm ${msg.includes("成功") ? "text-jarvis-green" : "text-jarvis-red"}`}>
+            {msg}
+          </span>
+        )}
+      </div>
+
+      {testResult && (
+        <div className="mt-3 bg-jarvis-bg rounded-md p-3 text-xs space-y-1.5">
+          <div className="flex items-center justify-between">
+            <span className="text-jarvis-text-secondary">模型连通性</span>
+            <span className={testResult.ok ? "text-jarvis-green" : "text-jarvis-red"}>
+              {testResult.ok
+                ? `✓ 可用（${testResult.model} · ${testResult.latency_ms}ms）`
+                : `✗ 不可用`}
+            </span>
+          </div>
+          {testResult.ok && testResult.reply && (
+            <div className="flex items-center justify-between">
+              <span className="text-jarvis-text-secondary">模型回复</span>
+              <span className="text-jarvis-text">{testResult.reply}</span>
+            </div>
+          )}
+          {!testResult.ok && testResult.error && (
+            <p className="text-jarvis-red break-all">错误：{testResult.error}</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PaperTradingSafetyCard() {
   const [cfg, setCfg] = useState<TradingConfig>({});
   const [cb, setCb] = useState<CircuitBreakerStatus | null>(null);
@@ -438,7 +751,9 @@ function PaperTradingSafetyCard() {
     }
   };
 
-  const tripped = cb?.state?.tripped ?? cb?.evaluation?.already_tripped;
+  const tripped = Boolean(
+    cb?.state?.tripped ?? cb?.evaluation?.already_tripped,
+  );
 
   return (
     <div className="card mb-4">
@@ -538,6 +853,7 @@ function PaperTradingSafetyCard() {
 }
 
 export default function SettingsPage() {
+  const { supported } = useSymbol();
   const { data: rawConfig, refetch } = useApi<ScalperConfig>(
     () => api.config() as Promise<ScalperConfig>,
   );
@@ -570,6 +886,15 @@ export default function SettingsPage() {
     },
     [],
   );
+
+  // 已保存的交易对可能不在当前币种列表（如自定义币种被删除），补进选项避免下拉显示错位
+  const scalperSymbolOptions = (() => {
+    const opts = supported.map((s) => ({ value: s.value, label: s.label }));
+    if (config.symbol && !supported.some((s) => s.value === config.symbol)) {
+      opts.push({ value: config.symbol, label: config.symbol });
+    }
+    return opts;
+  })();
 
   const handleSave = async () => {
     setSaving(true);
@@ -712,12 +1037,7 @@ export default function SettingsPage() {
           <SelectInput
             label="交易对"
             value={config.symbol}
-            options={[
-              { value: "BTCUSDT", label: "BTC/USDT" },
-              { value: "ETHUSDT", label: "ETH/USDT" },
-              { value: "SOLUSDT", label: "SOL/USDT" },
-              { value: "BNBUSDT", label: "BNB/USDT" },
-            ]}
+            options={scalperSymbolOptions}
             onChange={(v) => setConfig((c) => ({ ...c, symbol: v }))}
           />
         </div>
@@ -793,22 +1113,8 @@ export default function SettingsPage() {
           {/* QD 网关 + Agent Token 配置 */}
           <QdGatewayCard />
 
-          {/* LLM 配置 */}
-          <div className="card">
-            <h3 className="text-sm font-semibold text-jarvis-text mb-3 flex items-center gap-2">
-              <Key size={14} />
-              LLM API 配置
-            </h3>
-            <p className="text-xs text-jarvis-text-secondary mb-2">
-              在项目根目录 .env 文件中设置：
-            </p>
-            <div className="bg-jarvis-bg rounded-md p-3 text-xs font-mono text-jarvis-text-secondary space-y-1">
-              <p>DEEPSEEK_API_KEY=sk-xxx</p>
-              <p># 或</p>
-              <p>JARVIS_LLM_API_KEY=xxx</p>
-              <p>JARVIS_LLM_BASE_URL=https://...</p>
-            </div>
-          </div>
+          {/* 大模型 (LLM) 配置 */}
+          <LlmConfigCard />
 
           {/* 主题切换（占位） */}
           <div className="card">

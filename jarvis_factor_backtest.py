@@ -133,9 +133,19 @@ def _sharpe(daily_rets: list) -> float:
     return mean / sd * math.sqrt(365)
 
 
+def _default_cost_bps() -> float:
+    """[D1] 回测默认换仓成本：读 jarvis_config 的 backtest_cost_bps（默认单边 10bps，
+    与 jarvis_slippage.FALLBACK_BPS 同口径）。配置层异常回退 10，永不抛出。"""
+    try:
+        import jarvis_config as jcfg
+        return float(jcfg.get("backtest_cost_bps"))
+    except Exception:  # noqa: BLE001 — 配置不可用不拖垮回测
+        return 10.0
+
+
 def backtest(dates: list, prices: dict, fng: dict, funding: dict,
              fear_thresh: int, greed_thresh: int, use_funding: bool,
-             allow_short: bool, cost_bps: float = 0.0) -> dict:
+             allow_short: bool, cost_bps: float | None = None) -> dict:
     """逐日回测。仓位由前一日信号决定（防前瞻）。
 
     多头条件: F&G < fear_thresh (且若 use_funding，要求当日资金费率 <= 0)
@@ -143,8 +153,11 @@ def backtest(dates: list, prices: dict, fng: dict, funding: dict,
     其余: 维持上一仓位（持有惯性）。
 
     [T-07] cost_bps：每次换仓（开/平/翻转）扣减的单边滑点成本（bps）。
-    默认 0 = 零回归（与历史 P3/P4 结果一致）；传入正值即得「滑点后 edge」。
+    [D1] 默认 None = 读 jarvis_config.backtest_cost_bps（内置 10bps，绩效不再虚高）；
+    显式传 0 可复现历史 P3/P4 零成本口径（零回归）；传正值即得「滑点后 edge」。
     """
+    if cost_bps is None:
+        cost_bps = _default_cost_bps()
     pos = 0  # -1 / 0 / 1
     strat_equity = [1.0]
     bh_equity = [1.0]
@@ -327,7 +340,10 @@ def event_study_advanced(dates: list, prices: dict, fng: dict, horizon: int = 30
     }
 
 
-def run(cost_bps: float = 0.0) -> dict:
+def run(cost_bps: float | None = None) -> dict:
+    """[D1] cost_bps=None 时按 jarvis_config.backtest_cost_bps（默认 10bps）扣成本。"""
+    if cost_bps is None:
+        cost_bps = _default_cost_bps()
     prices = fetch_price_daily()
     fng = fetch_fng_all()
     funding = fetch_funding_daily()
@@ -426,8 +442,9 @@ def to_markdown(r: dict) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description="贾维斯 P3 因子回测")
     ap.add_argument("--json", action="store_true")
-    ap.add_argument("--slippage-bps", type=float, default=0.0,
-                    help="[T-07] 每次换仓单边滑点成本(bps)，默认0；传入即得滑点后 edge")
+    ap.add_argument("--slippage-bps", type=float, default=None,
+                    help="[T-07/D1] 每次换仓单边滑点成本(bps)；缺省读配置 backtest_cost_bps"
+                         "（内置默认 10）；显式传 0 复现历史零成本口径")
     args = ap.parse_args()
     r = run(cost_bps=args.slippage_bps)
     print(json.dumps(r, ensure_ascii=False, indent=2) if args.json else to_markdown(r))

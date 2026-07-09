@@ -5,6 +5,8 @@ import Dashboard from "./pages/Dashboard";
 import Chart from "./pages/Chart";
 import Trading from "./pages/Trading";
 import StrategyLab from "./pages/StrategyLab";
+import AIStrategy from "./pages/AIStrategy";
+import StrategyEvolve from "./pages/StrategyEvolve";
 import MarketIntel from "./pages/MarketIntel";
 import AIChat from "./pages/AIChat";
 import ScalperData from "./pages/ScalperData";
@@ -12,6 +14,7 @@ import Growth from "./pages/Growth";
 import Backtest from "./pages/Backtest";
 import Terminal from "./pages/Terminal";
 import PriceAlerts from "./pages/PriceAlerts";
+import TradeRecords from "./pages/TradeRecords";
 import SettingsPage from "./pages/Settings";
 
 function PageGuard({ children, name }: { children: React.ReactNode; name: string }) {
@@ -25,7 +28,10 @@ export default function App() {
         <Route index element={<PageGuard name="总览"><Dashboard /></PageGuard>} />
         <Route path="chart" element={<PageGuard name="K线图表"><Chart /></PageGuard>} />
         <Route path="trading" element={<PageGuard name="交易中心"><Trading /></PageGuard>} />
+        <Route path="trades" element={<PageGuard name="交易记录"><TradeRecords /></PageGuard>} />
         <Route path="strategy" element={<PageGuard name="策略实验室"><StrategyLab /></PageGuard>} />
+        <Route path="ai-strategy" element={<PageGuard name="AI 策略工坊"><AIStrategy /></PageGuard>} />
+        <Route path="strategy-evolve" element={<PageGuard name="策略自动进化"><StrategyEvolve /></PageGuard>} />
         <Route path="backtest" element={<PageGuard name="回测"><Backtest /></PageGuard>} />
         <Route path="market" element={<PageGuard name="市场情报"><MarketIntel /></PageGuard>} />
         <Route path="ai" element={<PageGuard name="AI 助手"><AIChat /></PageGuard>} />

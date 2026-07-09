@@ -68,12 +68,50 @@ export const api = {
 
   orders: () => api.get<Record<string, unknown>[]>("/orders"),
 
+  // 后端 /api/orders/* 均为 FastAPI query 参数签名（非 JSON body）
+  placeOrder: (p: {
+    symbol: string;
+    side: "buy" | "sell";
+    price: number;
+    qty: number;
+    stopLoss?: number;
+    takeProfit?: number;
+  }) => {
+    const q = new URLSearchParams({
+      symbol: p.symbol,
+      side: p.side,
+      price: String(p.price),
+      qty: String(p.qty),
+    });
+    if (p.stopLoss != null) q.set("stop_loss", String(p.stopLoss));
+    if (p.takeProfit != null) q.set("take_profit", String(p.takeProfit));
+    return api.post<{ ok: boolean; order_id?: number; reason?: string }>(
+      `/orders/place?${q.toString()}`,
+    );
+  },
+
+  cancelOrder: (orderId: number) =>
+    api.post<{ ok: boolean; order_id?: number; reason?: string }>(
+      `/orders/cancel?order_id=${orderId}`,
+    ),
+
+  // 平掉该 symbol 的全部未平仓位：POST /api/positions/close?symbol=BTCUSDT
+  closePosition: (symbol: string) =>
+    api.post<{ closed: Record<string, unknown>[] }>(
+      `/positions/close?symbol=${encodeURIComponent(symbol)}`,
+    ),
+
   ledger: () => api.get<Record<string, unknown>[]>("/ledger"),
 
   traderStatus: () => api.get<Record<string, unknown>>("/trader/status"),
 
-  ask: (question: string, symbol = "BTCUSDT") =>
-    api.post<{ answer: string }>("/ask", { question, symbol }),
+  // history = 多轮上下文（最近若干条 {role, content}），后端最多取 8 条
+  ask: (question: string, symbol = "BTCUSDT", history?: ChatTurn[]) =>
+    request<{ answer: string; engine?: string; lessons_cited?: number }>(
+      "/ask",
+      { method: "POST", body: JSON.stringify({ question, symbol, history }) },
+      60_000,
+    ),
 
   events: () => api.get<Record<string, unknown>>("/events"),
 
@@ -213,6 +251,85 @@ export const api = {
       `/backtest/code?name=${encodeURIComponent(name)}`,
     ),
 
+  // ─── 大模型 (LLM) 配置 ───
+  llmConfig: () => api.get<LlmConfig>("/llm-config"),
+  updateLlmConfig: (data: {
+    provider?: string;
+    base_url?: string;
+    model?: string;
+    api_key?: string;
+    clear_key?: boolean;
+    temperature?: number;
+    max_tokens?: number;
+    system_prompt_extra?: string;
+  }) =>
+    api.put<{ ok: boolean; reason?: string; config?: LlmConfig }>(
+      "/llm-config",
+      data,
+    ),
+  testLlmConfig: () =>
+    request<LlmTestResult>("/llm-config/test", { method: "POST" }, 40_000),
+
+  // ─── AI 交易复盘（模拟盘已平仓交易 → 统计 + LLM 诊断）───
+  jarvisReview: (symbol?: string, limit = 50) =>
+    request<JarvisReviewResponse>(
+      "/jarvis/review",
+      { method: "POST", body: JSON.stringify({ symbol: symbol ?? "", limit }) },
+      60_000,
+    ),
+
+  // ─── AI 策略工坊：自然语言 → 可回测策略 ───
+  strategyGenerate: (payload: {
+    description: string;
+    symbol?: string;
+    timeframe?: string;
+  }) =>
+    request<{ ok: boolean; error?: string }>(
+      "/strategy/generate",
+      { method: "POST", body: JSON.stringify(payload) },
+      30_000,
+    ),
+  strategyGenerateResult: () =>
+    api.get<StrategyGenState>("/strategy/generate/result"),
+  strategySaveToHall: (payload: {
+    name: string;
+    code: string;
+    rule?: Record<string, unknown>;
+    result?: Record<string, unknown>;
+    reasoning?: string;
+  }) =>
+    api.post<{ ok: boolean; error?: string; name?: string }>(
+      "/strategy/save-to-hall",
+      payload,
+    ),
+
+  // ─── 策略自动进化：生成→回测→复盘→改进循环 ───
+  strategyEvolveStart: (payload: {
+    description: string;
+    rounds?: number;
+    symbol?: string;
+    timeframe?: string;
+    start_date?: string;
+    end_date?: string;
+    initial_capital?: number;
+    resume_run_id?: string;
+  }) =>
+    request<{ ok: boolean; run_id?: string; error?: string }>(
+      "/strategy-evolve/start",
+      { method: "POST", body: JSON.stringify(payload) },
+      30_000,
+    ),
+  strategyEvolveStatus: () =>
+    api.get<StrategyEvolveStatus>("/strategy-evolve/status"),
+  strategyEvolveResult: (runId = "") =>
+    api.get<{ ok: boolean; run?: StrategyEvolveRun; error?: string }>(
+      `/strategy-evolve/result${runId ? `?run_id=${encodeURIComponent(runId)}` : ""}`,
+    ),
+  strategyEvolveRuns: () =>
+    api.get<{ runs: StrategyEvolveRunBrief[] }>("/strategy-evolve/runs"),
+  strategyEvolveStop: () =>
+    api.post<{ ok: boolean; error?: string }>("/strategy-evolve/stop"),
+
   // ─── 价位邮件提醒 ───
   alertConfig: () => api.get<AlertConfig>("/alerts/config"),
   updateAlertConfig: (data: AlertConfigUpdate) =>
@@ -274,7 +391,153 @@ export const api = {
     api.get<{ symbol: string; price: number | null }>(
       `/alerts/price?symbol=${encodeURIComponent(symbol)}`,
     ),
+
+  // ─── 贾维斯信号引擎（后端可能未就绪，调用方必须做空态/降级处理）───
+  // 响应均为封套结构（含 ok 字段）；ok:false 时 HTTP 仍是 200，调用方须自行判断
+  twelveConsensus: (symbol = "BTCUSDT") =>
+    api.get<TwelveConsensusResponse>(
+      `/twelve/consensus?symbol=${encodeURIComponent(symbol)}`,
+    ),
+  twelveSignals: (symbol = "BTCUSDT", tf = "4h") =>
+    api.get<TwelveSignalsResponse>(
+      `/twelve/signals?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(tf)}`,
+    ),
+  // LLM 推理链耗时较长，超时放宽到 60s
+  jarvisReason: (symbol = "BTCUSDT") =>
+    request<JarvisReasonResponse>(
+      "/jarvis/reason",
+      { method: "POST", body: JSON.stringify({ symbol }) },
+      60_000,
+    ),
+  jarvisInsights: (limit = 20) =>
+    api.get<JarvisInsightsResponse>(`/jarvis/insights?limit=${limit}`),
 };
+
+// ─── AI 问答多轮 + 流式 ───
+
+export interface ChatTurn {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export interface AskStreamMeta {
+  engine: "llm" | "rule";
+  model?: string | null;
+}
+
+/**
+ * 流式问答（POST + SSE 手工解析；EventSource 不支持 POST）。
+ * 事件回调：onMeta 首包（引擎/模型）、onDelta 增量文本、onDone 收尾。
+ * 抛错 = 连接/解析失败，调用方应回退 api.ask 非流式。
+ */
+export async function askStream(
+  params: { question: string; symbol?: string; history?: ChatTurn[] },
+  handlers: {
+    onMeta?: (meta: AskStreamMeta) => void;
+    onDelta: (text: string) => void;
+    onDone?: (info: { lessons_cited?: number }) => void;
+  },
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch(`${BASE_URL}/ask/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      question: params.question,
+      symbol: params.symbol ?? "BTCUSDT",
+      history: params.history ?? [],
+    }),
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    throw new Error(`API ${res.status}: ${res.statusText}`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let doneSeen = false;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    // SSE 帧以空行分隔；最后一段可能是半帧，留在 buf 里等下一轮
+    const frames = buf.split("\n\n");
+    buf = frames.pop() ?? "";
+    for (const frame of frames) {
+      const line = frame.split("\n").find((l) => l.startsWith("data:"));
+      if (!line) continue;
+      let obj: {
+        type?: string;
+        engine?: "llm" | "rule";
+        model?: string | null;
+        content?: string;
+        lessons_cited?: number;
+        message?: string;
+      };
+      try {
+        obj = JSON.parse(line.slice(5).trim());
+      } catch {
+        continue;
+      }
+      if (obj.type === "meta") {
+        handlers.onMeta?.({ engine: obj.engine ?? "llm", model: obj.model });
+      } else if (obj.type === "delta" && obj.content) {
+        handlers.onDelta(obj.content);
+      } else if (obj.type === "done") {
+        doneSeen = true;
+        handlers.onDone?.({ lessons_cited: obj.lessons_cited });
+      } else if (obj.type === "error") {
+        throw new Error(obj.message ?? "流式输出异常");
+      }
+    }
+  }
+  if (!doneSeen) {
+    // 流被服务端提前挂断且没有 done 事件：已渲染内容有效，不额外报错
+    handlers.onDone?.({});
+  }
+}
+
+// ─── AI 交易复盘 ───
+
+export interface ReviewTradeBrief {
+  symbol?: string;
+  side?: string;
+  pnl_usdt?: number;
+  pnl_pct?: number | null;
+  exit_reason?: string | null;
+}
+
+export interface JarvisReviewStats {
+  closed_trades: number;
+  win_rate_pct: number | null;
+  profit_factor: number | null;
+  total_pnl_usdt: number;
+  avg_win_usdt: number | null;
+  avg_loss_usdt: number | null;
+  avg_hold_days: number | null;
+  max_consecutive_losses: number;
+  exit_reason_dist: Record<string, number>;
+  by_side: Record<string, { trades: number; win_rate_pct: number; pnl_usdt: number }>;
+  best_trade: ReviewTradeBrief | null;
+  worst_trade: ReviewTradeBrief | null;
+}
+
+export interface JarvisReviewContent {
+  summary: string;
+  diagnosis: string[];
+  recommendations: string[];
+  cautions: string[];
+}
+
+export interface JarvisReviewResponse {
+  ok: boolean;
+  symbol?: string;
+  stats?: JarvisReviewStats;
+  review?: JarvisReviewContent;
+  source?: "llm" | "rules";
+  cached?: boolean;
+  error?: string;
+}
 
 export type AlertDirection = "above" | "below";
 
@@ -372,6 +635,138 @@ export interface QdConfig {
   env_base_active: boolean;
 }
 
+export interface LlmConfig {
+  provider: string;
+  base_url: string;
+  model: string;
+  api_key_masked: string;
+  has_key: boolean;
+  env_fallback_available: boolean;
+  configured: boolean;
+  source: "file" | "env" | "none";
+  effective_base: string;
+  effective_model: string;
+  temperature: number;
+  max_tokens: number;
+  system_prompt_extra: string;
+  presets: Record<string, { base_url: string; model: string }>;
+}
+
+export interface LlmTestResult {
+  ok: boolean;
+  latency_ms?: number;
+  model?: string;
+  base?: string;
+  reply?: string;
+  error?: string;
+}
+
+export interface StrategyFactor {
+  id: string;
+  name: string;
+  description: string;
+}
+
+export interface StrategyGenResult {
+  ok: boolean;
+  rule?: Record<string, unknown>;
+  code?: string;
+  name?: string;
+  explain?: string;
+  reasoning?: string;
+  summary?: {
+    factors: StrategyFactor[];
+    direction: string;
+    logic: string;
+    stop_loss: string;
+    take_profit: string;
+  };
+  issues?: string[];
+  error?: string;
+}
+
+export interface StrategyGenState {
+  running: boolean;
+  started_at: number;
+  finished_at: number;
+  elapsed_seconds: number;
+  params: {
+    description: string;
+    symbol: string;
+    timeframe: string;
+  } | null;
+  result: StrategyGenResult | null;
+  error: string | null;
+}
+
+// ─── 策略自动进化 ───
+export interface StrategyEvolveMetrics {
+  status?: string;
+  total_return_pct?: number;
+  win_rate?: number;
+  profit_factor?: number;
+  max_drawdown_pct?: number;
+  sharpe_ratio?: number;
+  total_trades?: number;
+  avg_trade_pnl?: number;
+  error?: string | null;
+}
+
+export interface StrategyEvolveRound {
+  round: number;
+  name: string;
+  metrics: StrategyEvolveMetrics;
+  fitness: number | null;
+  ts?: string;
+  rule?: Record<string, unknown>;
+  code?: string;
+  explain?: string;
+}
+
+export interface StrategyEvolveRun {
+  run_id: string;
+  description: string;
+  symbol: string;
+  timeframe: string;
+  start_date?: string;
+  end_date?: string;
+  status: string;
+  rounds: number;
+  history: StrategyEvolveRound[];
+  best: StrategyEvolveRound | null;
+  top3?: StrategyEvolveRound[];
+  error?: string | null;
+}
+
+export interface StrategyEvolveStatus {
+  running: boolean;
+  run_id: string | null;
+  elapsed_seconds: number;
+  error: string | null;
+  run: {
+    status: string;
+    rounds_planned: number;
+    rounds_done: number;
+    description: string;
+    symbol: string;
+    timeframe: string;
+    history: StrategyEvolveRound[];
+    best: StrategyEvolveRound | null;
+  } | null;
+}
+
+export interface StrategyEvolveRunBrief {
+  run_id: string;
+  description: string;
+  symbol: string;
+  timeframe: string;
+  status: string;
+  rounds_done: number;
+  rounds_planned: number;
+  best_fitness: number | null;
+  updated_at?: string;
+}
+
 export interface QdConfigTest {
   ok: boolean;
   healthy?: boolean;
@@ -418,6 +813,8 @@ export interface BacktestResult {
   avg_trade_pnl: number;
   avg_bars_held: number;
   trades: BacktestTrade[];
+  /** 0 成交时后端给出的友好诊断（K 线不足/预热吃光/策略无信号） */
+  diagnosis?: string;
   error?: string;
 }
 
@@ -486,4 +883,171 @@ export interface TradingConfig {
   min_conviction?: number;
   intraday_enabled?: boolean;
   intraday_max_open_positions?: number;
+}
+
+// ─── 贾维斯信号引擎类型 ───
+
+export type SignalDirection = "bullish" | "bearish" | "neutral";
+
+/** 后端支持的单时间框架 */
+export type TwelveTf = "15m" | "1h" | "4h" | "1d";
+
+/** 驾驶舱共识口径："auto" = 多周期综合，其余 = 单周期 */
+export type ConsensusScope = TwelveTf | "auto";
+
+export interface KeyLevel {
+  label: string;
+  price: number;
+}
+
+export interface DirectionVotes {
+  bullish: number;
+  bearish: number;
+  neutral: number;
+}
+
+/** 单信号交易计划（signal.trade_plan，可能为 null） */
+export interface SignalTradePlan {
+  /** 多空标识（后端 v2 补充）；旧缓存响应可能缺失，前端由 SL/TP 相对入场价派生兜底 */
+  side?: "long" | "short" | null;
+  entry: number;
+  entry_type: "breakout" | "pullback" | "market";
+  stop_loss: number;
+  take_profit: number;
+  rr?: number | null;
+  note?: string;
+}
+
+/** 共识级交易计划（consensus.trade_plan，中性/分歧时为 null） */
+export interface ConsensusTradePlan {
+  /** 多空标识（后端 v2 补充）；旧缓存响应可能缺失，前端由 SL/TP1 相对入场区间派生兜底 */
+  side?: "long" | "short" | null;
+  entry_zone: [number, number];
+  stop_loss: number;
+  take_profit_1: number;
+  take_profit_2?: number | null;
+  rr?: number | null;
+  position_pct?: number;
+  /** 计划依据的系统名列表 */
+  basis?: string[];
+  note?: string | null;
+  /** 计划取自哪个时间框架（如 "4h"） */
+  source_tf?: string | null;
+}
+
+/** 价格动态精度格式化：≥1 两位小数；0.01~1 四位；<0.01 六位有效数字 */
+export function formatPrice(n: number | null | undefined): string {
+  if (n == null || !Number.isFinite(Number(n))) return "—";
+  const v = Number(n);
+  if (v === 0) return "0.00";
+  const abs = Math.abs(v);
+  if (abs >= 1) {
+    return v.toLocaleString("en-US", {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    });
+  }
+  if (abs >= 0.01) {
+    return v.toLocaleString("en-US", {
+      minimumFractionDigits: 4,
+      maximumFractionDigits: 4,
+    });
+  }
+  return v.toPrecision(6);
+}
+
+export interface TwelveConsensus {
+  direction: SignalDirection;
+  confidence: number;
+  score?: number;
+  /** 12 套系统投票分布（和 = 12） */
+  votes: DirectionVotes;
+  /** 时间框架级投票（15m/1h/4h 各投 1 票） */
+  tf_votes?: DirectionVotes;
+  layers?: Record<string, unknown>;
+  reasoning?: string;
+  key_levels?: KeyLevel[];
+  tfs?: Record<string, unknown>;
+  /** 共识交易计划；中性/分歧时为 null */
+  trade_plan?: ConsensusTradePlan | null;
+}
+
+/** GET /api/twelve/consensus 封套 */
+export interface TwelveConsensusResponse {
+  ok: boolean;
+  symbol?: string;
+  price?: number | null;
+  tf_available?: string[];
+  consensus?: TwelveConsensus | null;
+  error?: string;
+}
+
+export interface TwelveSignal {
+  system: string;
+  name_cn: string;
+  direction: SignalDirection;
+  strength: number;
+  reasoning?: string;
+  key_levels?: KeyLevel[];
+  /** 单信号交易计划；无可执行计划时为 null */
+  trade_plan?: SignalTradePlan | null;
+}
+
+/** GET /api/twelve/signals 封套 */
+export interface TwelveSignalsResponse {
+  ok: boolean;
+  symbol?: string;
+  tf?: string;
+  price?: number;
+  signals: TwelveSignal[];
+  consensus?: TwelveConsensus | null;
+  error?: string;
+}
+
+export interface JarvisSuggestion {
+  action?: string;
+  entry_zone?: string;
+  stop_loss?: string | number;
+  target?: string | number;
+  position_pct?: number;
+}
+
+export interface JarvisReasonResult {
+  direction: SignalDirection;
+  confidence: number;
+  reasoning_chain: string[];
+  risks: string[];
+  suggestion?: JarvisSuggestion;
+  model?: string;
+  degraded?: boolean;
+}
+
+/** POST /api/jarvis/reason 封套；ok:false 时 HTTP 仍为 200 */
+export interface JarvisReasonResponse {
+  ok: boolean;
+  symbol?: string;
+  market?: Record<string, unknown>;
+  consensus?: TwelveConsensus | null;
+  reasoning?: JarvisReasonResult;
+  cached?: boolean;
+  error?: string;
+}
+
+export type InsightSeverity = "info" | "warning" | "critical" | string;
+
+export interface JarvisInsight {
+  ts: string | number;
+  symbol: string;
+  kind: string;
+  title: string;
+  detail?: string;
+  severity: InsightSeverity;
+}
+
+/** GET /api/jarvis/insights 封套 */
+export interface JarvisInsightsResponse {
+  ok: boolean;
+  insights: JarvisInsight[];
+  total?: number;
+  error?: string;
 }

@@ -276,7 +276,130 @@ def poll_job(job_id: str, timeout_sec: int = 300, interval_sec: int = 3) -> dict
     return {"status": "timeout", "job_id": job_id, "error": f"轮询超时 {timeout_sec}s"}
 
 
-def parse_backtest_result(job_data: dict[str, Any]) -> dict[str, Any]:
+_EXIT_REASON_CN = {
+    "stop": "止损",
+    "profit": "止盈",
+    "trailing": "移动止损",
+    "liquidation": "爆仓",
+    "": "信号平仓",
+}
+
+
+def _normalize_trades(events: list[dict], timeframe: str | None = None) -> list[dict]:
+    """把 QD 引擎的事件流（open_*/close_* 各一条）配对成前端友好的「回合制」记录。
+
+    QD 每条事件形如 {time, type: open_long|close_long_stop|.., price, amount, profit, balance}；
+    桌面端表格与 analyzer 期望 {direction, entry_time, exit_time, entry_price, exit_price,
+    pnl, bars_held, ...}。若事件本身已是回合制（带 entry_price），原样透传。
+    """
+    if not events:
+        return []
+    if any(t.get("entry_price") is not None or t.get("entryPrice") is not None for t in events):
+        return list(events)  # 已是回合制结构，勿重复加工
+
+    tf_min = _timeframe_minutes(timeframe or "") or 0
+
+    def _bars_between(t0: str, t1: str) -> float:
+        if not tf_min:
+            return 0
+        try:
+            d0 = datetime.strptime(str(t0), "%Y-%m-%d %H:%M")
+            d1 = datetime.strptime(str(t1), "%Y-%m-%d %H:%M")
+            return max(0.0, round((d1 - d0).total_seconds() / 60 / tf_min, 1))
+        except (ValueError, TypeError):
+            return 0
+
+    rounds: list[dict] = []
+    open_pos: dict | None = None
+    for ev in events:
+        etype = str(ev.get("type", "") or "")
+        if etype.startswith("open_"):
+            # 极端情况下连续两个 open（不应发生）：先把前一个记为未平仓回合
+            if open_pos is not None:
+                rounds.append(open_pos | {"status": "open"})
+            open_pos = {
+                "direction": "long" if "long" in etype else "short",
+                "entry_time": ev.get("time"),
+                "entry_price": ev.get("price"),
+                "amount": ev.get("amount"),
+                "exit_time": None,
+                "exit_price": None,
+                "pnl": 0.0,
+                "exit_reason": None,
+                "balance": ev.get("balance"),
+                "status": "open",
+            }
+            continue
+        if etype.startswith("close_") or etype == "liquidation":
+            direction = "long" if "long" in etype else ("short" if "short" in etype else
+                                                        (open_pos or {}).get("direction", "long"))
+            suffix = etype.rsplit("_", 1)[-1] if "_" in etype else ""
+            reason = "liquidation" if etype == "liquidation" else (
+                suffix if suffix in ("stop", "profit", "trailing") else "")
+            rnd = {
+                "direction": direction,
+                "entry_time": (open_pos or {}).get("entry_time"),
+                "entry_price": (open_pos or {}).get("entry_price"),
+                "amount": ev.get("amount", (open_pos or {}).get("amount")),
+                "exit_time": ev.get("time"),
+                "exit_price": ev.get("price"),
+                "pnl": float(ev.get("profit", 0) or 0),
+                "exit_reason": _EXIT_REASON_CN.get(reason, "信号平仓"),
+                "balance": ev.get("balance"),
+                "status": "closed",
+            }
+            if rnd["entry_time"] and rnd["exit_time"]:
+                rnd["bars_held"] = _bars_between(rnd["entry_time"], rnd["exit_time"])
+            rounds.append(rnd)
+            open_pos = None
+            continue
+        # 未知事件类型：原样保留，避免吞数据
+        rounds.append(dict(ev))
+    if open_pos is not None:
+        rounds.append(open_pos)
+    return rounds
+
+
+def _diagnose_no_trades(
+    timeframe: str | None,
+    start_date: str | None,
+    end_date: str | None,
+    bar_count: int | None,
+) -> str:
+    """0 成交时生成用户友好诊断：区分「K 线不足/指标预热」与「策略本身无信号」。"""
+    WARMUP_BARS = 200  # 常见指标（EMA200/rolling200）预热需求
+    tf = timeframe or "?"
+    tf_min = _timeframe_minutes(timeframe or "")
+    est_bars = None
+    if tf_min and start_date and end_date:
+        try:
+            d0 = datetime.strptime(start_date, "%Y-%m-%d")
+            d1 = datetime.strptime(end_date, "%Y-%m-%d")
+            est_bars = max(0, int((d1 - d0).total_seconds() / 60 / tf_min))
+        except (ValueError, TypeError):
+            est_bars = None
+    bars = bar_count if bar_count else est_bars
+    if bars is not None and bars < WARMUP_BARS + 50:
+        need_days = ""
+        if tf_min:
+            days = int((WARMUP_BARS + 100) * tf_min / 1440) + 1
+            need_days = f"，建议把回测区间拉长到 {days} 天以上"
+        return (
+            f"{tf} 周期该区间约 {bars} 根 K 线，常见指标预热需要约 {WARMUP_BARS} 根，"
+            f"信号区几乎被预热吃光{need_days}。"
+        )
+    return (
+        "回测区间 K 线充足，策略在该区间没有触发进场信号，属于策略行为而非系统故障；"
+        "可尝试放宽进场条件（AND 改 OR / 降低阈值）或更换因子组合。"
+    )
+
+
+def parse_backtest_result(
+    job_data: dict[str, Any],
+    timeframe: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
     """解析 QD 回测结果为标准化格式。
 
     Returns:
@@ -290,8 +413,9 @@ def parse_backtest_result(job_data: dict[str, Any]) -> dict[str, Any]:
             "total_trades": int,
             "avg_trade_pnl": float,
             "avg_bars_held": float,
-            "trades": [...],   # 逐笔交易记录
-            "raw": {...},      # 原始返回
+            "trades": [...],   # 逐笔交易（回合制：direction/entry_*/exit_*/pnl）
+            "diagnosis": str,  # 仅 0 成交时给出的友好诊断
+            "raw": {...},      # 原始返回（含 QD 原始事件流与资金曲线）
         }
     """
     status = job_data.get("status", "unknown")
@@ -315,7 +439,8 @@ def parse_backtest_result(job_data: dict[str, Any]) -> dict[str, Any]:
     # QD（run_aligned → _format_result）把指标平铺在 result 顶层、采用驼峰命名，
     # 并无 "metrics"/"summary" 包裹层；缺包裹层时回退到 result 本身，否则全部读成 0。
     metrics = result.get("metrics") or result.get("summary") or result
-    trades = result.get("trades", result.get("trade_list", []))
+    raw_trades = result.get("trades", result.get("trade_list", []))
+    trades = _normalize_trades(raw_trades, timeframe)
 
     total_return = metrics.get(
         "total_return_pct",
@@ -332,13 +457,14 @@ def parse_backtest_result(job_data: dict[str, Any]) -> dict[str, Any]:
 
     avg_pnl = 0.0
     avg_bars = 0.0
-    if trades:
-        pnls = [t.get("pnl", t.get("profit", 0)) for t in trades]
-        bars = [t.get("bars_held", t.get("barsHeld", 0)) for t in trades]
+    closed = [t for t in trades if t.get("status") != "open"]
+    if closed:
+        pnls = [t.get("pnl", t.get("profit", 0)) for t in closed]
+        bars = [t.get("bars_held", t.get("barsHeld", 0)) for t in closed]
         avg_pnl = sum(pnls) / len(pnls) if pnls else 0
         avg_bars = sum(bars) / len(bars) if bars else 0
 
-    return {
+    out = {
         "status": "succeeded",
         "total_return_pct": float(total_return),
         "win_rate": float(win_rate),
@@ -351,6 +477,12 @@ def parse_backtest_result(job_data: dict[str, Any]) -> dict[str, Any]:
         "trades": trades,
         "raw": result,
     }
+    if int(total_trades) == 0:
+        equity = result.get("equity_curve") or result.get("equityCurve") or []
+        out["diagnosis"] = _diagnose_no_trades(
+            timeframe, start_date, end_date, len(equity) or None,
+        )
+    return out
 
 
 def run_backtest(
@@ -435,7 +567,10 @@ def run_backtest(
         interval_sec=cfg["poll_interval_sec"],
     )
 
-    return parse_backtest_result(job_data)
+    # 传入区间与周期：0 成交时才能给出「K 线不足/预热」类友好诊断
+    return parse_backtest_result(
+        job_data, timeframe=timeframe, start_date=start_date, end_date=end_date,
+    )
 
 
 def check_qd_health() -> dict[str, Any]:

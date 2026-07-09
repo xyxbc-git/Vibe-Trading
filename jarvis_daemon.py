@@ -37,6 +37,7 @@ jarvis_net.ensure_proxy()   # 大陆网络：探测本地代理，Binance 等出
 LOG_DIR = os.path.expanduser("~/.vibe-trading")
 LOG_PATH = os.path.join(LOG_DIR, "jarvis_daemon.log")
 STATUS_PATH = os.path.join(LOG_DIR, "jarvis_daemon_status.json")
+TWELVE_STATE_PATH = os.path.join(LOG_DIR, "jarvis_twelve_state.json")
 PLIST_LABEL = "com.jarvis.daemon"
 
 
@@ -49,6 +50,162 @@ def _log(msg: str) -> None:
             f.write(line + "\n")
     except Exception:  # noqa: BLE001 — 日志失败不应中断主循环
         pass
+
+
+def _twelve_events(sym: str, prev: dict, cons: dict, strong_conf: float = 0.75) -> list[dict]:
+    """由上一轮状态 + 本轮共识判定应上报的洞察事件（纯函数，便于离线测试）。
+
+    规则（防翻转噪音）：
+      - bullish ↔ bearish 互翻 → consensus_flip（强共识 critical，否则 warning）
+      - neutral → 方向 且新共识为强（conf ≥ strong_conf）→ consensus_established
+      - 方向 → neutral 且原共识曾为强（prev_conf ≥ strong_conf）→ consensus_lost
+      - 同向置信度首次站上阈值（或首轮即强）→ strong_signal
+      - 其余（弱共识间摆动、neutral↔弱方向）一律静默
+    """
+    cur_dir = cons.get("direction", "neutral")
+    cur_conf = float(cons.get("confidence", 0.0) or 0.0)
+    prev_dir = (prev or {}).get("direction")
+    prev_conf = float((prev or {}).get("confidence", 0.0) or 0.0)
+    dir_cn = {"bullish": "看涨", "bearish": "看跌", "neutral": "中性"}
+    reasoning = cons.get("reasoning", "")
+    directional = ("bullish", "bearish")
+
+    if prev_dir in directional and cur_dir in directional and cur_dir != prev_dir:
+        return [{
+            "kind": "consensus_flip",
+            "severity": "critical" if cur_conf >= strong_conf else "warning",
+            "title": f"{sym} 十二套共识翻转：{dir_cn[prev_dir]} → {dir_cn[cur_dir]}",
+            "detail": reasoning,
+        }]
+    if prev_dir == "neutral" and cur_dir in directional and cur_conf >= strong_conf:
+        return [{
+            "kind": "consensus_established",
+            "severity": "warning",
+            "title": f"{sym} 十二套共识建立：中性 → {dir_cn[cur_dir]}（置信度 {cur_conf:.0%}）",
+            "detail": reasoning,
+        }]
+    if prev_dir in directional and cur_dir == "neutral" and prev_conf >= strong_conf:
+        return [{
+            "kind": "consensus_lost",
+            "severity": "warning",
+            "title": f"{sym} 十二套共识消失：{dir_cn[prev_dir]} → 中性",
+            "detail": reasoning,
+        }]
+    if (cur_dir in directional and cur_conf >= strong_conf
+            and (prev_dir != cur_dir or prev_conf < strong_conf) and prev_dir != "neutral"):
+        return [{
+            "kind": "strong_signal",
+            "severity": "warning",
+            "title": f"{sym} 十二套强{dir_cn[cur_dir]}共识（置信度 {cur_conf:.0%}）",
+            "detail": reasoning,
+        }]
+    return []
+
+
+def twelve_step(symbols: list[str], strong_conf: float = 0.75) -> dict:
+    """十二套技术共识巡检（自主意识）：方向翻转 / 强信号时写 insight 并推送。
+
+    永不抛出；K线拉取失败只跳过该币。状态存 TWELVE_STATE_PATH（原子写），
+    insight 落库走 jarvis_reasoning（复用 jarvis_db 连接层），
+    推送走 jarvis_notify.notify（未配置渠道自动跳过）。
+    """
+    res: dict = {"started_at": time.strftime("%Y-%m-%d %H:%M:%S"), "symbols": {}}
+    try:
+        import jarvis_reasoning as jre
+        import jarvis_twelve_systems as jts
+        try:
+            with open(TWELVE_STATE_PATH, encoding="utf-8") as f:
+                state = json.load(f) or {}
+        except Exception:  # noqa: BLE001 — 状态文件缺失/损坏视为首轮
+            state = {}
+        for sym in symbols:
+            try:
+                # [D2] 战绩口径只认已收盘 bar：进行中 bar 会随行情重绘，污染共识翻转判定
+                df = jts.fetch_klines_df(sym, "4h", 300, drop_unclosed=True)
+                if df is None or len(df) < 30:
+                    res["symbols"][sym] = {"skipped": "K线不足或拉取失败"}
+                    continue
+                out = jts.analyze(df)
+                cons = out["consensus"]
+                cur_dir, cur_conf = cons["direction"], float(cons["confidence"])
+                events = _twelve_events(sym, state.get(sym) or {}, cons, strong_conf)
+                for ev in events:
+                    wr = jre.add_insight(sym, ev["kind"], ev["title"],
+                                         detail=ev["detail"], severity=ev["severity"])
+                    if not wr.get("ok"):
+                        _log(f"🧠 {sym} insight 落库失败: {wr.get('error')}")
+                    try:
+                        import jarvis_notify as jn
+                        jn.notify(f"🧠 贾维斯洞察\n{ev['title']}\n{ev['detail'][:300]}")
+                    except Exception as e:  # noqa: BLE001 — 推送失败不影响巡检
+                        _log(f"🧠 {sym} 洞察推送失败（已兜底）: {repr(e)[:150]}")
+                    _log(f"🧠 洞察：{ev['title']}")
+                state[sym] = {"direction": cur_dir, "confidence": cur_conf,
+                              "score": cons["score"], "ts": time.time()}
+                res["symbols"][sym] = {"direction": cur_dir, "confidence": cur_conf,
+                                       "events": len(events)}
+            except Exception as e:  # noqa: BLE001 — 单币失败不拖垮整轮
+                res["symbols"][sym] = {"error": repr(e)[:200]}
+                _log(f"🧠 {sym} 十二套巡检异常（已兜底）: {repr(e)[:150]}")
+        try:
+            # 原子写：先落临时文件再 rename，避免进程被杀时留下半截 JSON
+            tmp_path = TWELVE_STATE_PATH + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, TWELVE_STATE_PATH)
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception as e:  # noqa: BLE001 — 模块级失败也不许抛出
+        res["error"] = repr(e)[:300]
+        _log("🧠 十二套巡检 ❌ 异常（已兜底）: " + repr(e)[:200])
+    res["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    return res
+
+
+# ── pg 健康检查（C3）─────────────────────────────────────────────────────────
+
+_PG_ALERT_COOLDOWN_S = 3600.0  # 宕机告警通知冷却，防止每轮重复刷屏
+_pg_health_state: dict = {"down_since": None, "last_alert_ts": 0.0}
+
+
+def pg_health_check() -> bool:
+    """每轮开始前探测数据库连通性。返回 True=健康（SQLite 模式恒健康）。
+
+    pg 不可达时：日志告警 + 经 jarvis_notify 推送一次（冷却 1h），
+    调用方据此跳过本轮写库操作（降级而非 crash），下轮自动重试。
+    恢复时推一条恢复通知并重置冷却。永不抛出。
+    """
+    try:
+        import jarvis_db as jdb
+        r = jdb.ping()
+    except Exception as e:  # noqa: BLE001 — 探测自身异常按不健康处理
+        r = {"ok": False, "backend": "pg", "error": repr(e)[:200]}
+    now = time.time()
+    if r.get("ok"):
+        if _pg_health_state["down_since"] is not None:
+            downtime_min = round((now - _pg_health_state["down_since"]) / 60, 1)
+            _log(f"✅ 数据库恢复（{r.get('backend')}），宕机约 {downtime_min} 分钟，恢复写库")
+            try:
+                import jarvis_notify as jn
+                jn.notify(f"✅ 贾维斯数据库已恢复（宕机约 {downtime_min} 分钟），已恢复正常写库")
+            except Exception:  # noqa: BLE001 — 通知失败不影响主循环
+                pass
+            _pg_health_state["down_since"] = None
+            _pg_health_state["last_alert_ts"] = 0.0
+        return True
+    if _pg_health_state["down_since"] is None:
+        _pg_health_state["down_since"] = now
+    _log(f"🛑 数据库不可达：{r.get('error')} → 本轮降级跳过写库，下轮自动重试")
+    if now - _pg_health_state["last_alert_ts"] >= _PG_ALERT_COOLDOWN_S:
+        _pg_health_state["last_alert_ts"] = now
+        try:
+            import jarvis_notify as jn
+            jn.notify("🛑 贾维斯数据库(PostgreSQL)不可达，daemon 已降级（跳过写库）。\n"
+                      "排查：docker ps | grep quantdinger-db；"
+                      "手动拉起：docker start quantdinger-db")
+        except Exception:  # noqa: BLE001
+            pass
+    return False
 
 
 def run_cycle(symbols: list[str], paper_trade: bool = False) -> dict:
@@ -97,6 +254,14 @@ def run_cycle(symbols: list[str], paper_trade: bool = False) -> dict:
     except Exception as e:  # noqa: BLE001 — 熔断巡检失败不影响主心跳
         cycle["circuit_breaker"] = {"error": repr(e)[:300]}
         _log("熔断巡检 ❌ 异常（已兜底）: " + repr(e)[:200])
+    # 十二套技术共识巡检（自主意识）：方向翻转/强信号 → insight 落库 + 推送。
+    # twelve_step 自身永不抛出，此处再兜一层保持主心跳零风险。
+    try:
+        tw = twelve_step(symbols)
+        cycle["twelve"] = tw.get("symbols", {}) if not tw.get("error") else {"error": tw["error"]}
+    except Exception as e:  # noqa: BLE001
+        cycle["twelve"] = {"error": repr(e)[:300]}
+        _log("十二套巡检 ❌ 异常（已兜底）: " + repr(e)[:200])
     if paper_trade:
         try:
             import jarvis_executor as jx
@@ -211,15 +376,18 @@ def loop(symbols: list[str], interval_hours: float, paper_trade: bool = False,
     last_morning_date = None
     last_daily_date = None
     while True:
+        # [C3] 每轮先探测数据库；不可达则本轮跳过所有写库步骤（降级），下轮自动重试。
+        # 注意：跳过时不更新 last_daily_date，pg 恢复后当天仍会补跑 record/evaluate（幂等）。
+        db_ok = pg_health_check()
         # intraday 模式下：日线 record/evaluate 只在日历日切换时跑一次（幂等，防高频打点）
         today = time.strftime("%Y-%m-%d")
-        if not intraday or today != last_daily_date:
+        if db_ok and (not intraday or today != last_daily_date):
             last_daily_date = today
             try:
                 run_cycle(symbols, paper_trade=paper_trade)
             except Exception:  # noqa: BLE001 — 兜底，确保循环不死
                 _log("本轮异常（已兜底，继续运行）:\n" + traceback.format_exc())
-        if intraday:
+        if intraday and db_ok:
             intraday_step(symbols)
         cycle_count += 1
         # [T-14] 每日晨报：日历日切换即触发一次（避免高频；首轮也会发一封）。

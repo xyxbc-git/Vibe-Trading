@@ -104,7 +104,10 @@ async function createWindow() {
     minWidth: 1024,
     minHeight: 700,
     title: "JARVIS Terminal",
-    titleBarStyle: "hiddenInset",
+    titleBarStyle: "hidden",
+    // 红绿灯定位在侧栏顶部 48px 预留区（Sidebar 顶部拖拽条）内垂直居中：
+    // 按钮组约 52x12px，x:8 保证收起态 64px 侧栏内不越界，y:18 = (48-12)/2
+    trafficLightPosition: { x: 8, y: 18 },
     backgroundColor: "#0d1117",
     webPreferences: {
       nodeIntegration: false,

@@ -1,4 +1,5 @@
-import { Zap, Activity, TrendingUp, Clock, Target } from "lucide-react";
+import { useState } from "react";
+import { Zap, Activity, TrendingUp, Clock, Target, Play, Square } from "lucide-react";
 import {
   LineChart,
   Line,
@@ -56,7 +57,7 @@ function SignalIndicator({ label, value }: { label: string; value: string }) {
 }
 
 export default function ScalperData() {
-  const { data: status } = usePolling<ScalperStatus>(
+  const { data: status, refetch } = usePolling<ScalperStatus>(
     () => api.scalperStatus() as unknown as Promise<ScalperStatus>,
     15_000,
   );
@@ -64,6 +65,28 @@ export default function ScalperData() {
     () => api.scalperLog(30) as unknown as Promise<ScalperLog>,
     30_000,
   );
+  const [busy, setBusy] = useState(false);
+  const [actionMsg, setActionMsg] = useState<string | null>(null);
+
+  const toggleEngine = async () => {
+    if (busy) return;
+    setBusy(true);
+    setActionMsg(null);
+    try {
+      const res = (status?.running
+        ? await api.scalperStop()
+        : await api.scalperStart(status?.symbol ?? "BTCUSDT")) as {
+        ok?: boolean;
+        reason?: string;
+      };
+      if (!res.ok && res.reason) setActionMsg(res.reason);
+      refetch();
+    } catch (e) {
+      setActionMsg((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const report = status?.report;
 
@@ -108,8 +131,23 @@ export default function ScalperData() {
                 激进模式
               </span>
             )}
+            <button
+              onClick={toggleEngine}
+              disabled={busy}
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded border transition-colors disabled:opacity-50 ${
+                status?.running
+                  ? "border-jarvis-red/60 text-jarvis-red hover:bg-jarvis-red/10"
+                  : "border-jarvis-green/60 text-jarvis-green hover:bg-jarvis-green/10"
+              }`}
+            >
+              {status?.running ? <Square size={12} /> : <Play size={12} />}
+              {busy ? "处理中…" : status?.running ? "停止引擎" : "启动引擎（模拟盘）"}
+            </button>
           </div>
         </div>
+        {actionMsg && (
+          <p className="text-xs text-jarvis-yellow mt-2">{actionMsg}</p>
+        )}
       </div>
 
       <div className="grid grid-cols-2 gap-4 mb-4">

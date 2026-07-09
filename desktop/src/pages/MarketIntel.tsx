@@ -1,4 +1,4 @@
-import { Globe, TrendingUp, TrendingDown, AlertTriangle, Link2, Activity } from "lucide-react";
+import { Globe, TrendingUp, TrendingDown, AlertTriangle, Link2, Activity, RefreshCw, Loader2 } from "lucide-react";
 import { api } from "@/api/client";
 import { usePolling } from "@/hooks/useApi";
 
@@ -11,6 +11,8 @@ interface SnapshotData {
   onchain?: { active_addresses: number; exchange_inflow: number; nvt: number };
 }
 
+// 仅在后端失败/字段缺失时兜底展示；所属卡片必须带「演示数据」水印（见 DemoBadge），
+// 防止用户把占位行情当真实数据做交易决策。
 const PLACEHOLDER: SnapshotData = {
   fng: { value: 35, classification: "恐惧" },
   funding_rate: { BTCUSDT: 0.0042, ETHUSDT: 0.0031, SOLUSDT: -0.0015, BNBUSDT: 0.0028 },
@@ -19,6 +21,19 @@ const PLACEHOLDER: SnapshotData = {
   liquidations: { long_usd: 42_500_000, short_usd: 28_300_000, total_usd: 70_800_000 },
   onchain: { active_addresses: 982_451, exchange_inflow: 12_340, nvt: 45.2 },
 };
+
+/** 演示数据水印：占位数据卡片右上角的醒目标签 */
+function DemoBadge() {
+  return (
+    <span
+      className="text-[10px] px-1.5 py-0.5 rounded border font-medium flex-shrink-0
+                 bg-jarvis-yellow/15 text-jarvis-yellow border-jarvis-yellow/40"
+      title="后端行情数据不可用，当前展示的是内置演示数据，请勿作为交易依据"
+    >
+      演示数据
+    </span>
+  );
+}
 
 function fngColor(value: number): string {
   if (value <= 25) return "#f85149";
@@ -50,17 +65,54 @@ function formatNumber(value: number): string {
 }
 
 export default function MarketIntel() {
-  const { data: rawSnapshot } = usePolling(() => api.snapshot(), 30_000);
-  const snap = (rawSnapshot as unknown as SnapshotData) ?? PLACEHOLDER;
+  const {
+    data: rawSnapshot,
+    loading,
+    error,
+    refetch,
+  } = usePolling(() => api.snapshot(), 30_000);
+  const snap = (rawSnapshot as unknown as SnapshotData) ?? null;
 
-  const fng = snap.fng ?? PLACEHOLDER.fng!;
-  const fundingRate = snap.funding_rate ?? PLACEHOLDER.funding_rate!;
-  const oi = snap.oi ?? PLACEHOLDER.oi!;
-  const ls = snap.long_short ?? PLACEHOLDER.long_short!;
-  const liq = snap.liquidations ?? PLACEHOLDER.liquidations!;
-  const onchain = snap.onchain ?? PLACEHOLDER.onchain!;
+  // 逐字段判定真实性：后端成功但个别字段缺失时，只给缺失卡片打演示水印
+  const real = {
+    fng: snap?.fng != null,
+    funding: snap?.funding_rate != null,
+    oi: snap?.oi != null,
+    ls: snap?.long_short != null,
+    liq: snap?.liquidations != null,
+    onchain: snap?.onchain != null,
+  };
+
+  const fng = snap?.fng ?? PLACEHOLDER.fng!;
+  const fundingRate = snap?.funding_rate ?? PLACEHOLDER.funding_rate!;
+  const oi = snap?.oi ?? PLACEHOLDER.oi!;
+  const ls = snap?.long_short ?? PLACEHOLDER.long_short!;
+  const liq = snap?.liquidations ?? PLACEHOLDER.liquidations!;
+  const onchain = snap?.onchain ?? PLACEHOLDER.onchain!;
+
+  // 后端响应成功但一个真实字段都没有（当前 /api/snapshot 返回 brief 结构，
+  // 顶层无本页字段）：全页演示数据，必须给显式横幅而不只是角标
+  const allDemo =
+    snap != null &&
+    !real.fng && !real.funding && !real.oi && !real.ls && !real.liq && !real.onchain;
 
   const fColor = fngColor(fng.value);
+
+  // 首次加载且无任何数据：不渲染占位卡片，避免演示数据闪现误导
+  if (loading && !snap && !error) {
+    return (
+      <div>
+        <h1 className="page-title flex items-center gap-2">
+          <Globe size={22} />
+          市场情报
+        </h1>
+        <div className="card h-[280px] flex items-center justify-center gap-2 text-jarvis-text-secondary text-sm">
+          <Loader2 size={16} className="animate-spin" />
+          正在获取市场行情...
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div>
@@ -69,10 +121,42 @@ export default function MarketIntel() {
         市场情报
       </h1>
 
+      {error && (
+        <div className="mb-4 flex items-center justify-between gap-3 p-3 rounded-lg bg-jarvis-red/10 border border-jarvis-red/40">
+          <div className="flex items-start gap-2 text-sm text-jarvis-red">
+            <AlertTriangle size={16} className="flex-shrink-0 mt-0.5" />
+            <span>
+              行情接口请求失败：{error}。
+              {!snap && "下方全部为内置演示数据，请勿作为交易依据。"}
+            </span>
+          </div>
+          <button
+            onClick={refetch}
+            disabled={loading}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg border border-jarvis-red/40 text-jarvis-red hover:bg-jarvis-red/10 transition-colors flex-shrink-0 disabled:opacity-50"
+          >
+            <RefreshCw size={13} className={loading ? "animate-spin" : ""} />
+            {loading ? "重试中..." : "重试"}
+          </button>
+        </div>
+      )}
+
+      {!error && allDemo && (
+        <div className="mb-4 flex items-start gap-2 p-3 rounded-lg bg-jarvis-yellow/10 border border-jarvis-yellow/40 text-sm text-jarvis-yellow">
+          <AlertTriangle size={16} className="flex-shrink-0 mt-0.5" />
+          <span>
+            后端行情快照中暂无本页所需字段，下方全部为内置演示数据，请勿作为交易依据。
+          </span>
+        </div>
+      )}
+
       <div className="grid grid-cols-3 gap-4 mb-4">
         {/* 恐慌贪婪指数 */}
         <div className="card flex flex-col items-center">
-          <p className="stat-label mb-3">恐慌贪婪指数</p>
+          <div className="flex items-center gap-2 mb-3">
+            <p className="stat-label mb-0">恐慌贪婪指数</p>
+            {!real.fng && <DemoBadge />}
+          </div>
           <div className="relative w-28 h-28 mb-2">
             <svg viewBox="0 0 120 120" className="w-full h-full">
               <circle
@@ -124,6 +208,7 @@ export default function MarketIntel() {
           <p className="stat-label mb-3 flex items-center gap-1.5">
             <Activity size={14} />
             资金费率
+            {!real.funding && <DemoBadge />}
           </p>
           <div className="space-y-2.5">
             {Object.entries(fundingRate).map(([symbol, rate]) => (
@@ -158,6 +243,7 @@ export default function MarketIntel() {
           <p className="stat-label mb-3 flex items-center gap-1.5">
             <TrendingUp size={14} />
             持仓量 (OI)
+            {!real.oi && <DemoBadge />}
           </p>
           <p className="stat-value">{formatUsd(oi.value)}</p>
           <div className="flex items-center gap-1 mt-2">
@@ -182,7 +268,10 @@ export default function MarketIntel() {
       <div className="grid grid-cols-3 gap-4">
         {/* 多空比 */}
         <div className="card">
-          <p className="stat-label mb-3">多空比</p>
+          <p className="stat-label mb-3 flex items-center gap-1.5">
+            多空比
+            {!real.ls && <DemoBadge />}
+          </p>
           <div className="flex items-center justify-between mb-2">
             <span className="text-xs text-jarvis-green">多 {ls.long_pct.toFixed(1)}%</span>
             <span className="text-sm text-jarvis-text font-mono">{ls.ratio.toFixed(2)}</span>
@@ -210,6 +299,7 @@ export default function MarketIntel() {
           <p className="stat-label mb-3 flex items-center gap-1.5">
             <AlertTriangle size={14} className="text-jarvis-yellow" />
             爆仓数据 (24h)
+            {!real.liq && <DemoBadge />}
           </p>
           <p className="stat-value mb-2">{formatUsd(liq.total_usd)}</p>
           <div className="space-y-1.5">
@@ -229,6 +319,7 @@ export default function MarketIntel() {
           <p className="stat-label mb-3 flex items-center gap-1.5">
             <Link2 size={14} className="text-jarvis-purple" />
             链上指标
+            {!real.onchain && <DemoBadge />}
           </p>
           <div className="space-y-3">
             <div>

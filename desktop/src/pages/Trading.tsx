@@ -3,17 +3,38 @@ import { usePolling } from "@/hooks/useApi";
 import { useSymbol } from "@/hooks/useSymbol";
 import { api } from "@/api/client";
 import PositionCard from "@/components/cards/PositionCard";
-import { ArrowLeftRight, ShieldCheck, AlertTriangle, Zap, FileText, Radar, Play, RotateCw, TrendingUp } from "lucide-react";
+import { ArrowLeftRight, ShieldCheck, AlertTriangle, Zap, FileText, Radar, Play, RotateCw, TrendingUp, Compass } from "lucide-react";
 import { clsx } from "clsx";
 
 function fmtUsd(n: number) {
   return n.toLocaleString("en-US", { minimumFractionDigits: 2 });
 }
 
+/** 跑一轮 12 系统信号矩阵跟盘（多币多周期拉 K 线较慢，独立 90s 超时） */
+async function runTwelveCycle(): Promise<Record<string, unknown>> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 90_000);
+  try {
+    const res = await fetch("/api/twelve/cycle", {
+      method: "POST",
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(`API ${res.status}: ${res.statusText}`);
+    return res.json();
+  } catch (e) {
+    if (e instanceof DOMException && e.name === "AbortError") {
+      throw new Error("请求超时（多币种共识计算中，稍后查看交易记录）");
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export default function Trading() {
   const { symbol } = useSymbol();
-  const { data: positions } = usePolling(api.positions, 3_000);
-  const { data: orders } = usePolling(api.orders, 15_000);
+  const { data: positions, refetch: refetchPositions } = usePolling(api.positions, 3_000);
+  const { data: orders, refetch: refetchOrders } = usePolling(api.orders, 15_000);
   const { data: wallet } = usePolling(api.wallet, 30_000);
   const { data: traderStatus } = usePolling(api.traderStatus, 15_000);
 
@@ -29,24 +50,103 @@ export default function Trading() {
     takeProfit: "3.0",
   });
   const [ordering, setOrdering] = useState(false);
+  // 下单结果横幅：成功/失败都要给用户反馈，禁止静默吞错
+  const [orderResult, setOrderResult] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [closingSymbol, setClosingSymbol] = useState<string | null>(null);
+  const [cancellingId, setCancellingId] = useState<number | null>(null);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [actionResult, setActionResult] = useState<{ type: string; ok: boolean; msg: string } | null>(null);
 
   const handleOrder = async () => {
     if (!orderForm.amount) return;
     setOrdering(true);
+    setOrderResult(null);
     try {
-      await api.post("/orders/place", {
+      // 后端 /orders/place 需要限价+数量：以最新市价为限价，金额换算成数量
+      const { price } = await api.alertPrice(symbol);
+      if (price == null || !Number.isFinite(price) || price <= 0) {
+        throw new Error(`无法获取 ${symbol} 最新价格，后端行情源可能未就绪`);
+      }
+      const amount = parseFloat(orderForm.amount);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        throw new Error("下单金额必须大于 0");
+      }
+      const slPct = parseFloat(orderForm.stopLoss) / 100;
+      const tpPct = parseFloat(orderForm.takeProfit) / 100;
+      const isLong = orderForm.direction === "long";
+      const res = await api.placeOrder({
         symbol,
-        direction: orderForm.direction,
-        amount: parseFloat(orderForm.amount),
-        stop_loss_pct: parseFloat(orderForm.stopLoss),
-        take_profit_pct: parseFloat(orderForm.takeProfit),
+        side: isLong ? "buy" : "sell",
+        price,
+        qty: amount / price,
+        stopLoss: Number.isFinite(slPct) && slPct > 0
+          ? price * (isLong ? 1 - slPct : 1 + slPct)
+          : undefined,
+        takeProfit: Number.isFinite(tpPct) && tpPct > 0
+          ? price * (isLong ? 1 + tpPct : 1 - tpPct)
+          : undefined,
       });
-    } catch {
-      // API 可能未就绪
+      if (res.ok) {
+        setOrderResult({
+          ok: true,
+          msg: `挂单成功 #${res.order_id}（限价 ${price.toLocaleString()}）`,
+        });
+        setOrderForm((f) => ({ ...f, amount: "" }));
+        refetchOrders();
+      } else {
+        setOrderResult({ ok: false, msg: `下单失败：${res.reason ?? "未知原因"}` });
+      }
+    } catch (e) {
+      setOrderResult({
+        ok: false,
+        msg: `下单失败：${e instanceof Error ? e.message : "后端服务不可达"}`,
+      });
+    } finally {
+      setOrdering(false);
     }
-    setOrdering(false);
+  };
+
+  const handleClosePosition = async (posSymbol: string) => {
+    if (!window.confirm(`确认平掉 ${posSymbol} 的全部持仓吗？将按最新市价手动平仓。`)) return;
+    setClosingSymbol(posSymbol);
+    try {
+      const res = await api.closePosition(posSymbol);
+      const n = res.closed?.length ?? 0;
+      setOrderResult(
+        n > 0
+          ? { ok: true, msg: `已平仓 ${posSymbol} × ${n} 笔` }
+          : { ok: false, msg: `${posSymbol} 无可平仓位（可能已被止盈/止损平掉）` },
+      );
+      refetchPositions();
+    } catch (e) {
+      setOrderResult({
+        ok: false,
+        msg: `平仓失败：${e instanceof Error ? e.message : "后端服务不可达"}`,
+      });
+    } finally {
+      setClosingSymbol(null);
+    }
+  };
+
+  const handleCancelOrder = async (orderId: number) => {
+    if (!window.confirm(`确认撤销挂单 #${orderId} 吗？买单冻结资金将解冻退回。`)) return;
+    setCancellingId(orderId);
+    try {
+      const res = await api.cancelOrder(orderId);
+      setOrderResult(
+        res.ok
+          ? { ok: true, msg: `已撤销挂单 #${orderId}` }
+          : { ok: false, msg: `撤单失败：${res.reason ?? "未知原因"}` },
+      );
+      refetchOrders();
+    } catch (e) {
+      setOrderResult({
+        ok: false,
+        msg: `撤单失败：${e instanceof Error ? e.message : "后端服务不可达"}`,
+      });
+    } finally {
+      setCancellingId(null);
+    }
   };
 
   const runAction = async (name: string, fn: () => Promise<Record<string, unknown>>) => {
@@ -75,6 +175,16 @@ export default function Trading() {
         const opened = (data?.opened as unknown[])?.length ?? 0;
         const closed = (data?.closed as unknown[])?.length ?? 0;
         msg = `开仓 ${opened} | 平仓 ${closed}`;
+      } else if (name === "twelve") {
+        const opened = (data?.opened as unknown[]) ?? [];
+        const closed = (data?.closed as unknown[])?.length ?? 0;
+        const basis = opened
+          .map((o) => {
+            const r = o as Record<string, unknown>;
+            return `${r.symbol}(${((r.systems as string[]) ?? []).length}系统)`;
+          })
+          .join("、");
+        msg = `12系统共识：开仓 ${opened.length}${basis ? `（${basis}）` : ""} | 平仓 ${closed}`;
       } else if (name === "open") {
         msg = data?.action === "opened"
           ? `已开仓 #${data.position_id} ${data.side === "sell" ? "做空" : "做多"}`
@@ -108,30 +218,35 @@ export default function Trading() {
             <p className="stat-label mb-4">活跃持仓</p>
             {pos.length > 0 ? (
               <div className="grid grid-cols-2 gap-3">
-                {pos.map((p, i) => (
-                  <PositionCard
-                    key={`${String(p.symbol ?? "—")}-${i}`}
-                    symbol={String(p.symbol ?? "—")}
-                    direction={
-                      String(p.direction ?? "long") === "short"
-                        ? "short"
-                        : "long"
-                    }
-                    entryPrice={Number(p.entry_price ?? 0)}
-                    currentPrice={
-                      p.current_price != null
-                        ? Number(p.current_price)
-                        : undefined
-                    }
-                    pnlPct={
-                      p.pnl_pct != null ? Number(p.pnl_pct) : undefined
-                    }
-                    stopLoss={p.stop_loss ? Number(p.stop_loss) : undefined}
-                    takeProfit={
-                      p.take_profit ? Number(p.take_profit) : undefined
-                    }
-                  />
-                ))}
+                {pos.map((p, i) => {
+                  const posSymbol = String(p.symbol ?? "—");
+                  return (
+                    <PositionCard
+                      key={`${posSymbol}-${i}`}
+                      symbol={posSymbol}
+                      direction={
+                        String(p.direction ?? "long") === "short"
+                          ? "short"
+                          : "long"
+                      }
+                      entryPrice={Number(p.entry_price ?? 0)}
+                      currentPrice={
+                        p.current_price != null
+                          ? Number(p.current_price)
+                          : undefined
+                      }
+                      pnlPct={
+                        p.pnl_pct != null ? Number(p.pnl_pct) : undefined
+                      }
+                      stopLoss={p.stop_loss ? Number(p.stop_loss) : undefined}
+                      takeProfit={
+                        p.take_profit ? Number(p.take_profit) : undefined
+                      }
+                      onClose={() => handleClosePosition(posSymbol)}
+                      closing={closingSymbol === posSymbol}
+                    />
+                  );
+                })}
               </div>
             ) : (
               <p className="text-jarvis-text-secondary text-sm">暂无活跃持仓</p>
@@ -139,7 +254,7 @@ export default function Trading() {
           </div>
 
           <div className="card">
-            <p className="stat-label mb-4">历史订单</p>
+            <p className="stat-label mb-4">当前挂单</p>
             {ord.length > 0 ? (
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
@@ -148,20 +263,31 @@ export default function Trading() {
                       <th className="text-left py-2 font-medium">时间</th>
                       <th className="text-left py-2 font-medium">币种</th>
                       <th className="text-left py-2 font-medium">方向</th>
+                      <th className="text-right py-2 font-medium">限价</th>
                       <th className="text-right py-2 font-medium">金额</th>
-                      <th className="text-right py-2 font-medium">收益</th>
+                      <th className="text-right py-2 font-medium">操作</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {ord.slice(-10).reverse().map((o, i) => {
-                      const pnl = Number((o as Record<string, number>).pnl ?? 0);
+                    {/* /api/orders 返回 pending 限价单，字段对齐后端 limit_orders 表 */}
+                    {ord.slice(0, 10).map((o, i) => {
+                      const orderId = Number((o as Record<string, number>).id ?? 0);
+                      const side = String((o as Record<string, string>).side ?? "buy");
+                      const createdTs = Number((o as Record<string, number>).created_ts ?? 0);
                       return (
                         <tr
-                          key={i}
+                          key={orderId || i}
                           className="border-b border-jarvis-border/50 last:border-0"
                         >
                           <td className="py-2 text-jarvis-text-secondary font-mono">
-                            {String((o as Record<string, string>).time ?? "—")}
+                            {createdTs > 0
+                              ? new Date(createdTs * 1000).toLocaleString("zh-CN", {
+                                  month: "2-digit",
+                                  day: "2-digit",
+                                  hour: "2-digit",
+                                  minute: "2-digit",
+                                })
+                              : "—"}
                           </td>
                           <td className="py-2 text-jarvis-text">
                             {String((o as Record<string, string>).symbol ?? "—")}
@@ -170,24 +296,28 @@ export default function Trading() {
                             <span
                               className={clsx(
                                 "text-xs px-2 py-0.5 rounded-full",
-                                String((o as Record<string, string>).direction) === "short"
+                                side === "sell"
                                   ? "bg-jarvis-red/15 text-jarvis-red"
                                   : "bg-jarvis-green/15 text-jarvis-green",
                               )}
                             >
-                              {String((o as Record<string, string>).direction) === "short" ? "空" : "多"}
+                              {side === "sell" ? "卖" : "买"}
                             </span>
                           </td>
                           <td className="py-2 text-right text-jarvis-text font-mono">
-                            ${fmtUsd(Number((o as Record<string, number>).amount ?? 0))}
+                            ${fmtUsd(Number((o as Record<string, number>).limit_price ?? 0))}
                           </td>
-                          <td
-                            className={clsx("py-2 text-right font-mono", {
-                              "text-jarvis-green": pnl >= 0,
-                              "text-jarvis-red": pnl < 0,
-                            })}
-                          >
-                            {pnl >= 0 ? "+" : ""}${fmtUsd(pnl)}
+                          <td className="py-2 text-right text-jarvis-text font-mono">
+                            ${fmtUsd(Number((o as Record<string, number>).notional_usdt ?? 0))}
+                          </td>
+                          <td className="py-2 text-right">
+                            <button
+                              onClick={() => handleCancelOrder(orderId)}
+                              disabled={cancellingId === orderId || !orderId}
+                              className="text-xs px-2 py-1 rounded-md border border-jarvis-red/40 text-jarvis-red hover:bg-jarvis-red/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                              {cancellingId === orderId ? "撤销中..." : "撤单"}
+                            </button>
                           </td>
                         </tr>
                       );
@@ -196,7 +326,7 @@ export default function Trading() {
                 </table>
               </div>
             ) : (
-              <p className="text-jarvis-text-secondary text-sm">暂无订单记录</p>
+              <p className="text-jarvis-text-secondary text-sm">暂无挂单</p>
             )}
           </div>
         </div>
@@ -363,6 +493,32 @@ export default function Trading() {
                   ? "下单中..."
                   : `确认${orderForm.direction === "long" ? "做多" : "做空"}`}
               </button>
+
+              {orderResult && (
+                <div
+                  role="status"
+                  className={clsx(
+                    "flex items-start justify-between gap-2 p-2.5 rounded-lg text-xs",
+                    orderResult.ok
+                      ? "bg-jarvis-green/10 text-jarvis-green"
+                      : "bg-jarvis-red/10 text-jarvis-red",
+                  )}
+                >
+                  <span className="flex items-start gap-1.5">
+                    {!orderResult.ok && (
+                      <AlertTriangle size={13} className="flex-shrink-0 mt-0.5" />
+                    )}
+                    {orderResult.msg}
+                  </span>
+                  <button
+                    onClick={() => setOrderResult(null)}
+                    className="flex-shrink-0 opacity-60 hover:opacity-100 transition-opacity"
+                    aria-label="关闭提示"
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
             </div>
           </div>
 
@@ -411,6 +567,14 @@ export default function Trading() {
               >
                 <RotateCw size={14} className="text-jarvis-yellow" />
                 {actionLoading === "cycle" ? "执行中..." : "跑一轮自动跟盘"}
+              </button>
+              <button
+                onClick={() => runAction("twelve", runTwelveCycle)}
+                disabled={!!actionLoading}
+                className="w-full flex items-center gap-2 px-3 py-2.5 bg-jarvis-bg border border-jarvis-border rounded-lg text-sm text-jarvis-text hover:border-jarvis-purple transition-colors disabled:opacity-50"
+              >
+                <Compass size={14} className="text-jarvis-purple" />
+                {actionLoading === "twelve" ? "共识计算中..." : "12系统信号跟盘"}
               </button>
             </div>
             {actionResult && (

@@ -10,6 +10,9 @@ interface PositionCardProps {
   pnlPct?: number;
   stopLoss?: number;
   takeProfit?: number;
+  /** 传入后卡片底部显示「平仓」按钮（Trading 页用；Dashboard 不传则不显示） */
+  onClose?: () => void;
+  closing?: boolean;
 }
 
 type Flash = "up" | "down" | null;
@@ -31,6 +34,8 @@ export default function PositionCard({
   pnlPct,
   stopLoss,
   takeProfit,
+  onClose,
+  closing,
 }: PositionCardProps) {
   const [flash, setFlash] = useState<Flash>(null);
   const prevPriceRef = useRef<number | undefined>(currentPrice);
@@ -138,22 +143,33 @@ export default function PositionCard({
         )}
       </div>
 
-      <div className="mt-3 pt-3 border-t border-jarvis-border">
-        <span className="text-jarvis-text-secondary text-sm">浮盈</span>
-        {hasPnl ? (
-          <span
-            className={clsx(
-              "ml-2 text-lg font-semibold font-mono transition-colors duration-300",
-              isProfit ? "text-jarvis-green" : "text-jarvis-red",
-            )}
+      <div className="mt-3 pt-3 border-t border-jarvis-border flex items-center justify-between">
+        <div>
+          <span className="text-jarvis-text-secondary text-sm">浮盈</span>
+          {hasPnl ? (
+            <span
+              className={clsx(
+                "ml-2 text-lg font-semibold font-mono transition-colors duration-300",
+                isProfit ? "text-jarvis-green" : "text-jarvis-red",
+              )}
+            >
+              {isProfit ? "+" : ""}
+              {(pnlPct as number).toFixed(2)}%
+            </span>
+          ) : (
+            <span className="ml-2 text-lg font-semibold font-mono text-jarvis-text-secondary">
+              ——
+            </span>
+          )}
+        </div>
+        {onClose && (
+          <button
+            onClick={onClose}
+            disabled={closing}
+            className="text-xs px-2.5 py-1.5 rounded-lg border border-jarvis-red/40 text-jarvis-red hover:bg-jarvis-red/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {isProfit ? "+" : ""}
-            {(pnlPct as number).toFixed(2)}%
-          </span>
-        ) : (
-          <span className="ml-2 text-lg font-semibold font-mono text-jarvis-text-secondary">
-            ——
-          </span>
+            {closing ? "平仓中..." : "平仓"}
+          </button>
         )}
       </div>
     </div>

@@ -16,15 +16,24 @@ export function useApi<T>(
   const [error, setError] = useState<string | null>(null);
   const fetcherRef = useRef(fetcher);
   fetcherRef.current = fetcher;
+  // 请求序号：只有最新一次请求可写回 state，防止慢响应乱序覆盖新数据
+  const seqRef = useRef(0);
 
   const refetch = useCallback(() => {
+    const seq = ++seqRef.current;
     setLoading(true);
     setError(null);
     fetcherRef
       .current()
-      .then(setData)
-      .catch((e: Error) => setError(e.message))
-      .finally(() => setLoading(false));
+      .then((d) => {
+        if (seq === seqRef.current) setData(d);
+      })
+      .catch((e: Error) => {
+        if (seq === seqRef.current) setError(e.message);
+      })
+      .finally(() => {
+        if (seq === seqRef.current) setLoading(false);
+      });
   }, []);
 
   useEffect(() => {

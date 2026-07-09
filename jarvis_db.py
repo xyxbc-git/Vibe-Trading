@@ -63,6 +63,23 @@ def use_pg() -> bool:
     return db_url().lower().startswith(("postgres://", "postgresql://"))
 
 
+def ping(timeout_s: float = 5.0) -> dict:
+    """探测当前生效后端的连通性（供 daemon 健康检查）。永不抛出。
+
+    返回 {"ok": bool, "backend": "pg"|"sqlite", "error"?: str}。
+    SQLite 模式恒 ok（本地文件无远端依赖）。
+    """
+    if not use_pg():
+        return {"ok": True, "backend": "sqlite"}
+    try:
+        import psycopg
+        with psycopg.connect(db_url(), connect_timeout=int(timeout_s)) as c:
+            c.execute("SELECT 1")
+        return {"ok": True, "backend": "pg"}
+    except Exception as exc:  # noqa: BLE001 — 健康探测只报状态，不许抛出
+        return {"ok": False, "backend": "pg", "error": repr(exc)[:200]}
+
+
 def connect(sqlite_path: str):
     """统一入口：pg 已配置且用默认库路径 → PgConnection；否则 SQLite（含测试自定义路径）。
 

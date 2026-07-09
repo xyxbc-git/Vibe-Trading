@@ -74,6 +74,9 @@ DEFAULTS: dict = {
     "debate_enabled": False,              # 总开关（关=executor 完全跳过辩论层）
     "debate_mode": "warn",                # warn=只警示不拦单 | veto=反向结论否决下单
     "debate_timeout_sec": 300,            # 单次辩论子进程超时（LLM 多轮，量级分钟）
+    # ── D1 回测成本口径（jarvis_factor_backtest 换仓单边滑点成本，bps）─────────
+    # 10bps 与 jarvis_slippage.FALLBACK_BPS 同口径（保守兜底）；显式传 0 可复现旧零成本结果。
+    "backtest_cost_bps": 10.0,
 }
 
 # 关键风控旋钮的安全区间（写入时夹紧；未列的键不夹）。
@@ -98,6 +101,7 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "intraday_cooldown_bars": (0, 12),
     "intraday_max_consecutive_losses": (1, 20),
     "debate_timeout_sec": (30, 1800),
+    "backtest_cost_bps": (0.0, 800.0),  # 上限对齐 jarvis_slippage.MAX_ONE_WAY_BPS
 }
 
 # 允许的枚举键。

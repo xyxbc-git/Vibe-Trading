@@ -44,6 +44,7 @@ import urllib.error
 from dataclasses import dataclass, asdict, field
 from typing import Any
 
+import jarvis_llm_config as jlc
 import jarvis_scalper_features as sf
 import jarvis_scalper_codegen as codegen
 import jarvis_scalper_backtest as bt
@@ -262,18 +263,8 @@ def _get_live_performance_summary() -> dict:
 # ═══════════════════════════ LLM 调用 ═══════════════════════════
 
 def _llm_config() -> dict[str, str] | None:
-    """读取 LLM 配置（与 jarvis_dashboard 一致）。"""
-    ds_key = os.environ.get("DEEPSEEK_API_KEY")
-    key = os.environ.get("JARVIS_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY") or ds_key
-    if not key:
-        return None
-    base = os.environ.get("JARVIS_LLM_BASE_URL")
-    if not base:
-        base = "https://api.deepseek.com" if ds_key else "https://api.openai.com/v1"
-    base = base.rstrip("/")
-    is_deepseek = "deepseek" in base.lower()
-    model = os.environ.get("JARVIS_LLM_MODEL") or ("deepseek-chat" if is_deepseek else "gpt-4o-mini")
-    return {"key": key, "base": base, "model": model}
+    """读取 LLM 配置：UI 保存的 llm_config.json 优先，环境变量兜底。"""
+    return jlc.get_llm_config()
 
 
 def _call_llm(prompt: str, system: str = "", temperature: float = 0.7) -> str:
@@ -281,7 +272,8 @@ def _call_llm(prompt: str, system: str = "", temperature: float = 0.7) -> str:
     cfg = _llm_config()
     if not cfg:
         raise RuntimeError(
-            "未配置 LLM。请设置环境变量：\n"
+            "未配置 LLM。请在桌面端「设置 → 大模型 (LLM)」填入 API Key，\n"
+            "或设置环境变量：\n"
             "  export DEEPSEEK_API_KEY=your_key\n"
             "或\n"
             "  export JARVIS_LLM_API_KEY=your_key\n"

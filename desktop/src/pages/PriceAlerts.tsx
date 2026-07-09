@@ -20,8 +20,7 @@ import {
   type AlertDirection,
 } from "@/api/client";
 import { useApi } from "@/hooks/useApi";
-
-const SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"];
+import { useSymbol } from "@/hooks/useSymbol";
 
 function fmtTs(ts: number | null): string {
   if (!ts) return "—";
@@ -470,6 +469,7 @@ function NewPlanForm({
   contacts: AlertContact[];
   onCreated: () => void;
 }) {
+  const { supported } = useSymbol();
   const [form, setForm] = useState({ ...emptyPlan });
   const [livePrice, setLivePrice] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
@@ -547,9 +547,9 @@ function NewPlanForm({
             value={form.symbol}
             onChange={(e) => setForm({ ...form, symbol: e.target.value })}
           >
-            {SYMBOLS.map((s) => (
-              <option key={s} value={s}>
-                {s}
+            {supported.map((s) => (
+              <option key={s.value} value={s.value}>
+                {s.value}
               </option>
             ))}
           </select>
@@ -639,6 +639,7 @@ function PlanRow({
   defaultRecipients: string[];
   onChanged: () => void;
 }) {
+  const { supported } = useSymbol();
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState(false);
   const [form, setForm] = useState({
@@ -649,6 +650,10 @@ function PlanRow({
     repeat: plan.repeat,
     recipients: plan.recipients,
   });
+  // 计划里的 symbol 可能已从自定义列表删除，仍需在下拉中可见以免编辑时丢失
+  const symbolOptions = supported.some((s) => s.value === form.symbol)
+    ? supported.map((s) => s.value)
+    : [...supported.map((s) => s.value), form.symbol];
   const [msg, setMsg] = useState("");
 
   const startEdit = () => {
@@ -739,7 +744,7 @@ function PlanRow({
               value={form.symbol}
               onChange={(e) => setForm({ ...form, symbol: e.target.value })}
             >
-              {SYMBOLS.map((s) => (
+              {symbolOptions.map((s) => (
                 <option key={s} value={s}>
                   {s}
                 </option>

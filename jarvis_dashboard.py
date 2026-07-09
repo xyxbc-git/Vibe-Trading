@@ -744,12 +744,18 @@ def api_trader_status(symbol: str | None = None):
 
 
 @app.get("/api/positions")
-def api_positions(symbol: str | None = None, status: str = "all"):
+def api_positions(symbol: str | None = None, status: str = "all", limit: int = 0,
+                  include_replay: bool = False):
     rows = jpt.all_positions(symbol)
+    if not include_replay:
+        # 历史回放样本默认不进台账/交易记录（只在信号胜率统计 source=replay 可见）
+        rows = [r for r in rows if (r.get("signal_source") or "") != "replay"]
     if status == "open":
         rows = [r for r in rows if r["status"] == "open"]
     elif status == "closed":
         rows = [r for r in rows if r["status"] == "closed"]
+    if limit and limit > 0:
+        rows = rows[:limit]   # all_positions 已按 opened_ts 倒序，截断即取最近 N 笔
 
     # 给所有行补 direction（前端按 long/short 渲染，DB 里只有 buy/sell）
     # 同时给 open 持仓补 current_price / pnl_pct / pnl_usdt
@@ -1104,22 +1110,12 @@ def _answer_question(q: str, snap: dict, st: dict) -> str:
 
 
 def _llm_config() -> dict | None:
-    """从环境变量读取 LLM 配置；未配置返回 None（此时走规则问答兜底）。
-    支持任意 OpenAI 兼容服务（OpenAI / DeepSeek / 国产中转等）：
-      - JARVIS_LLM_API_KEY 或 OPENAI_API_KEY 或 DEEPSEEK_API_KEY
-      - JARVIS_LLM_BASE_URL（DeepSeek 用 https://api.deepseek.com）
-      - JARVIS_LLM_MODEL（DeepSeek 默认 deepseek-chat，OpenAI 默认 gpt-4o-mini）"""
-    ds_key = os.environ.get("DEEPSEEK_API_KEY")
-    key = os.environ.get("JARVIS_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY") or ds_key
-    if not key:
-        return None
-    base = os.environ.get("JARVIS_LLM_BASE_URL")
-    if not base:
-        base = "https://api.deepseek.com" if ds_key else "https://api.openai.com/v1"
-    base = base.rstrip("/")
-    is_deepseek = "deepseek" in base.lower()
-    model = os.environ.get("JARVIS_LLM_MODEL") or ("deepseek-chat" if is_deepseek else "gpt-4o-mini")
-    return {"key": key, "base": base, "model": model}
+    """读取 LLM 配置；未配置返回 None（此时走规则问答兜底）。
+    统一走 jarvis_llm_config：桌面端「设置 → 大模型」保存的 llm_config.json 优先，
+    环境变量（DEEPSEEK_API_KEY / JARVIS_LLM_API_KEY / OPENAI_API_KEY + BASE_URL/MODEL）兜底。"""
+    import jarvis_llm_config as _jlc
+
+    return _jlc.get_llm_config()
 
 
 def _gather_lessons(snap: dict, sym: str) -> list[dict]:
@@ -1136,17 +1132,68 @@ def _gather_lessons(snap: dict, sym: str) -> list[dict]:
         return []
 
 
-def _llm_answer(
-    question: str, snap: dict, st: dict, sym: str, lessons: list[dict] | None = None
-) -> str | None:
-    """接入真实 LLM 回答问题；失败/未配置返回 None 让上层走规则兜底。
+# 内置问答 system prompt（设置页 system_prompt_extra 会追加在其后，借鉴 QD 可配置化思路）。
+# 人设定位：并肩看盘的老战友，说人话、有温度；禁模板腔/AI 腔/满屏列表/重复免责声明。
+_ASK_SYSTEM = (
+    "你是贾维斯，用户的贴身交易搭档——像陪他并肩看盘好几年的老战友，不是客服机器人。\n"
+    "\n"
+    "说话方式：\n"
+    "- 说人话：口语、自然、有温度，偶尔可以调侃一句或自嘲一下，但别尬、别油。\n"
+    "- 长短看问题：打招呼、闲聊、简单确认，一两句话就完事；真问行情、要不要动手，再认真展开。\n"
+    "- 别套模板：不要固定开场白和收尾（比如「好的」「关于您的问题」「希望对您有帮助」），"
+    "严禁「作为AI助手」「作为一个人工智能」这类话。\n"
+    "- 少用列表：能用一段自然的话说清楚就别拆条目；只有真在对比好几个要点时才用列表。\n"
+    "- 上一轮聊过的东西别从头复述，接着话头往下说。\n"
+    "\n"
+    "专业底线（这些不许松）：\n"
+    "- 所有数字和结论只能来自 context 数据（决策快照、持仓、挂单、战绩、经验教训），"
+    "绝不编造价位；手上没有的数据就直说「这个我这没数」。\n"
+    "- 用户问持仓、挂单、盈亏，直接引用 open_positions / pending_orders 里的真实数字，"
+    "像老朋友替他盯着账户那样自然带出来。\n"
+    "- 命中 lessons（经验教训）时，用「我以前在这上面栽过跟头，所以这次…」的口吻自然引出，别生硬罗列。\n"
+    "- 真给出操作建议（开仓/止损/止盈价位）时，顺口带一句这是模拟盘研究、最终他自己拿主意——"
+    "轻轻一句就够，别每条都念免责声明。\n"
+    "\n"
+    "全程简体中文。"
+)
 
-    除当前决策快照外，还把 lessons（经验教训库命中项）一并喂给模型，
-    让贾维斯能援引"自己踩过的坑"而不是每次复述当前数据。
-    """
-    cfg = _llm_config()
-    if not cfg:
-        return None
+_ASK_HISTORY_MAX = 8          # 多轮上下文最多携带的历史消息条数
+_ASK_HISTORY_ITEM_MAX = 1500  # 单条历史消息截断长度
+
+
+def _ask_live_context(spot: str) -> dict:
+    """持仓 + 挂单实时摘要（问答上下文注入）；任何失败降级为空，绝不拖垮问答。"""
+    out: dict = {"open_positions": [], "pending_orders": []}
+    try:
+        for p in jpt.all_positions(spot):
+            if p.get("status") != "open":
+                continue
+            side = (p.get("side") or "buy").lower()
+            out["open_positions"].append({
+                "symbol": p.get("symbol"),
+                "direction": "long" if side == "buy" else "short",
+                "qty": p.get("qty"),
+                "entry_price": p.get("entry_price"),
+                "stop_loss": p.get("stop_loss"),
+                "take_profit": p.get("take_profit"),
+                "opened_date": p.get("entry_date"),
+            })
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        out["pending_orders"] = [
+            {"symbol": o.get("symbol"), "side": o.get("side"),
+             "price": o.get("price"), "qty": o.get("qty")}
+            for o in jw.pending_orders(spot)[:5]
+        ]
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _build_ask_context(snap: dict, st: dict, sym: str,
+                       lessons: list[dict] | None) -> dict:
+    """聚合问答上下文 JSON（决策快照 + 教训 + 战绩 + 持仓/挂单）。"""
     d = (snap or {}).get("decision", {}) or {}
     fac = (snap or {}).get("factor_state", {}) or {}
     rd = (snap or {}).get("real_data", {}) or {}
@@ -1184,56 +1231,326 @@ def _llm_answer(
             "equity_usdt": st.get("equity_usdt"),
         } if st else {},
     }
-    system = (
-        "你是『贾维斯』加密交易助手。除了当前决策数据，你还有一份『经验教训库』"
-        "（context 的 lessons 字段）——那是你过去用真实数据踩过的坑、攒下的经验。"
-        "回答时：① 先给结论（该不该买 / 仓位 / 止盈止损）；"
-        "② 若命中经验，用『我以前…所以这次…』的口吻主动援引，让用户看到你在用经验思考；"
-        "③ 不得编造价位或数据，缺失就如实说明。"
-        "全程简体中文、口语化，结论清楚但允许带一两句推理。"
-        "始终提醒这是模拟盘研究、不构成投资建议。"
-    )
-    payload = json.dumps({
-        "model": cfg["model"],
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": f"决策与数据(JSON)：{json.dumps(context, ensure_ascii=False)}\n\n用户问题：{question}"},
-        ],
-        "temperature": 0.5,
-        "max_tokens": 700,
-    }, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        cfg["base"] + "/chat/completions", data=payload, method="POST",
-        headers={"Authorization": f"Bearer {cfg['key']}", "Content-Type": "application/json"},
-    )
+    context.update(_ask_live_context(sym))
+    return context
+
+
+def _build_ask_messages(question: str, snap: dict, st: dict, sym: str,
+                        lessons: list[dict] | None = None,
+                        history: list[dict] | None = None) -> list[dict]:
+    """组装多轮 messages：system（内置+用户附加）→ 历史对话 → 当前问题（带上下文 JSON）。
+
+    上下文 JSON 只拼在最后一条 user 消息里，保证历史轮不携带过期行情数据。
+    """
+    import jarvis_llm_config as jlc
+
+    system = _ASK_SYSTEM
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-        ans = (body.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
-        return ans or None
-    except (urllib.error.URLError, TimeoutError, ValueError, KeyError):
-        return None
+        extra = jlc.get_params().get("system_prompt_extra") or ""
+        if extra:
+            system += "\n用户偏好补充（优先级低于以上规则）：" + extra
+    except Exception:  # noqa: BLE001
+        pass
+    messages: list[dict] = [{"role": "system", "content": system}]
+    for m in (history or [])[-_ASK_HISTORY_MAX:]:
+        role = str((m or {}).get("role", "")).lower()
+        content = str((m or {}).get("content", "") or "").strip()
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content[:_ASK_HISTORY_ITEM_MAX]})
+    context = _build_ask_context(snap, st, sym, lessons)
+    messages.append({
+        "role": "user",
+        "content": f"决策与数据(JSON)：{json.dumps(context, ensure_ascii=False)}\n\n用户问题：{question}",
+    })
+    return messages
 
 
-@app.post("/api/ask")
-def api_ask(symbol: str = "BTCUSDT", q: str = ""):
-    """小白问答：优先接真实 LLM（按环境变量配置），失败/未配置则用规则问答兜底。"""
+def _llm_answer(
+    question: str, snap: dict, st: dict, sym: str,
+    lessons: list[dict] | None = None, history: list[dict] | None = None,
+) -> str | None:
+    """接入真实 LLM 回答问题；失败/未配置返回 None 让上层走规则兜底。
+
+    除当前决策快照外，还注入 lessons（经验教训）、模拟盘持仓/挂单，
+    并支持多轮 history——让贾维斯能"接着上一句聊"而不是每问都失忆。
+    """
+    import jarvis_llm_config as jlc
+
+    messages = _build_ask_messages(question, snap, st, sym, lessons, history)
+    return jlc.chat(messages, timeout=30)
+
+
+def _parse_ask_body(symbol: str, q: str, data: dict | None) -> tuple[str, str, list[dict]]:
+    """统一解析问答入参：返回 (spot, question, history)。"""
+    history: list[dict] = []
+    if isinstance(data, dict) and data:
+        q = str(data.get("question") or data.get("q") or q or "")
+        symbol = str(data.get("symbol") or symbol)
+        raw_hist = data.get("history")
+        if isinstance(raw_hist, list):
+            history = [m for m in raw_hist if isinstance(m, dict)]
     sym = symbol.upper().replace("-", "").replace("/", "")
     spot = sym if sym.endswith("USDT") else sym + "USDT"
-    question = (q or "").strip()
-    if not question:
-        return JSONResponse({"ok": False, "answer": "你想问点啥？比如「现在该买吗」「止盈止损在哪」「最近战绩怎样」。"})
+    return spot, (q or "").strip(), history
+
+
+def _ask_gather(spot: str) -> tuple[dict, dict, list[dict]]:
+    """聚合问答依赖数据：快照（5min 缓存）+ 模拟盘战绩 + 经验教训。"""
     snap = _cached(f"snap:{spot}", 300, lambda: jb.build(spot))
     try:
         st = jpt.stats(_trader_cfg(), spot)
     except Exception:  # noqa: BLE001
         st = {}
     lessons = _gather_lessons(snap, spot)
-    llm = _llm_answer(question, snap, st, spot, lessons)
+    return snap, st, lessons
+
+
+@app.post("/api/ask")
+def api_ask(symbol: str = "BTCUSDT", q: str = "", data: dict | None = None):
+    """小白问答：优先接真实 LLM（设置页/环境变量配置），失败/未配置则用规则问答兜底。
+
+    入参兼容两种形态（桌面端发 JSON body，网页端发 query 参数）：
+      - JSON body：{"question"|"q": "...", "symbol": "...", "history": [{role,content}...]}
+      - query：?symbol=BTCUSDT&q=...
+    history 为前端携带的多轮上下文（最多取最近 8 条），实现连续对话。
+    """
+    spot, question, history = _parse_ask_body(symbol, q, data)
+    if not question:
+        return JSONResponse({"ok": False, "answer": "你想问点啥？比如「现在该买吗」「止盈止损在哪」「最近战绩怎样」。"})
+    snap, st, lessons = _ask_gather(spot)
+    llm = _llm_answer(question, snap, st, spot, lessons, history)
     answer = llm if llm else _answer_question(question, snap, st)
     return JSONResponse({"ok": True, "symbol": spot, "question": question,
                          "answer": answer, "engine": "llm" if llm else "rule",
                          "lessons_cited": len(lessons) if llm else 0})
+
+
+@app.post("/api/ask/stream")
+def api_ask_stream(data: dict | None = None):
+    """流式问答（借鉴 QD 的 SSE 输出）：token 级增量推送，前端边收边渲染。
+
+    body: {"question": "...", "symbol": "BTCUSDT", "history": [{role,content}...]}
+    SSE 事件（data: JSON）：
+      {"type":"meta","engine":"llm"|"rule","model":...}   —— 首包
+      {"type":"delta","content":"..."}                    —— 增量文本（rule 模式为整段一次）
+      {"type":"done","lessons_cited":N}                   —— 收尾
+      {"type":"error","message":"..."}                    —— 异常（已推送的内容仍有效）
+    未配置 LLM / 首包前失败自动降级规则问答（engine=rule），保证永远有回答。
+    """
+    import jarvis_llm_config as jlc
+
+    spot, question, history = _parse_ask_body("BTCUSDT", "", data)
+    if not question:
+        return JSONResponse({"ok": False, "answer": "你想问点啥？"}, status_code=400)
+
+    def _sse(obj: dict) -> str:
+        return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+
+    def gen():
+        try:
+            snap, st, lessons = _ask_gather(spot)
+        except Exception as exc:  # noqa: BLE001 — 数据聚合失败也要给出可读回复
+            yield _sse({"type": "meta", "engine": "rule", "model": None})
+            yield _sse({"type": "delta", "content": f"数据获取失败（{repr(exc)[:120]}），稍后再试。"})
+            yield _sse({"type": "done", "lessons_cited": 0})
+            return
+        cfg = jlc.get_llm_config()
+        if cfg:
+            messages = _build_ask_messages(question, snap, st, spot, lessons, history)
+            try:
+                stream = jlc.chat_stream(messages, timeout=90)
+                yield _sse({"type": "meta", "engine": "llm", "model": cfg.get("model")})
+                got_any = False
+                for delta in stream:
+                    got_any = True
+                    yield _sse({"type": "delta", "content": delta})
+                if got_any:
+                    yield _sse({"type": "done", "lessons_cited": len(lessons)})
+                    return
+                # 流成功建立但一个字没吐：走规则兜底
+            except (jlc.LLMNotConfigured, jlc.LLMCallError) as exc:
+                _log_emit(f"ask/stream LLM 失败转规则兜底: {exc}", "warn", "ask")
+        # 规则兜底（未配置 / 首包前失败 / 空流）
+        answer = _answer_question(question, snap, st)
+        yield _sse({"type": "meta", "engine": "rule", "model": None})
+        yield _sse({"type": "delta", "content": answer})
+        yield _sse({"type": "done", "lessons_cited": 0})
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+# ─────────────────────────── AI 交易复盘 API（借鉴 QD 策略复盘）───────────────────────────
+
+_REVIEW_TTL = 600  # 复盘结果缓存 10 分钟（同参数重复点击不重复烧 token）
+
+
+def _review_rule_stats(closed: list[dict]) -> dict:
+    """已平仓交易的规则统计（不依赖 LLM，永远可用）。"""
+    wins = [p for p in closed if (p.get("realized_pnl_usdt") or 0) > 0]
+    losses = [p for p in closed if (p.get("realized_pnl_usdt") or 0) < 0]
+    gross_profit = sum(p["realized_pnl_usdt"] for p in wins) if wins else 0.0
+    gross_loss = sum(p["realized_pnl_usdt"] for p in losses) if losses else 0.0
+    exit_dist: dict[str, int] = {}
+    hold_days: list[float] = []
+    max_consec_loss = consec = 0
+    for p in sorted(closed, key=lambda x: x.get("closed_ts") or 0):
+        reason = str(p.get("exit_reason") or "unknown")
+        exit_dist[reason] = exit_dist.get(reason, 0) + 1
+        if p.get("opened_ts") and p.get("closed_ts"):
+            hold_days.append((p["closed_ts"] - p["opened_ts"]) / 86400)
+        if (p.get("realized_pnl_usdt") or 0) < 0:
+            consec += 1
+            max_consec_loss = max(max_consec_loss, consec)
+        else:
+            consec = 0
+    by_side: dict[str, dict] = {}
+    for side_key, side_name in (("buy", "long"), ("sell", "short")):
+        rows = [p for p in closed if (p.get("side") or "buy").lower() == side_key]
+        if rows:
+            side_wins = [p for p in rows if (p.get("realized_pnl_usdt") or 0) > 0]
+            by_side[side_name] = {
+                "trades": len(rows),
+                "win_rate_pct": round(100 * len(side_wins) / len(rows), 1),
+                "pnl_usdt": round(sum(p.get("realized_pnl_usdt") or 0 for p in rows), 2),
+            }
+    best = max(closed, key=lambda p: p.get("realized_pnl_usdt") or 0, default=None)
+    worst = min(closed, key=lambda p: p.get("realized_pnl_usdt") or 0, default=None)
+
+    def _trade_brief(p: dict | None) -> dict | None:
+        if not p:
+            return None
+        return {"symbol": p.get("symbol"), "side": p.get("side"),
+                "pnl_usdt": round(p.get("realized_pnl_usdt") or 0, 2),
+                "pnl_pct": p.get("realized_pnl_pct"),
+                "exit_reason": p.get("exit_reason")}
+
+    return {
+        "closed_trades": len(closed),
+        "win_rate_pct": round(100 * len(wins) / len(closed), 1) if closed else None,
+        "profit_factor": round(gross_profit / abs(gross_loss), 3) if gross_loss else None,
+        "total_pnl_usdt": round(gross_profit + gross_loss, 2),
+        "avg_win_usdt": round(gross_profit / len(wins), 2) if wins else None,
+        "avg_loss_usdt": round(gross_loss / len(losses), 2) if losses else None,
+        "avg_hold_days": round(sum(hold_days) / len(hold_days), 1) if hold_days else None,
+        "max_consecutive_losses": max_consec_loss,
+        "exit_reason_dist": exit_dist,
+        "by_side": by_side,
+        "best_trade": _trade_brief(best),
+        "worst_trade": _trade_brief(worst),
+    }
+
+
+def _review_rules_only(stats: dict) -> dict:
+    """无 LLM 时的规则复盘（阈值化诊断，保证功能可用）。"""
+    diagnosis, recommendations = [], []
+    wr = stats.get("win_rate_pct")
+    pf = stats.get("profit_factor")
+    aw, al = stats.get("avg_win_usdt"), stats.get("avg_loss_usdt")
+    if wr is not None and wr < 40:
+        diagnosis.append(f"胜率 {wr}% 偏低，入场信号质量或时机需要复查")
+        recommendations.append("提高开仓信心阈值，减少弱信号出手")
+    if pf is not None and pf < 1:
+        diagnosis.append(f"盈亏比 {pf} 小于 1，整体在亏损")
+        recommendations.append("检查止损/止盈比例设置，砍掉期望值为负的交易模式")
+    if aw is not None and al is not None and abs(al) > abs(aw):
+        diagnosis.append(f"平均亏损 {al}U 大于平均盈利 {aw}U，存在「亏大赚小」")
+        recommendations.append("止损更果断、让盈利多跑一段（收紧止损或放宽止盈）")
+    if (stats.get("max_consecutive_losses") or 0) >= 3:
+        diagnosis.append(f"最大连亏 {stats['max_consecutive_losses']} 笔，注意情绪化连续开仓")
+        recommendations.append("连亏 2 笔后暂停开仓、复查市场环境是否变化")
+    dist = stats.get("exit_reason_dist") or {}
+    if dist.get("stop_loss", 0) > dist.get("take_profit", 0):
+        diagnosis.append("止损离场多于止盈离场，方向判断或入场点位有系统性偏差")
+    if not diagnosis:
+        diagnosis.append("样本内未发现显著问题，继续积累样本")
+    return {
+        "summary": (f"已平仓 {stats.get('closed_trades', 0)} 笔，胜率 {wr if wr is not None else '—'}%，"
+                    f"盈亏比 {pf if pf is not None else '—'}，累计盈亏 {stats.get('total_pnl_usdt', 0)}U。"),
+        "diagnosis": diagnosis,
+        "recommendations": recommendations or ["保持当前纪律，样本到 30 笔后再做深度复盘"],
+        "cautions": ["模拟盘研究，不构成投资建议"],
+    }
+
+
+_REVIEW_SYSTEM = (
+    "你是专业量化交易复盘员。基于给定的模拟盘统计 JSON（胜率/盈亏比/离场原因分布/"
+    "多空表现/最佳最差交易/连亏等），输出严格 JSON："
+    '{"summary":"一段话总结","diagnosis":["问题1",…],"recommendations":["建议1",…],"cautions":["提醒1",…]}。'
+    "要求：① 每条诊断必须引用统计里的具体数字；② 不得编造统计之外的交易；"
+    "③ diagnosis/recommendations 各 2~5 条，cautions 1~3 条且必含「模拟盘研究，不构成投资建议」；"
+    "④ 简体中文；⑤ 只输出 JSON。"
+)
+
+
+@app.post("/api/jarvis/review")
+def api_jarvis_review(data: dict | None = None):
+    """AI 交易复盘（借鉴 QD 策略复盘）：模拟盘已平仓交易 → 规则统计 + LLM 诊断建议。
+
+    body: {"symbol": "BTCUSDT" | 空=全部, "limit": 50}
+    响应: {ok, symbol, stats, review:{summary,diagnosis,recommendations,cautions},
+           source:"llm"|"rules", cached}
+    无已平仓交易时 ok:false；无 LLM 配置自动降级规则复盘（source=rules）。
+    """
+    import jarvis_llm_config as jlc
+
+    d = data or {}
+    sym_raw = str(d.get("symbol") or "").upper().replace("-", "").replace("/", "").strip()
+    spot = (sym_raw if sym_raw.endswith("USDT") else sym_raw + "USDT") if sym_raw else None
+    limit = max(5, min(int(d.get("limit") or 50), 200))
+    cache_key = f"review:{spot or 'ALL'}:{limit}"
+    hit = _CACHE.get(cache_key)
+    if hit and time.time() - hit[0] < _REVIEW_TTL:
+        return JSONResponse({**hit[1], "cached": True})
+
+    try:
+        closed = [p for p in jpt.all_positions(spot)
+                  if p.get("status") == "closed" and p.get("realized_pnl_usdt") is not None]
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": f"读取台账失败: {repr(exc)[:200]}"})
+    closed = closed[:limit]
+    if not closed:
+        return JSONResponse({"ok": False,
+                             "error": "还没有已平仓的模拟盘交易，先让贾维斯跑一阵再来复盘。"})
+
+    stats = _review_rule_stats(closed)
+    review, source = None, "rules"
+    raw = jlc.chat(
+        [{"role": "system", "content": _REVIEW_SYSTEM},
+         {"role": "user", "content": json.dumps(stats, ensure_ascii=False)}],
+        temperature=0.3, max_tokens=1200, json_mode=True, timeout=45,
+    )
+    if raw:
+        try:
+            text = raw.strip()
+            if text.startswith("```"):
+                text = text.strip("`")
+                if text.startswith("json"):
+                    text = text[4:]
+            obj = json.loads(text)
+            if isinstance(obj, dict) and obj.get("summary"):
+                review = {
+                    "summary": str(obj.get("summary", ""))[:600],
+                    "diagnosis": [str(x)[:200] for x in (obj.get("diagnosis") or [])][:6],
+                    "recommendations": [str(x)[:200] for x in (obj.get("recommendations") or [])][:6],
+                    "cautions": [str(x)[:200] for x in (obj.get("cautions") or [])][:4],
+                }
+                source = "llm"
+        except ValueError:
+            review = None
+    if review is None:
+        review = _review_rules_only(stats)
+    result = {"ok": True, "symbol": spot or "ALL", "stats": stats,
+              "review": review, "source": source}
+    _CACHE[cache_key] = (time.time(), result)
+    return JSONResponse({**result, "cached": False})
 
 
 # ─────────────────────────── 短线自动交易 API ───────────────────────────
@@ -1316,6 +1633,67 @@ def _evolve_reader(proc: "_subprocess.Popen") -> None:
         )
 
 
+# ============ 短线交易引擎进程管理（桌面端一键启动/停止，模拟盘）============
+_SCALPER_LOCK = _threading.Lock()
+_SCALPER_PROC: "_subprocess.Popen | None" = None
+_SCALPER_STATE_PATH = os.path.expanduser("~/.vibe-trading/scalper_trader_state.json")
+
+
+def _scalper_reader(proc: "_subprocess.Popen") -> None:
+    """读取短线交易子进程输出，逐行进日志缓冲（前端「终端」页可见）。"""
+    try:
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            line = raw.rstrip("\n")
+            if line.strip():
+                _log_emit(line, "info", "scalper")
+    except Exception as e:  # noqa: BLE001
+        _log_emit(f"读取短线交易输出异常: {e}", "error", "scalper")
+    finally:
+        try:
+            proc.wait()
+        except Exception:  # noqa: BLE001
+            pass
+        _log_emit(
+            f"{'✓' if proc.returncode == 0 else '✗'} 短线交易进程结束 (code={proc.returncode})",
+            "info" if proc.returncode == 0 else "error",
+            "scalper",
+        )
+
+
+def _scalper_heartbeat() -> tuple[bool, float | None]:
+    """通过状态文件心跳判断短线引擎是否存活（覆盖命令行手动启动的场景）。
+
+    仅认 run 永续循环写入的 loop_ts + loop_pid（dry-run 单轮不写不误报）：
+    loop_ts 在两个 15m 周期内 且 loop_pid 进程仍存活 → 引擎在跑。
+
+    Returns:
+        (alive, last_cycle_ts)
+    """
+    try:
+        with open(_SCALPER_STATE_PATH, encoding="utf-8") as f:
+            st = json.load(f) or {}
+        last_cycle_ts = float(st.get("last_cycle_ts") or 0) or None
+        loop_ts = float(st.get("loop_ts") or 0)
+        loop_pid = int(st.get("loop_pid") or 0)
+    except Exception:  # noqa: BLE001
+        return False, None
+    if loop_ts <= 0 or loop_pid <= 0:
+        return False, last_cycle_ts
+    if (time.time() - loop_ts) >= 1800:
+        return False, last_cycle_ts
+    try:
+        os.kill(loop_pid, 0)  # 信号 0 仅探测进程存在
+    except OSError:
+        return False, last_cycle_ts
+    return True, last_cycle_ts
+
+
+def _scalper_proc_running() -> bool:
+    with _SCALPER_LOCK:
+        return _SCALPER_PROC is not None and _SCALPER_PROC.poll() is None
+
+
 @app.get("/api/scalper/status")
 def api_scalper_status():
     if not _HAS_SCALPER_TRADER:
@@ -1326,8 +1704,12 @@ def api_scalper_status():
         best = None
         if _HAS_SCALPER_EVOLVE:
             best = jse.get_best_strategy()
+        hb_alive, hb_ts = _scalper_heartbeat()
+        running = _scalper_proc_running() or hb_alive
         return JSONResponse({
-            "running": False,
+            "running": running,
+            "managed_by_dashboard": _scalper_proc_running(),
+            "last_cycle_ts": hb_ts,
             "strategy": best.get("name") if best else None,
             "symbol": cfg.get("symbol", "BTCUSDT"),
             "timeframe": cfg.get("timeframe", "15m"),
@@ -1369,12 +1751,52 @@ def api_scalper_log(limit: int = 50):
 
 @app.post("/api/scalper/start")
 def api_scalper_start(symbol: str = "BTCUSDT"):
-    return JSONResponse({"ok": False, "reason": "短线交易需通过命令行启动: python jarvis_scalper_trader.py run --symbol " + symbol})
+    """后台启动短线交易永续循环（模拟盘）；输出实时进「终端」页。"""
+    global _SCALPER_PROC
+    if not _HAS_SCALPER_TRADER:
+        return JSONResponse({"ok": False, "reason": "jarvis_scalper_trader 模块未安装"}, status_code=503)
+    if _scalper_proc_running():
+        return JSONResponse({"ok": False, "reason": "短线交易已在运行中"})
+    hb_alive, _ = _scalper_heartbeat()
+    if hb_alive:
+        return JSONResponse({"ok": False, "reason": "检测到命令行启动的短线交易正在运行，请先停止它"})
+    sym = symbol.upper().replace("-", "").replace("/", "")
+    cmd = [_sys.executable, "jarvis_scalper_trader.py", "run", "--symbol", sym]
+    try:
+        proc = _subprocess.Popen(
+            cmd,
+            cwd=_DASH_ROOT,
+            stdout=_subprocess.PIPE,
+            stderr=_subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except Exception as e:  # noqa: BLE001
+        _log_emit(f"✗ 短线交易启动失败: {e}", "error", "scalper")
+        return JSONResponse({"ok": False, "reason": str(e)}, status_code=500)
+    with _SCALPER_LOCK:
+        _SCALPER_PROC = proc
+    _log_emit(f"▶ 短线交易启动 symbol={sym} (pid={proc.pid}，模拟盘)", "info", "scalper")
+    _threading.Thread(target=_scalper_reader, args=(proc,), daemon=True).start()
+    return JSONResponse({"ok": True, "pid": proc.pid, "symbol": sym})
 
 
 @app.post("/api/scalper/stop")
 def api_scalper_stop():
-    return JSONResponse({"ok": False, "reason": "短线交易需通过命令行停止（Ctrl+C）"})
+    global _SCALPER_PROC
+    with _SCALPER_LOCK:
+        proc = _SCALPER_PROC
+    if proc is None or proc.poll() is not None:
+        hb_alive, _ = _scalper_heartbeat()
+        if hb_alive:
+            return JSONResponse({"ok": False, "reason": "短线交易由命令行启动，请在对应终端 Ctrl+C 停止"})
+        return JSONResponse({"ok": False, "reason": "当前没有运行中的短线交易"})
+    try:
+        proc.terminate()
+        _log_emit("■ 已请求停止短线交易进程", "warn", "scalper")
+        return JSONResponse({"ok": True})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "reason": str(e)}, status_code=500)
 
 
 # ─────────────────────────── 进化引擎 API ───────────────────────────
@@ -1492,6 +1914,15 @@ try:
 except ImportError:
     _HAS_BACKTEST = False
 
+# 回测历史持久化（backtest_runs 表 + /api/backtest/history 端点，见独立模块）
+try:
+    import jarvis_backtest_history as _jbh
+    if _jbh.router is not None:
+        app.include_router(_jbh.router)
+    _HAS_BT_HISTORY = True
+except ImportError:
+    _HAS_BT_HISTORY = False
+
 
 class BacktestReq(BaseModel):
     name: str = ""
@@ -1545,6 +1976,14 @@ def _backtest_worker(code, symbol, timeframe, start, end, capital, label):
         with _BT_LOCK:
             _BT_STATE["result"] = res
             _BT_STATE["error"] = None if ok else res.get("error", res.get("status"))
+        if _HAS_BT_HISTORY:
+            rid = _jbh.record_run(
+                {"name": label, "symbol": symbol, "timeframe": timeframe,
+                 "start": start, "end": end, "capital": capital},
+                res,
+            )
+            if rid:
+                _log_emit(f"回测历史已保存 #{rid}", "info", "backtest")
         if ok:
             _log_emit(
                 f"✓ 回测完成 收益={res.get('total_return_pct', 0):.2f}% "
@@ -1559,6 +1998,12 @@ def _backtest_worker(code, symbol, timeframe, start, end, capital, label):
         with _BT_LOCK:
             _BT_STATE["error"] = str(e)
             _BT_STATE["result"] = None
+        if _HAS_BT_HISTORY:
+            _jbh.record_run(
+                {"name": label, "symbol": symbol, "timeframe": timeframe,
+                 "start": start, "end": end, "capital": capital},
+                None, error=str(e),
+            )
         _log_emit(f"✗ 回测异常: {e}", "error", "backtest")
     finally:
         with _BT_LOCK:
@@ -1909,6 +2354,45 @@ def _start_price_alert_monitor():
         _log_emit(f"价位提醒监控启动失败: {e}", level="error", source="price-alert")
 
 
+def _twelve_auto_trader_loop():
+    """12 系统信号矩阵自动模拟跟盘循环（daemon 线程）。
+
+    每 twelve_auto_interval_min 分钟对 watchlist 跑一轮 run_twelve_cycle：
+    共识方向明确即自动模拟开仓（记录信号归因），持仓按 SL/TP/到期/共识反转平仓。
+    配置开关 twelve_auto_trade=false 时本轮跳过（循环保持存活，改配置无需重启）。
+    """
+    import jarvis_config as jc_mod
+    time.sleep(60)   # 等服务与网络就绪，避免启动风暴
+    while True:
+        interval_min = 15.0
+        try:
+            if bool(jc_mod.get("twelve_auto_trade", True)):
+                interval_min = float(jc_mod.get("twelve_auto_interval_min", 15) or 15)
+                syms = list(jc_mod.get("watchlist") or ["BTCUSDT"])
+                out = jpt.run_twelve_cycle(syms, _trader_cfg(), notify_on_action=True)
+                if out.get("opened") or out.get("closed"):
+                    _log_emit(
+                        f"12系统自动跟盘：开仓 {len(out.get('opened') or [])} / "
+                        f"平仓 {len(out.get('closed') or [])} / 持仓 {out.get('open_after')}",
+                        level="info", source="twelve-trader")
+        except Exception as e:  # noqa: BLE001 — 单轮失败不退出循环
+            _log_emit(f"12系统自动跟盘异常（下轮重试）: {repr(e)[:200]}",
+                      level="warn", source="twelve-trader")
+        time.sleep(max(60.0, interval_min * 60.0))
+
+
+@app.on_event("startup")
+def _start_twelve_auto_trader():
+    """随 dashboard 启动 12 系统自动模拟跟盘线程（开关由配置 twelve_auto_trade 控制）。"""
+    try:
+        _threading.Thread(target=_twelve_auto_trader_loop, daemon=True,
+                          name="twelve-auto-trader").start()
+        _log_emit("12系统信号自动跟盘线程已启动（twelve_auto_trade 可关）",
+                  level="info", source="twelve-trader")
+    except Exception as e:  # noqa: BLE001
+        _log_emit(f"12系统自动跟盘启动失败: {e}", level="error", source="twelve-trader")
+
+
 # ─────────────────────────── QD 网关配置 API ───────────────────────────
 # 回测子进程 jarvis_scalper_backtest.py 每次运行时重读该文件，故无需重启 dashboard。
 _QD_CONFIG_PATH = os.path.join(os.path.expanduser("~/.vibe-trading"), "scalper_backtest_config.json")
@@ -2066,6 +2550,192 @@ def api_qd_config_issue_token(data: dict):
         })
     except Exception as e:
         return JSONResponse({"ok": False, "reason": str(e)}, status_code=500)
+
+
+# ─────────────────────────── 大模型 (LLM) 配置 API ───────────────────────────
+# 桌面端「设置 → 大模型」读写 ~/.vibe-trading/llm_config.json；
+# evolve / reasoning / ask / AI 策略工坊统一经 jarvis_llm_config 读取生效配置。
+
+try:
+    import jarvis_llm_config as jlc
+    _HAS_LLM_CONFIG = True
+except ImportError:
+    _HAS_LLM_CONFIG = False
+
+
+@app.get("/api/llm-config")
+def api_llm_config_get():
+    """读取 LLM 配置：key 只回脱敏值，并标注当前生效来源（file/env/none）。"""
+    if not _HAS_LLM_CONFIG:
+        return JSONResponse({"error": "jarvis_llm_config 模块未安装"}, status_code=503)
+    try:
+        return JSONResponse(jlc.read_config_masked())
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.put("/api/llm-config")
+def api_llm_config_put(data: dict):
+    """保存 LLM 配置（api_key 留空表示不修改；clear_key=True 清空回退环境变量）。"""
+    if not _HAS_LLM_CONFIG:
+        return JSONResponse({"ok": False, "reason": "jarvis_llm_config 模块未安装"}, status_code=503)
+    try:
+        cfg = jlc.save_config(data or {})
+        return JSONResponse({"ok": True, "config": cfg})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "reason": str(e)}, status_code=500)
+
+
+@app.post("/api/llm-config/test")
+def api_llm_config_test():
+    """真实调用一次模型验证连通性（按当前生效配置）。"""
+    if not _HAS_LLM_CONFIG:
+        return JSONResponse({"ok": False, "error": "jarvis_llm_config 模块未安装"}, status_code=503)
+    try:
+        return JSONResponse(jlc.test_connection())
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+# ─────────────────────────── AI 策略工坊 API ───────────────────────────
+# 自然语言 → LLM 生成规则 → 校验 → 拼装 QD 代码；结果可直接送 /api/backtest/run。
+# LLM 生成耗时 10~60s，走后台线程 + 轮询状态（与 _BT_STATE 同款模式）。
+
+try:
+    import jarvis_strategy_gen as jsg
+    _HAS_STRATEGY_GEN = True
+except ImportError:
+    _HAS_STRATEGY_GEN = False
+
+
+class StrategyGenReq(BaseModel):
+    description: str = ""
+    symbol: str = "BTCUSDT"
+    timeframe: str = "15m"
+
+
+_SG_LOCK = _threading.Lock()
+_SG_STATE: dict = {
+    "running": False,
+    "started_at": 0.0,
+    "finished_at": 0.0,
+    "params": None,
+    "result": None,
+    "error": None,
+}
+
+
+def _strategy_gen_worker(description: str, symbol: str, timeframe: str) -> None:
+    _log_emit(f"▶ AI 策略生成开始: {description[:60]}", "info", "strategy-gen")
+    t0 = time.time()
+    try:
+        res = jsg.generate_from_description(description, symbol=symbol, timeframe=timeframe)
+        with _SG_LOCK:
+            _SG_STATE["result"] = res
+            _SG_STATE["error"] = None if res.get("ok") else res.get("error", "生成失败")
+        if res.get("ok"):
+            _log_emit(
+                f"✓ AI 策略生成完成: {res.get('name')} "
+                f"因子={[f['id'] for f in res.get('summary', {}).get('factors', [])]} "
+                f"({time.time() - t0:.1f}s)",
+                "info",
+                "strategy-gen",
+            )
+        else:
+            _log_emit(f"✗ AI 策略生成失败: {res.get('error')}", "error", "strategy-gen")
+    except Exception as e:  # noqa: BLE001
+        with _SG_LOCK:
+            _SG_STATE["error"] = str(e)
+            _SG_STATE["result"] = None
+        _log_emit(f"✗ AI 策略生成异常: {e}", "error", "strategy-gen")
+    finally:
+        with _SG_LOCK:
+            _SG_STATE["running"] = False
+            _SG_STATE["finished_at"] = time.time()
+
+
+@app.post("/api/strategy/generate")
+def api_strategy_generate(req: StrategyGenReq):
+    """启动一次「自然语言 → 可回测策略」生成（后台线程，轮询 result 取结果）。"""
+    if not _HAS_STRATEGY_GEN:
+        return JSONResponse({"ok": False, "error": "jarvis_strategy_gen 模块未安装"}, status_code=503)
+    description = (req.description or "").strip()
+    if not description:
+        return JSONResponse({"ok": False, "error": "请先描述你的策略想法"}, status_code=400)
+    if _HAS_LLM_CONFIG and not jlc.get_llm_config():
+        return JSONResponse(
+            {"ok": False, "error": "未配置大模型，请先到「设置 → 大模型 (LLM)」填入 API Key"},
+            status_code=400,
+        )
+    with _SG_LOCK:
+        if _SG_STATE["running"]:
+            return JSONResponse({"ok": False, "error": "已有生成任务在运行中"})
+        _SG_STATE.update({
+            "running": True,
+            "started_at": time.time(),
+            "finished_at": 0.0,
+            "params": {
+                "description": description,
+                "symbol": req.symbol,
+                "timeframe": req.timeframe,
+            },
+            "result": None,
+            "error": None,
+        })
+    _threading.Thread(
+        target=_strategy_gen_worker,
+        args=(description, req.symbol, req.timeframe),
+        daemon=True,
+    ).start()
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/strategy/generate/result")
+def api_strategy_generate_result():
+    with _SG_LOCK:
+        st = dict(_SG_STATE)
+    elapsed = 0.0
+    if st["started_at"]:
+        endt = st["finished_at"] or time.time()
+        elapsed = max(0.0, endt - st["started_at"])
+    st["elapsed_seconds"] = round(elapsed, 1)
+    return JSONResponse(st)
+
+
+@app.post("/api/strategy/save-to-hall")
+def api_strategy_save_to_hall(data: dict):
+    """把 AI 工坊生成并回测满意的策略存入名人堂，供实盘引擎与回测页复用。"""
+    if not _HAS_SCALPER_EVOLVE:
+        return JSONResponse({"ok": False, "error": "jarvis_scalper_evolve 模块未安装"}, status_code=503)
+    name = str(data.get("name", "") or "").strip()
+    code = str(data.get("code", "") or "")
+    rule = data.get("rule") or {}
+    result = data.get("result") or {}
+    if not name or not code:
+        return JSONResponse({"ok": False, "error": "缺少策略名或代码"}, status_code=400)
+    try:
+        existing = [e.get("name") for e in jse.load_hall_of_fame()]
+        if name in existing:
+            return JSONResponse({"ok": False, "error": f"名人堂已存在同名策略: {name}"})
+        jse.add_to_hall_of_fame({
+            "name": name,
+            "rule": rule,
+            "result": result,
+            "code": code,
+            "reasoning": str(data.get("reasoning", "") or ""),
+            "source": "ai_workshop",
+        })
+        return JSONResponse({"ok": True, "name": name})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+# ─────────────────────────── 策略自动进化 API（路由定义在独立模块） ───────────────────────────
+try:
+    import jarvis_strategy_evolve_llm as _jsel
+    app.include_router(_jsel.router)
+except ImportError:
+    pass
 
 
 # ─────────────────────────── 市场概览 API ───────────────────────────
@@ -2364,6 +3034,200 @@ def api_watchlist_post(data: dict):
         wl.remove(sym)
     jc_mod.save({"watchlist": wl}, source="cockpit", note=f"{action} {sym}")
     return JSONResponse({"ok": True, "symbols": wl})
+
+
+# ─────────────────── 十二套技术信号引擎 & 贾维斯自主推理 API ───────────────────
+
+_TWELVE_TFS = ("15m", "1h", "4h")
+
+
+@app.get("/api/twelve/signals")
+def api_twelve_signals(symbol: str = "BTCUSDT", tf: str = "4h"):
+    """十二套技术单时间框架信号 + 分层共识（海龟/道氏/缠论…12 套逐一给方向与强度）。"""
+    import jarvis_twelve_systems as jts
+    sym = symbol.upper().replace("-", "").replace("/", "")
+    if not sym.endswith(("USDT", "USDC")):
+        sym += "USDT"
+    iv = tf if tf in {"15m", "1h", "4h", "1d"} else "4h"
+
+    def _calc():
+        df = jts.fetch_klines_df(sym, iv, 300)
+        if df is None or len(df) < 30:
+            return {"ok": False, "error": "K线数据不足或拉取失败", "symbol": sym,
+                    "tf": iv, "signals": [], "consensus": None}
+        out = jts.analyze(df)
+        return {"ok": True, "symbol": sym, "tf": iv,
+                "price": round(float(df["close"].iloc[-1]), 6),
+                "signals": out["signals"], "consensus": out["consensus"]}
+
+    return JSONResponse(_cached(f"twelve:sig:{sym}:{iv}", 120, _calc))
+
+
+@app.get("/api/twelve/consensus")
+def api_twelve_consensus(symbol: str = "BTCUSDT"):
+    """十二套技术多时间框架（15m/1h/4h）加权共识：看涨/看跌总裁决。"""
+    import jarvis_twelve_systems as jts
+    sym = symbol.upper().replace("-", "").replace("/", "")
+    if not sym.endswith(("USDT", "USDC")):
+        sym += "USDT"
+
+    def _calc():
+        tf_cons: dict = {}
+        price = None
+        for tf in _TWELVE_TFS:
+            df = jts.fetch_klines_df(sym, tf, 300)
+            if df is None or len(df) < 30:
+                continue
+            out = jts.analyze(df)
+            tf_cons[tf] = out["consensus"]
+            if tf == "4h" or price is None:
+                price = round(float(df["close"].iloc[-1]), 6)
+        merged = jts.consensus_multi_tf(tf_cons)
+        return {"ok": bool(tf_cons), "symbol": sym, "price": price,
+                "tf_available": sorted(tf_cons.keys()), "consensus": merged}
+
+    return JSONResponse(_cached(f"twelve:cons:{sym}", 180, _calc))
+
+
+# 推理端点并发锁（按 symbol 粒度）：缓存未命中时防多请求并发双烧 LLM token
+_REASON_LOCKS: "dict[str, _threading.Lock]" = {}
+_REASON_LOCKS_GUARD = _threading.Lock()
+_REASON_TTL = 300
+
+
+@app.post("/api/jarvis/reason")
+def api_jarvis_reason(data: dict):
+    """贾维斯自主推理：十二套信号+共识+市场快照 → DeepSeek 链式推理（无 key 自动降级）。
+
+    body: {"symbol": "BTCUSDT"}；命中缓存的响应带 cached:true。
+    """
+    import jarvis_reasoning as jre
+    import jarvis_twelve_systems as jts
+    sym = str((data or {}).get("symbol", "BTCUSDT")).upper().replace("-", "").replace("/", "")
+    if not sym.endswith(("USDT", "USDC")):
+        sym += "USDT"
+    key = f"twelve:reason:{sym}"
+
+    def _hit():
+        h = _CACHE.get(key)
+        if h and time.time() - h[0] < _REASON_TTL:
+            return h[1]
+        return None
+
+    def _calc():
+        df = jts.fetch_klines_df(sym, "4h", 300)
+        if df is None or len(df) < 30:
+            return {"ok": False, "error": "K线数据不足或拉取失败", "symbol": sym}
+        out = jts.analyze(df)
+        market = {"symbol": sym, "tf": "4h",
+                  "price": round(float(df["close"].iloc[-1]), 6),
+                  "atr": round(float(jts._atr(df).iloc[-1]), 6)}
+        res = jre.reason(market, out["signals"], out["consensus"])
+        return {"ok": True, "symbol": sym, "market": market,
+                "consensus": out["consensus"], "reasoning": res}
+
+    cached_val = _hit()
+    if cached_val is not None:
+        return JSONResponse({**cached_val, "cached": True})
+    with _REASON_LOCKS_GUARD:
+        lock = _REASON_LOCKS.setdefault(sym, _threading.Lock())
+    with lock:
+        cached_val = _hit()   # 双检：等锁期间可能已被并发请求算完
+        if cached_val is not None:
+            return JSONResponse({**cached_val, "cached": True})
+        val = _calc()
+        _CACHE[key] = (time.time(), val)
+    return JSONResponse(val)
+
+
+@app.get("/api/jarvis/insights")
+def api_jarvis_insights(limit: int = 20, symbol: str | None = None):
+    """贾维斯自主意识产出的最近洞察列表 [{ts,symbol,kind,title,detail,severity}]。"""
+    import jarvis_reasoning as jre
+    items = jre.list_insights(limit=limit, symbol=symbol)
+    return JSONResponse({"ok": True, "insights": items, "total": len(items)})
+
+
+@app.post("/api/twelve/cycle")
+def api_twelve_cycle(symbols: str = "", dry_run: bool = False):
+    """跑一轮 12 系统信号矩阵模拟跟盘：盯平仓 → 共识达标自动开仓（含信号归因）。
+
+    symbols 缺省取 watchlist。
+    """
+    import jarvis_config as jc_mod
+    syms = [s.strip() for s in symbols.split(",") if s.strip()] or \
+        list(jc_mod.get("watchlist") or ["BTCUSDT"])
+    try:
+        out = jpt.run_twelve_cycle(syms, _trader_cfg(), dry_run=dry_run)
+        return JSONResponse({"ok": True, "data": out})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
+
+
+@app.get("/api/twelve/signal-stats")
+def api_twelve_signal_stats(symbol: str | None = None, direction: str | None = None,
+                            tf: str | None = None, resonance: str | None = None,
+                            regime: str | None = None, source: str = "realtime"):
+    """12 系统信号胜率归因统计（基于已平仓的共识模拟单）。
+
+    多维筛选（全部可选，无参调用兼容旧行为）：
+      direction=long|short  tf=15m|1h|4h  resonance=1|2-3|4+
+      regime=trending|ranging|breakout|unknown
+      source=realtime|replay|all（默认 realtime=实时模拟单；replay=历史回放样本）
+    非法取值按未传/默认处理，不报错。
+    """
+    def _norm(v, allowed):
+        return v if v in allowed else None
+    try:
+        return JSONResponse({"ok": True, **jpt.signal_stats(
+            symbol,
+            direction=_norm(direction, ("long", "short")),
+            tf=_norm(tf, ("15m", "1h", "4h")),
+            resonance=_norm(resonance, ("1", "2-3", "4+")),
+            regime=_norm(regime, ("trending", "ranging", "breakout", "unknown")),
+            source=_norm(source, ("realtime", "replay", "all")) or "realtime",
+        )})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
+
+
+@app.post("/api/twelve/replay")
+def api_twelve_replay(data: dict | None = None):
+    """启动 12 系统历史回放预积累（异步后台线程，进度查 /api/twelve/replay/status）。
+
+    body（全部可选）：{"symbols": "BTC,ETH"|["BTC"], "tfs": "15m,1h"|["15m"],
+    "days": 30, "stride": 1}；symbols 缺省取 watchlist，tfs 缺省 15m/1h/4h。
+    已在回放中时返回 ok:false。
+    """
+    import jarvis_config as jc_mod
+    import jarvis_signal_replay as jsr
+    d = data or {}
+
+    def _as_list(v, fallback):
+        if isinstance(v, str):
+            items = [x.strip() for x in v.split(",") if x.strip()]
+            return items or fallback
+        if isinstance(v, list):
+            items = [str(x).strip() for x in v if str(x).strip()]
+            return items or fallback
+        return fallback
+
+    symbols = _as_list(d.get("symbols"), list(jc_mod.get("watchlist") or ["BTCUSDT"]))
+    tfs = _as_list(d.get("tfs"), ["15m", "1h", "4h"])
+    try:
+        days = max(1, min(180, int(d.get("days") or 30)))
+        stride = max(1, min(16, int(d.get("stride") or 1)))
+    except (TypeError, ValueError):
+        days, stride = 30, 1
+    out = jsr.start_replay_async(symbols, tfs, days=days, stride=stride)
+    return JSONResponse(out, status_code=200 if out.get("ok") else 409)
+
+
+@app.get("/api/twelve/replay/status")
+def api_twelve_replay_status():
+    """回放进度：{running, progress(0-100), detail, result, error}。"""
+    import jarvis_signal_replay as jsr
+    return JSONResponse({"ok": True, **jsr.get_status()})
 
 
 @app.get("/", response_class=HTMLResponse)

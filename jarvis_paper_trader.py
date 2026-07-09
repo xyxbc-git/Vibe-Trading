@@ -69,6 +69,20 @@ def _log(msg: str) -> None:
 
 # ─────────────────────────── 表结构 ───────────────────────────
 
+# 信号归因列（v2 追加）：记录每笔单来自哪个决策源/哪些信号系统，供胜率归因统计。
+#   signal_source : 'brief'（决策简报）/ 'twelve'（12系统信号矩阵）/ 'manual' / 'limit'
+#   signal_systems: JSON 数组，如 ["turtle","dow"]（twelve 来源 = 共识计划的 basis）
+#   signal_tf     : 信号时间框架（"4h" / "multi" 等）
+#   signal_regime : 开仓时市场状态（jarvis_regime_classifier 枚举
+#                   trending/ranging/breakout）；存量无标记录统计归 'unknown'
+_ATTRIBUTION_COLS = (
+    ("signal_source", "TEXT"),
+    ("signal_systems", "TEXT"),
+    ("signal_tf", "TEXT"),
+    ("signal_regime", "TEXT"),
+)
+
+
 def init_positions_table() -> None:
     jj.init_db()
     with jj._conn() as conn:
@@ -98,6 +112,14 @@ def init_positions_table() -> None:
             )
             """
         )
+    # 旧库升级：逐列 ALTER（SQLite 无 IF NOT EXISTS，重复加列抛错即视为已存在；
+    # pg 后端经 jarvis_db 翻译自动带 IF NOT EXISTS，天然幂等）。
+    for col, typ in _ATTRIBUTION_COLS:
+        try:
+            with jj._conn() as conn:
+                conn.execute(f"ALTER TABLE paper_positions ADD COLUMN {col} {typ}")
+        except Exception:  # noqa: BLE001 — duplicate column = 已升级过
+            pass
 
 
 # ─────────────────────────── 取现价 ───────────────────────────
@@ -240,19 +262,29 @@ def open_from_decision(symbol: str, cfg: dict, dry_run: bool = False) -> dict:
 
 def _insert_position(sym: str, qty: float, entry_date: str, entry_price: float,
                      order_uid: str | None, stop_loss, take_profit,
-                     time_stop_days, conviction_score, *, side: str = "buy") -> int:
-    """登记一条 open 持仓，返回 position_id。"""
+                     time_stop_days, conviction_score, *, side: str = "buy",
+                     signal_source: str = "brief",
+                     signal_systems: list[str] | None = None,
+                     signal_tf: str | None = None,
+                     signal_regime: str | None = None,
+                     opened_ts: float | None = None) -> int:
+    """登记一条 open 持仓，返回 position_id。opened_ts 缺省=当前（回放传历史时间）。"""
     init_positions_table()
     with jj._conn() as conn:
         cur = conn.execute(
             """
             INSERT INTO paper_positions
               (symbol, status, side, qty, entry_date, entry_price, entry_order_uid,
-               stop_loss, take_profit, time_stop_days, conviction_score, opened_ts)
-            VALUES (?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               stop_loss, take_profit, time_stop_days, conviction_score, opened_ts,
+               signal_source, signal_systems, signal_tf, signal_regime)
+            VALUES (?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (sym, side, qty, entry_date, entry_price, order_uid,
-             stop_loss, take_profit, time_stop_days, conviction_score, time.time()),
+             stop_loss, take_profit, time_stop_days, conviction_score,
+             opened_ts if opened_ts is not None else time.time(),
+             signal_source,
+             json.dumps(signal_systems, ensure_ascii=False) if signal_systems else None,
+             signal_tf, signal_regime),
         )
         return cur.lastrowid
 
@@ -341,9 +373,14 @@ def _exit_reason(pos: dict, price: float, fresh_direction: str | None) -> str | 
 
 
 def check_exits(cfg: dict, symbols: list[str] | None = None) -> list:
-    """盯所有未平仓持仓，触发条件则平仓。"""
+    """盯所有未平仓持仓，触发条件则平仓。
+
+    信号反转口径按开仓来源分流：twelve 持仓看 12 系统共识方向，其余看 brief 决策方向。
+    """
     closed = []
     poss = open_positions()
+    # replay 单由回放引擎自管离场（历史价），实时盯盘绝不能用现价碰它
+    poss = [p for p in poss if (p.get("signal_source") or "") != "replay"]
     if symbols:
         want = {(s if s.endswith("USDT") else s + "USDT").upper() for s in symbols}
         poss = [p for p in poss if p["symbol"] in want]
@@ -352,16 +389,335 @@ def check_exits(cfg: dict, symbols: list[str] | None = None) -> list:
         if price is None:
             _log(f"⏸ {pos['symbol']} #{pos['id']} 无现价，跳过本轮平仓判断")
             continue
-        # 信号反转：取最新决策方向
+        # 信号反转：取与开仓同源的最新方向
         fresh_dir = None
         try:
-            fresh_dir = jb.build(pos["symbol"]).get("decision", {}).get("direction")
+            if (pos.get("signal_source") or "") == "twelve":
+                cons = _twelve_consensus(pos["symbol"])
+                if cons:
+                    # 共识方向翻译成 brief 方向词，复用 _exit_reason 的前缀判定
+                    fresh_dir = {"bullish": "偏多", "bearish": "偏空"}.get(
+                        cons.get("direction"), "中性")
+            else:
+                fresh_dir = jb.build(pos["symbol"]).get("decision", {}).get("direction")
         except Exception:  # noqa: BLE001
             pass
         reason = _exit_reason(pos, price, fresh_dir)
         if reason:
             closed.append(_close_position(pos, price, reason, cfg))
     return closed
+
+
+# ─────────────────── 12 系统信号矩阵 → 模拟下单 ───────────────────
+
+# 各时间框架信号的默认时间止损（天）；multi 取主周期 4h 的口径
+_TWELVE_TIME_STOP = {"15m": 1, "1h": 3, "4h": 7, "1d": 14}
+TWELVE_MIN_CONFIDENCE = 0.45   # 共识置信度低于此不开仓
+TWELVE_POSITION_PCT_FALLBACK = 10.0   # 计划缺仓位建议时的权益占比兜底
+
+_TWELVE_NAME_CN = {
+    "turtle": "海龟交易", "dow": "道氏理论", "elliott": "艾略特波浪",
+    "volatility": "波动率系统", "gann": "江恩时间窗", "chanlun": "缠论",
+    "rule123": "123法则", "gap": "跳空缺口", "martingale": "马丁格尔",
+    "oscillator": "摆动震荡", "triple_rsi": "三重平滑RSI", "arbitrage": "套利系统",
+}
+
+# 同一轮 cycle 内共识结果缓存（symbol → (ts, consensus)），避免重复拉 K 线
+_TWELVE_CACHE: dict = {}
+_TWELVE_CACHE_TTL = 120.0
+
+# 市场状态（regime）缓存（symbol → (ts, regime)）；分类要拉 3 个 TF 的 K 线，短期内复用
+_REGIME_CACHE: dict = {}
+_REGIME_CACHE_TTL = 300.0
+REGIMES = ("trending", "ranging", "breakout")
+
+
+def _classify_regime(symbol: str) -> str | None:
+    """开仓时打标市场状态（jarvis_regime_classifier 多 TF 融合）。
+
+    返回 trending/ranging/breakout；失败或 unknown 返回 None（统计侧归 'unknown'）。
+    """
+    sym = (symbol if symbol.endswith("USDT") else symbol + "USDT").upper()
+    hit = _REGIME_CACHE.get(sym)
+    if hit and time.time() - hit[0] < _REGIME_CACHE_TTL:
+        return hit[1]
+    try:
+        import jarvis_regime_classifier as jrc
+        res = jrc.classify(sym)
+        regime = getattr(res, "regime", None)
+        regime = regime if regime in REGIMES else None
+        _REGIME_CACHE[sym] = (time.time(), regime)
+        return regime
+    except Exception as exc:  # noqa: BLE001 — 打标失败不阻断开仓，统计归未知
+        _log(f"⚠️ {sym} 市场状态打标失败: {exc!r}"[:160])
+        return None
+
+
+def _twelve_consensus(symbol: str) -> dict | None:
+    """拉多时间框架（15m/1h/4h）K 线并融合 12 系统共识；失败返回 None，绝不抛出。"""
+    sym = (symbol if symbol.endswith("USDT") else symbol + "USDT").upper()
+    hit = _TWELVE_CACHE.get(sym)
+    if hit and time.time() - hit[0] < _TWELVE_CACHE_TTL:
+        return hit[1]
+    try:
+        import jarvis_twelve_systems as jts
+        tf_cons: dict = {}
+        for tf in ("15m", "1h", "4h"):
+            df = jts.fetch_klines_df(sym, tf, 300)
+            if df is None or len(df) < 30:
+                continue
+            tf_cons[tf] = jts.analyze(df)["consensus"]
+        if not tf_cons:
+            return None
+        merged = jts.consensus_multi_tf(tf_cons)
+        _TWELVE_CACHE[sym] = (time.time(), merged)
+        return merged
+    except Exception as exc:  # noqa: BLE001 — 取数/计算失败降级为无信号
+        _log(f"⚠️ {sym} 12系统共识计算失败: {exc!r}"[:160])
+        return None
+
+
+def open_from_twelve(symbol: str, cfg: dict, dry_run: bool = False,
+                     consensus: dict | None = None,
+                     regime: str | None = None) -> dict:
+    """按 12 系统信号矩阵共识开模拟仓，并记录来源信号系统（归因）。
+
+    条件：共识方向明确（bullish/bearish）+ 置信度达标 + 有共识交易计划 +
+    该币无未平仓持仓 + 熔断未触发 + 钱包余额充足。
+    consensus / regime 参数供测试注入；生产传 None 自动计算。
+    """
+    sym = (symbol if symbol.endswith("USDT") else symbol + "USDT").upper()
+    if open_positions(sym):
+        return {"action": "skip", "symbol": sym, "reason": "已有未平仓持仓"}
+
+    if not dry_run:
+        try:
+            import jarvis_circuit_breaker as _cb
+            _g = _cb.guard_new_order(cfg)
+            if not _g.get("allow"):
+                return {"action": "skip", "symbol": sym,
+                        "reason": "熔断生效：" + str(_g.get("reason"))}
+        except Exception:  # noqa: BLE001
+            pass
+
+    cons = consensus if consensus is not None else _twelve_consensus(sym)
+    if not cons:
+        return {"action": "skip", "symbol": sym, "reason": "12系统共识不可用"}
+    direction = cons.get("direction")
+    confidence = float(cons.get("confidence") or 0.0)
+    plan = cons.get("trade_plan")
+    if direction not in ("bullish", "bearish"):
+        return {"action": "skip", "symbol": sym, "reason": "共识中性，不开仓"}
+    min_conf = float(cfg.get("twelve_min_confidence", TWELVE_MIN_CONFIDENCE))
+    if confidence < min_conf:
+        return {"action": "skip", "symbol": sym,
+                "reason": f"置信度 {confidence:.2f} < {min_conf}"}
+    if not plan:
+        return {"action": "skip", "symbol": sym, "reason": "共识无可执行交易计划"}
+
+    price = latest_price(cfg, sym)
+    if price is None or price <= 0:
+        return {"action": "skip", "symbol": sym, "reason": "无现价"}
+
+    side = "buy" if direction == "bullish" else "sell"
+    sl = plan.get("stop_loss")
+    tp = plan.get("take_profit_1")
+    # 现价开市价单：SL/TP 必须仍在现价的正确一侧，否则计划已失效（行情跑掉）
+    if sl is None or tp is None:
+        return {"action": "skip", "symbol": sym, "reason": "计划缺止损/止盈"}
+    if side == "buy" and not (float(sl) < price < float(tp)):
+        return {"action": "skip", "symbol": sym,
+                "reason": f"现价 {price} 已出多头计划区（SL {sl} / TP {tp}）"}
+    if side == "sell" and not (float(tp) < price < float(sl)):
+        return {"action": "skip", "symbol": sym,
+                "reason": f"现价 {price} 已出空头计划区（SL {sl} / TP {tp}）"}
+
+    equity = float(cfg.get("account_equity_usdt", 1000.0))
+    pos_pct = float(plan.get("position_pct") or TWELVE_POSITION_PCT_FALLBACK)
+    pos_pct = max(0.1, min(100.0, pos_pct))
+    notional_plan = equity * pos_pct / 100.0
+    qty = round(notional_plan / price, 8)
+    if qty <= 0:
+        return {"action": "skip", "symbol": sym, "reason": "仓位换算数量为 0"}
+
+    tf = str(plan.get("source_tf") or cons.get("primary_tf") or "4h")
+    systems = [s for s in (plan.get("basis") or []) if s in _TWELVE_NAME_CN]
+    time_stop = _TWELVE_TIME_STOP.get(tf, 7)
+    est_notional = round(qty * price, 2)
+    # 开仓时打标市场状态（测试可注入；分类失败为 None，统计归 'unknown'）
+    eff_regime = regime if regime in REGIMES else (
+        None if regime is not None else _classify_regime(sym))
+
+    wal = jw.ensure_account(equity)
+    if dry_run:
+        return {"action": "would_open", "symbol": sym, "side": side, "qty": qty,
+                "entry_price": price, "stop_loss": sl, "take_profit": tp,
+                "confidence": confidence, "systems": systems, "tf": tf,
+                "regime": eff_regime, "est_notional_usdt": est_notional,
+                "cash_available_usdt": round(wal["cash_usdt"], 2)}
+    if est_notional > wal["cash_usdt"] + 1e-9:
+        return {"action": "skip", "symbol": sym,
+                "reason": f"钱包余额不足：需≈{est_notional}U，可用 {round(wal['cash_usdt'], 2)}U"}
+
+    as_of = time.strftime("%Y-%m-%d")
+    notional = round(qty * price, 8)
+    deb = jw.debit_buy(sym, notional, ref=f"twelve-open-{side}-{sym}-{as_of}")
+    if not deb.get("ok"):
+        return {"action": "skip", "symbol": sym, "reason": deb.get("reason")}
+
+    pid = _insert_position(sym, qty, as_of, price, None, sl, tp, time_stop,
+                           confidence, side=side, signal_source="twelve",
+                           signal_systems=systems, signal_tf=tf,
+                           signal_regime=eff_regime)
+    side_label = "🔴 做空" if side == "sell" else "🟢 做多"
+    _log(f"{side_label} {sym} 12系统开仓 #{pid} qty={qty} 名义{notional}U 入场≈{price} "
+         f"SL {sl} TP {tp} 置信 {confidence:.2f} 依据 {','.join(systems) or '—'} "
+         f"状态 {eff_regime or '未知'} 余额{deb.get('cash_after')}U")
+    return {"action": "opened", "symbol": sym, "side": side, "position_id": pid,
+            "qty": qty, "entry_price": price, "stop_loss": sl, "take_profit": tp,
+            "confidence": confidence, "systems": systems, "tf": tf,
+            "regime": eff_regime,
+            "notional_usdt": notional, "cash_after": deb.get("cash_after")}
+
+
+def run_twelve_cycle(symbols: list[str], cfg: dict, dry_run: bool = False,
+                     notify_on_action: bool = False) -> dict:
+    """一轮 12 系统信号跟盘：先盯平仓（全部持仓，口径按来源分流），再按共识找新开仓。"""
+    syms = [(s if s.endswith("USDT") else s + "USDT").upper() for s in symbols]
+    closed = check_exits(cfg, syms)
+    opened = []
+    for s in syms:
+        r = open_from_twelve(s, cfg, dry_run=dry_run)
+        if r.get("action") in ("opened", "would_open"):
+            opened.append(r)
+    out = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "source": "twelve",
+           "closed": closed, "opened": opened, "open_after": len(open_positions())}
+    _log(f"🧭 12系统跟盘一轮：平仓 {len(closed)} / 开仓 {len(opened)} / 当前持仓 {out['open_after']}")
+    if notify_on_action and not dry_run and (opened or closed):
+        _notify_actions(out)
+    return out
+
+
+LOW_SAMPLE_N = 30   # 样本量低于此的分组统计置信度不足，前端提示
+
+
+def _resonance_bucket(n_systems: int) -> str:
+    """共振档（由依据系统数派生，不落库）：'1' 单系统 / '2-3' / '4+'。"""
+    if n_systems <= 1:
+        return "1"
+    if n_systems <= 3:
+        return "2-3"
+    return "4+"
+
+
+def _parse_systems(raw) -> list[str]:
+    try:
+        arr = json.loads(raw or "[]")
+        return [str(s) for s in arr] if isinstance(arr, list) else []
+    except (TypeError, ValueError):
+        return []
+
+
+def _grade_stats(pnls: list[float]) -> dict:
+    """对一组盈亏样本算 笔数/胜负/胜率/累计/均盈均亏/期望值/样本不足 标准块。"""
+    trades = len(pnls)
+    wins = [x for x in pnls if x > 0]
+    losses = [x for x in pnls if x < 0]
+    total = round(sum(pnls), 4)
+    win_rate = round(100.0 * len(wins) / trades, 1) if trades else None
+    avg_win = round(sum(wins) / len(wins), 4) if wins else None
+    avg_loss = round(sum(losses) / len(losses), 4) if losses else None   # 负值
+    expectancy = None
+    if trades:
+        wr = len(wins) / trades
+        lr = len(losses) / trades
+        # 期望值/笔 = 胜率×均盈 − 败率×|均亏|（均亏为负值，直接加权即等价）
+        expectancy = round(wr * (avg_win or 0.0) + lr * (avg_loss or 0.0), 4)
+    return {
+        "trades": trades,
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate_pct": win_rate,
+        "total_pnl_usdt": total,
+        "avg_pnl_usdt": round(total / trades, 4) if trades else None,
+        "avg_win_usdt": avg_win,
+        "avg_loss_usdt": avg_loss,
+        "expectancy_usdt": expectancy,
+        "low_sample": trades < LOW_SAMPLE_N,
+    }
+
+
+def signal_stats(symbol: str | None = None, direction: str | None = None,
+                 tf: str | None = None, resonance: str | None = None,
+                 regime: str | None = None, source: str = "realtime") -> dict:
+    """按信号系统归因统计胜率与盈亏（基于已平仓的共识模拟单），支持多维筛选。
+
+    筛选维度（全部可选，None=不过滤，无参调用与旧行为一致）：
+      direction : 'long' / 'short'（DB side buy/sell 映射）
+      tf        : '15m' / '1h' / '4h'（signal_tf）
+      resonance : '1' / '2-3' / '4+'（由 signal_systems 长度派生）
+      regime    : 'trending' / 'ranging' / 'breakout' / 'unknown'（signal_regime，
+                  存量无标记录归 'unknown'）
+      source    : 'realtime'（默认，实时 twelve 单）/ 'replay'（历史回放样本）
+                  / 'all'（两者合并）
+    一笔单的 basis 含多个系统时，每个系统各计一笔（共振归因）。
+    每组输出含期望值（胜率×均盈−败率×|均亏|）与 low_sample（样本<30）标记。
+    """
+    want_sources = {"realtime": ("twelve",), "replay": ("replay",),
+                    "all": ("twelve", "replay")}.get(source, ("twelve",))
+    poss = all_positions(symbol)
+    twelve = [p for p in poss if (p.get("signal_source") or "") in want_sources]
+    closed = [p for p in twelve
+              if p["status"] == "closed" and p.get("realized_pnl_usdt") is not None]
+    # 在途口径固定看实时单（回放结束不留 open，replay 不参与在途计数）
+    opens = [p for p in poss
+             if p["status"] == "open" and (p.get("signal_source") or "") == "twelve"]
+
+    def _match(p: dict) -> bool:
+        if direction in ("long", "short"):
+            want_side = "buy" if direction == "long" else "sell"
+            if (p.get("side") or "buy").lower() != want_side:
+                return False
+        if tf and (p.get("signal_tf") or "") != tf:
+            return False
+        if resonance and _resonance_bucket(len(_parse_systems(p.get("signal_systems")))) != resonance:
+            return False
+        if regime and ((p.get("signal_regime") or "unknown") != regime):
+            return False
+        return True
+
+    filtered = [p for p in closed if _match(p)]
+
+    per: dict[str, list[float]] = {}
+    for p in filtered:
+        pnl = float(p.get("realized_pnl_usdt") or 0.0)
+        for s in _parse_systems(p.get("signal_systems")):
+            per.setdefault(s, []).append(pnl)
+
+    systems_out = []
+    for s, pnls in per.items():
+        systems_out.append({
+            "system": s,
+            "name_cn": _TWELVE_NAME_CN.get(s, s),
+            **_grade_stats(pnls),
+        })
+    # 默认按期望值降序（None 置底），同值按样本量降序
+    systems_out.sort(key=lambda x: (x["expectancy_usdt"] is None,
+                                    -(x["expectancy_usdt"] or 0), -x["trades"]))
+
+    overall = {
+        "closed_trades": len(filtered),
+        **{k: v for k, v in _grade_stats(
+            [float(p.get("realized_pnl_usdt") or 0.0) for p in filtered]).items()
+           if k != "trades"},
+    }
+    return {
+        "overall": overall,
+        "systems": systems_out,
+        "open_twelve": len(opens),
+        "filters": {"symbol": symbol, "direction": direction, "tf": tf,
+                    "resonance": resonance, "regime": regime, "source": source},
+    }
 
 
 # ─────────────────────────── 限价挂单撮合 ───────────────────────────
@@ -387,7 +743,8 @@ def match_limit_orders(cfg: dict) -> list:
             sl = o["stop_loss"] if o["stop_loss"] else round(fill_price * 0.90, 2)
             tp = o["take_profit"] if o["take_profit"] else round(fill_price * 1.08, 2)
             pid = _insert_position(sym, o["qty"], time.strftime("%Y-%m-%d"), fill_price,
-                                   None, sl, tp, o["time_stop_days"] or 30, None)
+                                   None, sl, tp, o["time_stop_days"] or 30, None,
+                                   signal_source="limit")
             jw.mark_filled(o["id"], fill_price, pid)
             _log(f"✅ 限价买单 #{o['id']} {sym} @ {fill_price} 成交 → 持仓 #{pid}（现价 {price}）")
             filled.append({"order_id": o["id"], "side": "buy", "symbol": sym,
@@ -456,10 +813,11 @@ def run_cycle(symbols: list[str], cfg: dict, dry_run: bool = False,
 # ─────────────────────────── 盈亏统计 ───────────────────────────
 
 def stats(cfg: dict | None = None, symbol: str | None = None) -> dict:
-    """累计盈亏比统计 + 未平仓浮盈。"""
+    """累计盈亏比统计 + 未平仓浮盈（台账口径：排除 replay 历史回放样本）。"""
     cfg = cfg or jx.load_config()
     wal = jw.ensure_account(cfg.get("account_equity_usdt", 1000.0))
-    poss = all_positions(symbol)
+    poss = [p for p in all_positions(symbol)
+            if (p.get("signal_source") or "") != "replay"]   # 回放不动钱包，不进台账
     closed = [p for p in poss if p["status"] == "closed" and p.get("realized_pnl_usdt") is not None]
     opens = [p for p in poss if p["status"] == "open"]
 
@@ -588,6 +946,22 @@ def main() -> int:
     p_match = sub.add_parser("match", help="手动触发一次限价单撮合")
     p_match.add_argument("--json", action="store_true")
 
+    p_tw = sub.add_parser("twelve-cycle", help="跑一轮 12 系统信号矩阵跟盘（盯平仓+按共识开仓）")
+    p_tw.add_argument("--symbols", default="BTCUSDT", help="逗号分隔，如 BTC,ETH")
+    p_tw.add_argument("--equity", type=float, default=None)
+    p_tw.add_argument("--dry-run", action="store_true")
+    p_tw.add_argument("--json", action="store_true")
+
+    p_ss = sub.add_parser("signal-stats", help="12 系统信号胜率归因统计（支持多维筛选）")
+    p_ss.add_argument("--symbol", default=None)
+    p_ss.add_argument("--direction", choices=["long", "short"], default=None)
+    p_ss.add_argument("--tf", choices=["15m", "1h", "4h"], default=None)
+    p_ss.add_argument("--resonance", choices=["1", "2-3", "4+"], default=None)
+    p_ss.add_argument("--regime", choices=["trending", "ranging", "breakout", "unknown"],
+                      default=None)
+    p_ss.add_argument("--source", choices=["realtime", "replay", "all"],
+                      default="realtime")
+
     args = ap.parse_args()
     cli = {}
     if getattr(args, "equity", None) is not None:
@@ -649,6 +1023,27 @@ def main() -> int:
         matched = match_limit_orders(cfg)
         print(json.dumps(matched, ensure_ascii=False, indent=2) if args.json
               else f"撮合完成：成交 {len(matched)} 笔")
+    elif args.cmd == "twelve-cycle":
+        syms = [s.strip() for s in args.symbols.split(",") if s.strip()]
+        out = run_twelve_cycle(syms, cfg, dry_run=args.dry_run)
+        print(json.dumps(out, ensure_ascii=False, indent=2) if args.json
+              else f"12系统跟盘完成：平仓 {len(out['closed'])} / 开仓 {len(out['opened'])} / 持仓 {out['open_after']}")
+    elif args.cmd == "signal-stats":
+        st = signal_stats(args.symbol, direction=args.direction, tf=args.tf,
+                          resonance=args.resonance, regime=args.regime,
+                          source=args.source)
+        ov = st["overall"]
+        flt = {k: v for k, v in st["filters"].items() if v}
+        print(f"12系统模拟战绩{('（筛选 ' + str(flt) + '）') if flt else ''}："
+              f"已平仓 {ov['closed_trades']} 笔 | "
+              f"胜率 {ov['win_rate_pct'] if ov['win_rate_pct'] is not None else '—'}% | "
+              f"累计 {ov['total_pnl_usdt']}U | 期望 {ov['expectancy_usdt']}U/笔 | "
+              f"在途 {st['open_twelve']} 笔")
+        for s in st["systems"]:
+            mark = " ⚠样本不足" if s["low_sample"] else ""
+            print(f"  {s['name_cn']:<8} {s['trades']} 笔 | 胜率 "
+                  f"{s['win_rate_pct'] if s['win_rate_pct'] is not None else '—'}% | "
+                  f"累计 {s['total_pnl_usdt']}U | 期望 {s['expectancy_usdt']}U/笔{mark}")
     return 0
 
 

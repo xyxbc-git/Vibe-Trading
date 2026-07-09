@@ -154,31 +154,52 @@ def _reset_daily_if_needed(state: dict[str, Any]) -> None:
 
 # ═══════════════════════════ K 线获取 ═══════════════════════════
 
+_OKX_BAR_MAP = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1H", "4h": "4H", "1d": "1D"}
+
+
 def _fetch_latest_klines(symbol: str, timeframe: str = "15m", limit: int = 200) -> list[dict] | None:
-    """从 Binance 获取最新 K 线数据。"""
+    """获取最新 K 线（T-06 双源降级：Binance 现货 → OKX 永续）。
+
+    原直连 fapi.binance.com 期货接口在部分网络下被 418 拒绝；改走项目统一的
+    现货源封装（自带缓存回退），失败再切 OKX candles，口径与其余引擎一致。
+    """
+    interval = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}.get(timeframe, "15m")
+
+    # 主源：Binance 现货（jarvis_twelve_systems 封装，jcd._get 自带缓存降级）
     try:
-        import requests
-        interval_map = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
-        interval = interval_map.get(timeframe, "15m")
-        url = f"https://fapi.binance.com/fapi/v1/klines"
-        params = {"symbol": symbol, "interval": interval, "limit": limit}
-        resp = requests.get(url, params=params, timeout=15)
-        resp.raise_for_status()
-        raw = resp.json()
-        klines = []
-        for k in raw:
-            klines.append({
-                "time": k[0],
-                "open": float(k[1]),
-                "high": float(k[2]),
-                "low": float(k[3]),
-                "close": float(k[4]),
-                "volume": float(k[5]),
-            })
-        return klines
-    except Exception as e:
-        _log(f"K 线获取失败: {e}")
-        return None
+        import jarvis_twelve_systems as jts
+        df = jts.fetch_klines_df(symbol, interval, limit)
+        if df is not None and len(df) > 0:
+            return df.to_dict("records")
+    except Exception as e:  # noqa: BLE001
+        _log(f"K 线主源(Binance 现货)异常: {e}")
+
+    # 备用源：OKX 永续 candles（最新在前，需反转；字段 [ts,o,h,l,c,vol,...]）
+    try:
+        import jarvis_crypto_data as jcd
+        inst = jcd._okx_swap_inst(symbol)  # noqa: SLF001
+        bar = _OKX_BAR_MAP.get(timeframe, "15m")
+        resp = jcd._get(  # noqa: SLF001
+            f"{jcd.OKX_API}/api/v5/market/candles",
+            {"instId": inst, "bar": bar, "limit": str(min(int(limit), 300))},
+        )
+        rows = jcd._okx_rows(resp)  # noqa: SLF001
+        if rows:
+            klines = [{
+                "time": int(r[0]),
+                "open": float(r[1]),
+                "high": float(r[2]),
+                "low": float(r[3]),
+                "close": float(r[4]),
+                "volume": float(r[5]),
+            } for r in reversed(rows)]
+            _log(f"K 线切备用源 OKX: {inst} {bar} x{len(klines)}")
+            return klines
+    except Exception as e:  # noqa: BLE001
+        _log(f"K 线备用源(OKX)异常: {e}")
+
+    _log(f"K 线获取失败: {symbol} {timeframe} 主备源均不可用")
+    return None
 
 
 # ═══════════════════════════ 信号计算 ═══════════════════════════
@@ -514,7 +535,7 @@ def run_cycle(symbol: str, dry_run: bool = False) -> dict[str, Any]:
 
     # 风控检查
     jw.init_db()
-    bal = jw.get_balance()
+    bal = jw.get_wallet()
     balance = bal.get("cash_usdt", 0) if bal else 0
 
     can_trade, risk_reason = _check_risk(state, cfg, balance)
@@ -563,6 +584,10 @@ def run_cycle(symbol: str, dry_run: bool = False) -> dict[str, Any]:
         _log(f"风控拦截: {risk_reason}")
         action = f"blocked:{risk_reason}"
 
+    # 心跳：dashboard 据此判定引擎是否存活（外部命令行启动的场景）
+    state["last_cycle_ts"] = time.time()
+    state["last_cycle_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    state["last_symbol"] = symbol
     _save_state(state)
 
     return {
@@ -599,8 +624,15 @@ def run_loop(symbol: str, dry_run: bool = False) -> None:
         try:
             cfg = load_config()
 
+            # loop 心跳：仅永续循环写入（dry-run/单轮不写），dashboard 据
+            # loop_ts + loop_pid 判定引擎存活，进程退出后立即失效。
+            state = _load_state()
+            state["loop_ts"] = time.time()
+            state["loop_pid"] = os.getpid()
+            _save_state(state)
+
             jw.init_db()
-            bal = jw.get_balance()
+            bal = jw.get_wallet()
             balance = bal.get("cash_usdt", 0) if bal else 0
 
             min_bal = cfg.get("risk", {}).get("min_balance_to_trade", 10)
