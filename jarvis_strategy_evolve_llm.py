@@ -175,6 +175,7 @@ def _improve_rule(
     prompt = _build_review_prompt(description, history, best_rule, symbol, timeframe)
     response = llm.call_llm(
         prompt, system=REVIEW_SYSTEM, temperature=0.5, max_tokens=1600, timeout=120,
+        module="strategy_evolve",
     )
     rule = jsg._parse_llm_json(response)  # noqa: SLF001 — 同仓库模块复用解析器
     if not rule:

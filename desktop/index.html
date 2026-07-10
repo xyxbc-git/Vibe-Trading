@@ -14,6 +14,20 @@
         overflow: hidden;
       }
     </style>
+    <script>
+      // 首帧前注入强调色主题，防止刷新时闪回默认蓝（与 src/lib/theme.ts 的 key/清单保持一致）
+      (function () {
+        try {
+          var t = localStorage.getItem("jarvis-accent");
+          var valid = ["emerald", "violet", "amber", "cyber-pink", "silver"];
+          if (t && valid.indexOf(t) >= 0) {
+            document.documentElement.dataset.accent = t;
+          }
+        } catch (e) {
+          /* ignore */
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

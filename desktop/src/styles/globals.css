@@ -3,6 +3,35 @@
 @tailwind utilities;
 
 @layer base {
+  /* ── 强调色主题（深色底不变，仅换强调色）──
+     tailwind 的 jarvis-blue 已接到 --jarvis-accent，业务代码无需感知主题。
+     涨绿跌红（jarvis-green / jarvis-red）为盈亏语义色，铁律：不随主题变。
+     --jarvis-accent-fg 是实底强调色按钮上的文字色（亮强调色配深字保证对比度）。 */
+  :root {
+    --jarvis-accent: 88 166 255; /* 科技蓝（默认） */
+    --jarvis-accent-fg: 255 255 255;
+  }
+  :root[data-accent="emerald"] {
+    --jarvis-accent: 45 212 191; /* 翡翠绿 */
+    --jarvis-accent-fg: 13 17 23;
+  }
+  :root[data-accent="violet"] {
+    --jarvis-accent: 167 139 250; /* 紫罗兰 */
+    --jarvis-accent-fg: 13 17 23;
+  }
+  :root[data-accent="amber"] {
+    --jarvis-accent: 242 153 74; /* 琥珀橙 */
+    --jarvis-accent-fg: 13 17 23;
+  }
+  :root[data-accent="cyber-pink"] {
+    --jarvis-accent: 244 114 182; /* 赛博粉 */
+    --jarvis-accent-fg: 13 17 23;
+  }
+  :root[data-accent="silver"] {
+    --jarvis-accent: 156 163 175; /* 银灰 */
+    --jarvis-accent-fg: 13 17 23;
+  }
+
   * {
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
@@ -41,7 +70,7 @@
   }
 
   .btn-primary {
-    @apply px-4 py-2 bg-jarvis-blue text-white rounded-lg font-medium
+    @apply px-4 py-2 bg-jarvis-blue text-jarvis-accent-fg rounded-lg font-medium
            hover:bg-jarvis-blue/80 transition-colors;
   }
 

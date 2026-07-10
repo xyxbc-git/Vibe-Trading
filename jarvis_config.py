@@ -60,6 +60,11 @@ DEFAULTS: dict = {
     # sizing（T-11 动态仓位）
     "sizing_method": "fixed",         # fixed=固定比例（默认，零回归）| kelly=分数凯利
     "kelly_fraction": 0.5,            # 分数凯利系数（0~1，越小越保守）
+    # ── 合约仓位计算器（Task #3：小本金高杠杆风控建议，jarvis_position_calc）──
+    "poscalc_capital_usdt": 130.0,    # 合约本金（用户实际可亏总额）
+    "poscalc_leverage": 100.0,        # 目标杠杆（1~125；100x 爆仓距离仅约 0.5%）
+    "poscalc_risk_pct": 1.0,          # 单笔风险占本金%（风险法 legacy 口径，默认 1）
+    "poscalc_margin_pct": 100.0,      # 保证金占本金%（保证金法：名义=本金×该%×杠杆）
     # ── 4h 盘中引擎（jarvis_intraday_trader，扁平键便于 clamp 护栏）──────────
     "intraday_enabled": True,             # 总开关（关=心跳里跳过 4h 轮）
     "intraday_min_prob": 0.60,            # 开仓最低预测概率
@@ -77,6 +82,10 @@ DEFAULTS: dict = {
     # ── D1 回测成本口径（jarvis_factor_backtest 换仓单边滑点成本，bps）─────────
     # 10bps 与 jarvis_slippage.FALLBACK_BPS 同口径（保守兜底）；显式传 0 可复现旧零成本结果。
     "backtest_cost_bps": 10.0,
+    # ── 共识交易计划 RR 门槛（jarvis_twelve_systems._aggregate_trade_plan）───────
+    # 止盈按 RR ≥ 该值推导/验证；结构目标撑不起门槛时输出观望不硬造计划。
+    # 主流风控最低 1:2；激进可调 3.0（=用户口径「止损 1/2~1/3」）。
+    "plan_min_rr": 2.0,
 }
 
 # 关键风控旋钮的安全区间（写入时夹紧；未列的键不夹）。
@@ -92,6 +101,10 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "entry_band_below_pct": (0.0, 50.0),
     "entry_band_above_pct": (0.0, 50.0),
     "kelly_fraction": (0.0, 1.0),
+    "poscalc_capital_usdt": (1.0, 1e9),
+    "poscalc_leverage": (1.0, 125.0),
+    "poscalc_risk_pct": (0.1, 10.0),
+    "poscalc_margin_pct": (1.0, 100.0),
     "intraday_min_prob": (0.5, 0.99),
     "intraday_risk_pct_per_trade": (0.1, 5.0),
     "intraday_max_open_positions": (1, 10),
@@ -102,6 +115,7 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "intraday_max_consecutive_losses": (1, 20),
     "debate_timeout_sec": (30, 1800),
     "backtest_cost_bps": (0.0, 800.0),  # 上限对齐 jarvis_slippage.MAX_ONE_WAY_BPS
+    "plan_min_rr": (1.0, 10.0),         # RR 门槛安全区间（<1 无意义，>10 不现实）
 }
 
 # 允许的枚举键。

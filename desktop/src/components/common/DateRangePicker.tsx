@@ -107,7 +107,7 @@ function MonthGrid({
                 disabled
                   ? "text-jarvis-text-secondary/25 cursor-not-allowed"
                   : isEdge
-                    ? "bg-jarvis-blue text-white"
+                    ? "bg-jarvis-blue text-jarvis-accent-fg"
                     : inRange
                       ? "bg-jarvis-blue/15 text-jarvis-text"
                       : "text-jarvis-text hover:bg-white/10",
@@ -400,7 +400,7 @@ export default function DateRangePicker({
                 onChange(draftStart, draftEnd);
                 setOpen(false);
               }}
-              className="px-3 py-1 text-xs rounded-md bg-jarvis-blue text-white hover:bg-jarvis-blue/80 transition-colors"
+              className="px-3 py-1 text-xs rounded-md bg-jarvis-blue text-jarvis-accent-fg hover:bg-jarvis-blue/80 transition-colors"
             >
               应用
             </button>

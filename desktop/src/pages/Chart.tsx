@@ -1,8 +1,10 @@
 import { useState, useMemo, useEffect } from "react";
-import { usePolling } from "@/hooks/useApi";
+import { useSearchParams } from "react-router-dom";
+import { useApi, usePolling } from "@/hooks/useApi";
 import { useSymbol } from "@/hooks/useSymbol";
 import { api, type TwelveSignal, type ConsensusTradePlan } from "@/api/client";
 import KlineChart from "@/components/charts/KlineChart";
+import { tradesToMarks } from "@/lib/signalTrades";
 import {
   computeDrawings,
   computeSmartLevels,
@@ -42,7 +44,8 @@ import {
   type ViewMode,
   type ChartComposition,
 } from "@/lib/chartView";
-import { CandlestickChart, HelpCircle } from "lucide-react";
+import { CandlestickChart, HelpCircle, Target, X } from "lucide-react";
+import PositionAdvisor from "@/components/cards/PositionAdvisor";
 import { clsx } from "clsx";
 import type {
   CandlestickData,
@@ -149,7 +152,31 @@ export default function Chart() {
   const [autoTune, setAutoTune] = useState(true);
   const [twelve, setTwelve] = useState(false);
   const [plan, setPlan] = useState(true);
+  // 交易区间带（入场/止损/止盈时间锚定矩形）独立开关，三档视图均可用
+  const [zonesOn, setZonesOn] = useState(true);
   const { symbol } = useSymbol();
+
+  // ── 信号历史盈损标记（信号矩阵「盈损点」跳转携带 query 进入） ──
+  // sigmarks=系统slug & sigtf=回测周期 & sigside=long|short
+  const [searchParams, setSearchParams] = useSearchParams();
+  const sigSystem = searchParams.get("sigmarks");
+  const rawSigTf = searchParams.get("sigtf");
+  const sigTf: Timeframe | null =
+    rawSigTf && (TIMEFRAMES as readonly string[]).includes(rawSigTf)
+      ? (rawSigTf as Timeframe)
+      : null;
+  const rawSigSide = searchParams.get("sigside");
+  const sigSide: "long" | "short" | undefined =
+    rawSigSide === "long" || rawSigSide === "short" ? rawSigSide : undefined;
+  const clearSigMarks = () => {
+    setSearchParams({}, { replace: true });
+  };
+
+  // 进入/切换标记目标时自动对齐周期：胜率样本按 sigTf 回测，标记只有画在
+  // 同周期 K 线上才与样本口径一致（任务要求：周期不一致自动切换）
+  useEffect(() => {
+    if (sigSystem && sigTf) setTf(sigTf);
+  }, [sigSystem, sigTf]);
 
   // 各数据源的实际启用条件：简洁/进阶忽略专业模式的细粒度开关
   const isPro = viewMode === "pro";
@@ -192,6 +219,36 @@ export default function Chart() {
   }, [rawKline]);
 
   const lastCandle = candles.length > 0 ? candles[candles.length - 1] : null;
+
+  // ── 信号盈损标记：拉该系统的逐笔回测明细（与信号矩阵聚合胜率同源） ──
+  const { data: sigTradesResp, loading: sigTradesLoading } = useApi(
+    () =>
+      sigSystem && sigTf
+        ? api.twelveSignalWinrateTrades(symbol, sigTf, sigSystem, sigSide)
+        : Promise.resolve(null),
+    [sigSystem, sigTf, sigSide, symbol],
+  );
+
+  // 样本 → K 线 L/S 徽章标记（仅当前周期 = 样本回测周期时映射；手动切走周期
+  // 则暂不打标——4h 样本画在 15m 图上位置口径不对，会误导）。bar 高低点用于
+  // 把徽章锚到影线外侧（多单挂低点下方 / 空单挂高点上方）。
+  const sigMarks = useMemo(() => {
+    if (!sigSystem || !sigTf || tf !== sigTf) return null;
+    if (!sigTradesResp?.ok || !Array.isArray(sigTradesResp.trades) || candles.length === 0) {
+      return null;
+    }
+    const fromSec = Number(candles[0].time);
+    const toSec = Number(candles[candles.length - 1].time);
+    const bars = new Map<number, { high: number; low: number }>();
+    for (const c of candles) bars.set(Number(c.time), { high: c.high, low: c.low });
+    return tradesToMarks(
+      sigTradesResp.trades,
+      sigTradesResp.name_cn || sigSystem,
+      fromSec,
+      toSec,
+      bars,
+    );
+  }, [sigSystem, sigTf, tf, sigTradesResp, candles]);
 
   // Drawing-engine input arrays, derived once per kline refresh. `dates` is
   // index-aligned (the engine keys outputs by bar index, not by label).
@@ -438,29 +495,41 @@ export default function Chart() {
     direction: string;
     state: "idle" | "loading" | "ok" | "none-neutral" | "none-directional" | "failed" | "unavailable";
     meta: string;
+    /** 无计划原因（后端 v3 plan_status：RR 不达标/结构不支持等观望说明） */
+    watchReason: string;
   }>(() => {
-    if (!planActive) return { tradePlan: null, direction: "neutral", state: "idle", meta: "" };
-    if (planError) return { tradePlan: null, direction: "neutral", state: "unavailable", meta: "" };
-    if (!planRes) return { tradePlan: null, direction: "neutral", state: planLoading ? "loading" : "unavailable", meta: "" };
+    if (!planActive) return { tradePlan: null, direction: "neutral", state: "idle", meta: "", watchReason: "" };
+    if (planError) return { tradePlan: null, direction: "neutral", state: "unavailable", meta: "", watchReason: "" };
+    if (!planRes) return { tradePlan: null, direction: "neutral", state: planLoading ? "loading" : "unavailable", meta: "", watchReason: "" };
     // 回声校验：usePolling 无请求取消，快速切币种时旧币种的慢响应可能后到——
     // symbol 对不上一律不采用（旧币种计划线画到新币种图上会造成交易误导）
     if (isStaleEcho(symbol, planRes.symbol)) {
-      return { tradePlan: null, direction: "neutral", state: "loading", meta: "" };
+      return { tradePlan: null, direction: "neutral", state: "loading", meta: "", watchReason: "" };
     }
-    if (planRes.ok === false) return { tradePlan: null, direction: "neutral", state: "failed", meta: "" };
+    if (planRes.ok === false) return { tradePlan: null, direction: "neutral", state: "failed", meta: "", watchReason: "" };
     // 旧后端无 trade_plan 字段 / 中性无计划 → null
     const tp = planRes.consensus?.trade_plan ?? null;
     const direction = planRes.consensus?.direction ?? "neutral";
     const overlay = planToOverlay(tp);
     if (overlay.hlines.length === 0) {
-      return { tradePlan: null, direction, state: direction === "neutral" ? "none-neutral" : "none-directional", meta: "" };
+      return {
+        tradePlan: null,
+        direction,
+        state: direction === "neutral" ? "none-neutral" : "none-directional",
+        meta: "",
+        watchReason: planRes.consensus?.plan_status?.reason ?? "",
+      };
     }
     const bits: string[] = [];
-    if (tp?.rr != null && Number.isFinite(tp.rr)) bits.push(`RR ${Number(tp.rr).toFixed(1)}`);
+    if (tp?.rr != null && Number.isFinite(tp.rr)) {
+      const gate = tp?.min_rr != null && Number.isFinite(tp.min_rr) ? `(≥${Number(tp.min_rr).toFixed(1)})` : "";
+      bits.push(`RR ${Number(tp.rr).toFixed(1)}${gate}`);
+    }
     if (tp?.position_pct != null && Number.isFinite(tp.position_pct)) bits.push(`仓位 ${tp.position_pct}%`);
-    if (tp?.source_tf) bits.push(`周期 ${tp.source_tf}`);
+    if (tp?.source_tf) bits.push(`级别 ${tp.source_tf}`);
     if (tp?.basis?.length) bits.push(`依据 ${tp.basis.slice(0, 3).join("/")}`);
-    return { tradePlan: tp, direction, state: "ok", meta: bits.join(" · ") };
+    if (tp?.sl_basis) bits.push(`止损锚定 ${tp.sl_basis}`);
+    return { tradePlan: tp, direction, state: "ok", meta: bits.join(" · "), watchReason: "" };
   }, [planActive, planRes, planLoading, planError, symbol]);
 
   // ── 三档视图组合：把 计划/智能S·R/画线/关键位 裁剪成最终渲染载荷 + 图例 ──
@@ -610,7 +679,7 @@ export default function Chart() {
                 className={clsx(
                   "px-3 py-1 text-sm rounded-md transition-colors",
                   t === tf
-                    ? "bg-jarvis-blue text-white"
+                    ? "bg-jarvis-blue text-jarvis-accent-fg"
                     : "text-jarvis-text-secondary hover:text-jarvis-text",
                 )}
               >
@@ -632,7 +701,7 @@ export default function Chart() {
               className={clsx(
                 "px-3 py-1 text-sm rounded-md transition-colors",
                 viewMode === m.id
-                  ? "bg-jarvis-blue text-white"
+                  ? "bg-jarvis-blue text-jarvis-accent-fg"
                   : "text-jarvis-text-secondary hover:text-jarvis-text",
               )}
             >
@@ -640,6 +709,15 @@ export default function Chart() {
             </button>
           ))}
         </div>
+
+        {/* 区间带：入场/止损/止盈画成时间锚定的半透明矩形（supply/demand zone 风格） */}
+        <button
+          onClick={() => setZonesOn((v) => !v)}
+          title="把入场/止损/止盈画成半透明矩形（只覆盖最近一段 K 线，垫在 K 线下方不遮挡），悬停显示盈亏比"
+          className={pillCls(zonesOn)}
+        >
+          区间带{zonesOn ? "·开" : "·关"}
+        </button>
 
         {/* 图例：解释当前模式下每类线的含义 */}
         <div className="relative">
@@ -837,8 +915,11 @@ export default function Chart() {
           </span>
         )}
         {planActive && planInfo.state === "none-directional" && (
-          <span className="text-xs text-jarvis-text-secondary" title="共识有方向，但无同向系统给出点位（后端宁缺毋滥，不硬造）">
-            无可执行计划
+          <span
+            className="text-xs text-jarvis-yellow"
+            title={planInfo.watchReason || "共识有方向，但结构/盈亏比不达标（后端宁缺毋滥，不硬造）"}
+          >
+            {planInfo.watchReason ? `观望：${planInfo.watchReason}` : "无可执行计划"}
           </span>
         )}
         {planActive && planInfo.state === "failed" && (
@@ -853,6 +934,60 @@ export default function Chart() {
         )}
       </div>
 
+      {/* 信号盈损标记状态条：来自信号矩阵「盈损点」跳转，标出该信号每笔历史盈亏 */}
+      {sigSystem && (
+        <div className="flex items-center gap-2 flex-wrap text-xs bg-jarvis-card border border-jarvis-blue/40 rounded-lg px-3 py-2">
+          <Target size={13} className="text-jarvis-blue shrink-0" />
+          <span className="text-jarvis-text font-medium">
+            「{sigTradesResp?.name_cn || sigSystem}」历史盈损标记
+          </span>
+          {sigSide && (
+            <span
+              className={clsx(
+                "px-1.5 py-px rounded text-[10px] font-medium text-white",
+                sigSide === "long" ? "bg-jarvis-green" : "bg-jarvis-red",
+              )}
+            >
+              {sigSide === "long" ? "做多信号" : "做空信号"}
+            </span>
+          )}
+          {sigTf && tf !== sigTf ? (
+            <span className="flex items-center gap-1 text-jarvis-yellow">
+              样本按 {sigTf} 周期回测，当前 {tf} 周期不展示标记
+              <button
+                onClick={() => setTf(sigTf)}
+                className="px-1.5 py-px rounded border border-jarvis-yellow/50 hover:bg-jarvis-yellow/10 transition-colors"
+              >
+                切回 {sigTf}
+              </button>
+            </span>
+          ) : sigTradesLoading ? (
+            <span className="text-jarvis-text-secondary">加载逐笔明细…</span>
+          ) : sigTradesResp && !sigTradesResp.ok ? (
+            <span className="text-jarvis-yellow">
+              {sigTradesResp.need_run
+                ? "该周期暂无逐笔明细——回总览页信号矩阵点「胜率回测」跑一次后再来"
+                : sigTradesResp.error ?? "明细获取失败"}
+            </span>
+          ) : sigMarks ? (
+            <span className="text-jarvis-text-secondary">
+              当前窗口 {sigMarks.visible}/{sigMarks.total} 笔 · 徽章=入场（
+              <span className="text-jarvis-green">绿 L 多</span> /
+              <span className="text-jarvis-red"> 红 S 空</span>
+              ），角标 ✓盈 ✕亏 · 圆点=出场 · 悬停看每笔「入场→出场」详情
+            </span>
+          ) : null}
+          <button
+            onClick={clearSigMarks}
+            title="清除盈损标记"
+            className="ml-auto flex items-center gap-0.5 px-1.5 py-0.5 rounded text-jarvis-text-secondary hover:text-jarvis-red transition-colors"
+          >
+            <X size={12} />
+            清除
+          </button>
+        </div>
+      )}
+
       <div className="card p-0 overflow-hidden">
         {candles.length > 0 ? (
           <KlineChart
@@ -863,6 +998,8 @@ export default function Chart() {
             drawings={composition.drawings}
             keyLevels={composition.keyLevels.length > 0 ? composition.keyLevels : undefined}
             planLines={composition.planLines.length > 0 ? composition.planLines : undefined}
+            tradeZones={zonesOn && composition.tradeZones.length > 0 ? composition.tradeZones : undefined}
+            tradeMarks={sigMarks?.marks}
           />
         ) : (
           <div
@@ -887,6 +1024,13 @@ export default function Chart() {
           </div>
         )}
       </div>
+
+      {/* ── 仓位与风控建议：共识计划 ×（本金/杠杆/风险%）→ 可执行下单参数 ── */}
+      <PositionAdvisor
+        symbol={symbol}
+        tf={(["15m", "1h", "4h", "1d"] as const).includes(tf as never) ? (tf as "15m" | "1h" | "4h" | "1d") : "auto"}
+        compact
+      />
 
       {lastCandle && (
         <div className="flex gap-6 text-sm text-jarvis-text-secondary px-1">

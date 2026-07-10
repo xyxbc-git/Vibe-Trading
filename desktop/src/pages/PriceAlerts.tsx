@@ -439,7 +439,7 @@ function RecipientPicker({
           >
             <span
               className={`w-3 h-3 rounded-sm border flex items-center justify-center text-[8px] ${
-                on ? "bg-jarvis-blue border-jarvis-blue text-white" : "border-jarvis-border"
+                on ? "bg-jarvis-blue border-jarvis-blue text-jarvis-accent-fg" : "border-jarvis-border"
               }`}
             >
               {on ? "✓" : ""}

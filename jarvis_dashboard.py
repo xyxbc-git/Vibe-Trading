@@ -34,6 +34,7 @@ import jarvis_crypto_data as jcd
 import jarvis_net as _jnet
 
 _jnet.ensure_proxy()   # 大陆网络：探测本地代理，Binance 等出网自动走代理
+import jarvis_alert_center as jac
 import jarvis_executor as jx
 import jarvis_journal as jj
 import jarvis_lessons as jl
@@ -341,6 +342,8 @@ def api_health():
         }
     except Exception as exc:  # noqa: BLE001
         checks["price_alert_monitor"] = {"ok": False, "reachable": False, "error": repr(exc)[:200]}
+    # desktop 前端（HealthStatusCard）按 price_alert 键消费，保留旧键兼容其它调用方
+    checks["price_alert"] = checks["price_alert_monitor"]
 
     daemon = _read_daemon_status()
     age_h = None
@@ -354,6 +357,8 @@ def api_health():
     daemon_ok = daemon.get("available", False) and (age_h is None or age_h <= 48)
     checks["daemon"] = {
         "ok": daemon_ok,
+        # available 必须保留：desktop 前端据此区分「末轮 xx」与「未运行」
+        "available": daemon.get("available", False),
         "reachable": daemon.get("available", False),
         "age_hours": age_h,
         "last_finished_at": finished,
@@ -361,6 +366,25 @@ def api_health():
         "symbols": list((daemon.get("symbols") or {}).keys()),
         **{k: v for k, v in daemon.items() if k not in ("available",)},
     }
+
+    try:
+        import jarvis_circuit_breaker as _cb
+        cb_ev = _cb.evaluate(jx.load_config())
+        cb_st = _cb._read_state()  # noqa: SLF001 — 只读展示
+        tripped = bool(cb_st.get("tripped"))
+        checks["circuit_breaker"] = {
+            "ok": bool(cb_ev.get("ok")) and not tripped and not cb_ev.get("should_halt"),
+            "reachable": bool(cb_ev.get("ok")),
+            "tripped": tripped,
+            "should_halt": bool(cb_ev.get("should_halt")),
+            "equity_usdt": cb_ev.get("equity_usdt"),
+            "peak_equity": cb_ev.get("peak_equity"),
+            "drawdown_pct": cb_ev.get("drawdown_pct"),
+            "reason": cb_st.get("reason"),
+            "ts": cb_st.get("ts"),
+        }
+    except Exception as exc:  # noqa: BLE001
+        checks["circuit_breaker"] = {"ok": False, "reachable": False, "error": repr(exc)[:200]}
 
     try:
         import jarvis_scalper_backtest as jbt
@@ -1277,7 +1301,7 @@ def _llm_answer(
     import jarvis_llm_config as jlc
 
     messages = _build_ask_messages(question, snap, st, sym, lessons, history)
-    return jlc.chat(messages, timeout=30)
+    return jlc.chat(messages, timeout=30, module="ask")
 
 
 def _parse_ask_body(symbol: str, q: str, data: dict | None) -> tuple[str, str, list[dict]]:
@@ -1358,7 +1382,7 @@ def api_ask_stream(data: dict | None = None):
         if cfg:
             messages = _build_ask_messages(question, snap, st, spot, lessons, history)
             try:
-                stream = jlc.chat_stream(messages, timeout=90)
+                stream = jlc.chat_stream(messages, timeout=90, module="ask")
                 yield _sse({"type": "meta", "engine": "llm", "model": cfg.get("model")})
                 got_any = False
                 for delta in stream:
@@ -1526,6 +1550,7 @@ def api_jarvis_review(data: dict | None = None):
         [{"role": "system", "content": _REVIEW_SYSTEM},
          {"role": "user", "content": json.dumps(stats, ensure_ascii=False)}],
         temperature=0.3, max_tokens=1200, json_mode=True, timeout=45,
+        module="review",
     )
     if raw:
         try:
@@ -2354,6 +2379,147 @@ def _start_price_alert_monitor():
         _log_emit(f"价位提醒监控启动失败: {e}", level="error", source="price-alert")
 
 
+# ─────────────────────────── 主动提醒中心 API ───────────────────────────
+# 信号反转 / 价格关键位 / 割肉后回升监控 + 页内通知中心 + 浏览器通知（SSE 推送）。
+
+
+@app.get("/api/alert-center/rules")
+def api_ac_rules_get(symbol: str | None = None):
+    try:
+        return JSONResponse({"ok": True, "rules": jac.list_rules(symbol)})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
+
+
+@app.post("/api/alert-center/rules")
+def api_ac_rules_create(data: dict):
+    """新建提醒规则：{kind: signal_flip|price_level|reentry, symbol, ...kind 参数}。"""
+    out = jac.add_rule(data or {})
+    return JSONResponse(out, status_code=200 if out.get("ok") else 400)
+
+
+@app.put("/api/alert-center/rules/{rule_id}")
+def api_ac_rules_update(rule_id: str, data: dict):
+    out = jac.update_rule(rule_id, data or {})
+    return JSONResponse(out, status_code=200 if out.get("ok") else 404)
+
+
+@app.delete("/api/alert-center/rules/{rule_id}")
+def api_ac_rules_delete(rule_id: str):
+    out = jac.delete_rule(rule_id)
+    return JSONResponse(out, status_code=200 if out.get("ok") else 404)
+
+
+@app.get("/api/alert-center/events")
+def api_ac_events(limit: int = 50, unread_only: bool = False,
+                  symbol: str | None = None):
+    """提醒历史（页内通知中心数据源），新→旧。"""
+    try:
+        return JSONResponse({"ok": True,
+                             "events": jac.list_events(limit, unread_only, symbol),
+                             "unread": jac.unread_count()})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
+
+
+@app.get("/api/alert-center/unread-count")
+def api_ac_unread():
+    try:
+        return JSONResponse({"ok": True, "unread": jac.unread_count()})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
+
+
+@app.post("/api/alert-center/events/read")
+def api_ac_events_read(data: dict | None = None):
+    """标记已读：{"all": true} 或 {"ids": [1,2,3]}。"""
+    d = data or {}
+    out = jac.mark_read(ids=d.get("ids"), mark_all=bool(d.get("all")))
+    return JSONResponse(out)
+
+
+@app.get("/api/alert-center/settings")
+def api_ac_settings_get():
+    try:
+        return JSONResponse({"ok": True, "settings": jac.get_settings(),
+                             "monitor": jac.monitor_status()})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
+
+
+@app.put("/api/alert-center/settings")
+def api_ac_settings_put(data: dict):
+    try:
+        return JSONResponse({"ok": True, "settings": jac.update_settings(data or {})})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
+
+
+@app.post("/api/alert-center/check")
+def api_ac_check(data: dict | None = None):
+    """立即执行一轮巡检（信号规则跳过节流；dry_run 时外发渠道只演练）。"""
+    d = data or {}
+    try:
+        return JSONResponse(jac.evaluate_all(dry_run=bool(d.get("dry_run")),
+                                             force_signal=True))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
+
+
+@app.get("/api/alert-center/key-levels")
+def api_ac_key_levels(symbol: str = "BTCUSDT", tf: str = "4h"):
+    """系统关键支撑/阻力位建议（十二套共识聚合），供前端一键填入价位提醒。"""
+    try:
+        return JSONResponse(jac.key_levels(symbol, tf))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
+
+
+@app.get("/api/alert-center/status")
+def api_ac_status():
+    return JSONResponse({"ok": True, "monitor": jac.monitor_status()})
+
+
+@app.get("/api/alert-center/stream")
+def api_ac_stream():
+    """SSE 实时推送新提醒事件（前端弹页内 toast + 浏览器系统通知）。"""
+
+    def gen():
+        q = jac.subscribe()
+        try:
+            # 握手帧：带当前未读数，前端连上即可刷新角标
+            yield ("data: " + json.dumps({"type": "hello", "unread": jac.unread_count()},
+                                         ensure_ascii=False) + "\n\n")
+            while True:
+                try:
+                    item = q.get(timeout=15)
+                    yield "data: " + json.dumps(item, ensure_ascii=False) + "\n\n"
+                except _queue.Empty:
+                    yield ": keepalive\n\n"
+        finally:
+            jac.unsubscribe(q)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@app.on_event("startup")
+def _start_alert_center_monitor():
+    """随 dashboard 启动主动提醒中心后台巡检线程。"""
+    try:
+        jac.start_monitor()
+        _log_emit("主动提醒中心后台监控已启动", level="info", source="alert-center")
+    except Exception as e:  # noqa: BLE001
+        _log_emit(f"提醒中心监控启动失败: {e}", level="error", source="alert-center")
+
+
 def _twelve_auto_trader_loop():
     """12 系统信号矩阵自动模拟跟盘循环（daemon 线程）。
 
@@ -2595,6 +2761,38 @@ def api_llm_config_test():
         return JSONResponse(jlc.test_connection())
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.get("/api/llm/usage")
+def api_llm_usage(days: int = 30, recent: int = 20,
+                  module: str | None = None, offset: int = 0):
+    """LLM 用量/成本聚合：今日/本月/窗口合计 + 按日/模块/模型分布 + 最近明细。
+
+    module/offset 只筛选与分页 recent 明细；明细不带大文本（has_content 标记），
+    完整发送/返回内容走 /api/llm/usage/detail?id=。
+    数据来自 llm_usage 表（jarvis_db：PG 或本地 SQLite）与 jsonl 降级记录合并。
+    """
+    try:
+        import jarvis_llm_usage as jlu
+
+        return JSONResponse({"ok": True, **jlu.query_usage(
+            days=days, recent=recent, module=(module or None), offset=offset)})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(e)[:200]})
+
+
+@app.get("/api/llm/usage/detail")
+def api_llm_usage_detail(id: int):  # noqa: A002 — 对齐前端参数名
+    """按 id 取单条 LLM 调用完整日志（发送 messages JSON + 返回文本 + 元信息）。"""
+    try:
+        import jarvis_llm_usage as jlu
+
+        row = jlu.get_detail(int(id))
+        if not row:
+            return JSONResponse({"ok": False, "error": "记录不存在或内容已过保留期"})
+        return JSONResponse({"ok": True, "record": row})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(e)[:200]})
 
 
 # ─────────────────────────── AI 策略工坊 API ───────────────────────────
@@ -3041,6 +3239,21 @@ def api_watchlist_post(data: dict):
 _TWELVE_TFS = ("15m", "1h", "4h")
 
 
+def _twelve_basis(sym: str) -> dict | None:
+    """套利系统双腿数据：spot-perp 基差序列统计（5min 缓存）。
+
+    失败/样本不足返回 None → signal_arbitrage 按「数据不足」降级中性（不硬造）。
+    按需拉取 + 进程内缓存，不新增定时任务（避免与 com.jarvis.daemon 重复轮询）。
+    """
+    def _calc():
+        try:
+            import jarvis_crypto_data as jcd
+            return jcd.fetch_basis_series(sym) or None
+        except Exception:  # noqa: BLE001 — 基差取数失败不拖垮信号主体
+            return None
+    return _cached(f"twelve:basis:{sym}", 300, _calc)
+
+
 @app.get("/api/twelve/signals")
 def api_twelve_signals(symbol: str = "BTCUSDT", tf: str = "4h"):
     """十二套技术单时间框架信号 + 分层共识（海龟/道氏/缠论…12 套逐一给方向与强度）。"""
@@ -3055,7 +3268,7 @@ def api_twelve_signals(symbol: str = "BTCUSDT", tf: str = "4h"):
         if df is None or len(df) < 30:
             return {"ok": False, "error": "K线数据不足或拉取失败", "symbol": sym,
                     "tf": iv, "signals": [], "consensus": None}
-        out = jts.analyze(df)
+        out = jts.analyze(df, basis_data=_twelve_basis(sym))
         return {"ok": True, "symbol": sym, "tf": iv,
                 "price": round(float(df["close"].iloc[-1]), 6),
                 "signals": out["signals"], "consensus": out["consensus"]}
@@ -3074,11 +3287,12 @@ def api_twelve_consensus(symbol: str = "BTCUSDT"):
     def _calc():
         tf_cons: dict = {}
         price = None
+        basis = _twelve_basis(sym)   # 基差与 TF 无关，整轮共用一份
         for tf in _TWELVE_TFS:
             df = jts.fetch_klines_df(sym, tf, 300)
             if df is None or len(df) < 30:
                 continue
-            out = jts.analyze(df)
+            out = jts.analyze(df, basis_data=basis)
             tf_cons[tf] = out["consensus"]
             if tf == "4h" or price is None:
                 price = round(float(df["close"].iloc[-1]), 6)
@@ -3087,6 +3301,127 @@ def api_twelve_consensus(symbol: str = "BTCUSDT"):
                 "tf_available": sorted(tf_cons.keys()), "consensus": merged}
 
     return JSONResponse(_cached(f"twelve:cons:{sym}", 180, _calc))
+
+
+# ─────────────────── 市场情报页（免 Key 真实数据源）───────────────────
+
+@app.get("/api/market-intel")
+def api_market_intel():
+    """情报页聚合：资金费率 / OI / 多空比 / 恐慌贪婪（真实数据，TTL 缓存 + 降级）。
+
+    模块内自带各源独立 TTL 缓存与后台刷新，接口本身恒快速返回；
+    未接入源（爆仓/链上，需第三方 key）在 unavailable 中说明。
+    """
+    import jarvis_market_intel as jmi
+    try:
+        return JSONResponse(jmi.get_intel())
+    except Exception as exc:  # noqa: BLE001 — 情报页失败不应 500，前端按未接入处理
+        return JSONResponse({"ok": False, "error": repr(exc)[:200]})
+
+
+# ─────────────────── 合约仓位与风控计算器（Task #3）───────────────────
+
+_POSCALC_KEYS = ("poscalc_capital_usdt", "poscalc_leverage", "poscalc_risk_pct",
+                 "poscalc_margin_pct")
+
+
+@app.get("/api/position-calc/config")
+def api_poscalc_config_get():
+    """仓位计算器旋钮：本金 / 杠杆 / 风险% / 保证金%（jarvis_config 持久化）。"""
+    import jarvis_config as jc_mod
+    return JSONResponse({k: jc_mod.get(k) for k in _POSCALC_KEYS})
+
+
+@app.put("/api/position-calc/config")
+def api_poscalc_config_put(data: dict):
+    import jarvis_config as jc_mod
+    patch = {k: v for k, v in (data or {}).items() if k in _POSCALC_KEYS}
+    if not patch:
+        return JSONResponse({"ok": False, "reason": "无有效字段"}, status_code=400)
+    jc_mod.save(patch, source="desktop-poscalc", note="position-calc UI")
+    return JSONResponse({"ok": True, "config": {k: jc_mod.get(k) for k in _POSCALC_KEYS}})
+
+
+@app.get("/api/position-calc")
+def api_position_calc(symbol: str = "BTCUSDT", tf: str = "auto",
+                      capital: float | None = None, leverage: float | None = None,
+                      risk_pct: float | None = None,
+                      margin_pct: float | None = None,
+                      entry: float | None = None):
+    """基于当前信号共识 trade_plan 的完整下单建议（仓位/止损安全边距/分档止盈/爆仓价）。
+
+    tf=auto 用多时间框架综合共识；否则用指定单周期共识。
+    capital/leverage/risk_pct/margin_pct 可临时覆盖配置值（预览用，不落盘）。
+    margin_pct 生效时用保证金法口径（名义=本金×保证金%×杠杆），忽略 risk_pct。
+    entry 为用户手动入场价：止损/止盈/爆仓价随之平移重算。
+    """
+    import jarvis_config as jc_mod
+    import jarvis_position_calc as jpc
+    import jarvis_twelve_systems as jts
+
+    sym = symbol.upper().replace("-", "").replace("/", "")
+    if not sym.endswith(("USDT", "USDC")):
+        sym += "USDT"
+    iv = tf if tf in {"auto", "15m", "1h", "4h", "1d"} else "auto"
+    cap = capital if capital is not None else jc_mod.get("poscalc_capital_usdt")
+    lev = leverage if leverage is not None else jc_mod.get("poscalc_leverage")
+    rp = risk_pct if risk_pct is not None else jc_mod.get("poscalc_risk_pct")
+    mp = margin_pct if margin_pct is not None else jc_mod.get("poscalc_margin_pct")
+
+    def _plan_and_price() -> tuple[dict | None, float | None, str]:
+        """取共识 trade_plan（复用 twelve 端点的缓存键，避免重复算信号）。"""
+        if iv == "auto":
+            def _calc_cons():
+                tf_cons: dict = {}
+                price = None
+                basis = _twelve_basis(sym)
+                for t in _TWELVE_TFS:
+                    df = jts.fetch_klines_df(sym, t, 300)
+                    if df is None or len(df) < 30:
+                        continue
+                    out = jts.analyze(df, basis_data=basis)
+                    tf_cons[t] = out["consensus"]
+                    if t == "4h" or price is None:
+                        price = round(float(df["close"].iloc[-1]), 6)
+                merged = jts.consensus_multi_tf(tf_cons)
+                return {"ok": bool(tf_cons), "symbol": sym, "price": price,
+                        "tf_available": sorted(tf_cons.keys()), "consensus": merged}
+            data = _cached(f"twelve:cons:{sym}", 180, _calc_cons)
+            cons = (data or {}).get("consensus") or {}
+            return cons.get("trade_plan"), (data or {}).get("price"), \
+                str(cons.get("direction", "neutral"))
+
+        def _calc_sig():
+            df = jts.fetch_klines_df(sym, iv, 300)
+            if df is None or len(df) < 30:
+                return {"ok": False, "error": "K线数据不足或拉取失败", "symbol": sym,
+                        "tf": iv, "signals": [], "consensus": None}
+            out = jts.analyze(df, basis_data=_twelve_basis(sym))
+            return {"ok": True, "symbol": sym, "tf": iv,
+                    "price": round(float(df["close"].iloc[-1]), 6),
+                    "signals": out["signals"], "consensus": out["consensus"]}
+        data = _cached(f"twelve:sig:{sym}:{iv}", 120, _calc_sig)
+        cons = (data or {}).get("consensus") or {}
+        plan = cons.get("trade_plan")
+        if plan and iv:
+            plan = {**plan, "source_tf": plan.get("source_tf") or iv}
+        return plan, (data or {}).get("price"), str(cons.get("direction", "neutral"))
+
+    try:
+        plan, price, direction = _plan_and_price()
+        advice = jpc.advice_from_plan(plan, capital_usdt=cap, leverage=lev,
+                                      risk_pct=rp, symbol=sym,
+                                      margin_pct=mp, entry_override=entry)
+        return JSONResponse({
+            "ok": True, "symbol": sym, "tf": iv, "price": price,
+            "direction": direction,
+            "config": {"poscalc_capital_usdt": cap, "poscalc_leverage": lev,
+                       "poscalc_risk_pct": rp, "poscalc_margin_pct": mp},
+            "advice": advice,
+        })
+    except Exception as exc:  # noqa: BLE001 — 计算器故障不应 500 砸前端轮询
+        return JSONResponse({"ok": False, "symbol": sym, "tf": iv,
+                             "error": repr(exc)[:300]})
 
 
 # 推理端点并发锁（按 symbol 粒度）：缓存未命中时防多请求并发双烧 LLM token
@@ -3118,7 +3453,7 @@ def api_jarvis_reason(data: dict):
         df = jts.fetch_klines_df(sym, "4h", 300)
         if df is None or len(df) < 30:
             return {"ok": False, "error": "K线数据不足或拉取失败", "symbol": sym}
-        out = jts.analyze(df)
+        out = jts.analyze(df, basis_data=_twelve_basis(sym))
         market = {"symbol": sym, "tf": "4h",
                   "price": round(float(df["close"].iloc[-1]), 6),
                   "atr": round(float(jts._atr(df).iloc[-1]), 6)}
@@ -3228,6 +3563,201 @@ def api_twelve_replay_status():
     """回放进度：{running, progress(0-100), detail, result, error}。"""
     import jarvis_signal_replay as jsr
     return JSONResponse({"ok": True, **jsr.get_status()})
+
+
+@app.get("/api/twelve/signal-winrate")
+def api_twelve_signal_winrate(symbol: str = "BTCUSDT", tf: str = "4h"):
+    """单信号级历史胜率统计（随信号矩阵展示：「该信号近 N 次胜率 63%」）。
+
+    读 jarvis_signal_winrate 的缓存结果（无缓存返回 ok:true + stats:null，
+    前端提示先跑回测）；重算走 POST /api/twelve/signal-winrate/run。
+    响应：{ok, symbol, tf, stats: {horizon_bars, samples, systems:
+    {turtle: {name_cn, long: {...}, short: {...}}, ...}, directions, computed_at}}
+    逐笔明细（trades）体积大，不随聚合下发，走 /signal-winrate/trades。
+    """
+    import jarvis_signal_winrate as jsw
+    sym = symbol.upper().replace("-", "").replace("/", "")
+    if not sym.endswith(("USDT", "USDC")):
+        sym += "USDT"
+    iv = tf if tf in {"15m", "1h", "4h", "1d"} else "4h"
+    try:
+        stats = jsw.get_cached(sym, iv)
+        if isinstance(stats, dict) and "trades" in stats:
+            stats = {k: v for k, v in stats.items() if k != "trades"}
+        return JSONResponse({"ok": True, "symbol": sym, "tf": iv, "stats": stats})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
+
+
+@app.get("/api/twelve/signal-winrate/trades")
+def api_twelve_signal_winrate_trades(symbol: str = "BTCUSDT", tf: str = "4h",
+                                     system: str = "", side: str = ""):
+    """单信号胜率回测的逐笔样本明细（K 线图标记历史盈损点用）。
+
+    query：symbol、tf、system（必填，如 turtle / rsi_smooth）、side（可选
+    long/short 过滤）。复用 jarvis_signal_winrate 缓存的 trades 明细（与聚合
+    胜率同一次回测、同一口径），不另跑回测。
+    响应：{ok, symbol, tf, system, name_cn, horizon_bars, days, computed_at,
+    trades: [{t, exit_t(ms), side, entry, sl, tp, exit_price, win, pnl_pct,
+    bars_held, mode}]}；缓存缺失或旧版缓存无明细时 ok:false + need_run:true
+    （前端引导先点「胜率回测」重算）。
+    """
+    import jarvis_signal_winrate as jsw
+    sym = symbol.upper().replace("-", "").replace("/", "")
+    if not sym.endswith(("USDT", "USDC")):
+        sym += "USDT"
+    iv = tf if tf in {"15m", "1h", "4h", "1d"} else "4h"
+    if not system:
+        return JSONResponse({"ok": False, "error": "缺少 system 参数"}, status_code=400)
+    try:
+        stats = jsw.get_cached(sym, iv)
+        if not isinstance(stats, dict):
+            return JSONResponse({"ok": False, "need_run": True, "symbol": sym, "tf": iv,
+                                 "error": f"{sym} {iv} 尚未做过胜率回测"})
+        all_trades = stats.get("trades")
+        if not isinstance(all_trades, list):
+            # 旧版缓存（无逐笔明细）：引导重跑一次回测刷新缓存结构
+            return JSONResponse({"ok": False, "need_run": True, "symbol": sym, "tf": iv,
+                                 "error": "现有回测缓存无逐笔明细，请重跑一次「胜率回测」"})
+        picked = [t for t in all_trades if t.get("system") == system]
+        if side in ("long", "short"):
+            picked = [t for t in picked if t.get("side") == side]
+        name_cn = (stats.get("systems", {}).get(system) or {}).get("name_cn", system)
+        return JSONResponse({
+            "ok": True, "symbol": sym, "tf": iv, "system": system,
+            "side": side or None, "name_cn": name_cn,
+            "horizon_bars": stats.get("horizon_bars"),
+            "days": stats.get("days"),
+            "computed_at": stats.get("computed_at"),
+            "trades": picked,
+        })
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
+
+
+@app.post("/api/twelve/signal-winrate/run")
+def api_twelve_signal_winrate_run(data: dict | None = None):
+    """启动单信号级胜率回测（异步后台线程，进度查 /signal-winrate/status）。
+
+    body（全部可选）：{"symbols": "BTC,ETH"|["BTC"], "tfs": "15m,1h"|["15m"],
+    "days": 30, "stride": 1}；symbols 缺省取 watchlist，tfs 缺省 15m/1h/4h。
+    已在跑时返回 ok:false（HTTP 409）。
+    """
+    import jarvis_config as jc_mod
+    import jarvis_signal_winrate as jsw
+    d = data or {}
+
+    def _as_list(v, fallback):
+        if isinstance(v, str):
+            items = [x.strip() for x in v.split(",") if x.strip()]
+            return items or fallback
+        if isinstance(v, list):
+            items = [str(x).strip() for x in v if str(x).strip()]
+            return items or fallback
+        return fallback
+
+    symbols = _as_list(d.get("symbols"), list(jc_mod.get("watchlist") or ["BTCUSDT"]))
+    tfs = _as_list(d.get("tfs"), ["15m", "1h", "4h"])
+    try:
+        days = max(1, min(180, int(d.get("days") or 30)))
+        stride = max(1, min(16, int(d.get("stride") or 1)))
+    except (TypeError, ValueError):
+        days, stride = 30, 1
+    out = jsw.start_backtest_async(symbols, tfs, days=days, stride=stride)
+    return JSONResponse(out, status_code=200 if out.get("ok") else 409)
+
+
+@app.get("/api/twelve/signal-winrate/status")
+def api_twelve_signal_winrate_status():
+    """单信号胜率回测进度：{running, progress(0-100), detail, result, error}。"""
+    import jarvis_signal_winrate as jsw
+    return JSONResponse({"ok": True, **jsw.get_status()})
+
+
+# ─────────────────── 信号大白话解读（一键解读，SSE 流式）───────────────────
+
+_EXPLAIN_SIGNAL_SYS = (
+    "你是一位耐心的加密货币交易助教，对象是完全没有交易基础的新手。"
+    "用大白话解释，不堆术语；必须用到术语时立刻用一句话解释它。"
+    "根据传入的信号数据输出 Markdown 短段落，总长 250~400 字，按以下结构：\n"
+    "1. **这是什么信号**：它靠什么判断涨跌（用传入的 explain.type/trigger 转译成人话）\n"
+    "2. **它现在在说什么**：方向、强度、触发依据（对应 direction/strength/reasoning）\n"
+    "3. **历史胜率怎么读**：解释 win_rate/盈亏比/期望的含义；样本量小（low_sample）必须提醒别迷信\n"
+    "4. **新手要注意什么**：1~2 条风险提示（含适用周期 best_tfs 与当前周期是否匹配）\n"
+    "不要编造传入数据里没有的数字；结尾加一句「以上是教学解释，不构成投资建议」。"
+)
+
+_EXPLAIN_CONSENSUS_SYS = (
+    "你是一位耐心的加密货币交易助教，对象是完全没有交易基础的新手。"
+    "传入数据是 12 套技术分析系统对同一币种的投票（bullish=看涨/bearish=看跌/neutral=中性）。"
+    "用大白话解释为什么会出现分歧（不同系统看的东西不一样：趋势类、震荡类、量价类各有视角，"
+    "分歧是正常现象），当前投票分布说明市场处于什么状态，新手面对分歧该怎么办"
+    "（等待更明确共识/轻仓/看更大周期等）。Markdown 短段落，总长 250~400 字，"
+    "不要编造传入数据里没有的数字；结尾加一句「以上是教学解释，不构成投资建议」。"
+)
+
+
+@app.post("/api/twelve/signal-explain/stream")
+def api_twelve_signal_explain_stream(data: dict | None = None):
+    """信号矩阵「一键解读」：把单信号/共识分歧解释成小白话（SSE 流式）。
+
+    body：{"mode": "signal"|"consensus", "symbol", "tf", "payload": {...}}
+      - mode=signal：payload = 前端信号卡现成数据（name_cn/direction/strength/
+        reasoning/explain/trade_plan/grade/横截面元信息），不重复取数
+      - mode=consensus：payload = {votes, direction, confidence, per_system[]}
+    未配置 LLM 时返回 JSON {ok:false, code:"not_configured"}（HTTP 200，前端
+    引导去设置页，不报错）；配置了则 SSE 流式输出（复用 /api/ask/stream 帧格式），
+    记账 module=signal_explain。
+    """
+    import jarvis_llm_config as jlc
+
+    d = data or {}
+    mode = d.get("mode") if d.get("mode") in ("signal", "consensus") else "signal"
+    payload = d.get("payload") if isinstance(d.get("payload"), dict) else {}
+    symbol = str(d.get("symbol") or "BTCUSDT")
+    tf = str(d.get("tf") or "4h")
+
+    cfg = jlc.get_llm_config()
+    if not cfg:
+        return JSONResponse({"ok": False, "code": "not_configured",
+                             "message": "未配置 AI（LLM API Key），请到「设置」页配置后再用一键解读"})
+
+    sys_prompt = _EXPLAIN_CONSENSUS_SYS if mode == "consensus" else _EXPLAIN_SIGNAL_SYS
+    digest = {"symbol": symbol, "tf": tf, **payload}
+    messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": json.dumps(digest, ensure_ascii=False, default=str)},
+    ]
+
+    def _sse(obj: dict) -> str:
+        return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+
+    def gen():
+        try:
+            stream = jlc.chat_stream(messages, timeout=90, module="signal_explain")
+            yield _sse({"type": "meta", "engine": "llm", "model": cfg.get("model")})
+            got_any = False
+            for delta in stream:
+                got_any = True
+                yield _sse({"type": "delta", "content": delta})
+            if not got_any:
+                yield _sse({"type": "delta", "content": "模型没有返回内容，请稍后重试。"})
+            yield _sse({"type": "done"})
+        except (jlc.LLMNotConfigured, jlc.LLMCallError) as exc:
+            _log_emit(f"signal-explain LLM 失败: {exc}", "warn", "ask")
+            yield _sse({"type": "error", "message": f"AI 调用失败：{str(exc)[:160]}，稍后重试"})
+        except Exception as exc:  # noqa: BLE001 — 流中断兜底，已推送内容仍有效
+            yield _sse({"type": "error", "message": f"解读中断：{repr(exc)[:120]}"})
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -4265,6 +4795,61 @@ COCKPIT_HTML = r"""<!doctype html>
   .holds{font-size:11px;color:var(--mut);align-self:center;flex-shrink:0;max-width:300px}
   .foot{color:var(--mut);font-size:10px;padding:0 14px 8px;line-height:1.5}
   .foot a{color:var(--accent)}
+  /* ───── 主动提醒中心：铃铛 + 通知面板 + 页内 toast ───── */
+  .bellbtn{position:relative;background:var(--card);border:1px solid var(--bd);border-radius:var(--r2);color:var(--fg);font-size:15px;padding:5px 11px;cursor:pointer;transition:all .2s var(--ease)}
+  .bellbtn:hover{border-color:var(--bd2);transform:translateY(-1px)}
+  .bellbadge{position:absolute;top:-6px;right:-7px;background:var(--down);color:#fff;font-size:10px;font-weight:700;border-radius:var(--r3);padding:1px 5px;min-width:16px;text-align:center;box-shadow:0 0 0 2px var(--bg)}
+  .notifwrap{position:fixed;top:56px;right:14px;width:400px;max-width:calc(100vw - 24px);max-height:calc(100vh - 90px);z-index:60;background:var(--card);border:1px solid var(--bd2);border-radius:var(--r);box-shadow:0 18px 44px -12px rgba(0,0,0,0.65);display:flex;flex-direction:column;overflow:hidden;animation:fadeUp .22s var(--ease) both}
+  .ntop{display:flex;align-items:center;gap:6px;padding:10px 12px;border-bottom:1px solid var(--bd);background:var(--card2)}
+  .ntab{font-size:12.5px;font-weight:600;color:var(--mut);padding:4px 11px;border-radius:var(--r3);cursor:pointer;border:1px solid transparent;transition:all .2s var(--ease)}
+  .ntab:hover{color:var(--fg)}
+  .ntab.on{background:rgba(79,140,255,0.14);border-color:rgba(79,140,255,0.5);color:var(--accent2)}
+  .nact{font-size:11.5px;color:var(--mut);cursor:pointer;border:1px solid var(--bd);border-radius:var(--r3);padding:3px 10px;white-space:nowrap;transition:all .2s var(--ease)}
+  .nact:hover{color:var(--fg);border-color:var(--bd2)}
+  .nact.on{color:var(--up);border-color:rgba(16,214,140,0.4)}
+  .nbody{flex:1;overflow-y:auto;padding:10px 12px;display:flex;flex-direction:column;gap:8px;min-height:140px}
+  .nfoot{display:flex;gap:8px;padding:9px 12px;border-top:1px solid var(--bd);background:var(--card2)}
+  .nfoot:empty{display:none}
+  .nev{border-left:3px solid var(--bd2);background:var(--card2);border-radius:var(--r2);padding:8px 10px}
+  .nev.warning{border-left-color:var(--warn)} .nev.critical{border-left-color:var(--down)} .nev.info{border-left-color:var(--accent)}
+  .nev.unread{background:rgba(79,140,255,0.07)}
+  .nevhd{display:flex;gap:8px;align-items:baseline}
+  .nevtt{font-size:12.5px;font-weight:700;flex:1}
+  .nevt{font-size:10.5px;color:var(--mut);white-space:nowrap}
+  .nevdd{font-size:11.5px;color:var(--mut);line-height:1.6;margin-top:4px;word-break:break-word}
+  .nrule{display:flex;align-items:center;gap:9px;background:var(--card2);border:1px solid var(--bd);border-radius:var(--r2);padding:8px 10px}
+  .nkind{font-size:10.5px;font-weight:700;color:var(--accent2);border:1px solid rgba(79,140,255,0.4);border-radius:4px;padding:1px 6px;white-space:nowrap;flex-shrink:0}
+  .nrdesc{flex:1;font-size:12px;line-height:1.5}
+  .nrmeta{font-size:10.5px;color:var(--mut);margin-top:2px}
+  .ndel{color:var(--mut);cursor:pointer;font-size:13px;padding:2px 5px;flex-shrink:0}
+  .ndel:hover{color:var(--down)}
+  .nsw{position:relative;display:inline-block;width:32px;height:18px;flex-shrink:0}
+  .nsw input{display:none}
+  .nsw i{position:absolute;inset:0;background:rgba(139,149,167,0.3);border-radius:99px;cursor:pointer;transition:background .2s var(--ease)}
+  .nsw i::after{content:"";position:absolute;left:2px;top:2px;width:14px;height:14px;border-radius:50%;background:#fff;transition:transform .2s var(--ease)}
+  .nsw input:checked+i{background:var(--up)}
+  .nsw input:checked+i::after{transform:translateX(14px)}
+  .nform{display:flex;flex-direction:column;gap:9px}
+  .nkinds{display:flex;gap:6px;flex-wrap:wrap}
+  .nkbtn{font-size:12px;font-weight:600;color:var(--mut);border:1px solid var(--bd);border-radius:var(--r3);padding:5px 13px;cursor:pointer;transition:all .2s var(--ease)}
+  .nkbtn:hover{color:var(--fg);border-color:var(--bd2)}
+  .nkbtn.on{background:rgba(245,192,14,0.12);border-color:rgba(245,192,14,0.55);color:var(--warn)}
+  .nfrow{display:flex;align-items:center;gap:9px}
+  .nfrow label{font-size:12px;color:var(--mut);width:76px;flex-shrink:0}
+  .nfrow input,.nfrow select{flex:1;background:var(--card2);color:var(--fg);border:1px solid var(--bd);border-radius:var(--r2);padding:7px 10px;font-size:12.5px;min-width:0}
+  .nfrow input:focus,.nfrow select:focus{outline:none;border-color:var(--accent)}
+  .nhint{font-size:11px;color:var(--mut);line-height:1.65;background:rgba(79,140,255,0.06);border:1px dashed rgba(79,140,255,0.25);border-radius:var(--r2);padding:8px 10px}
+  .nkl{display:flex;gap:6px;flex-wrap:wrap;align-items:center;font-size:11px}
+  .nklbtn{font-size:11px;font-family:var(--mono);color:var(--fg2);border:1px solid var(--bd);border-radius:var(--r3);padding:3px 9px;cursor:pointer;transition:all .2s var(--ease)}
+  .nklbtn:hover{border-color:var(--accent);color:var(--accent2)}
+  .nsubmit{background:var(--accent);border:none;border-radius:var(--r2);color:#fff;padding:10px 0;font-weight:700;font-size:13px;cursor:pointer;transition:filter .2s var(--ease)}
+  .nsubmit:hover{filter:brightness(1.1)}
+  .toasts{position:fixed;right:14px;bottom:64px;z-index:70;display:flex;flex-direction:column;gap:8px;width:330px;max-width:calc(100vw - 24px);pointer-events:none}
+  .toast{pointer-events:auto;background:var(--card);border:1px solid var(--bd2);border-left:3px solid var(--accent);border-radius:var(--r2);padding:10px 12px;box-shadow:0 12px 30px -10px rgba(0,0,0,0.6);cursor:pointer;animation:fadeUp .25s var(--ease) both;transition:opacity .4s var(--ease),transform .4s var(--ease)}
+  .toast.warning{border-left-color:var(--warn)} .toast.critical{border-left-color:var(--down)}
+  .toast.out{opacity:0;transform:translateY(6px)}
+  .toast .tt{font-size:12.5px;font-weight:700}
+  .toast .dd{font-size:11.5px;color:var(--mut);margin-top:3px;line-height:1.5}
   @media(max-width:980px){.cockpit{grid-template-columns:1fr;overflow:auto}.sidecol{overflow:visible}#kline{height:340px;flex:none}.ask{height:300px}}
 </style>
 </head>
@@ -4275,8 +4860,22 @@ COCKPIT_HTML = r"""<!doctype html>
     <input class="symin" id="symin" placeholder="＋添加币种 如 DOGE" onkeydown="if(event.key==='Enter')pickInput()"/>
     <div class="price"><span id="px">—</span> <small id="pxsub"></small></div>
     <div class="spacer"></div>
+    <button class="bellbtn" id="bellBtn" onclick="toggleNotif()" title="通知中心：信号反转 / 价格关键位 / 割肉后回升提醒">🔔<span class="bellbadge" id="bellBadge" style="display:none">0</span></button>
     <div class="live"><span class="pulse"></span><span id="upAt">加载中…</span><br><span id="nextIn"></span></div>
   </div>
+
+  <div class="notifwrap" id="notifPanel" style="display:none">
+    <div class="ntop">
+      <span class="ntab on" data-ntab="events" onclick="notifTab('events')">通知</span>
+      <span class="ntab" data-ntab="rules" onclick="notifTab('rules')">规则</span>
+      <span class="ntab" data-ntab="new" onclick="notifTab('new')">＋新建提醒</span>
+      <span style="flex:1"></span>
+      <span class="nact" id="nbrowserBtn" onclick="enableBrowserNotif()" title="开启后触发提醒时弹浏览器系统通知，页面不在前台也能收到">🖥 系统通知</span>
+    </div>
+    <div class="nbody" id="notifBody"><div class="empty">加载中…</div></div>
+    <div class="nfoot" id="notifFoot"></div>
+  </div>
+  <div class="toasts" id="toasts"></div>
 
   <div class="cockpit">
     <div class="chartcol">
@@ -5079,11 +5678,242 @@ function loadAll(){ countdown=REFRESH; loadKline(); refreshSide(); if(HZHIST['4h
 window.addEventListener('resize',()=>{ if(HZHIST['4h']) requestAnimationFrame(drawHitCanvas); });
 function startTimer(){ if(tick)clearInterval(tick); tick=setInterval(()=>{ countdown--; renderLive(); if(countdown<=0){ countdown=REFRESH; refreshSide(); } },1000); }
 
+// ───────── 主动提醒中心：通知中心面板 + SSE 实时推送 + 浏览器系统通知 ─────────
+const KIND_CN={signal_flip:'信号反转', price_level:'价格关键位', reentry:'割肉回升'};
+let notifOpen=false, notifTabCur='events', notifUnread=0, notifES=null, notifESRetry=0;
+let newRuleKind='signal_flip', _klLevels=[], _nrKlLabel='';
+
+function esc(s){ return (''+(s??'')).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function renderBadge(){
+  const b=$('bellBadge'); if(!b) return;
+  b.style.display = notifUnread>0?'':'none';
+  b.textContent = notifUnread>99?'99+':notifUnread;
+}
+async function refreshUnread(){
+  try{ const d=await (await fetch('/api/alert-center/unread-count')).json();
+    if(d.ok){ notifUnread=d.unread||0; renderBadge(); } }catch(e){}
+}
+function toggleNotif(){
+  notifOpen=!notifOpen; $('notifPanel').style.display=notifOpen?'':'none';
+  if(notifOpen) notifTab(notifTabCur);
+}
+document.addEventListener('click',(e)=>{
+  if(!notifOpen) return;
+  const p=$('notifPanel'), b=$('bellBtn');
+  if(p&&!p.contains(e.target)&&b&&!b.contains(e.target)){ notifOpen=false; p.style.display='none'; }
+});
+function notifTab(t){
+  notifTabCur=t;
+  document.querySelectorAll('#notifPanel .ntab').forEach(el=>el.classList.toggle('on', el.getAttribute('data-ntab')===t));
+  if(t==='events') renderNotifEvents();
+  else if(t==='rules') renderNotifRules();
+  else renderNotifNew();
+}
+async function renderNotifEvents(){
+  const body=$('notifBody'); body.innerHTML='<div class="empty">加载中…</div>';
+  try{
+    const d=await (await fetch('/api/alert-center/events?limit=80')).json();
+    if(!d.ok) throw 0;
+    notifUnread=d.unread||0; renderBadge();
+    const evs=d.events||[];
+    body.innerHTML = evs.length ? evs.map(e=>
+      `<div class="nev ${e.severity}${e.read?'':' unread'}">`+
+      `<div class="nevhd"><span class="nevtt">${esc(e.title)}</span><span class="nevt">${e.time}</span></div>`+
+      (e.detail?`<div class="nevdd">${esc(e.detail).replace(/\n/g,'<br>')}</div>`:'')+
+      `</div>`).join('')
+      : '<div class="empty">还没有提醒。点「＋新建提醒」创建你的第一条监控规则：<br>信号反转 / 价格关键位 / 割肉后回升。</div>';
+    $('notifFoot').innerHTML =
+      `<span class="nact" onclick="markAllRead()">全部标为已读</span>`+
+      `<span class="nact" onclick="runAcCheck(this)">立即巡检一轮</span>`;
+  }catch(e){ body.innerHTML='<div class="empty">加载失败，稍后重试</div>'; }
+}
+async function renderNotifRules(){
+  const body=$('notifBody'); body.innerHTML='<div class="empty">加载中…</div>';
+  try{
+    const d=await (await fetch('/api/alert-center/rules')).json();
+    if(!d.ok) throw 0;
+    const rs=d.rules||[];
+    body.innerHTML = rs.length ? rs.map(r=>
+      `<div class="nrule">`+
+      `<span class="nkind">${KIND_CN[r.kind]||r.kind}</span>`+
+      `<div class="nrdesc">${esc(r.desc)}`+
+      ((r.triggered_count||!r.enabled)?`<div class="nrmeta">${r.triggered_count?('已触发 '+r.triggered_count+' 次'):''}${!r.enabled?(r.triggered_count?' · ':'')+'已停用':''}</div>`:'')+
+      `</div>`+
+      `<label class="nsw" title="启用/停用"><input type="checkbox" ${r.enabled?'checked':''} onchange="toggleRule('${r.id}',this.checked)"><i></i></label>`+
+      `<span class="ndel" onclick="delRule('${r.id}')" title="删除规则">✕</span>`+
+      `</div>`).join('')
+      : '<div class="empty">还没有监控规则，点「＋新建提醒」创建。</div>';
+    $('notifFoot').innerHTML='<span style="font-size:10.5px;color:var(--mut);line-height:1.6">一次性规则触发后自动停用（可重新打开开关续用）；信号反转规则持续监控。</span>';
+  }catch(e){ body.innerHTML='<div class="empty">加载失败，稍后重试</div>'; }
+}
+function renderNotifNew(){
+  const body=$('notifBody');
+  const k=newRuleKind;
+  const kindBtns=Object.entries(KIND_CN).map(([id,cn])=>
+    `<span class="nkbtn${k===id?' on':''}" onclick="newRuleKind='${id}';renderNotifNew()">${cn}</span>`).join('');
+  let fields='';
+  if(k==='signal_flip'){
+    fields=
+      `<div class="nfrow"><label>周期</label><select id="nrTf"><option value="4h">4小时（推荐）</option><option value="1h">1小时</option><option value="15m">15分钟</option><option value="1d">日线</option></select></div>`+
+      `<div class="nfrow"><label>置信度门槛</label><select id="nrConf"><option value="0">全部方向变化都提醒</option><option value="0.5">≥50% 才提醒</option><option value="0.75">≥75%（只要强信号）</option></select></div>`+
+      `<div class="nhint">盯住该币的十二套技术共识方向：看涨↔看跌互翻、信号建立、信号转中性都会立即通知。持续监控，每次变化都提醒——系统翻空时你不会再蒙在鼓里。</div>`;
+  }else if(k==='price_level'){
+    fields=
+      `<div class="nfrow"><label>方向</label><select id="nrDir"><option value="above">涨破（向上穿越）</option><option value="below">跌破（向下穿越）</option></select></div>`+
+      `<div class="nfrow"><label>目标价</label><input id="nrPrice" placeholder="如 100000" inputmode="decimal"></div>`+
+      `<div class="nfrow"><label>重复提醒</label><select id="nrRepeat"><option value="0">触发一次后停用</option><option value="1">每次穿越都提醒</option></select></div>`+
+      `<div class="nkl" id="nrKl"><span class="mut">系统关键位加载中…</span></div>`+
+      `<div class="nhint">价格从另一侧「穿越」目标价才触发，创建时不会误报。⛰=系统阻力位（建议涨破提醒），🛟=系统支撑位（建议跌破提醒），点击一键填入。</div>`;
+  }else{
+    fields=
+      `<div class="nfrow"><label>我的平仓价</label><input id="nrExit" placeholder="你割肉时的价格，如 92000" inputmode="decimal"></div>`+
+      `<div class="nfrow"><label>确认幅度</label><select id="nrConfirm"><option value="0">站回即提醒</option><option value="0.5" selected>+0.5%（防插针）</option><option value="1">+1%</option><option value="2">+2%</option></select></div>`+
+      `<div class="nfrow"><label>持仓方向</label><select id="nrSide"><option value="long">我平的是多单（等价格涨回来）</option><option value="short">我平的是空单（等价格跌回去）</option></select></div>`+
+      `<div class="nhint">割肉后价格又涨回去却不知情？标记你的平仓价，价格重新站回该位置时立即提醒你评估再入场，不再错过反弹行情。</div>`;
+  }
+  body.innerHTML=
+    `<div class="nform">`+
+    `<div class="nkinds">${kindBtns}</div>`+
+    `<div class="nfrow"><label>币种</label><input id="nrSym" value="${esc(sym.replace('USDT',''))}" placeholder="如 BTC"></div>`+
+    fields+
+    `<div class="nfrow"><label>备注</label><input id="nrNote" placeholder="可选，触发时随提醒展示"></div>`+
+    `<button class="nsubmit" onclick="submitRule(this)">创建提醒规则</button>`+
+    `</div>`;
+  $('notifFoot').innerHTML='';
+  if(k==='price_level') loadKlSuggest();
+}
+async function loadKlSuggest(){
+  const el=$('nrKl'); if(!el) return;
+  try{
+    const s=($('nrSym')&&$('nrSym').value)||sym;
+    const d=await (await fetch('/api/alert-center/key-levels?symbol='+encodeURIComponent(s))).json();
+    if(!d.ok||!(d.levels||[]).length){ el.innerHTML='<span class="mut">暂无系统关键位建议（K线计算中或数据不足）</span>'; return; }
+    _klLevels=d.levels.slice(0,6);
+    el.innerHTML='<span class="mut">系统关键位（点击填入）：</span>'+_klLevels.map((l,i)=>
+      `<span class="nklbtn" onclick="useKl(${i})" title="${esc(l.label)} · 来源 ${esc(l.source)}">${l.suggest_direction==='above'?'⛰':'🛟'} ${fmt(l.price)}</span>`).join('');
+  }catch(e){ el.innerHTML='<span class="mut">关键位加载失败</span>'; }
+}
+function useKl(i){
+  const l=_klLevels[i]; if(!l) return;
+  const pe=$('nrPrice'); if(pe) pe.value=l.price;
+  const de=$('nrDir'); if(de) de.value=l.suggest_direction;
+  _nrKlLabel=(l.label||'')+(l.source?('·'+l.source):'');
+}
+async function submitRule(btn){
+  const k=newRuleKind;
+  const payload={kind:k, symbol:(($('nrSym')&&$('nrSym').value)||sym), note:($('nrNote')?$('nrNote').value:'')};
+  if(k==='signal_flip'){
+    payload.tf=$('nrTf').value; payload.min_confidence=parseFloat($('nrConf').value)||0;
+  }else if(k==='price_level'){
+    payload.target_price=parseFloat($('nrPrice').value);
+    payload.direction=$('nrDir').value;
+    payload.repeat=$('nrRepeat').value==='1';
+    if(_nrKlLabel) payload.label=_nrKlLabel;
+    if(!(payload.target_price>0)){ alert('请填写目标价'); return; }
+  }else{
+    payload.exit_price=parseFloat($('nrExit').value);
+    payload.confirm_pct=parseFloat($('nrConfirm').value)||0;
+    payload.side=$('nrSide').value;
+    if(!(payload.exit_price>0)){ alert('请填写你的平仓价'); return; }
+  }
+  btn.disabled=true; btn.textContent='创建中…';
+  try{
+    const r=await fetch('/api/alert-center/rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const d=await r.json();
+    if(!d.ok){ alert(d.reason||'创建失败'); }
+    else{ _nrKlLabel=''; toast({title:'✅ 提醒规则已创建',detail:d.rule.desc,severity:'info'},false); notifTab('rules'); }
+  }catch(e){ alert('网络异常，稍后再试'); }
+  btn.disabled=false; btn.textContent='创建提醒规则';
+}
+async function toggleRule(id,on){
+  try{ await fetch('/api/alert-center/rules/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:on})}); }catch(e){}
+}
+async function delRule(id){
+  if(!confirm('删除这条提醒规则？')) return;
+  try{ await fetch('/api/alert-center/rules/'+id,{method:'DELETE'}); renderNotifRules(); }catch(e){}
+}
+async function markAllRead(){
+  try{
+    await fetch('/api/alert-center/events/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({all:true})});
+    notifUnread=0; renderBadge();
+    if(notifTabCur==='events') renderNotifEvents();
+  }catch(e){}
+}
+async function runAcCheck(el){
+  if(el) el.textContent='巡检中…';
+  try{
+    const d=await (await fetch('/api/alert-center/check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})})).json();
+    toast({title:`🔍 巡检完成：检查 ${d.checked} 条规则，触发 ${d.triggered} 条`,severity:'info'},false);
+    if(notifTabCur==='events') renderNotifEvents();
+  }catch(e){}
+  if(el) el.textContent='立即巡检一轮';
+}
+// 浏览器系统通知（Notification API）
+function browserNotifState(){ return ('Notification' in window)?Notification.permission:'unsupported'; }
+function renderBrowserBtn(){
+  const el=$('nbrowserBtn'); if(!el) return;
+  const st=browserNotifState();
+  el.textContent = st==='granted'?'🖥 系统通知已开':(st==='denied'?'🖥 系统通知被拒':'🖥 开启系统通知');
+  el.classList.toggle('on', st==='granted');
+}
+async function enableBrowserNotif(){
+  if(!('Notification' in window)){ alert('当前浏览器不支持系统通知'); return; }
+  if(Notification.permission==='default'){ try{ await Notification.requestPermission(); }catch(e){} }
+  else if(Notification.permission==='denied'){ alert('通知权限已被浏览器拒绝，请在地址栏左侧的站点设置里手动允许通知'); }
+  renderBrowserBtn();
+  if(Notification.permission==='granted'){
+    try{ new Notification('贾维斯提醒中心',{body:'浏览器系统通知已开启，触发提醒时即使页面不在前台也会弹出。',tag:'jarvis-ac-test'}); }catch(e){}
+  }
+}
+function sysNotify(ev){
+  try{
+    if(browserNotifState()!=='granted') return;
+    const n=new Notification(ev.title,{body:(ev.detail||'').split('\n')[0].slice(0,120),tag:'jarvis-ac-'+(ev.id||Date.now())});
+    n.onclick=()=>{ try{ window.focus(); if(!notifOpen) toggleNotif(); n.close(); }catch(e){} };
+  }catch(e){}
+}
+// 页内 toast（点击展开通知中心）
+function toast(ev,sys=true){
+  const box=$('toasts'); if(!box) return;
+  const el=document.createElement('div');
+  el.className='toast '+(ev.severity||'info');
+  el.innerHTML=`<div class="tt">${esc(ev.title)}</div>`+(ev.detail?`<div class="dd">${esc((ev.detail||'').split('\n')[0]).slice(0,160)}</div>`:'');
+  el.onclick=()=>{ el.remove(); if(!notifOpen) toggleNotif(); };
+  box.appendChild(el);
+  while(box.children.length>4) box.removeChild(box.firstChild);
+  setTimeout(()=>{ el.classList.add('out'); setTimeout(()=>{ try{el.remove();}catch(e){} },420); },8000);
+  if(sys) sysNotify(ev);
+}
+// SSE：后端触发提醒实时推到页面（断线自动重连，兜底靠未读数轮询）
+function openNotifStream(){
+  if(notifES){ try{ notifES.close(); }catch(e){} notifES=null; }
+  let es;
+  try{ es=new EventSource('/api/alert-center/stream'); }catch(e){ return; }
+  notifES=es;
+  es.onmessage=(m)=>{
+    let ev; try{ ev=JSON.parse(m.data); }catch(e){ return; }
+    if(ev.type==='hello'){ notifESRetry=0; notifUnread=ev.unread||0; renderBadge(); return; }
+    notifUnread++; renderBadge();
+    toast(ev,true);
+    if(notifOpen&&notifTabCur==='events') renderNotifEvents();
+  };
+  es.onerror=()=>{
+    try{ es.close(); }catch(e){}
+    if(notifES===es){ notifES=null; notifESRetry=Math.min(notifESRetry+1,6);
+      setTimeout(openNotifStream, 3000*Math.max(notifESRetry,1)); }
+  };
+}
+function initAlertCenter(){
+  renderBadge(); refreshUnread(); renderBrowserBtn(); openNotifStream();
+  setInterval(refreshUnread, 90000);   // SSE 断连期间的未读数兜底
+}
+
 renderChips();
 renderVisBtns();
 addMsg('你好！我是贾维斯。问我「现在该买什么」「卖多少」「为什么这么判断」，或直接点下面的快捷问题。','a');
 loadWatchlist().then(()=>{ loadAll(); });
 startTimer();
+initAlertCenter();
 </script>
 </body>
 </html>

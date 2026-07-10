@@ -5,6 +5,7 @@ import PositionCard from "@/components/cards/PositionCard";
 import HealthStatusCard from "@/components/cards/HealthStatusCard";
 import ConsensusGauge from "@/components/cards/ConsensusGauge";
 import SignalBoard from "@/components/cards/SignalBoard";
+import PositionAdvisor from "@/components/cards/PositionAdvisor";
 import InsightFeed from "@/components/cards/InsightFeed";
 import TradeHistory from "@/components/cards/TradeHistory";
 import SignalWinRate from "@/components/cards/SignalWinRate";
@@ -203,6 +204,9 @@ export default function Dashboard() {
 
       {/* ── 第二行 · 再看信号：12 套系统信号矩阵 ── */}
       <SignalBoard symbol={symbol} tf={consensusTf} onTfChange={setConsensusTf} />
+
+      {/* ── 第二行半 · 能开多少：仓位与风控建议（信号计划 × 本金/杠杆/风险%）── */}
+      <PositionAdvisor symbol={symbol} tf={consensusTf} />
 
       {/* ── 第三行 · 主动汇报：洞察流 | 净值曲线 ── */}
       <div className="grid grid-cols-3 gap-4">

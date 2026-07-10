@@ -212,7 +212,8 @@ def generate_from_description(
 
     for attempt in range(1, max_retries + 1):
         try:
-            response = llm.call_llm(prompt, system=SYSTEM_PROMPT, temperature=0.4)
+            response = llm.call_llm(prompt, system=SYSTEM_PROMPT, temperature=0.4,
+                                    module="strategy_gen")
         except Exception as e:  # noqa: BLE001
             # 配置缺失/网络错误没有重试价值，直接返回
             return {"ok": False, "error": f"调用大模型失败: {e}"}

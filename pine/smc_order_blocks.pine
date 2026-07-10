@@ -1,0 +1,261 @@
+//@version=5
+// =============================================================================
+// SMC 订单块 (Order Block) 指标
+// 多头看涨订单块（红色）：连续下跌/横盘后，大阳线向上突破区间，且随后 N 根K线
+//   不回落跌破该阳线开盘价 → 自动框选突破阳线之前整段下跌/盘整区间。
+// 空头看跌订单块（青色）：连续上涨/横盘后，大阴线向下跌破区间，且随后 N 根K线
+//   不反弹站上该阴线开盘价 → 自动框选破位阴线之前整段上涨/盘整区间。
+// 所有判定均在K线收盘确认后执行，历史与实时行为一致，不重绘。
+// =============================================================================
+indicator("SMC 订单块 (Order Block)", shorttitle="SMC OB", overlay=true,
+     max_boxes_count=500, max_lines_count=500, max_bars_back=500)
+
+// ================= 参数 =================
+grpShow = "显示开关"
+showBull   = input.bool(true,  "显示多头订单块（看涨·红）", group=grpShow)
+showBear   = input.bool(true,  "显示空头订单块（看跌·青）", group=grpShow)
+showMark   = input.bool(true,  "突破K线竖线标记",           group=grpShow)
+clearAll   = input.bool(false, "一键清空历史标注（勾选清空/取消恢复）", group=grpShow)
+
+grpColor = "颜色与透明度"
+bullColIn   = input.color(#f23645, "多头区块颜色", group=grpColor)
+bearColIn   = input.color(#00bcd4, "空头区块颜色", group=grpColor)
+fillTransp  = input.int(80, "区块填充透明度", minval=0, maxval=99, group=grpColor,
+     tooltip="数值越大越透明。区块为纯色填充、无边框；主图K线默认绘制在指标图层之上，不会被遮挡。")
+fadedTransp = input.int(94, "失效区块透明度", minval=0, maxval=100, group=grpColor)
+hideInvalid = input.bool(false, "失效后直接删除（否则淡化保留）", group=grpColor)
+
+grpLogic = "识别逻辑"
+rangeLen     = input.int(10, "突破区间检测长度（根）", minval=3, maxval=100, group=grpLogic,
+     tooltip="突破K线收盘价需越过之前 N 根K线的最高价（多）/最低价（空）；该 N 根也是区块框选的最小范围。")
+maxZone      = input.int(30, "区块最大回溯（根）", minval=5, maxval=100, group=grpLogic,
+     tooltip="自动向前框选整段下跌/上涨或盘整区间时的最大K线数。")
+strengthMode = input.string("ATR倍数", "突破实体强度模式", options=["ATR倍数", "实体占比", "两者皆需"], group=grpLogic)
+bodyAtrMult  = input.float(1.0,  "实体 ≥ ATR ×",      minval=0.1, step=0.1, group=grpLogic)
+bodyPctMin   = input.float(55.0, "实体占K线全幅 ≥ %", minval=10.0, maxval=100.0, step=5.0, group=grpLogic)
+confirmBars  = input.int(3, "确认K线数量（根）", minval=1, maxval=20, group=grpLogic,
+     tooltip="突破后连续 N 根K线不回破突破K线开盘价，区块才正式生成。")
+confirmBasis = input.string("收盘价", "回破判定依据", options=["收盘价", "影线极值"], group=grpLogic)
+flatTolAtr   = input.float(0.5, "前置走势容差（ATR倍数）", minval=0.0, step=0.1, group=grpLogic,
+     tooltip="突破前区间的净涨跌需不超过该容差：多头要求前置为下跌/横盘，空头要求前置为上涨/横盘。")
+
+grpMaint = "去重与失效"
+minGapBars  = input.int(5,  "同向区块最小间隔（根）", minval=0, maxval=100, group=grpMaint)
+overlapPct  = input.float(50.0, "价格重叠超过 % 则不重复生成", minval=0.0, maxval=100.0, step=5.0, group=grpMaint)
+invalidBars = input.int(8,  "深入区块停留 N 根后失效", minval=1, maxval=100, group=grpMaint,
+     tooltip="收盘价越过区块中线并连续停留 N 根K线，或收盘价完全穿越区块，则区块失效、不再高亮。")
+maxBlocks   = input.int(60, "最多保留区块数", minval=5, maxval=200, group=grpMaint,
+     tooltip="超出后自动删除最旧的区块（TradingView 单指标 box 上限 500）。")
+extendMode  = input.string("固定(仅框选前置区间)", "区块右边界", options=["固定(仅框选前置区间)", "向右延伸(直至失效)"], group=grpMaint)
+
+// ================= 全局序列 =================
+atrVal      = ta.atr(14)
+rangeHiPrev = ta.highest(high, rangeLen)[1]
+rangeLoPrev = ta.lowest(low,  rangeLen)[1]
+
+bullFill  = color.new(bullColIn, fillTransp)
+bearFill  = color.new(bearColIn, fillTransp)
+bullFaded = color.new(bullColIn, fadedTransp)
+bearFaded = color.new(bearColIn, fadedTransp)
+bullMark  = color.new(bullColIn, 45)
+bearMark  = color.new(bearColIn, 45)
+
+// ================= 状态容器 =================
+// 待确认订单块（突破已出现，等待确认K线走完）
+var p_dir    = array.new_int()
+var p_bkIdx  = array.new_int()
+var p_bkOpen = array.new_float()
+var p_top    = array.new_float()
+var p_bot    = array.new_float()
+var p_left   = array.new_int()
+var p_remain = array.new_int()
+
+// 已确认区块
+var b_box   = array.new_box()
+var b_line  = array.new_line()
+var b_dir   = array.new_int()
+var b_top   = array.new_float()
+var b_bot   = array.new_float()
+var b_state = array.new_int()   // 1=有效高亮 0=已失效淡化
+var b_deep  = array.new_int()
+
+var int lastBullBk = -99999
+var int lastBearBk = -99999
+
+// ================= 工具函数 =================
+f_strengthOK(_body, _range) =>
+    okAtr = _body >= atrVal * bodyAtrMult
+    okPct = _range > 0 and _body >= _range * bodyPctMin / 100.0
+    strengthMode == "ATR倍数" ? okAtr : strengthMode == "实体占比" ? okPct : okAtr and okPct
+
+// 自突破K线向前回溯，框选之前整段下跌/上涨或盘整区间：
+// 以被突破的区间极值为界，持续纳入未越界的K线，遇到越界K线（前一段反向冲高/杀跌的起点）即停。
+f_zone(_dir) =>
+    int lim = math.max(maxZone, rangeLen)
+    float tol = nz(atrVal) * 0.1
+    int len = 0
+    for i = 1 to lim
+        bool ok = false
+        if _dir > 0
+            ok := not na(high[i]) and high[i] <= rangeHiPrev + tol
+        else
+            ok := not na(low[i]) and low[i] >= rangeLoPrev - tol
+        if ok
+            len := i
+        else
+            break
+    float zt = na
+    float zb = na
+    if len > 0
+        zt := high[1]
+        zb := low[1]
+        if len >= 2
+            for i = 2 to len
+                zt := math.max(zt, high[i])
+                zb := math.min(zb, low[i])
+    [len, zt, zb]
+
+f_removePending(_i) =>
+    array.remove(p_dir, _i)
+    array.remove(p_bkIdx, _i)
+    array.remove(p_bkOpen, _i)
+    array.remove(p_top, _i)
+    array.remove(p_bot, _i)
+    array.remove(p_left, _i)
+    array.remove(p_remain, _i)
+
+f_removeBlock(_i) =>
+    box.delete(array.get(b_box, _i))
+    line lnRm = array.get(b_line, _i)
+    if not na(lnRm)
+        line.delete(lnRm)
+    array.remove(b_box, _i)
+    array.remove(b_line, _i)
+    array.remove(b_dir, _i)
+    array.remove(b_top, _i)
+    array.remove(b_bot, _i)
+    array.remove(b_state, _i)
+    array.remove(b_deep, _i)
+
+// 与现存同向有效区块的价格重叠比例是否超限（防冗余重叠区块）
+f_overlapped(_dir, _t, _b) =>
+    bool ov = false
+    float h = _t - _b
+    if h > 0 and array.size(b_box) > 0
+        int i = 0
+        while i < array.size(b_box) and not ov
+            if array.get(b_dir, i) == _dir and array.get(b_state, i) == 1
+                float inter = math.min(_t, array.get(b_top, i)) - math.max(_b, array.get(b_bot, i))
+                if inter > 0 and inter / h * 100.0 >= overlapPct
+                    ov := true
+            i += 1
+    ov
+
+f_confirmDraw(_dir, _left, _bkIdx, _t, _b) =>
+    if not f_overlapped(_dir, _t, _b)
+        color fillC = _dir > 0 ? bullFill : bearFill
+        color markC = _dir > 0 ? bullMark : bearMark
+        box bx = box.new(left=_left, top=_t, right=_bkIdx - 1, bottom=_b,
+             border_color=na, xloc=xloc.bar_index, bgcolor=fillC)
+        line ln = na
+        if showMark
+            ln := line.new(_bkIdx, _b, _bkIdx, _t, xloc=xloc.bar_index,
+                 extend=extend.both, color=markC, style=line.style_dotted, width=1)
+        array.push(b_box, bx)
+        array.push(b_line, ln)
+        array.push(b_dir, _dir)
+        array.push(b_top, _t)
+        array.push(b_bot, _b)
+        array.push(b_state, 1)
+        array.push(b_deep, 0)
+
+f_dropOldest() =>
+    box.delete(array.shift(b_box))
+    line lnOld = array.shift(b_line)
+    if not na(lnOld)
+        line.delete(lnOld)
+    array.shift(b_dir)
+    array.shift(b_top)
+    array.shift(b_bot)
+    array.shift(b_state)
+    array.shift(b_deep)
+
+// ================= 主逻辑（仅在K线收盘确认后执行，避免重绘） =================
+if barstate.isconfirmed and not clearAll
+    // 1) 推进待确认区块：回破突破K线开盘价则作废；撑满确认K线数则正式绘制
+    int i = 0
+    while i < array.size(p_dir)
+        int d    = array.get(p_dir, i)
+        float bo = array.get(p_bkOpen, i)
+        bool byClose  = confirmBasis == "收盘价"
+        bool violated = d > 0 ? (byClose ? close < bo : low < bo) : (byClose ? close > bo : high > bo)
+        if violated
+            f_removePending(i)
+        else
+            int rem = array.get(p_remain, i) - 1
+            if rem <= 0
+                f_confirmDraw(d, array.get(p_left, i), array.get(p_bkIdx, i), array.get(p_top, i), array.get(p_bot, i))
+                f_removePending(i)
+            else
+                array.set(p_remain, i, rem)
+                i += 1
+
+    // 2) 已确认区块失效维护：收盘穿越整个区块立即失效；深入中线内侧停留过久也失效
+    int j = 0
+    while j < array.size(b_box)
+        bool removed = false
+        if array.get(b_state, j) == 1
+            int d     = array.get(b_dir, j)
+            float t   = array.get(b_top, j)
+            float b   = array.get(b_bot, j)
+            float mid = (t + b) / 2.0
+            bool hardOut = d > 0 ? close < b : close > t
+            bool deepIn  = d > 0 ? (close >= b and close < mid) : (close <= t and close > mid)
+            array.set(b_deep, j, deepIn ? array.get(b_deep, j) + 1 : 0)
+            if hardOut or array.get(b_deep, j) >= invalidBars
+                if hideInvalid
+                    f_removeBlock(j)
+                    removed := true
+                else
+                    array.set(b_state, j, 0)
+                    box.set_bgcolor(array.get(b_box, j), d > 0 ? bullFaded : bearFaded)
+                    line lnj = array.get(b_line, j)
+                    if not na(lnj)
+                        line.set_color(lnj, d > 0 ? bullFaded : bearFaded)
+            else
+                if extendMode == "向右延伸(直至失效)"
+                    box.set_right(array.get(b_box, j), bar_index)
+        if not removed
+            j += 1
+
+    // 3) 检测新突破（本K线收盘确认后判定；新建的待确认块自下一根K线起校验）
+    bool ctxOK = not na(atrVal) and not na(rangeHiPrev) and not na(rangeLoPrev)
+    if ctxOK
+        float bodyUp = close - open
+        if showBull and bodyUp > 0 and close > rangeHiPrev and f_strengthOK(bodyUp, high - low) and bar_index - lastBullBk >= minGapBars
+            [lenB, ztB, zbB] = f_zone(1)
+            if lenB >= rangeLen and not na(ztB) and ztB > zbB and close[1] - close[lenB] <= flatTolAtr * atrVal
+                array.push(p_dir, 1)
+                array.push(p_bkIdx, bar_index)
+                array.push(p_bkOpen, open)
+                array.push(p_top, ztB)
+                array.push(p_bot, zbB)
+                array.push(p_left, bar_index - lenB)
+                array.push(p_remain, confirmBars)
+                lastBullBk := bar_index
+        float bodyDn = open - close
+        if showBear and bodyDn > 0 and close < rangeLoPrev and f_strengthOK(bodyDn, high - low) and bar_index - lastBearBk >= minGapBars
+            [lenS, ztS, zbS] = f_zone(-1)
+            if lenS >= rangeLen and not na(ztS) and ztS > zbS and close[1] - close[lenS] >= -flatTolAtr * atrVal
+                array.push(p_dir, -1)
+                array.push(p_bkIdx, bar_index)
+                array.push(p_bkOpen, open)
+                array.push(p_top, ztS)
+                array.push(p_bot, zbS)
+                array.push(p_left, bar_index - lenS)
+                array.push(p_remain, confirmBars)
+                lastBearBk := bar_index
+
+    // 4) 数量上限修剪：超出保留上限时删除最旧区块
+    while array.size(b_box) > maxBlocks
+        f_dropOldest()

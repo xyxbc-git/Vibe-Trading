@@ -5,6 +5,7 @@ import {
   type ISeriesApi,
   type IPriceLine,
   type LineWidth,
+  type MouseEventParams,
   ColorType,
   CrosshairMode,
   LineStyle,
@@ -13,6 +14,10 @@ import {
   type Time,
 } from "lightweight-charts";
 import type { DrawingResult, SmartLevels, KeyLevel, DrawLineStyle, DrawHLine } from "@/lib/drawings";
+import { zoneTimeWindow, type TradeZone } from "@/lib/tradeZones";
+import type { TradeMark } from "@/lib/signalTrades";
+import { TradeZonesPrimitive } from "./TradeZonesPrimitive";
+import { TradeMarkersPrimitive } from "./TradeMarkersPrimitive";
 
 interface KlineChartProps {
   data: CandlestickData<Time>[];
@@ -26,6 +31,10 @@ interface KlineChartProps {
   keyLevels?: KeyLevel[];
   /** 交易计划线（入场区 / 止损 / 止盈），由 planToOverlay 生成。 */
   planLines?: DrawHLine[];
+  /** 交易区间带（入场/止损/止盈时间锚定矩形），由 planToZones 生成；悬停显示盈亏比。 */
+  tradeZones?: TradeZone[];
+  /** 信号历史盈损标记（L/S 字母徽章 + 出场圆点，盈✓亏✕），由 tradesToMarks 生成。 */
+  tradeMarks?: TradeMark[];
 }
 
 function fmtPrice(v: number): string {
@@ -60,6 +69,8 @@ export default function KlineChart({
   drawings,
   keyLevels,
   planLines,
+  tradeZones,
+  tradeMarks,
 }: KlineChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -67,7 +78,11 @@ export default function KlineChart({
   const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const priceLinesRef = useRef<IPriceLine[]>([]);
   const overlaySeriesRef = useRef<ISeriesApi<"Line">[]>([]);
+  const zonesPrimitiveRef = useRef<TradeZonesPrimitive | null>(null);
+  const marksPrimitiveRef = useRef<TradeMarkersPrimitive | null>(null);
   const disposedRef = useRef(false);
+  // 悬停在区间带上时的浮层文案（含盈亏比）；null = 隐藏
+  const [zoneTip, setZoneTip] = useState<{ x: number; y: number; text: string } | null>(null);
   // Bumped after every chart (re-)init so data/overlay effects re-apply onto
   // the freshly created series (e.g. after a height-change re-init).
   const [initVersion, setInitVersion] = useState(0);
@@ -117,9 +132,39 @@ export default function KlineChart({
       scaleMargins: { top: 0.8, bottom: 0 },
     });
 
+    // 交易区间带 primitive：zOrder "bottom"，垫在蜡烛下方；信号盈损 L/S 徽章
+    // primitive：zOrder "top"，浮在蜡烛上方。缩放/平移/切周期由库的
+    // updateAllViews 回调驱动重投影（价格→y、时间/bar 索引→x），天然不错位。
+    const zonesPrimitive = new TradeZonesPrimitive();
+    candleSeries.attachPrimitive(zonesPrimitive);
+    const marksPrimitive = new TradeMarkersPrimitive();
+    candleSeries.attachPrimitive(marksPrimitive);
+
+    // 悬停浮层（两类命中共用一个浮层，徽章优先）：
+    //   1. 信号盈损 L/S 徽章 / 出场圆点：像素坐标命中测试 → 每笔详情
+    //   2. 交易区间带：时间锚定矩形命中测试 → 区间详情（含盈亏比）
+    const handleCrosshair = (param: MouseEventParams<Time>) => {
+      if (disposedRef.current) return;
+      const pt = param.point;
+      if (!pt) {
+        setZoneTip(null);
+        return;
+      }
+      const markTip = marksPrimitive.markAt(pt.x, pt.y);
+      if (markTip) {
+        setZoneTip({ x: pt.x, y: pt.y, text: markTip });
+        return;
+      }
+      const hit = zonesPrimitive.zoneAt(pt.x, pt.y);
+      setZoneTip(hit ? { x: pt.x, y: pt.y, text: hit.tooltip } : null);
+    };
+    chart.subscribeCrosshairMove(handleCrosshair);
+
     chartRef.current = chart;
     candleSeriesRef.current = candleSeries;
     volumeSeriesRef.current = volumeSeries;
+    zonesPrimitiveRef.current = zonesPrimitive;
+    marksPrimitiveRef.current = marksPrimitive;
     priceLinesRef.current = [];
     overlaySeriesRef.current = [];
     setInitVersion(v => v + 1);
@@ -134,11 +179,15 @@ export default function KlineChart({
     return () => {
       disposedRef.current = true;
       window.removeEventListener("resize", handleResize);
+      chart.unsubscribeCrosshairMove(handleCrosshair);
       candleSeriesRef.current = null;
       volumeSeriesRef.current = null;
+      zonesPrimitiveRef.current = null;
+      marksPrimitiveRef.current = null;
       priceLinesRef.current = [];
       overlaySeriesRef.current = [];
       chartRef.current = null;
+      setZoneTip(null);
       chart.remove();
     };
   }, [height]);
@@ -159,6 +208,30 @@ export default function KlineChart({
       // chart may have been disposed between render and effect
     }
   }, [data, volumeData, initVersion]);
+
+  // 交易区间带：把 zones + 时间窗口（覆盖最近 N 根 K 线 + 右侧延伸）灌进
+  // primitive（内部 requestUpdate 触发重绘）。关闭开关 / 计划消失时传空数组
+  // 即清空；窗口随 K 线根数变化滑动（新 K 线收线后矩形右移跟进）。
+  useEffect(() => {
+    if (disposedRef.current) return;
+    try {
+      zonesPrimitiveRef.current?.setZones(tradeZones ?? [], zoneTimeWindow(data.length));
+    } catch {
+      // chart may have been disposed between render and effect
+    }
+    setZoneTip(null);
+  }, [tradeZones, data.length, initVersion]);
+
+  // 信号历史盈损标记：L/S 字母徽章（入场）+ 出场圆点，选中信号变化时整组重设；
+  // 传空/未传即清空。悬停命中直接查 primitive 的投影结果。
+  useEffect(() => {
+    if (disposedRef.current) return;
+    try {
+      marksPrimitiveRef.current?.setMarks(tradeMarks ?? []);
+    } catch {
+      // chart may have been disposed between render and effect
+    }
+  }, [tradeMarks, initVersion]);
 
   // Overlay pass: smart levels, auto-drawings and external key levels.
   //  - horizontal levels (S/R、fib、现价、外部关键位) → series.createPriceLine
@@ -313,5 +386,20 @@ export default function KlineChart({
     }
   }, [data, smartLevels, drawings, keyLevels, planLines, initVersion]);
 
-  return <div ref={containerRef} className="w-full rounded-lg overflow-hidden" />;
+  return (
+    <div className="relative">
+      <div ref={containerRef} className="w-full rounded-lg overflow-hidden" />
+      {zoneTip && (
+        <div
+          className="pointer-events-none absolute z-10 px-2 py-1 rounded border border-jarvis-border bg-jarvis-card/95 text-xs text-jarvis-text whitespace-nowrap shadow-lg"
+          style={{
+            left: Math.min(zoneTip.x + 12, (containerRef.current?.clientWidth ?? 0) - 240),
+            top: zoneTip.y + 12,
+          }}
+        >
+          {zoneTip.text}
+        </div>
+      )}
+    </div>
+  );
 }

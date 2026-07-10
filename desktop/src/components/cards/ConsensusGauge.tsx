@@ -7,11 +7,12 @@ import {
   formatPrice,
   type ConsensusScope,
   type ConsensusTradePlan,
+  type PlanStatus,
   type SignalDirection,
   type TwelveConsensusResponse,
 } from "@/api/client";
 import GaugeChart from "@/components/common/GaugeChart";
-import { planSide, SideBadge } from "@/components/cards/SignalBoard";
+import { planSide, SideBadge, ChaseWarning } from "@/components/cards/SignalBoard";
 
 const DIR_META: Record<
   SignalDirection,
@@ -54,12 +55,18 @@ function consensusPlanSummary(side: "long" | "short", plan: ConsensusTradePlan):
 /** 共识交易计划区：多空徽章 + 大白话摘要 + 入场区间 / 止损 / TP1/TP2 / 盈亏比 / 建议仓位 */
 function TradePlanSection({
   plan,
+  planStatus,
   lowConfidence,
   consensusDirection,
+  price,
 }: {
   plan: ConsensusTradePlan | null | undefined;
+  /** 计划状态（后端 v3）：无计划时携带观望原因（RR 不达标等） */
+  planStatus?: PlanStatus | null;
   lowConfidence: boolean;
   consensusDirection: SignalDirection;
+  /** 当前现价（追高/追空警示用） */
+  price?: number | null;
 }) {
   const hasTp2 = plan?.take_profit_2 != null;
   const side = plan ? planSide(plan) : null;
@@ -92,9 +99,15 @@ function TradePlanSection({
         )}
       </p>
       {!plan ? (
-        <p className="text-xs text-jarvis-text-secondary">
-          当前共识不构成交易计划（中性/分歧）
-        </p>
+        planStatus?.state === "watch" ? (
+          <p className="text-xs text-jarvis-yellow" title="有方向但结构/盈亏比不达标，系统选择观望而不是硬造点位">
+            观望：{planStatus.reason || "结构/盈亏比不达标，等待更优入场"}
+          </p>
+        ) : (
+          <p className="text-xs text-jarvis-text-secondary">
+            {planStatus?.reason || "当前共识不构成交易计划（中性/分歧）"}
+          </p>
+        )
       ) : (
         <div className={clsx(lowConfidence && "opacity-60")}>
           {side != null && (
@@ -102,6 +115,13 @@ function TradePlanSection({
               {consensusPlanSummary(side, plan)}
             </p>
           )}
+          <ChaseWarning
+            side={side}
+            price={price}
+            entryLo={plan.entry_zone?.[0]}
+            entryHi={plan.entry_zone?.[1]}
+          />
+
           <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-[11px] font-mono">
             <div>
               <p className="text-jarvis-text-secondary text-[9px]">入场区间</p>
@@ -115,6 +135,11 @@ function TradePlanSection({
                 止损{side === "short" ? "（涨破离场）" : side === "long" ? "（跌破离场）" : ""}
               </p>
               <p className="text-jarvis-red">{formatPrice(plan.stop_loss)}</p>
+              {plan.sl_basis && (
+                <p className="text-[9px] text-jarvis-text-secondary/80 leading-snug" title="止损锚定的结构依据">
+                  锚定 {plan.sl_basis}
+                </p>
+              )}
             </div>
             <div>
               <p className="text-jarvis-text-secondary text-[9px]">
@@ -138,6 +163,14 @@ function TradePlanSection({
                 {plan.rr != null && Number.isFinite(Number(plan.rr))
                   ? Number(plan.rr).toFixed(1)
                   : "—"}
+                {plan.min_rr != null && Number.isFinite(Number(plan.min_rr)) && (
+                  <span
+                    className="text-jarvis-green text-[9px]"
+                    title={`盈亏比门槛 ≥${Number(plan.min_rr).toFixed(1)}：不达标的计划后端直接输出观望，不会硬造`}
+                  >
+                    {" "}≥{Number(plan.min_rr).toFixed(1)}达标
+                  </span>
+                )}
                 <span className="text-jarvis-text-secondary"> · </span>
                 {lowConfidence ? (
                   <span className="text-jarvis-yellow">低置信，仅供参考</span>
@@ -330,11 +363,13 @@ export default function ConsensusGauge({ symbol, tf }: ConsensusGaugeProps) {
             </div>
           </div>
 
-          {/* 交易计划：多空徽章 + 大白话摘要 + 入场区间/止损/止盈/盈亏比/建议仓位 */}
+          {/* 交易计划：多空徽章 + 大白话摘要 + 追高警示 + 入场区间/止损/止盈/盈亏比/建议仓位 */}
           <TradePlanSection
             plan={data.trade_plan}
+            planStatus={data.plan_status}
             lowConfidence={lowConfidence}
             consensusDirection={direction}
+            price={!stale && resp?.ok ? resp.price : null}
           />
 
           {/* 关键价位 */}

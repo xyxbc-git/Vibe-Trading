@@ -39,8 +39,6 @@ import os
 import re
 import sys
 import time
-import urllib.request
-import urllib.error
 from dataclasses import dataclass, asdict, field
 from typing import Any
 
@@ -268,7 +266,7 @@ def _llm_config() -> dict[str, str] | None:
 
 
 def _call_llm(prompt: str, system: str = "", temperature: float = 0.7) -> str:
-    """调用 LLM，返回文本响应。"""
+    """调用 LLM，返回文本响应（统一走 jarvis_llm_config，自动记账 module=scalper_evolve）。"""
     cfg = _llm_config()
     if not cfg:
         raise RuntimeError(
@@ -279,33 +277,10 @@ def _call_llm(prompt: str, system: str = "", temperature: float = 0.7) -> str:
             "  export JARVIS_LLM_API_KEY=your_key\n"
             "  export JARVIS_LLM_BASE_URL=https://api.xxx.com"
         )
-
-    messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
-
-    payload = json.dumps({
-        "model": cfg["model"],
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": 2000,
-    }, ensure_ascii=False).encode("utf-8")
-
-    req = urllib.request.Request(
-        cfg["base"] + "/chat/completions",
-        data=payload,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {cfg['key']}",
-            "Content-Type": "application/json",
-        },
-    )
-
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-        return (body.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+        return jlc.call_llm(prompt, system=system, temperature=temperature,
+                            max_tokens=2000, timeout=60, cfg=cfg,
+                            module="scalper_evolve")
     except Exception as e:
         _log(f"LLM 调用失败: {e}")
         raise

@@ -270,6 +270,15 @@ export const api = {
   testLlmConfig: () =>
     request<LlmTestResult>("/llm-config/test", { method: "POST" }, 40_000),
 
+  // ─── LLM 用量/成本记账 + 调用内容日志 ───
+  llmUsage: (days = 30, recent = 10, module?: string, offset = 0) =>
+    api.get<LlmUsageResponse>(
+      `/llm/usage?days=${days}&recent=${recent}&offset=${offset}` +
+        (module ? `&module=${encodeURIComponent(module)}` : ""),
+    ),
+  llmUsageDetail: (id: number) =>
+    api.get<LlmUsageDetailResponse>(`/llm/usage/detail?id=${id}`),
+
   // ─── AI 交易复盘（模拟盘已平仓交易 → 统计 + LLM 诊断）───
   jarvisReview: (symbol?: string, limit = 50) =>
     request<JarvisReviewResponse>(
@@ -402,6 +411,28 @@ export const api = {
     api.get<TwelveSignalsResponse>(
       `/twelve/signals?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(tf)}`,
     ),
+  // 单信号级历史胜率（缓存读取；null = 尚未回测过该 symbol×tf）
+  twelveSignalWinrate: (symbol = "BTCUSDT", tf = "4h") =>
+    api.get<SignalWinrateResponse>(
+      `/twelve/signal-winrate?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(tf)}`,
+    ),
+  twelveSignalWinrateRun: (payload?: {
+    symbols?: string | string[];
+    tfs?: string | string[];
+    days?: number;
+    stride?: number;
+  }) =>
+    api.post<{ ok: boolean; error?: string }>(
+      "/twelve/signal-winrate/run",
+      payload ?? {},
+    ),
+  twelveSignalWinrateStatus: () =>
+    api.get<SignalWinrateStatus>("/twelve/signal-winrate/status"),
+  // 单信号胜率回测逐笔明细（K 线标记历史盈损点；side 可选过滤 long/short）
+  twelveSignalWinrateTrades: (symbol: string, tf: string, system: string, side?: "long" | "short") =>
+    api.get<SignalWinrateTradesResponse>(
+      `/twelve/signal-winrate/trades?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(tf)}&system=${encodeURIComponent(system)}${side ? `&side=${side}` : ""}`,
+    ),
   // LLM 推理链耗时较长，超时放宽到 60s
   jarvisReason: (symbol = "BTCUSDT") =>
     request<JarvisReasonResponse>(
@@ -411,7 +442,72 @@ export const api = {
     ),
   jarvisInsights: (limit = 20) =>
     api.get<JarvisInsightsResponse>(`/jarvis/insights?limit=${limit}`),
+
+  // ─── 合约仓位与风控计算器（Task #3）───
+  positionCalc: (
+    symbol = "BTCUSDT",
+    tf: ConsensusScope = "auto",
+    overrides?: Partial<PositionCalcConfig>,
+    /** 用户手动入场价（临时预览，不落盘）；缺省用信号计划价 */
+    entryOverride?: number | null,
+  ) => {
+    const q = new URLSearchParams({ symbol, tf });
+    if (overrides?.poscalc_capital_usdt != null)
+      q.set("capital", String(overrides.poscalc_capital_usdt));
+    if (overrides?.poscalc_leverage != null)
+      q.set("leverage", String(overrides.poscalc_leverage));
+    if (overrides?.poscalc_risk_pct != null)
+      q.set("risk_pct", String(overrides.poscalc_risk_pct));
+    if (overrides?.poscalc_margin_pct != null)
+      q.set("margin_pct", String(overrides.poscalc_margin_pct));
+    if (entryOverride != null && Number.isFinite(entryOverride) && entryOverride > 0)
+      q.set("entry", String(entryOverride));
+    // 多币多周期信号计算冷启动较慢，独立 30s 超时
+    return request<PositionCalcResponse>(`/position-calc?${q.toString()}`, undefined, 30_000);
+  },
+  positionCalcConfig: () =>
+    api.get<PositionCalcConfig>("/position-calc/config"),
+  updatePositionCalcConfig: (data: Partial<PositionCalcConfig>) =>
+    api.put<{ ok: boolean; reason?: string; config?: PositionCalcConfig }>(
+      "/position-calc/config",
+      data,
+    ),
+
+  // ─── 市场情报页（免 Key 真实数据源；后端 TTL 缓存 + 降级）───
+  marketIntel: () => api.get<MarketIntelResponse>("/market-intel"),
 };
+
+// ─── GET /api/market-intel 响应 ───
+
+export interface MarketIntelResponse {
+  ok: boolean;
+  /** 各源中最近一次成功拉取的 unix 秒 */
+  updated_at?: number | null;
+  fng?: { value: number; classification: string; ts?: number | null } | null;
+  /** symbol -> lastFundingRate（小数，如 0.0001 = 0.01%） */
+  funding_rate?: Record<string, number> | null;
+  funding_ts?: number | null;
+  oi?: {
+    symbol: string;
+    value: number;
+    change_pct: number | null;
+    ts?: number | null;
+  } | null;
+  long_short?: {
+    symbol: string;
+    long_pct: number;
+    short_pct: number;
+    ratio: number;
+    ts?: number | null;
+  } | null;
+  liquidations?: null;
+  onchain?: null;
+  /** 未接入源 -> 原因说明（前端渲染灰化占位态） */
+  unavailable?: Record<string, string> | null;
+  /** 拉取失败的源 -> 错误摘要（保留旧缓存时也会带上） */
+  errors?: Record<string, string> | null;
+  error?: string;
+}
 
 // ─── AI 问答多轮 + 流式 ───
 
@@ -494,6 +590,87 @@ export async function askStream(
   if (!doneSeen) {
     // 流被服务端提前挂断且没有 done 事件：已渲染内容有效，不额外报错
     handlers.onDone?.({});
+  }
+}
+
+// ─── 信号一键解读（大白话，SSE 流式）───
+
+/** 解读模式：signal = 单信号卡；consensus = 12 系统整体分歧 */
+export interface SignalExplainBody {
+  mode: "signal" | "consensus";
+  symbol: string;
+  tf: string;
+  /** 前端现成数据打包给后端进 prompt（不重复取数） */
+  payload: Record<string, unknown>;
+}
+
+/**
+ * 信号大白话解读（POST /twelve/signal-explain/stream，SSE 手工解析）。
+ * 后端未配置 LLM 时返回 JSON {ok:false, code:"not_configured"}（非 SSE），
+ * 此时回调 onNotConfigured 并结束（不抛错，前端引导去设置页）。
+ */
+export async function signalExplainStream(
+  body: SignalExplainBody,
+  handlers: {
+    onMeta?: (meta: AskStreamMeta) => void;
+    onDelta: (text: string) => void;
+    onDone?: () => void;
+    onNotConfigured?: (message: string) => void;
+  },
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch(`${BASE_URL}/twelve/signal-explain/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    throw new Error(`API ${res.status}: ${res.statusText}`);
+  }
+  // 未配置 LLM：后端直接回 JSON（非 event-stream）
+  const ctype = res.headers.get("content-type") ?? "";
+  if (!ctype.includes("text/event-stream")) {
+    const d = (await res.json()) as { ok?: boolean; code?: string; message?: string };
+    if (d.code === "not_configured") {
+      handlers.onNotConfigured?.(d.message ?? "未配置 AI，请到设置页配置 API Key");
+      return;
+    }
+    throw new Error(d.message ?? "解读服务响应异常");
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let doneSeen = false;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const frames = buf.split("\n\n");
+    buf = frames.pop() ?? "";
+    for (const frame of frames) {
+      const line = frame.split("\n").find((l) => l.startsWith("data:"));
+      if (!line) continue;
+      let obj: { type?: string; engine?: "llm" | "rule"; model?: string | null; content?: string; message?: string };
+      try {
+        obj = JSON.parse(line.slice(5).trim());
+      } catch {
+        continue;
+      }
+      if (obj.type === "meta") {
+        handlers.onMeta?.({ engine: obj.engine ?? "llm", model: obj.model });
+      } else if (obj.type === "delta" && obj.content) {
+        handlers.onDelta(obj.content);
+      } else if (obj.type === "done") {
+        doneSeen = true;
+        handlers.onDone?.();
+      } else if (obj.type === "error") {
+        throw new Error(obj.message ?? "解读输出异常");
+      }
+    }
+  }
+  if (!doneSeen) {
+    handlers.onDone?.();
   }
 }
 
@@ -659,6 +836,88 @@ export interface LlmTestResult {
   base?: string;
   reply?: string;
   error?: string;
+}
+
+// ─── LLM 用量/成本记账 ───
+
+export interface LlmUsageSum {
+  calls: number;
+  ok_calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+  estimated_calls: number;
+}
+
+export interface LlmUsageBucket {
+  module?: string;
+  model?: string;
+  calls: number;
+  ok_calls: number;
+  total_tokens: number;
+  cost_usd: number;
+}
+
+export interface LlmUsageRecent {
+  /** jsonl 降级记录无 id（不可展开详情） */
+  id: number | null;
+  ts: number;
+  module: string;
+  model: string | null;
+  total_tokens: number;
+  cost_usd: number;
+  latency_ms: number | null;
+  ok: boolean;
+  error: string | null;
+  estimated: boolean;
+  has_content: boolean;
+}
+
+export interface LlmUsageResponse {
+  ok: boolean;
+  error?: string;
+  days?: number;
+  today?: LlmUsageSum;
+  month?: LlmUsageSum;
+  window?: LlmUsageSum;
+  by_day?: { day: string; calls: number; total_tokens: number; cost_usd: number }[];
+  by_module?: LlmUsageBucket[];
+  by_model?: LlmUsageBucket[];
+  recent?: LlmUsageRecent[];
+  recent_total?: number;
+  recent_offset?: number;
+  module_filter?: string | null;
+  content_retention_days?: number;
+  pricing_note?: string;
+}
+
+/** 单条调用完整日志（prompt_text 为 messages JSON 字符串，可解析出 role 结构） */
+export interface LlmUsageDetail {
+  id: number;
+  ts: number;
+  day: string;
+  module: string;
+  model: string | null;
+  base: string | null;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+  latency_ms: number | null;
+  ok: boolean;
+  error: string | null;
+  estimated: boolean;
+  prompt_text: string | null;
+  response_text: string | null;
+  prompt_chars: number | null;
+  response_chars: number | null;
+}
+
+export interface LlmUsageDetailResponse {
+  ok: boolean;
+  error?: string;
+  record?: LlmUsageDetail;
 }
 
 export interface StrategyFactor {
@@ -927,12 +1186,26 @@ export interface ConsensusTradePlan {
   take_profit_1: number;
   take_profit_2?: number | null;
   rr?: number | null;
+  /** RR 门槛（后端 v3：计划保证 rr ≥ 该值，jarvis_config.plan_min_rr 可调） */
+  min_rr?: number | null;
   position_pct?: number;
   /** 计划依据的系统名列表 */
   basis?: string[];
+  /** 入场区间口径（如「同向 3 系统入场中位数 ±0.3xATR」，后端 v3） */
+  entry_basis?: string | null;
+  /** 止损锚定依据（如「摆动低点 63200 下方 0.5xATR 缓冲」，后端 v3） */
+  sl_basis?: string | null;
+  /** 止盈推导口径（结构目标 / RR 门槛推导 + 结构验证，后端 v3） */
+  tp_basis?: string | null;
   note?: string | null;
   /** 计划取自哪个时间框架（如 "4h"） */
   source_tf?: string | null;
+}
+
+/** 计划状态（后端 v3）：ok=有计划；watch=有方向但 RR/结构不达标（观望，不硬造）；neutral=中性 */
+export interface PlanStatus {
+  state: "ok" | "watch" | "neutral";
+  reason?: string | null;
 }
 
 /** 价格动态精度格式化：≥1 两位小数；0.01~1 四位；<0.01 六位有效数字 */
@@ -970,6 +1243,8 @@ export interface TwelveConsensus {
   tfs?: Record<string, unknown>;
   /** 共识交易计划；中性/分歧时为 null */
   trade_plan?: ConsensusTradePlan | null;
+  /** 计划状态与无计划原因（后端 v3；旧缓存响应可能缺失） */
+  plan_status?: PlanStatus | null;
 }
 
 /** GET /api/twelve/consensus 封套 */
@@ -982,6 +1257,14 @@ export interface TwelveConsensusResponse {
   error?: string;
 }
 
+/** 信号静态画像（signal.explain）：类型/触发依据/适用周期/滞后特性 */
+export interface SignalExplain {
+  type: string;
+  trigger: string;
+  best_tfs: string[];
+  lag: string;
+}
+
 export interface TwelveSignal {
   system: string;
   name_cn: string;
@@ -991,6 +1274,101 @@ export interface TwelveSignal {
   key_levels?: KeyLevel[];
   /** 单信号交易计划；无可执行计划时为 null */
   trade_plan?: SignalTradePlan | null;
+  /** 静态画像；旧缓存响应可能缺失 */
+  explain?: SignalExplain | null;
+}
+
+// ─── 单信号级历史胜率统计 ───
+
+/** 某系统某方向的历史触发统计块 */
+export interface SignalGradeStats {
+  trades: number;
+  wins: number;
+  losses: number;
+  win_rate_pct: number;
+  avg_win_pct: number | null;
+  /** 均亏（≤0） */
+  avg_loss_pct: number | null;
+  /** 平均盈亏比 = 均盈 / |均亏| */
+  payoff_ratio: number | null;
+  /** 期望值 %/笔 */
+  expectancy_pct: number;
+  /** 最大回撤（持有期最差不利偏移，≤0） */
+  max_drawdown_pct: number;
+  avg_bars_held: number;
+  /** 样本 <30，统计置信度低 */
+  low_sample: boolean;
+}
+
+export interface SignalWinrateStats {
+  symbol: string;
+  tf: string;
+  days?: number;
+  /** 观察期根数（与实时模拟盘时间止损同口径） */
+  horizon_bars: number;
+  bars: number;
+  samples: number;
+  systems: Record<
+    string,
+    { name_cn: string; long: SignalGradeStats | null; short: SignalGradeStats | null }
+  >;
+  directions: { long: SignalGradeStats | null; short: SignalGradeStats | null };
+  computed_at: number;
+  error?: string;
+}
+
+/** GET /api/twelve/signal-winrate 封套；stats:null = 该 symbol×tf 尚未回测 */
+export interface SignalWinrateResponse {
+  ok: boolean;
+  symbol?: string;
+  tf?: string;
+  stats: SignalWinrateStats | null;
+  error?: string;
+}
+
+export interface SignalWinrateStatus {
+  ok: boolean;
+  running: boolean;
+  progress: number;
+  detail: string;
+  error: string | null;
+  result: { total_samples?: number } | null;
+}
+
+/** 单信号胜率回测的逐笔样本（K 线图标记历史盈损点用） */
+export interface SignalWinrateTrade {
+  /** 触发（入场）K 线开盘时间戳 ms */
+  t: number;
+  /** 出场 K 线开盘时间戳 ms */
+  exit_t: number;
+  side: "long" | "short";
+  entry: number;
+  sl: number | null;
+  tp: number | null;
+  exit_price: number;
+  win: boolean;
+  pnl_pct: number;
+  bars_held: number;
+  /** plan = 触 SL/TP 判定；horizon = 满观察期按期末收盘 */
+  mode: "plan" | "horizon";
+  system?: string;
+}
+
+/** GET /api/twelve/signal-winrate/trades 封套 */
+export interface SignalWinrateTradesResponse {
+  ok: boolean;
+  symbol?: string;
+  tf?: string;
+  system?: string;
+  side?: string | null;
+  name_cn?: string;
+  horizon_bars?: number;
+  days?: number;
+  computed_at?: number;
+  trades?: SignalWinrateTrade[];
+  /** true = 缓存缺失或旧版缓存无逐笔明细，需重跑一次胜率回测 */
+  need_run?: boolean;
+  error?: string;
 }
 
 /** GET /api/twelve/signals 封套 */
@@ -1001,6 +1379,83 @@ export interface TwelveSignalsResponse {
   price?: number;
   signals: TwelveSignal[];
   consensus?: TwelveConsensus | null;
+  error?: string;
+}
+
+// ─── 合约仓位与风控计算器（Task #3）───
+
+/** 仓位计算器旋钮（jarvis_config 持久化）：本金/杠杆/风险%(legacy)/保证金% */
+export interface PositionCalcConfig {
+  poscalc_capital_usdt: number;
+  poscalc_leverage: number;
+  poscalc_risk_pct: number;
+  poscalc_margin_pct: number;
+}
+
+/** 止损安全等级：ok=边距充足 / warning=距爆仓过近 / danger=止损在爆仓之外 */
+export type SlSafety = "ok" | "warning" | "danger";
+
+export interface PositionAdvice {
+  ok: boolean;
+  error?: string;
+  symbol?: string;
+  side?: "long" | "short";
+  entry?: number;
+  entry_zone?: [number, number];
+  capital_usdt?: number;
+  leverage?: number;
+  /** margin=保证金法（名义=本金×保证金%×杠杆）/ risk=风险法 legacy */
+  sizing_mode?: "margin" | "risk";
+  /** 保证金法时的保证金占本金%；风险法为 null */
+  margin_pct?: number | null;
+  /** 保证金法下为派生值（止损触发亏损 ÷ 本金） */
+  risk_pct?: number;
+  /** 止损触发时的计划亏损额 */
+  risk_usdt?: number;
+  /** 用户手动入场价生效标记（止损/止盈随之平移） */
+  entry_overridden?: boolean;
+  sl?: {
+    price: number;
+    dist_pct: number;
+    safety: SlSafety;
+    /** 爆仓距离 − 止损距离（负数 = 先爆仓后止损） */
+    safety_margin_pct: number;
+  };
+  liquidation?: {
+    price: number;
+    dist_pct: number;
+    /** 爆仓时损失 ≈ 全部保证金 */
+    loss_usdt: number;
+  };
+  position?: {
+    notional_usdt: number;
+    margin_usdt: number;
+    qty_coin: number;
+    /** OKX 口径张数；无面值表的币种为 null */
+    contracts: number | null;
+    contract_size: number | null;
+    capital_used_pct: number;
+    capped: boolean;
+  };
+  take_profits?: { rr: number; price: number; profit_usdt: number }[];
+  max_safe_leverage?: number;
+  est_fee_usdt?: number;
+  warnings?: string[];
+  note?: string;
+  plan_tp_ref?: number;
+  source_tf?: string;
+  basis?: string[];
+}
+
+/** GET /api/position-calc 封套 */
+export interface PositionCalcResponse {
+  ok: boolean;
+  symbol?: string;
+  tf?: string;
+  price?: number | null;
+  direction?: SignalDirection;
+  config?: PositionCalcConfig;
+  advice?: PositionAdvice;
   error?: string;
 }
 

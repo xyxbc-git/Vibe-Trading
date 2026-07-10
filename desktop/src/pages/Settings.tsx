@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback } from "react";
-import { Settings as SettingsIcon, Save, RefreshCw, Wifi, Key, Palette, Server, Plug, Download, ShieldAlert, OctagonX } from "lucide-react";
-import { api, type QdConfig, type QdConfigTest, type TradingConfig, type CircuitBreakerStatus, type LlmConfig, type LlmTestResult } from "@/api/client";
+import { Settings as SettingsIcon, Save, RefreshCw, Wifi, Key, Palette, Server, Plug, Download, ShieldAlert, OctagonX, Coins, ChevronDown, Loader2 } from "lucide-react";
+import { api, type QdConfig, type QdConfigTest, type TradingConfig, type CircuitBreakerStatus, type LlmConfig, type LlmTestResult, type LlmUsageResponse, type LlmUsageRecent, type LlmUsageDetail } from "@/api/client";
 import { useApi } from "@/hooks/useApi";
 import { useSymbol } from "@/hooks/useSymbol";
+import { ACCENT_THEMES, applyAccent, getAccent } from "@/lib/theme";
 
 interface ScalperConfig {
   risk?: {
@@ -683,6 +684,416 @@ function LlmConfigCard() {
   );
 }
 
+function ThemeCard() {
+  const [accent, setAccent] = useState(getAccent());
+
+  const handlePick = (id: string) => {
+    applyAccent(id);
+    setAccent(id);
+  };
+
+  return (
+    <div className="card">
+      <h3 className="text-sm font-semibold text-jarvis-text mb-3 flex items-center gap-2">
+        <Palette size={14} />
+        主题
+      </h3>
+
+      <p className="text-xs text-jarvis-text-secondary mb-2">强调色（即时生效，自动保存）</p>
+      <div className="grid grid-cols-3 gap-2 mb-3">
+        {ACCENT_THEMES.map((t) => {
+          const active = accent === t.id;
+          return (
+            <button
+              key={t.id}
+              onClick={() => handlePick(t.id)}
+              aria-pressed={active}
+              className={`flex items-center gap-2 px-2.5 py-2 rounded-lg border text-xs transition-colors ${
+                active
+                  ? "border-jarvis-blue bg-jarvis-blue/10 text-jarvis-text"
+                  : "border-jarvis-border text-jarvis-text-secondary hover:text-jarvis-text hover:border-jarvis-text-secondary"
+              }`}
+            >
+              <span
+                className="w-4 h-4 rounded-full shrink-0 border border-black/30"
+                style={{ backgroundColor: t.preview }}
+              />
+              {t.name}
+              {active && <span className="ml-auto text-jarvis-blue">✓</span>}
+            </button>
+          );
+        })}
+      </div>
+      <p className="text-xs text-jarvis-text-secondary mb-3">
+        涨绿跌红等盈亏色不随主题变化；图表内部线色暂不联动。
+      </p>
+
+      <p className="text-xs text-jarvis-text-secondary mb-2">底色模式</p>
+      <div className="flex gap-3">
+        <button className="flex-1 py-2 rounded-lg bg-jarvis-bg border-2 border-jarvis-blue text-sm text-jarvis-text text-center">
+          深色
+        </button>
+        <button
+          disabled
+          className="flex-1 py-2 rounded-lg bg-jarvis-card border border-jarvis-border text-sm text-jarvis-text-secondary text-center opacity-50 cursor-not-allowed"
+        >
+          浅色（开发中）
+        </button>
+      </div>
+    </div>
+  );
+}
+
+const MODULE_LABELS: Record<string, string> = {
+  ask: "AI 问答",
+  reason: "深度推理",
+  review: "交易复盘",
+  strategy_gen: "策略工坊",
+  strategy_evolve: "策略进化",
+  scalper_evolve: "短线进化",
+  test: "连接测试",
+  unknown: "其它",
+};
+
+function fmtTokens(n: number | undefined | null): string {
+  const v = Number(n ?? 0);
+  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(2)}M`;
+  if (v >= 1_000) return `${(v / 1_000).toFixed(1)}k`;
+  return String(v);
+}
+
+function fmtCost(n: number | undefined | null): string {
+  const v = Number(n ?? 0);
+  if (v === 0) return "$0";
+  if (v < 0.01) return `$${v.toFixed(4)}`;
+  return `$${v.toFixed(2)}`;
+}
+
+/** prompt_text（messages JSON 字符串）→ 结构化消息数组；解析失败返回 null 走原文展示 */
+function parsePromptMessages(
+  text: string | null | undefined,
+): { role: string; content: string }[] | null {
+  if (!text) return null;
+  try {
+    const arr: unknown = JSON.parse(text);
+    if (Array.isArray(arr)) {
+      return arr.filter(
+        (m): m is { role: string; content: string } =>
+          !!m && typeof (m as { content?: unknown }).content === "string",
+      );
+    }
+  } catch {
+    /* 非 JSON（异常数据）走原文展示 */
+  }
+  return null;
+}
+
+function LlmLogDetailView({ detail }: { detail: LlmUsageDetail }) {
+  const messages = parsePromptMessages(detail.prompt_text);
+  const roleLabel: Record<string, string> = {
+    system: "系统提示词",
+    user: "发送内容",
+    assistant: "历史回复",
+    note: "省略说明",
+  };
+  return (
+    <div className="mt-1.5 space-y-2 border-t border-jarvis-border/50 pt-2">
+      <p className="text-[11px] text-jarvis-text-secondary font-mono">
+        {detail.model ?? "—"} · 输入 {fmtTokens(detail.prompt_tokens)} / 输出{" "}
+        {fmtTokens(detail.completion_tokens)} tok{detail.estimated ? "（估算）" : ""} ·{" "}
+        {detail.latency_ms != null ? `${detail.latency_ms}ms` : "—"} · {fmtCost(detail.cost_usd)}
+        {detail.error ? ` · 错误：${detail.error}` : ""}
+      </p>
+
+      <div>
+        <p className="text-[11px] text-jarvis-text-secondary mb-1">发送 ↑</p>
+        {messages ? (
+          <div className="space-y-1">
+            {messages.map((m, i) =>
+              m.role === "system" ? (
+                <details key={i} className="bg-jarvis-card rounded border border-jarvis-border/60">
+                  <summary className="px-2 py-1 text-[11px] text-jarvis-text-secondary cursor-pointer select-none">
+                    {roleLabel.system}（点击展开 · {m.content.length} 字）
+                  </summary>
+                  <pre className="px-2 pb-1.5 text-[11px] leading-relaxed text-jarvis-text-secondary whitespace-pre-wrap break-all max-h-40 overflow-y-auto select-text">
+                    {m.content}
+                  </pre>
+                </details>
+              ) : (
+                <div key={i} className="bg-jarvis-card rounded border border-jarvis-border/60 px-2 py-1.5">
+                  <p className="text-[10px] text-jarvis-text-secondary mb-0.5">
+                    {roleLabel[m.role] ?? m.role}
+                  </p>
+                  <pre className="text-[11px] leading-relaxed text-jarvis-text whitespace-pre-wrap break-all max-h-48 overflow-y-auto select-text">
+                    {m.content}
+                  </pre>
+                </div>
+              ),
+            )}
+          </div>
+        ) : (
+          <pre className="bg-jarvis-card rounded border border-jarvis-border/60 px-2 py-1.5 text-[11px] leading-relaxed text-jarvis-text whitespace-pre-wrap break-all max-h-48 overflow-y-auto select-text">
+            {detail.prompt_text ?? "（内容已过保留期或未记录）"}
+          </pre>
+        )}
+        {(detail.prompt_chars ?? 0) > (detail.prompt_text?.length ?? 0) && (
+          <p className="text-[10px] text-jarvis-yellow mt-0.5">
+            原文 {detail.prompt_chars} 字，已截断保存
+          </p>
+        )}
+      </div>
+
+      <div>
+        <p className="text-[11px] text-jarvis-text-secondary mb-1">返回 ↓</p>
+        <pre className="bg-jarvis-card rounded border border-jarvis-border/60 px-2 py-1.5 text-[11px] leading-relaxed text-jarvis-text whitespace-pre-wrap break-all max-h-56 overflow-y-auto select-text">
+          {detail.response_text ?? "（无返回内容：调用失败或内容已过保留期）"}
+        </pre>
+        {(detail.response_chars ?? 0) > (detail.response_text?.length ?? 0) && (
+          <p className="text-[10px] text-jarvis-yellow mt-0.5">
+            原文 {detail.response_chars} 字，已截断保存
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function LlmLogRow({ r }: { r: LlmUsageRecent }) {
+  const [open, setOpen] = useState(false);
+  const [detail, setDetail] = useState<LlmUsageDetail | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const expandable = r.id != null && r.has_content;
+
+  const toggle = async () => {
+    if (!expandable) return;
+    if (open) {
+      setOpen(false);
+      return;
+    }
+    setOpen(true);
+    if (detail || r.id == null) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      const res = await api.llmUsageDetail(r.id);
+      if (res.ok && res.record) setDetail(res.record);
+      else setErr(res.error ?? "加载失败");
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "网络错误");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="bg-jarvis-bg rounded px-2 py-1">
+      <button
+        onClick={toggle}
+        disabled={!expandable}
+        className={`w-full flex items-center gap-2 text-xs text-left ${expandable ? "cursor-pointer" : "cursor-default"}`}
+        title={r.error ?? (expandable ? "点击查看发送/返回内容" : "该记录无内容日志")}
+      >
+        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${r.ok ? "bg-jarvis-green" : "bg-jarvis-red"}`} />
+        <span className="w-14 shrink-0 font-mono text-jarvis-text-secondary">
+          {new Date(r.ts * 1000).toLocaleTimeString("en-GB", { hour12: false })}
+        </span>
+        <span className="w-16 shrink-0 text-jarvis-text">
+          {MODULE_LABELS[r.module] ?? r.module}
+        </span>
+        <span className="flex-1 truncate text-jarvis-text-secondary font-mono">
+          {r.model ?? "—"}
+        </span>
+        <span className="shrink-0 font-mono text-jarvis-text">
+          {fmtTokens(r.total_tokens)}
+          {r.estimated ? "≈" : ""} · {fmtCost(r.cost_usd)}
+        </span>
+        {expandable && (
+          <ChevronDown
+            size={12}
+            className={`shrink-0 text-jarvis-text-secondary transition-transform ${open ? "rotate-180" : ""}`}
+          />
+        )}
+      </button>
+      {open && (
+        busy ? (
+          <p className="flex items-center gap-1.5 text-[11px] text-jarvis-text-secondary py-1.5">
+            <Loader2 size={11} className="animate-spin" />
+            加载内容...
+          </p>
+        ) : err ? (
+          <p className="text-[11px] text-jarvis-red py-1.5">{err}</p>
+        ) : detail ? (
+          <LlmLogDetailView detail={detail} />
+        ) : null
+      )}
+    </div>
+  );
+}
+
+const LLM_LOG_PAGE = 10;
+
+function LlmUsageCard() {
+  const [data, setData] = useState<LlmUsageResponse | null>(null);
+  const [records, setRecords] = useState<LlmUsageRecent[]>([]);
+  const [moduleFilter, setModuleFilter] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(
+    async (mod: string, offset: number, append: boolean) => {
+      setLoading(true);
+      setError(null);
+      try {
+        const res = await api.llmUsage(30, LLM_LOG_PAGE, mod || undefined, offset);
+        if (!res.ok) {
+          setError(res.error ?? "加载失败");
+          return;
+        }
+        setData(res);
+        setRecords((prev) => (append ? [...prev, ...(res.recent ?? [])] : res.recent ?? []));
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "网络错误");
+      } finally {
+        setLoading(false);
+      }
+    },
+    [],
+  );
+
+  useEffect(() => {
+    load(moduleFilter, 0, false);
+  }, [moduleFilter, load]);
+
+  const usage = data;
+  const maxModuleCost = Math.max(
+    0.000001,
+    ...(usage?.by_module ?? []).map((b) => b.cost_usd),
+  );
+  const moduleChips = (usage?.by_module ?? []).map((b) => b.module ?? "").filter(Boolean);
+  const hasMore = records.length < (usage?.recent_total ?? 0);
+
+  return (
+    <div className="card">
+      <div className="flex items-center justify-between mb-1">
+        <h3 className="text-sm font-semibold text-jarvis-text flex items-center gap-2">
+          <Coins size={14} />
+          LLM 用量与日志
+        </h3>
+        <button
+          onClick={() => load(moduleFilter, 0, false)}
+          className="flex items-center gap-1 text-xs text-jarvis-blue hover:underline"
+          title="重新拉取用量统计与日志"
+        >
+          <RefreshCw size={12} />
+          刷新
+        </button>
+      </div>
+      <p className="text-xs text-jarvis-text-secondary mb-3">
+        每次 AI 调用自动记账并保留发送/返回内容（默认 {usage?.content_retention_days ?? 30} 天）。成本为按公开牌价的估算，非账单口径。
+      </p>
+
+      {!usage ? (
+        <p className="text-xs text-jarvis-text-secondary py-2">
+          {loading ? "加载中..." : error ? `加载失败：${error}` : "暂无记账数据，触发一次 AI 问答/推理后再来看。"}
+        </p>
+      ) : (
+        <>
+          <div className="grid grid-cols-2 gap-3 mb-3">
+            <div className="bg-jarvis-bg rounded-md p-2.5">
+              <p className="text-xs text-jarvis-text-secondary mb-1">今日</p>
+              <p className="text-sm font-mono text-jarvis-text">
+                {fmtCost(usage.today?.cost_usd)}
+                <span className="text-xs text-jarvis-text-secondary ml-1.5">
+                  {fmtTokens(usage.today?.total_tokens)} tok · {usage.today?.calls ?? 0} 次
+                </span>
+              </p>
+            </div>
+            <div className="bg-jarvis-bg rounded-md p-2.5">
+              <p className="text-xs text-jarvis-text-secondary mb-1">本月</p>
+              <p className="text-sm font-mono text-jarvis-text">
+                {fmtCost(usage.month?.cost_usd)}
+                <span className="text-xs text-jarvis-text-secondary ml-1.5">
+                  {fmtTokens(usage.month?.total_tokens)} tok · {usage.month?.calls ?? 0} 次
+                </span>
+              </p>
+            </div>
+          </div>
+
+          {(usage.by_module ?? []).length > 0 && (
+            <div className="mb-3">
+              <p className="text-xs text-jarvis-text-secondary mb-1.5">
+                按功能分布（近 {usage.days ?? 30} 天）
+              </p>
+              <div className="space-y-1.5">
+                {(usage.by_module ?? []).slice(0, 6).map((b) => (
+                  <div key={b.module} className="flex items-center gap-2 text-xs">
+                    <span className="w-16 shrink-0 text-jarvis-text-secondary">
+                      {MODULE_LABELS[b.module ?? ""] ?? b.module}
+                    </span>
+                    <div className="flex-1 h-1.5 bg-jarvis-bg rounded overflow-hidden">
+                      <div
+                        className="h-full bg-jarvis-blue/70"
+                        style={{ width: `${Math.max(2, (b.cost_usd / maxModuleCost) * 100)}%` }}
+                      />
+                    </div>
+                    <span className="w-24 shrink-0 text-right font-mono text-jarvis-text">
+                      {fmtCost(b.cost_usd)} · {fmtTokens(b.total_tokens)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div>
+            <div className="flex items-center justify-between mb-1.5">
+              <p className="text-xs text-jarvis-text-secondary">调用日志（点击展开内容）</p>
+            </div>
+            {moduleChips.length > 1 && (
+              <div className="flex flex-wrap gap-1 mb-1.5">
+                {["", ...moduleChips].map((m) => (
+                  <button
+                    key={m || "__all"}
+                    onClick={() => setModuleFilter(m)}
+                    className={`px-1.5 py-0.5 text-[11px] rounded border transition-colors ${
+                      moduleFilter === m
+                        ? "border-jarvis-blue text-jarvis-blue bg-jarvis-blue/10"
+                        : "border-jarvis-border text-jarvis-text-secondary hover:text-jarvis-text"
+                    }`}
+                  >
+                    {m ? (MODULE_LABELS[m] ?? m) : "全部"}
+                  </button>
+                ))}
+              </div>
+            )}
+            {records.length > 0 ? (
+              <div className="space-y-1 max-h-80 overflow-y-auto">
+                {records.map((r, i) => (
+                  <LlmLogRow key={r.id ?? `jsonl-${r.ts}-${i}`} r={r} />
+                ))}
+                {hasMore && (
+                  <button
+                    onClick={() => load(moduleFilter, records.length, true)}
+                    disabled={loading}
+                    className="w-full py-1 text-[11px] text-jarvis-blue hover:underline disabled:opacity-50"
+                  >
+                    {loading ? "加载中..." : `加载更多（还有 ${(usage.recent_total ?? 0) - records.length} 条）`}
+                  </button>
+                )}
+              </div>
+            ) : (
+              <p className="text-xs text-jarvis-text-secondary py-1">
+                {loading ? "加载中..." : "该筛选下暂无调用记录。"}
+              </p>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function PaperTradingSafetyCard() {
   const [cfg, setCfg] = useState<TradingConfig>({});
   const [cb, setCb] = useState<CircuitBreakerStatus | null>(null);
@@ -1116,21 +1527,11 @@ export default function SettingsPage() {
           {/* 大模型 (LLM) 配置 */}
           <LlmConfigCard />
 
-          {/* 主题切换（占位） */}
-          <div className="card">
-            <h3 className="text-sm font-semibold text-jarvis-text mb-3 flex items-center gap-2">
-              <Palette size={14} />
-              主题
-            </h3>
-            <div className="flex gap-3">
-              <button className="flex-1 py-2 rounded-lg bg-jarvis-bg border-2 border-jarvis-blue text-sm text-jarvis-text text-center">
-                深色
-              </button>
-              <button className="flex-1 py-2 rounded-lg bg-jarvis-card border border-jarvis-border text-sm text-jarvis-text-secondary text-center opacity-50 cursor-not-allowed">
-                浅色（开发中）
-              </button>
-            </div>
-          </div>
+          {/* LLM 用量与成本记账 */}
+          <LlmUsageCard />
+
+          {/* 主题切换 */}
+          <ThemeCard />
         </div>
       </div>
     </div>

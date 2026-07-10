@@ -760,8 +760,22 @@ def signal_triple_rsi(df: pd.DataFrame) -> dict:
 
 # ═══════════════════════════ 12. 套利 ═══════════════════════════
 
+# 套利触发口径（参考主流资金费/期现套利实践）：
+#   相对偏离  |z| ≥ 2σ（回归统计显著），且
+#   绝对空间  |基差| ≥ 0.05%（covering taker 双腿手续费 ~0.04%+滑点的下限）
+# 二者同时满足才视为可操作偏离；只满足其一视为「接近触发」弱提示。
+ARB_Z_TRIGGER = 2.0
+ARB_MIN_ABS_BASIS_PCT = 0.05
+
+
 def signal_arbitrage(df: pd.DataFrame, basis_data: dict | None = None) -> dict:
-    """套利需要期现/跨期/跨市多腿价差数据；单腿 K 线不足以生成信号时如实说明。"""
+    """期现基差统计套利：基差偏离历史分布触发（方向中性策略）。
+
+    basis_data 期望 jarvis_crypto_data.fetch_basis_series 的输出
+    （basis_pct/basis_mean_pct/basis_std_pct/zscore/percentile/n_samples/window）；
+    兼容旧 {basis_pct} 单值输入（无序列统计时退化为绝对阈值口径）。
+    多腿数据缺失时如实说明，不硬造信号。
+    """
     name = ("arbitrage", "套利系统")
     if not basis_data:
         return _sig(*name, "neutral", 0.0,
@@ -772,11 +786,39 @@ def signal_arbitrage(df: pd.DataFrame, basis_data: dict | None = None) -> dict:
     if basis_pct is None:
         return _sig(*name, "neutral", 0.0, "基差数据缺失 basis_pct 字段，无法评估套利空间")
     b = float(basis_pct)
-    if abs(b) >= 0.5:
-        side = "正基差（期货升水）做空期货+买现货" if b > 0 else "负基差（期货贴水）做多期货+卖现货"
-        return _sig(*name, "neutral", min(1.0, 0.4 + abs(b) * 0.4),
-                    f"期现基差 {b:.3f}% 偏离显著 → {side}，等待价差收敛（方向中性策略）")
-    return _sig(*name, "neutral", 0.1, f"期现基差 {b:.3f}% 处于正常区间，无套利空间")
+    z = basis_data.get("zscore")
+    side = ("正基差（永续升水）→ 空永续+买现货，赚价差收敛" if b > 0
+            else "负基差（永续贴水）→ 多永续+卖现货，赚价差收敛")
+
+    # 旧单值输入（无序列统计）：退化为绝对阈值 0.5% 口径，保持向后兼容
+    if z is None:
+        if abs(b) >= 0.5:
+            return _sig(*name, "neutral", min(1.0, 0.4 + abs(b) * 0.4),
+                        f"期现基差 {b:.3f}% 偏离显著 → {side}（方向中性策略）")
+        return _sig(*name, "neutral", 0.1, f"期现基差 {b:.3f}% 处于正常区间，无套利空间")
+
+    z = float(z)
+    mean = float(basis_data.get("basis_mean_pct") or 0.0)
+    std = float(basis_data.get("basis_std_pct") or 0.0)
+    window = str(basis_data.get("window") or f"{basis_data.get('n_samples', '?')}样本")
+    fund = basis_data.get("funding_8h_pct")
+    fund_txt = f"，8h资金费 {float(fund):+.4f}%" if fund is not None else ""
+    ctx = (f"期现基差 {b:+.4f}%（{window} 均值 {mean:+.4f}%±{std:.4f}），"
+           f"z={z:+.2f}{fund_txt}")
+
+    triggered = abs(z) >= ARB_Z_TRIGGER and abs(b) >= ARB_MIN_ABS_BASIS_PCT
+    if triggered:
+        # 强度：2σ 起步 0.5，每多 1σ +0.2，封顶 1.0
+        strength = min(1.0, 0.5 + (abs(z) - ARB_Z_TRIGGER) * 0.2)
+        return _sig(*name, "neutral", round(strength, 3),
+                    f"{ctx} → 偏离≥{ARB_Z_TRIGGER:g}σ 且绝对基差≥"
+                    f"{ARB_MIN_ABS_BASIS_PCT:g}%，{side}（方向中性策略）")
+    if abs(z) >= ARB_Z_TRIGGER:
+        return _sig(*name, "neutral", 0.2,
+                    f"{ctx} → 统计偏离显著但绝对基差 < {ARB_MIN_ABS_BASIS_PCT:g}%"
+                    "（不够覆盖双腿成本），暂无可操作空间")
+    return _sig(*name, "neutral", 0.1,
+                f"{ctx} → 偏离 < {ARB_Z_TRIGGER:g}σ，基差处于正常波动区间，无套利空间")
 
 
 # ═══════════════════════════ 信号器注册表 ═══════════════════════════
@@ -796,10 +838,88 @@ SIGNAL_FUNCS = {
     "arbitrage": signal_arbitrage,
 }
 
+# ═══════════════════════════ 信号解释元数据 ═══════════════════════════
+# 静态画像：每套系统的类型 / 触发依据 / 适用周期 / 滞后特性。
+# 随每个信号一起下发（signal.explain），回答用户「这信号凭什么、什么周期能用、
+# 为什么我买了就跌」三连问。best_tfs 为经验推荐，实际有效性以胜率回测为准。
+
+SYSTEM_META: dict[str, dict] = {
+    "turtle": {
+        "type": "趋势跟随", "trigger": "20日高/低突破 + ATR 止损 + 10日反向极值退出",
+        "best_tfs": ["4h", "1d"],
+        "lag": "突破确认型（右侧），入场天然滞后于起点；震荡市假突破多，"
+               "突破瞬间追单易买在短期高点",
+    },
+    "dow": {
+        "type": "趋势跟随", "trigger": "swing 高低点结构：高低点逐级抬高/降低",
+        "best_tfs": ["4h", "1d"],
+        "lag": "结构确认需要 2-3 个 swing 点，是 12 套中最滞后的顶层过滤器；"
+               "确认时行情往往已走出一段",
+    },
+    "elliott": {
+        "type": "形态回撤", "trigger": "主浪后 fib 0.382/0.5/0.618 回撤位的守破",
+        "best_tfs": ["1h", "4h", "1d"],
+        "lag": "左侧预判型，回踩位提前可见；但浪型划分主观，破位即失效需严格止损",
+    },
+    "volatility": {
+        "type": "波动率环境", "trigger": "ATR/布林带宽历史分位（极低=酝酿突破，极高=均值回归）",
+        "best_tfs": ["1h", "4h"],
+        "lag": "不判多空方向，只提示变盘窗口；单独使用无意义，需与方向系统叠加",
+    },
+    "gann": {
+        "type": "时间周期", "trigger": "距显著高/低点的斐波那契根数时间窗（±1根）",
+        "best_tfs": ["4h", "1d"],
+        "lag": "提示变盘敏感期而非方向；窗口内方向按现价相对波段位置的均值回归倾向",
+    },
+    "chanlun": {
+        "type": "结构形态", "trigger": "分型→笔→中枢，三类买卖点近似 + 笔力度背离",
+        "best_tfs": ["15m", "1h", "4h"],
+        "lag": "中枢突破（三买三卖）为右侧确认；背离类买卖点偏左侧，需下级别确认配合",
+    },
+    "rule123": {
+        "type": "反转确认", "trigger": "①破趋势线 ②回调不创新低/高 ③破反弹高/回调低 三步",
+        "best_tfs": ["1h", "4h"],
+        "lag": "三步走完才确认（右侧），错过反转头部但胜率相对高；两步时仅弱信号",
+    },
+    "gap": {
+        "type": "形态缺口", "trigger": "未回补跳空缺口的支撑/压力牵引",
+        "best_tfs": ["1h", "4h", "1d"],
+        "lag": "缺口即时可见（左侧参考位）；加密市场 7×24 缺口少，样本天然稀疏",
+    },
+    "martingale": {
+        "type": "资金管理", "trigger": "连亏序列倍投（不产生方向信号）",
+        "best_tfs": [],
+        "lag": "非方向系统；参与共识仅作仓位提示，胜率统计不适用",
+    },
+    "oscillator": {
+        "type": "均值回归", "trigger": "RSI<30/KDJ<20 超卖，RSI>70/KDJ>80 超买",
+        "best_tfs": ["15m", "1h"],
+        "lag": "震荡市利器、趋势市毒药：单边行情中超买可以更超买，逆势接飞刀是"
+               "「买了就跌」重灾区；需道氏顶层过滤配合",
+    },
+    "triple_rsi": {
+        "type": "动量平滑", "trigger": "三级 EMA 平滑 RSI 金叉/死叉 + 顶底背离共振",
+        "best_tfs": ["1h", "4h"],
+        "lag": "三重平滑显著降噪但也显著滞后，交叉信号出现时短线波段常已过半；"
+               "背离分量偏左侧可提前预警",
+    },
+    "arbitrage": {
+        "type": "中性套利",
+        "trigger": "spot-perp 期现基差偏离历史分布 ≥2σ 且绝对基差 ≥0.05%（覆盖双腿成本）",
+        "best_tfs": [],
+        "lag": "方向中性策略（赚价差收敛不赌方向）；基差双腿数据缺失时自动降级中性，"
+               "胜率统计不适用",
+    },
+}
+
 
 def run_all(df: pd.DataFrame, basis_data: dict | None = None,
             trade_history: list[dict] | None = None) -> list[dict]:
-    """跑全部 12 套信号器；单个信号器异常降级为 neutral，绝不抛出。"""
+    """跑全部 12 套信号器；单个信号器异常降级为 neutral，绝不抛出。
+
+    每个信号附 explain 静态画像（类型/触发依据/适用周期/滞后特性），
+    供前端「信号解释」与用户信任链路使用。
+    """
     out = []
     for key, fn in SIGNAL_FUNCS.items():
         try:
@@ -816,6 +936,10 @@ def run_all(df: pd.DataFrame, basis_data: dict | None = None,
                        "oscillator": "摆动震荡", "triple_rsi": "三重平滑RSI",
                        "arbitrage": "套利系统"}.get(key, key)
             out.append(_sig(key, name_cn, "neutral", 0.0, f"信号器异常已降级: {repr(e)[:120]}"))
+    for sig in out:
+        meta = SYSTEM_META.get(sig.get("system") or "")
+        if meta:
+            sig["explain"] = meta
     return out
 
 
@@ -839,23 +963,82 @@ _LAYER_DEF = {
 _DIR_VAL = {"bullish": 1.0, "bearish": -1.0, "neutral": 0.0}
 
 RISK_PCT_PER_TRADE = 1.0   # 单笔风险占权益 1%，仓位按止损距离反推
+DEFAULT_PLAN_MIN_RR = 2.0  # 共识计划最低盈亏比门槛（主流风控最低 1:2；jarvis_config.plan_min_rr 可调 1:3）
+SL_STRUCT_BUF_ATR = 0.5    # 止损结构位外侧缓冲（xATR），与道氏单信号 SL 同口径
 
 
-def _aggregate_trade_plan(direction: str, signals: list[dict],
-                          atr: float | None = None) -> dict | None:
-    """把主方向各系统 trade_plan 聚合成共识级交易计划。
+def _plan_min_rr_from_config() -> float:
+    """读 jarvis_config.plan_min_rr（缺失/异常回退内置 2.0），夹到 [1, 10]。"""
+    try:
+        import jarvis_config as _jc
+        v = float(_jc.get("plan_min_rr"))
+        if math.isfinite(v):
+            return min(10.0, max(1.0, v))
+    except Exception:  # noqa: BLE001 — 配置层故障不拖垮信号引擎
+        pass
+    return DEFAULT_PLAN_MIN_RR
 
-    口径：entry_zone=入场价中位数±0.3xATR；stop_loss=同方向最保守但不超过
-    2xATR 兜底（多单二者取近/较高者）；tp1=目标中位数、tp2=激进目标；
-    position_pct=单笔风险 1% 权益按止损距离反推，封顶 100。
-    无可用 plan 或方向中性 → None。
+
+def _structure_stop(direction: str, df: pd.DataFrame | None,
+                    zone_lo: float, zone_hi: float,
+                    atr_v: float) -> tuple[float, float] | None:
+    """结构锚定止损：多单=入场区下方最近 swing 低点 - 0.5xATR；空单镜像。
+
+    「最近」= 时间上最新且落在入场区正确外侧的摆动点（多头趋势的最后一个
+    higher-low / 空头的最后一个 lower-high，即市场最近一次防守的结构位）。
+    返回 (sl, 锚点价)；df 缺失、无有效结构位或推导出非正价格 → None（走兜底口径）。
+    """
+    if df is None or len(df) < MIN_BARS:
+        return None
+    try:
+        highs_i, lows_i = _swing_points(df, window=5)
+        if direction == "bullish":
+            for i in reversed(lows_i):
+                anchor = float(df["low"].iloc[i])
+                if math.isfinite(anchor) and 0 < anchor < zone_lo:
+                    sl = anchor - SL_STRUCT_BUF_ATR * atr_v
+                    return (sl, anchor) if sl > 0 else None
+        else:
+            for i in reversed(highs_i):
+                anchor = float(df["high"].iloc[i])
+                if math.isfinite(anchor) and anchor > zone_hi:
+                    return anchor + SL_STRUCT_BUF_ATR * atr_v, anchor
+    except Exception:  # noqa: BLE001 — 结构检测失败降级为兜底止损，不硬崩
+        return None
+    return None
+
+
+def _aggregate_trade_plan_ex(direction: str, signals: list[dict],
+                             atr: float | None = None,
+                             df: pd.DataFrame | None = None,
+                             min_rr: float | None = None,
+                             ) -> tuple[dict | None, dict]:
+    """把主方向各系统 trade_plan 聚合成共识级交易计划（v3：结构锚定+RR 门槛）。
+
+    口径：
+      - entry_zone = 同向系统入场价中位数 ±0.3xATR
+      - stop_loss  = 结构锚定优先（入场区外侧最近 swing 低/高点 ∓0.5xATR 缓冲，
+                     锚点与依据写入 sl_basis）；无结构位时兜底「同向系统最保守
+                     SL 与 2xATR 取近」并在 sl_basis 注明
+      - take_profit= 双重口径：结构目标中位数天然满足 RR 门槛则直接采用；
+                     不满足但最远结构目标撑得住 → TP1=RR 门槛推导价（结构验证）；
+                     连最远结构目标都撑不住 → 不硬造，返回观望
+      - rr 门槛    = min_rr（默认 2.0，jarvis_config.plan_min_rr 支持 1:3）
+      - position_pct = 单笔风险 1% 权益按止损距离反推，封顶 100
+    返回 (plan | None, plan_status)；plan_status = {state: ok|watch|neutral, reason}。
     """
     if direction not in ("bullish", "bearish"):
-        return None
+        return None, {"state": "neutral", "reason": "共识中性/分歧，不构成计划"}
     plans = [(s["system"], s["trade_plan"]) for s in signals
              if s.get("direction") == direction and s.get("trade_plan")]
     if not plans:
-        return None
+        return None, {"state": "watch",
+                      "reason": "无同向系统给出点位（宁缺毋滥，不硬造计划）"}
+    if min_rr is not None and math.isfinite(float(min_rr)):
+        thr = min(10.0, max(1.0, float(min_rr)))
+    else:
+        thr = _plan_min_rr_from_config()
+
     entries = sorted(p["entry"] for _, p in plans)
     sls = [p["stop_loss"] for _, p in plans]
     tps = [p["take_profit"] for _, p in plans]
@@ -863,49 +1046,97 @@ def _aggregate_trade_plan(direction: str, signals: list[dict],
         float((entries[len(entries) // 2 - 1] + entries[len(entries) // 2]) / 2)
     buf = 0.3 * float(atr) if atr and math.isfinite(atr) and atr > 0 else entry_mid * 0.005
     atr_v = float(atr) if atr and math.isfinite(atr) and atr > 0 else entry_mid * 0.02
-
-    tps_sorted = sorted(tps)
-    tp_mid = float(tps_sorted[len(tps_sorted) // 2]) if len(tps_sorted) % 2 else \
-        float((tps_sorted[len(tps_sorted) // 2 - 1] + tps_sorted[len(tps_sorted) // 2]) / 2)
     zone_lo, zone_hi = entry_mid - buf, entry_mid + buf
-    # 自洽门禁：SL/TP 必须落在整个入场区间外侧（落进 zone 内=挂单未成交即触发，坑人计划）
-    if direction == "bullish":
-        sl = max(min(sls), entry_mid - 2 * atr_v)   # 最保守(最低) 与 2xATR 兜底取近
-        tp2 = max(tps)
-        if not (sl < zone_lo and tp_mid > zone_hi):
-            return None
+
+    # ── 止损：结构锚定优先，成员最保守/2xATR 兜底 ─────────────────────
+    bullish = direction == "bullish"
+    struct = _structure_stop(direction, df, zone_lo, zone_hi, atr_v)
+    if struct is not None:
+        sl, anchor = struct
+        sl_basis = (f"摆动{'低' if bullish else '高'}点 {_round_price(anchor)} "
+                    f"{'下' if bullish else '上'}方 {SL_STRUCT_BUF_ATR}xATR 缓冲")
     else:
-        sl = min(max(sls), entry_mid + 2 * atr_v)
-        tp2 = min(tps)
-        if not (tp_mid < zone_lo and sl > zone_hi):
-            return None
+        sl = max(min(sls), entry_mid - 2 * atr_v) if bullish else \
+            min(max(sls), entry_mid + 2 * atr_v)
+        sl_basis = "同向系统最保守止损与 2xATR 兜底取近（未检出有效摆动结构位）"
+    # 自洽门禁：SL 必须落在整个入场区间外侧（落进 zone 内=挂单未成交即触发）
+    if bullish and not sl < zone_lo:
+        return None, {"state": "watch",
+                      "reason": "止损位距入场过近（落入入场区），结构不支持该计划"}
+    if not bullish and not sl > zone_hi:
+        return None, {"state": "watch",
+                      "reason": "止损位距入场过近（落入入场区），结构不支持该计划"}
     risk = abs(entry_mid - sl)
     if risk <= 0:
-        return None
-    rr = round(abs(tp_mid - entry_mid) / risk, 2)
-    if rr < 0.5:   # 盈亏比荒谬（潜在收益不足风险一半）→ 宁缺毋滥
-        return None
+        return None, {"state": "watch", "reason": "止损距离退化为 0，无法定义风险"}
+
+    # ── 止盈：结构目标 + RR 门槛双重口径 ──────────────────────────────
+    tps_sorted = sorted(tps)
+    tp_struct_mid = float(tps_sorted[len(tps_sorted) // 2]) if len(tps_sorted) % 2 else \
+        float((tps_sorted[len(tps_sorted) // 2 - 1] + tps_sorted[len(tps_sorted) // 2]) / 2)
+    tp_struct_far = max(tps) if bullish else min(tps)
+    rr_floor_price = entry_mid + thr * risk if bullish else entry_mid - thr * risk
+    struct_mid_ok = tp_struct_mid >= rr_floor_price if bullish else \
+        tp_struct_mid <= rr_floor_price
+    struct_far_ok = tp_struct_far >= rr_floor_price if bullish else \
+        tp_struct_far <= rr_floor_price
+    if struct_mid_ok:
+        tp1, tp2 = tp_struct_mid, tp_struct_far
+        tp_basis = f"{len(plans)} 套同向系统结构目标中位数（天然满足 RR≥{thr:g}）"
+    elif struct_far_ok:
+        tp1, tp2 = rr_floor_price, tp_struct_far
+        tp_basis = (f"RR {thr:g} 推导价（最远结构目标 "
+                    f"{_round_price(tp_struct_far)} 验证支撑）")
+    else:
+        rr_best = round(abs(tp_struct_far - entry_mid) / risk, 2)
+        return None, {"state": "watch",
+                      "reason": (f"结构目标最远 {_round_price(tp_struct_far)} 仅 RR "
+                                 f"{rr_best:.2f} < 门槛 {thr:g}，观望等待更优入场")}
+
+    # 防御性自洽（构造上已保证，护住未来改动）：SL < zone < TP1（多）/镜像（空）
+    if bullish and not (sl < zone_lo < zone_hi < tp1):
+        return None, {"state": "watch", "reason": "点位自洽校验未通过（多单）"}
+    if not bullish and not (tp1 < zone_lo < zone_hi < sl):
+        return None, {"state": "watch", "reason": "点位自洽校验未通过（空单）"}
+
+    rr = round(abs(tp1 - entry_mid) / risk, 2)
     risk_pct = risk / entry_mid * 100
     position_pct = round(min(100.0, RISK_PCT_PER_TRADE / max(risk_pct, 1e-9) * 100), 1)
     position_pct = max(position_pct, 0.1)
-    tp1_r, tp2_r = _round_price(tp_mid), _round_price(tp2)
-    return {
+    tp1_r, tp2_r = _round_price(tp1), _round_price(tp2)
+    entry_basis = f"同向 {len(plans)} 系统入场中位数 ±0.3xATR"
+    plan = {
         # 显式多空标识（与单信号 trade_plan.side 同口径）
-        "side": "long" if direction == "bullish" else "short",
+        "side": "long" if bullish else "short",
         "entry_zone": [_round_price(zone_lo), _round_price(zone_hi)],
         "stop_loss": _round_price(sl),
         "take_profit_1": tp1_r,
         # TP2 与 TP1 重合时输出 None（前端允许 null，避免图上重叠双线）
         "take_profit_2": tp2_r if tp2_r != tp1_r else None,
         "rr": rr,
+        "min_rr": thr,
         "position_pct": position_pct,
         "basis": [k for k, _ in plans],
-        "note": (f"聚合 {len(plans)} 套系统：入场=中位数±0.3xATR，"
-                 f"SL=最保守/2xATR 兜底取近，仓位按单笔风险 {RISK_PCT_PER_TRADE}% 权益反推"),
+        "entry_basis": entry_basis,
+        "sl_basis": sl_basis,
+        "tp_basis": tp_basis,
+        "note": (f"入场={entry_basis}；止损锚定={sl_basis}；止盈={tp_basis}；"
+                 f"仓位=单笔风险 {RISK_PCT_PER_TRADE}% 权益按止损距离反推"),
     }
+    return plan, {"state": "ok", "reason": None}
 
 
-def consensus(signals: list[dict], atr: float | None = None) -> dict:
+def _aggregate_trade_plan(direction: str, signals: list[dict],
+                          atr: float | None = None,
+                          df: pd.DataFrame | None = None,
+                          min_rr: float | None = None) -> dict | None:
+    """兼容包装：只返回 plan（None=无计划/观望）。详见 _aggregate_trade_plan_ex。"""
+    return _aggregate_trade_plan_ex(direction, signals, atr=atr, df=df,
+                                    min_rr=min_rr)[0]
+
+
+def consensus(signals: list[dict], atr: float | None = None,
+              df: pd.DataFrame | None = None) -> dict:
     """分层共识融合。
 
     口径：
@@ -913,6 +1144,8 @@ def consensus(signals: list[dict], atr: float | None = None) -> dict:
       - 总分 = Σ 层得分 × 层权重（道氏顶层过滤：与道氏相反的层贡献减半）
       - direction：|score| ≥ 0.12 → bullish/bearish，否则 neutral
       - confidence：|score| 与投票一致率的融合，∈ [0, 1]
+      - df：K 线（可选）。传入时 trade_plan 止损走摆动结构锚定；缺省走兜底口径
+      - trade_plan 不成立时 plan_status 说明原因（watch=RR 不达标等观望态）
     """
     by_system = {s["system"]: s for s in signals}
     votes = {"bullish": 0, "bearish": 0, "neutral": 0}
@@ -995,6 +1228,8 @@ def consensus(signals: list[dict], atr: float | None = None) -> dict:
     if filtered_layers:
         reasoning += "。逆势层已被道氏过滤减权：" + "、".join(filtered_layers)
 
+    trade_plan, plan_status = _aggregate_trade_plan_ex(direction, signals,
+                                                       atr=atr, df=df)
     return {
         "direction": direction,
         "confidence": round(confidence, 3),
@@ -1003,7 +1238,10 @@ def consensus(signals: list[dict], atr: float | None = None) -> dict:
         "layers": layers,
         "reasoning": reasoning,
         "key_levels": key_levels,
-        "trade_plan": _aggregate_trade_plan(direction, signals, atr=atr),
+        "trade_plan": trade_plan,
+        # 计划状态：ok=有计划；watch=有方向但 RR/结构不达标（观望，不硬造）；
+        # neutral=中性本无计划。前端据此把「无计划」讲清楚凭什么。
+        "plan_status": plan_status,
     }
 
 
@@ -1015,7 +1253,7 @@ def analyze(df: pd.DataFrame, basis_data: dict | None = None,
         atr = float(_atr(df).iloc[-1]) if len(df) else None
     except Exception:  # noqa: BLE001 — ATR 计算失败不影响共识主体
         atr = None
-    return {"signals": signals, "consensus": consensus(signals, atr=atr)}
+    return {"signals": signals, "consensus": consensus(signals, atr=atr, df=df)}
 
 
 # ═══════════════════════════ 多时间框架共识融合 ═══════════════════════════
@@ -1043,6 +1281,7 @@ def consensus_multi_tf(tf_consensus: dict[str, dict]) -> dict:
                 "votes": {"bullish": 0, "bearish": 0, "neutral": 0},
                 "tf_votes": {"bullish": 0, "bearish": 0, "neutral": 0},
                 "layers": {}, "trade_plan": None,
+                "plan_status": {"state": "neutral", "reason": "无可用时间框架数据"},
                 "reasoning": "无可用时间框架数据", "key_levels": [], "tfs": {}}
 
     dir_cn = {"bullish": "看涨", "bearish": "看跌", "neutral": "中性"}
@@ -1090,12 +1329,21 @@ def consensus_multi_tf(tf_consensus: dict[str, dict]) -> dict:
 
     # 交易计划：MTF 综合为中性 → None；有方向时取「与综合方向一致」的最长周期的聚合计划
     trade_plan = None
+    plan_status: dict = {"state": "neutral", "reason": "综合共识中性/分歧，不构成计划"}
     if direction in ("bullish", "bearish"):
+        plan_status = {"state": "watch", "reason": "各周期均无达标计划（观望）"}
         for tf in [primary_tf] + [t for t in _TF_PRIORITY if t in valid and t != primary_tf]:
             c = valid.get(tf) or {}
-            if c.get("direction") == direction and c.get("trade_plan"):
+            if c.get("direction") != direction:
+                continue
+            if c.get("trade_plan"):
                 trade_plan = {**c["trade_plan"], "source_tf": tf}
+                plan_status = {"state": "ok", "reason": None}
                 break
+            # 同向但被 RR 门槛/结构门禁拦下：向上传观望原因（带周期标注）
+            ps = c.get("plan_status") or {}
+            if ps.get("state") == "watch" and ps.get("reason"):
+                plan_status = {"state": "watch", "reason": f"[{tf}] {ps['reason']}"}
 
     return {
         "direction": direction,
@@ -1106,6 +1354,7 @@ def consensus_multi_tf(tf_consensus: dict[str, dict]) -> dict:
         "layers": layers,
         "primary_tf": primary_tf,
         "trade_plan": trade_plan,
+        "plan_status": plan_status,
         "reasoning": "；".join(parts),
         "key_levels": key_levels,
         "tfs": valid,

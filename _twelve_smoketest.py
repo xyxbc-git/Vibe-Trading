@@ -231,6 +231,37 @@ arb2 = jts.signal_arbitrage(df_up, basis_data={"basis_pct": 0.8})
 check("套利有基差数据出信号", "基差" in arb2["reasoning"] and arb2["strength"] > 0,
       arb2["reasoning"])
 
+# ── 6.1 套利 v2：基差序列统计口径（z-score + 绝对基差双门槛） ─────────
+import jarvis_crypto_data as jcd
+
+# _basis_stats：50 样本均值 0、末值 3σ 偏离
+_bvals = [0.01 * ((-1) ** i) for i in range(49)] + [0.30]
+_bs = jcd._basis_stats(_bvals)
+check("arb2 _basis_stats 字段完整",
+      {"basis_pct", "basis_mean_pct", "basis_std_pct", "zscore",
+       "percentile", "n_samples"}.issubset(_bs.keys()), str(_bs))
+check("arb2 _basis_stats 样本不足返回空", jcd._basis_stats([0.1] * 19) == {})
+check("arb2 _basis_stats z 显著偏离", _bs["zscore"] >= 2.0, str(_bs["zscore"]))
+
+# 双门槛触发：|z|≥2 且 |基差|≥0.05% → 强信号 + 文案带实际数值与方向中性说明
+arb_hit = jts.signal_arbitrage(df_up, basis_data=_bs)
+check("arb2 双门槛触发强度≥0.5", arb_hit["strength"] >= 0.5, str(arb_hit["strength"]))
+check("arb2 触发文案带实际基差与σ", "z=" in arb_hit["reasoning"]
+      and "中性" in arb_hit["reasoning"], arb_hit["reasoning"][:120])
+check("arb2 方向恒中性（不赌方向）", arb_hit["direction"] == "neutral")
+# 统计显著但绝对基差不够覆盖成本 → 弱提示 0.2
+arb_thin = jts.signal_arbitrage(df_up, basis_data={
+    "basis_pct": 0.03, "basis_mean_pct": 0.0, "basis_std_pct": 0.01,
+    "zscore": 3.0, "percentile": 99.0, "n_samples": 96, "window": "1hx96"})
+check("arb2 绝对基差不足→0.2 弱提示", arb_thin["strength"] == 0.2
+      and "不够覆盖" in arb_thin["reasoning"], arb_thin["reasoning"][:100])
+# 正常区间 → 0.1
+arb_norm = jts.signal_arbitrage(df_up, basis_data={
+    "basis_pct": 0.005, "basis_mean_pct": 0.0, "basis_std_pct": 0.01,
+    "zscore": 0.5, "percentile": 60.0, "n_samples": 96, "window": "1hx96"})
+check("arb2 正常区间→0.1 无套利空间", arb_norm["strength"] == 0.1
+      and "正常波动" in arb_norm["reasoning"], arb_norm["reasoning"][:100])
+
 # ── 7. 幂等：同数据两次结果一致 ──────────────────────────────────────
 check("同数据幂等", jts.analyze(df_up) == out_up)
 
@@ -405,6 +436,87 @@ single = jts._aggregate_trade_plan("bullish", [
 ], atr=1.0)
 check("m3 单计划 TP2 重合输出 None", single is not None
       and single["take_profit_2"] is None, str(single))
+
+# ── 10.2.2 v3：止损结构锚定 + RR 门槛 + 级别透明化 ──────────────────
+
+def _mk_struct_df(n: int = 40, dip_at: int = 30, dip_low: float = 97.0,
+                  spike_at: int | None = None, spike_high: float = 103.0) -> pd.DataFrame:
+    """平坦盘 + 指定位置摆动低点（可选摆动高点）：结构锚定的受控输入。"""
+    rows = []
+    for i in range(n):
+        lo = dip_low if i == dip_at else 100.2
+        hi = spike_high if (spike_at is not None and i == spike_at) else 101.0
+        rows.append({"open": 100.5, "high": hi, "low": lo, "close": 100.5,
+                     "volume": 1.0})
+    return pd.DataFrame(rows)
+
+
+_struct_df = _mk_struct_df()
+# v3a 结构锚定：swing 低点 97 → SL = 97 - 0.5x1.0(ATR) = 96.5，sl_basis 写明锚点
+v3a = jts._aggregate_trade_plan("bullish", [
+    _mk_plan_sig("dow", "bullish", 100.0, 99.0, 105.0),
+    _mk_plan_sig("turtle", "bullish", 100.0, 98.0, 112.0),
+], atr=1.0, df=_struct_df, min_rr=2.0)
+check("v3a 结构锚定 SL=摆动低点-0.5xATR", v3a is not None
+      and abs(v3a["stop_loss"] - 96.5) < 1e-6, str(v3a))
+check("v3a sl_basis 写明摆动低点锚点", v3a is not None
+      and "摆动低点 97" in (v3a.get("sl_basis") or ""), str(v3a and v3a.get("sl_basis")))
+check("v3a 计划携带级别透明化字段",
+      v3a is not None and all(v3a.get(k) for k in ("entry_basis", "sl_basis", "tp_basis"))
+      and v3a.get("min_rr") == 2.0, str(v3a))
+check("v3a rr ≥ 门槛", v3a is not None and v3a["rr"] >= 2.0, str(v3a and v3a["rr"]))
+# 结构目标中位 (105+112)/2=108.5 ≥ 100+2x3.5=107 → 直接采用结构目标
+check("v3a 结构目标达标直接采用", v3a is not None
+      and abs(v3a["take_profit_1"] - 108.5) < 1e-6, str(v3a and v3a["take_profit_1"]))
+
+# v3b RR 推导止盈：结构中位不足、最远目标撑得住 → TP1=RR 门槛推导价（结构验证）
+v3b = jts._aggregate_trade_plan("bullish", [
+    _mk_plan_sig("dow", "bullish", 100.0, 99.0, 105.0),
+    _mk_plan_sig("turtle", "bullish", 100.0, 98.0, 108.0),
+], atr=1.0, df=_struct_df, min_rr=2.0)
+check("v3b TP1=RR 门槛推导价 107", v3b is not None
+      and abs(v3b["take_profit_1"] - 107.0) < 1e-6, str(v3b and v3b["take_profit_1"]))
+check("v3b tp_basis 写明 RR 推导+结构验证", v3b is not None
+      and "RR" in (v3b.get("tp_basis") or "") and "验证" in (v3b.get("tp_basis") or ""),
+      str(v3b and v3b.get("tp_basis")))
+
+# v3c RR 不达标 → 观望不硬造：最远结构目标 105 < 107
+v3c_plan, v3c_st = jts._aggregate_trade_plan_ex("bullish", [
+    _mk_plan_sig("dow", "bullish", 100.0, 99.0, 104.0),
+    _mk_plan_sig("turtle", "bullish", 100.0, 98.0, 105.0),
+], atr=1.0, df=_struct_df, min_rr=2.0)
+check("v3c RR 不达标 plan=None", v3c_plan is None, str(v3c_plan))
+check("v3c plan_status=watch+观望原因", v3c_st.get("state") == "watch"
+      and "观望" in (v3c_st.get("reason") or ""), str(v3c_st))
+
+# v3d 空头镜像结构锚定：swing 高点 103 → SL = 103 + 0.5xATR = 103.5
+v3d = jts._aggregate_trade_plan("bearish", [
+    _mk_plan_sig("dow", "bearish", 100.0, 101.5, 92.0),
+], atr=1.0, df=_mk_struct_df(spike_at=30, spike_high=103.0), min_rr=2.0)
+check("v3d 空头结构锚定 SL=摆动高点+0.5xATR", v3d is not None
+      and abs(v3d["stop_loss"] - 103.5) < 1e-6, str(v3d))
+check("v3d 空头 rr ≥ 门槛", v3d is not None and v3d["rr"] >= 2.0,
+      str(v3d and v3d["rr"]))
+
+# v3e 无 df（兜底口径）：sl_basis 注明未检出结构位；门槛仍生效
+v3e = jts._aggregate_trade_plan("bullish", [
+    _mk_plan_sig("dow", "bullish", 100.0, 95.0, 110.0),
+], atr=1.0, min_rr=2.0)
+check("v3e 兜底 sl_basis 注明未检出结构位", v3e is not None
+      and "未检出" in (v3e.get("sl_basis") or ""), str(v3e and v3e.get("sl_basis")))
+
+# v3f consensus() 输出 plan_status 字段（ok/watch/neutral 三态之一）
+_c_up = out_up["consensus"]
+check("v3f consensus 携带 plan_status", isinstance(_c_up.get("plan_status"), dict)
+      and _c_up["plan_status"].get("state") in ("ok", "watch", "neutral"),
+      str(_c_up.get("plan_status")))
+check("v3f plan 与 plan_status 自洽",
+      (_c_up.get("trade_plan") is not None) == (_c_up["plan_status"]["state"] == "ok"),
+      str(_c_up.get("plan_status")))
+# MTF 融合结果同样携带 plan_status
+check("v3f MTF 携带 plan_status", isinstance(mtf.get("plan_status"), dict)
+      and mtf["plan_status"].get("state") in ("ok", "watch", "neutral"),
+      str(mtf.get("plan_status")))
 
 # m2 微价资产精度：PEPE 级价格不归零
 micro = jts._plan("bullish", 0.00001234, "market", 0.00001111, 0.00001456, "t")

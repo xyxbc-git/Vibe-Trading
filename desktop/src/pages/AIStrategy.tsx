@@ -77,7 +77,7 @@ function StepBadge({ n, active }: { n: number; active: boolean }) {
     <span
       className={`inline-flex items-center justify-center w-6 h-6 rounded-full text-xs font-bold mr-2 ${
         active
-          ? "bg-jarvis-blue text-white"
+          ? "bg-jarvis-blue text-jarvis-accent-fg"
           : "bg-jarvis-border text-jarvis-text-secondary"
       }`}
     >

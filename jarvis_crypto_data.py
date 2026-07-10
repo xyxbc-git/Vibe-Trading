@@ -445,6 +445,69 @@ def fetch_fng(limit: int = 14) -> dict:
     return out
 
 
+def _basis_stats(vals: list[float]) -> dict:
+    """基差序列 → 偏离统计（纯函数，供离线测试）：均值/σ/z-score/分位。
+
+    样本 < 20 视为不足，返回 {}（调用方降级）。
+    """
+    if not vals or len(vals) < 20:
+        return {}
+    cur = float(vals[-1])
+    mean = sum(vals) / len(vals)
+    std = (sum((v - mean) ** 2 for v in vals) / len(vals)) ** 0.5
+    z = (cur - mean) / std if std > 1e-12 else 0.0
+    pctl = sum(1 for v in vals if v <= cur) / len(vals) * 100
+    return {
+        "basis_pct": round(cur, 4),
+        "basis_mean_pct": round(mean, 4),
+        "basis_std_pct": round(std, 4),
+        "zscore": round(z, 2),
+        "percentile": round(pctl, 1),
+        "n_samples": len(vals),
+    }
+
+
+def fetch_basis_series(symbol: str, interval: str = "1h", limit: int = 96) -> dict:
+    """期现基差序列：Binance 现货 vs USDⓈ-M 永续同周期收盘价按开盘时间对齐。
+
+    供十二系统套利信号评估基差偏离（z-score/分位）。返回 _basis_stats 字段 +
+    spot_price/perp_price/window/funding_8h_pct(佐证，可缺)；任一腿取数失败或
+    对齐样本 < 20 → 返回 {}（调用方降级中性，不硬造信号）。
+    """
+    sym = (symbol or "").upper().replace("-", "").replace("/", "")
+    if not sym.endswith(("USDT", "USDC")):
+        sym += "USDT"
+    lim = max(20, min(int(limit), 500))
+    spot = _get(f"{SPOT_API}/api/v3/klines",
+                {"symbol": sym, "interval": interval, "limit": lim})
+    perp = _get(f"{FAPI}/fapi/v1/klines",
+                {"symbol": sym, "interval": interval, "limit": lim})
+    if not (isinstance(spot, list) and spot and isinstance(perp, list) and perp):
+        return {}
+    try:
+        spot_close = {int(k[0]): float(k[4]) for k in spot}
+        pairs = [(float(k[4]), spot_close[int(k[0])]) for k in perp
+                 if int(k[0]) in spot_close and float(spot_close[int(k[0])]) > 0]
+    except (IndexError, TypeError, ValueError):
+        return {}
+    vals = [(p - s) / s * 100 for p, s in pairs]
+    out = _basis_stats(vals)
+    if not out:
+        return {}
+    out["spot_price"] = pairs[-1][1]
+    out["perp_price"] = pairs[-1][0]
+    out["window"] = f"{interval}x{len(vals)}"
+    out["_source"] = "binance"
+    # 资金费佐证（单次 premiumIndex，失败不影响主体）
+    prem = _get(f"{FAPI}/fapi/v1/premiumIndex", {"symbol": sym}, retries=2)
+    if isinstance(prem, dict) and "lastFundingRate" in prem:
+        try:
+            out["funding_8h_pct"] = round(float(prem["lastFundingRate"]) * 100, 5)
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
 def fetch_basis(symbol: str, mark_price: float) -> dict:
     """期现基差：永续标记价 vs 现货价。"""
     out: dict = {}

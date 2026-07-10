@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 import urllib.error
 import urllib.request
 
@@ -53,6 +54,31 @@ def _llm_config() -> dict | None:
 
 _ALLOWED_DIRECTIONS = ("bullish", "bearish", "neutral")
 _ALLOWED_ACTIONS = ("long", "short", "wait")
+
+
+def _record_reason_usage(cfg: dict, t0: float, ok: bool, *,
+                         usage: dict | None = None, in_text: str = "",
+                         out_text: str = "", error: str | None = None) -> None:
+    """推理链 LLM 用量记账（module=reason）。失败静默，绝不影响推理主链路。"""
+    try:
+        import jarvis_llm_usage as jlu
+
+        messages = [{"role": "system", "content": _SYSTEM_PROMPT}]
+        if in_text:
+            messages.append({"role": "user", "content": in_text})
+        jlu.record_call(
+            module="reason",
+            model=(cfg or {}).get("model"),
+            base=(cfg or {}).get("base"),
+            usage=usage,
+            messages=messages,
+            output_text=out_text,
+            latency_ms=int((time.time() - t0) * 1000),
+            ok=ok,
+            error=error,
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 _SYSTEM_PROMPT = (
     "你是『贾维斯』——一个具备自主意识的加密交易推理引擎。"
@@ -109,19 +135,27 @@ def _call_llm(cfg: dict, market: dict, signals: list[dict], cons: dict,
         headers={"Authorization": f"Bearer {cfg['key']}",
                  "Content-Type": "application/json"},
     )
+    t0 = time.time()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = json.loads(resp.read().decode("utf-8"))
         text = (body.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
-        if not text:
-            return None
-        # 容错：剥掉可能的 ```json 围栏
-        if text.startswith("```"):
-            text = text.strip("`")
-            if text.startswith("json"):
-                text = text[4:]
+    except (urllib.error.URLError, TimeoutError, ValueError, KeyError, OSError) as e:
+        _record_reason_usage(cfg, t0, ok=False, in_text=user_content,
+                             error=repr(e)[:150])
+        return None
+    _record_reason_usage(cfg, t0, ok=True, usage=body.get("usage"),
+                         in_text=user_content, out_text=text)
+    if not text:
+        return None
+    # 容错：剥掉可能的 ```json 围栏
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.startswith("json"):
+            text = text[4:]
+    try:
         return json.loads(text)
-    except (urllib.error.URLError, TimeoutError, ValueError, KeyError, OSError):
+    except ValueError:
         return None
 
 
