@@ -22,7 +22,6 @@ import type {
 } from "./drawings";
 import type { ConsensusTradePlan, TwelveSignal } from "../api/client";
 import { planToOverlay, PLAN_COLORS, fmt } from "./tradePlan";
-import { planToZones, type TradeZone } from "./tradeZones";
 
 export type ViewMode = "simple" | "advanced" | "pro";
 
@@ -263,8 +262,6 @@ export interface ChartComposition {
   smartLevels: SmartLevels | null;
   drawings: DrawingResult | null;
   keyLevels: KeyLevel[];
-  /** 交易区间带（入场/止损/止盈时间锚定矩形），三档视图共用，随计划自动多空镜像 */
-  tradeZones: TradeZone[];
   legend: LegendEntry[];
   lineCount: number;
 }
@@ -289,17 +286,9 @@ function buildLegend(opts: {
   usedTypes: DrawMode[];
   hasKeyLevels: boolean;
   short: boolean;
-  hasZones?: boolean;
 }): LegendEntry[] {
-  const { planLines, hasSmartPlain, proSmart, usedTypes, hasKeyLevels, short, hasZones } = opts;
+  const { planLines, hasSmartPlain, proSmart, usedTypes, hasKeyLevels, short } = opts;
   const legend: LegendEntry[] = [];
-  if (hasZones) {
-    legend.push({
-      color: PLAN_COLORS.entry,
-      name: "交易区间带",
-      explain: "彩色矩形 = 入场（蓝）/止损（红）/止盈（绿）区间，只覆盖最近一段 K 线，悬停可看盈亏比",
-    });
-  }
   if (planLines.some((l) => l.color === PLAN_COLORS.entry)) {
     legend.push({
       color: PLAN_COLORS.entry,
@@ -349,8 +338,6 @@ export function composeChartView(input: ComposeInput): ChartComposition {
     reliability, price, signals, twelveOn,
   } = input;
   const short = planDirection === "bearish";
-  // 区间带三档共用：随计划自动生成（多空镜像），无计划时为空数组
-  const tradeZones = planToZones(tradePlan, planDirection);
 
   if (mode === "pro") {
     // 专业：全量现状——原始 label 计划线 + 智能视图（含现价）+ 用户开关画线 + 未过滤关键位
@@ -371,8 +358,7 @@ export function composeChartView(input: ComposeInput): ChartComposition {
       smartLevels: smart,
       drawings: fullDrawings,
       keyLevels,
-      tradeZones,
-      legend: buildLegend({ planLines, hasSmartPlain: false, proSmart: smart, usedTypes, hasKeyLevels: keyLevels.length > 0, short, hasZones: tradeZones.length > 0 }),
+      legend: buildLegend({ planLines, hasSmartPlain: false, proSmart: smart, usedTypes, hasKeyLevels: keyLevels.length > 0, short }),
       lineCount: planLines.length + drawingsCost(fullDrawings) + keyLevels.length + (smart ? (smart.support ? 1 : 0) + (smart.resistance ? 1 : 0) + 1 : 0),
     };
   }
@@ -392,8 +378,7 @@ export function composeChartView(input: ComposeInput): ChartComposition {
       smartLevels: null,
       drawings: null,
       keyLevels: [],
-      tradeZones,
-      legend: buildLegend({ planLines: core, hasSmartPlain: srPlain.length > 0, proSmart: null, usedTypes: [], hasKeyLevels: false, short, hasZones: tradeZones.length > 0 }),
+      legend: buildLegend({ planLines: core, hasSmartPlain: srPlain.length > 0, proSmart: null, usedTypes: [], hasKeyLevels: false, short }),
       lineCount: core.length,
     };
   }
@@ -413,8 +398,7 @@ export function composeChartView(input: ComposeInput): ChartComposition {
     smartLevels: null,
     drawings: trimmed.cost > 0 ? trimmed.result : null,
     keyLevels,
-    tradeZones,
-    legend: buildLegend({ planLines: core, hasSmartPlain: srPlain.length > 0, proSmart: null, usedTypes: trimmed.usedTypes, hasKeyLevels: keyLevels.length > 0, short, hasZones: tradeZones.length > 0 }),
+    legend: buildLegend({ planLines: core, hasSmartPlain: srPlain.length > 0, proSmart: null, usedTypes: trimmed.usedTypes, hasKeyLevels: keyLevels.length > 0, short }),
     lineCount: core.length + trimmed.cost + keyLevels.length,
   };
 }

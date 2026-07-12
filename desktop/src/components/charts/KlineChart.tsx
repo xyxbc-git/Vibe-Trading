@@ -14,10 +14,12 @@ import {
   type Time,
 } from "lightweight-charts";
 import type { DrawingResult, SmartLevels, KeyLevel, DrawLineStyle, DrawHLine } from "@/lib/drawings";
-import { zoneTimeWindow, type TradeZone } from "@/lib/tradeZones";
 import type { TradeMark } from "@/lib/signalTrades";
-import { TradeZonesPrimitive } from "./TradeZonesPrimitive";
+import type { PredictionOverlay } from "@/lib/predict";
+import { positionZoneWindow, type PositionZoneView } from "@/lib/positionZone";
 import { TradeMarkersPrimitive } from "./TradeMarkersPrimitive";
+import { PredictionPrimitive } from "./PredictionPrimitive";
+import { PositionZonePrimitive } from "./PositionZonePrimitive";
 
 interface KlineChartProps {
   data: CandlestickData<Time>[];
@@ -31,10 +33,18 @@ interface KlineChartProps {
   keyLevels?: KeyLevel[];
   /** 交易计划线（入场区 / 止损 / 止盈），由 planToOverlay 生成。 */
   planLines?: DrawHLine[];
-  /** 交易区间带（入场/止损/止盈时间锚定矩形），由 planToZones 生成；悬停显示盈亏比。 */
-  tradeZones?: TradeZone[];
   /** 信号历史盈损标记（L/S 字母徽章 + 出场圆点，盈✓亏✕），由 tradesToMarks 生成。 */
   tradeMarks?: TradeMark[];
+  /** 走势预测层（概率锥 + 路径虚线 + 概率标签），由 buildPredictionOverlay 生成；null/undefined 不渲染。 */
+  prediction?: PredictionOverlay | null;
+  /** 信号多空区间图（TradingView position 风格，同时只显一个），由 buildPositionZoneView 生成；null/undefined 不渲染。 */
+  positionZone?: PositionZoneView | null;
+  /**
+   * 实时最新价（与顶栏同源的 ticker 报价）。存在时把最后一根未收线蜡烛的
+   * close 流式更新为该价（high/low 相应扩展），使图表右侧最新价标签与顶栏
+   * 价格一致；null/undefined 时保持 kline 轮询数据原样。
+   */
+  livePrice?: { price: number; timeSec: number } | null;
 }
 
 function fmtPrice(v: number): string {
@@ -69,8 +79,10 @@ export default function KlineChart({
   drawings,
   keyLevels,
   planLines,
-  tradeZones,
   tradeMarks,
+  prediction,
+  positionZone,
+  livePrice,
 }: KlineChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -78,10 +90,14 @@ export default function KlineChart({
   const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const priceLinesRef = useRef<IPriceLine[]>([]);
   const overlaySeriesRef = useRef<ISeriesApi<"Line">[]>([]);
-  const zonesPrimitiveRef = useRef<TradeZonesPrimitive | null>(null);
   const marksPrimitiveRef = useRef<TradeMarkersPrimitive | null>(null);
+  const predictionPrimitiveRef = useRef<PredictionPrimitive | null>(null);
+  const positionZonePrimitiveRef = useRef<PositionZonePrimitive | null>(null);
+  // 预测视口右扩去重：同一份预测（genKey）只扩一次，用户随后缩放/平移不被打断
+  const predictionRef = useRef<PredictionOverlay | null>(null);
+  const appliedGenKeyRef = useRef<string | null>(null);
   const disposedRef = useRef(false);
-  // 悬停在区间带上时的浮层文案（含盈亏比）；null = 隐藏
+  // 悬停命中（盈损徽章 / 预测层）时的浮层文案；null = 隐藏
   const [zoneTip, setZoneTip] = useState<{ x: number; y: number; text: string } | null>(null);
   // Bumped after every chart (re-)init so data/overlay effects re-apply onto
   // the freshly created series (e.g. after a height-change re-init).
@@ -132,17 +148,20 @@ export default function KlineChart({
       scaleMargins: { top: 0.8, bottom: 0 },
     });
 
-    // 交易区间带 primitive：zOrder "bottom"，垫在蜡烛下方；信号盈损 L/S 徽章
-    // primitive：zOrder "top"，浮在蜡烛上方。缩放/平移/切周期由库的
-    // updateAllViews 回调驱动重投影（价格→y、时间/bar 索引→x），天然不错位。
-    const zonesPrimitive = new TradeZonesPrimitive();
-    candleSeries.attachPrimitive(zonesPrimitive);
+    // 信号盈损 L/S 徽章 primitive：zOrder "top"，浮在蜡烛上方。缩放/平移/
+    // 切周期由库的 updateAllViews 回调驱动重投影（价格→y、时间/bar 索引→x），
+    // 天然不错位。
     const marksPrimitive = new TradeMarkersPrimitive();
     candleSeries.attachPrimitive(marksPrimitive);
+    const predictionPrimitive = new PredictionPrimitive();
+    candleSeries.attachPrimitive(predictionPrimitive);
+    // 信号多空区间图（TradingView position 风格）：独立图元，与预测层互不影响
+    const positionZonePrimitive = new PositionZonePrimitive();
+    candleSeries.attachPrimitive(positionZonePrimitive);
 
-    // 悬停浮层（两类命中共用一个浮层，徽章优先）：
+    // 悬停浮层（两类命中共用一个浮层，徽章 > 预测层）：
     //   1. 信号盈损 L/S 徽章 / 出场圆点：像素坐标命中测试 → 每笔详情
-    //   2. 交易区间带：时间锚定矩形命中测试 → 区间详情（含盈亏比）
+    //   2. 走势预测层：概率标签盒 / 概率锥命中 → 概率与目标区摘要
     const handleCrosshair = (param: MouseEventParams<Time>) => {
       if (disposedRef.current) return;
       const pt = param.point;
@@ -155,18 +174,21 @@ export default function KlineChart({
         setZoneTip({ x: pt.x, y: pt.y, text: markTip });
         return;
       }
-      const hit = zonesPrimitive.zoneAt(pt.x, pt.y);
-      setZoneTip(hit ? { x: pt.x, y: pt.y, text: hit.tooltip } : null);
+      const predictTip = predictionPrimitive.predictionAt(pt.x, pt.y);
+      setZoneTip(predictTip ? { x: pt.x, y: pt.y, text: predictTip } : null);
     };
     chart.subscribeCrosshairMove(handleCrosshair);
 
     chartRef.current = chart;
     candleSeriesRef.current = candleSeries;
     volumeSeriesRef.current = volumeSeries;
-    zonesPrimitiveRef.current = zonesPrimitive;
     marksPrimitiveRef.current = marksPrimitive;
+    predictionPrimitiveRef.current = predictionPrimitive;
+    positionZonePrimitiveRef.current = positionZonePrimitive;
     priceLinesRef.current = [];
     overlaySeriesRef.current = [];
+    // 重建后的图表实例 rightOffset 归零，同一份预测需重新扩一次视野
+    appliedGenKeyRef.current = null;
     setInitVersion(v => v + 1);
 
     const handleResize = () => {
@@ -182,8 +204,9 @@ export default function KlineChart({
       chart.unsubscribeCrosshairMove(handleCrosshair);
       candleSeriesRef.current = null;
       volumeSeriesRef.current = null;
-      zonesPrimitiveRef.current = null;
       marksPrimitiveRef.current = null;
+      predictionPrimitiveRef.current = null;
+      positionZonePrimitiveRef.current = null;
       priceLinesRef.current = [];
       overlaySeriesRef.current = [];
       chartRef.current = null;
@@ -203,24 +226,67 @@ export default function KlineChart({
       }
       if (chartRef.current && data.length > 0) {
         chartRef.current.timeScale().fitContent();
+        // 预测层开启时：fitContent 会把视口收到最后一根 K 线，右侧未来区域
+        // （概率锥/路径所在）被挤出画面——刷新后滚出 horizon+2 根右侧留白。
+        // 数据轮询本来就周期性 fitContent 重置视口，这里跟随同一节奏，不额外
+        // 打断用户手动缩放/平移。
+        const pred = predictionRef.current;
+        if (pred) {
+          chartRef.current.timeScale().scrollToPosition(pred.horizon + 2, false);
+        }
       }
     } catch {
       // chart may have been disposed between render and effect
     }
   }, [data, volumeData, initVersion]);
 
-  // 交易区间带：把 zones + 时间窗口（覆盖最近 N 根 K 线 + 右侧延伸）灌进
-  // primitive（内部 requestUpdate 触发重绘）。关闭开关 / 计划消失时传空数组
-  // 即清空；窗口随 K 线根数变化滑动（新 K 线收线后矩形右移跟进）。
+  // 实时价补丁：用与顶栏同源的 ticker 报价流式更新最后一根未收线蜡烛
+  // （series.update 只动最后一根，不触发 setData/fitContent，不打断用户
+  // 缩放/平移）。声明在 setData effect 之后——kline 轮询覆盖后本 effect
+  // 依赖 data 重跑，立即把可能滞后（后端 60s 缓存）的 close 再对齐回来。
   useEffect(() => {
     if (disposedRef.current) return;
+    const series = candleSeriesRef.current;
+    if (!series || !livePrice || data.length === 0) return;
+    const last = data[data.length - 1];
+    // 报价须不早于最后一根蜡烛的开始时间（防切币/切周期瞬间旧报价错画）
+    if (livePrice.timeSec < Number(last.time)) return;
     try {
-      zonesPrimitiveRef.current?.setZones(tradeZones ?? [], zoneTimeWindow(data.length));
+      series.update({
+        time: last.time,
+        open: last.open,
+        high: Math.max(last.high, livePrice.price),
+        low: Math.min(last.low, livePrice.price),
+        close: livePrice.price,
+      });
     } catch {
       // chart may have been disposed between render and effect
     }
-    setZoneTip(null);
-  }, [tradeZones, data.length, initVersion]);
+  }, [livePrice, data, initVersion]);
+
+  // 走势预测层：载荷灌进 primitive（内部 requestUpdate 触发重绘）；开启/换一份
+  // 新预测（genKey 变化）时滚出右侧未来区域，关闭时回到贴右缘的默认视口。
+  // genKey 去重保证同一份预测只调整一次视野，用户随后的缩放/平移不被打断。
+  useEffect(() => {
+    if (disposedRef.current) return;
+    predictionRef.current = prediction ?? null;
+    try {
+      predictionPrimitiveRef.current?.setPrediction(prediction ?? null);
+      const chart = chartRef.current;
+      if (!chart || data.length === 0) return;
+      if (prediction) {
+        if (appliedGenKeyRef.current !== prediction.genKey) {
+          appliedGenKeyRef.current = prediction.genKey;
+          chart.timeScale().scrollToPosition(prediction.horizon + 2, false);
+        }
+      } else if (appliedGenKeyRef.current !== null) {
+        appliedGenKeyRef.current = null;
+        chart.timeScale().scrollToPosition(0, false);
+      }
+    } catch {
+      // chart may have been disposed between render and effect
+    }
+  }, [prediction, data.length, initVersion]);
 
   // 信号历史盈损标记：L/S 字母徽章（入场）+ 出场圆点，选中信号变化时整组重设；
   // 传空/未传即清空。悬停命中直接查 primitive 的投影结果。
@@ -232,6 +298,20 @@ export default function KlineChart({
       // chart may have been disposed between render and effect
     }
   }, [tradeMarks, initVersion]);
+
+  // 信号多空区间图：view + 时间窗口（最新 K 线向右延伸固定根数）灌进独立
+  // primitive；切换信号即整体替换（同时只显一个），传 null 即清除。
+  useEffect(() => {
+    if (disposedRef.current) return;
+    try {
+      positionZonePrimitiveRef.current?.setZone(
+        positionZone ?? null,
+        positionZone ? positionZoneWindow(data.length) : null,
+      );
+    } catch {
+      // chart may have been disposed between render and effect
+    }
+  }, [positionZone, data.length, initVersion]);
 
   // Overlay pass: smart levels, auto-drawings and external key levels.
   //  - horizontal levels (S/R、fib、现价、外部关键位) → series.createPriceLine

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { clsx } from "clsx";
-import { TrendingUp, TrendingDown, ArrowUp, ArrowDown } from "lucide-react";
+import { TrendingUp, TrendingDown, ArrowUp, ArrowDown, Bell } from "lucide-react";
+import { riskReward, baseAsset, fmtQty } from "@/lib/positionMetrics";
 
 interface PositionCardProps {
   symbol: string;
@@ -8,11 +9,25 @@ interface PositionCardProps {
   entryPrice: number;
   currentPrice?: number;
   pnlPct?: number;
+  /** 浮盈金额（USDT，后端按现价补列） */
+  pnlUsdt?: number;
   stopLoss?: number;
   takeProfit?: number;
+  /** 持仓数量（币数） */
+  qty?: number;
+  /** 投入/占用保证金（USDT） */
+  marginUsdt?: number;
+  /** 名义仓位（USDT，杠杆>1 时与保证金不同） */
+  notionalUsdt?: number;
+  /** 杠杆倍数（现货全额记账=1）；不传则不显示杠杆徽标 */
+  leverage?: number;
   /** 传入后卡片底部显示「平仓」按钮（Trading 页用；Dashboard 不传则不显示） */
   onClose?: () => void;
   closing?: boolean;
+  /** 传入后显示「提醒」铃铛按钮（打开该单邮件提醒配置弹窗） */
+  onNotify?: () => void;
+  /** 该单已配置邮件提醒（铃铛点亮） */
+  notifyOn?: boolean;
 }
 
 type Flash = "up" | "down" | null;
@@ -26,16 +41,30 @@ function fmtPrice(n: number) {
   });
 }
 
+function fmtUsd(n: number) {
+  return n.toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+
 export default function PositionCard({
   symbol,
   direction,
   entryPrice,
   currentPrice,
   pnlPct,
+  pnlUsdt,
   stopLoss,
   takeProfit,
+  qty,
+  marginUsdt,
+  notionalUsdt,
+  leverage,
   onClose,
   closing,
+  onNotify,
+  notifyOn,
 }: PositionCardProps) {
   const [flash, setFlash] = useState<Flash>(null);
   const prevPriceRef = useRef<number | undefined>(currentPrice);
@@ -60,7 +89,21 @@ export default function PositionCard({
 
   const hasPrice = currentPrice !== undefined && Number.isFinite(currentPrice);
   const hasPnl = pnlPct !== undefined && Number.isFinite(pnlPct);
-  const isProfit = hasPnl && (pnlPct as number) >= 0;
+  const hasPnlUsd = pnlUsdt !== undefined && Number.isFinite(pnlUsdt);
+  const isProfit = hasPnl
+    ? (pnlPct as number) >= 0
+    : hasPnlUsd && (pnlUsdt as number) >= 0;
+
+  const rr = riskReward(direction, entryPrice, stopLoss, takeProfit);
+  const hasQty = qty !== undefined && Number.isFinite(qty) && qty > 0;
+  const hasMargin =
+    marginUsdt !== undefined && Number.isFinite(marginUsdt) && marginUsdt > 0;
+  const showNotional =
+    notionalUsdt !== undefined &&
+    Number.isFinite(notionalUsdt) &&
+    notionalUsdt > 0 &&
+    leverage !== undefined &&
+    leverage > 1;
 
   return (
     <div className="card transition-colors duration-300">
@@ -77,6 +120,23 @@ export default function PositionCard({
           >
             {direction === "long" ? "多" : "空"}
           </span>
+          {leverage !== undefined && leverage > 0 && (
+            <span
+              title={
+                leverage > 1
+                  ? "计划杠杆倍数（来自保存的交易计划）"
+                  : "现货全额记账（无杠杆）"
+              }
+              className={clsx(
+                "text-xs px-1.5 py-0.5 rounded font-mono font-medium",
+                leverage > 1
+                  ? "bg-jarvis-purple/15 text-jarvis-purple"
+                  : "bg-jarvis-border/40 text-jarvis-text-secondary",
+              )}
+            >
+              {leverage}x
+            </span>
+          )}
           {flash && (
             <span
               className={clsx(
@@ -141,20 +201,83 @@ export default function PositionCard({
             </span>
           </div>
         )}
+        {hasQty && (
+          <div title="持仓数量（币数）">
+            <span className="text-jarvis-text-secondary">数量</span>
+            <span className="ml-2 text-jarvis-text font-mono">
+              {fmtQty(qty)}
+              <span className="ml-1 text-xs text-jarvis-text-secondary">
+                {baseAsset(symbol)}
+              </span>
+            </span>
+          </div>
+        )}
+        {hasMargin && (
+          <div title="占用保证金 / 投入金额（USDT）">
+            <span className="text-jarvis-text-secondary">投入</span>
+            <span className="ml-2 text-jarvis-text font-mono">
+              ${fmtUsd(marginUsdt as number)}
+            </span>
+          </div>
+        )}
+        {showNotional && (
+          <div title="名义仓位 = 保证金 × 杠杆">
+            <span className="text-jarvis-text-secondary">名义</span>
+            <span className="ml-2 text-jarvis-text font-mono">
+              ${fmtUsd(notionalUsdt as number)}
+            </span>
+          </div>
+        )}
+        {rr !== null && (
+          <div title="盈亏比 = (止盈-入场) / (入场-止损)，按持仓方向">
+            <span className="text-jarvis-text-secondary">盈亏比</span>
+            <span
+              className={clsx(
+                "ml-2 font-mono",
+                rr >= 1.5
+                  ? "text-jarvis-green"
+                  : rr >= 1
+                    ? "text-jarvis-yellow"
+                    : "text-jarvis-red",
+              )}
+            >
+              1:{rr}
+            </span>
+          </div>
+        )}
       </div>
 
       <div className="mt-3 pt-3 border-t border-jarvis-border flex items-center justify-between">
         <div>
           <span className="text-jarvis-text-secondary text-sm">浮盈</span>
-          {hasPnl ? (
-            <span
-              className={clsx(
-                "ml-2 text-lg font-semibold font-mono transition-colors duration-300",
-                isProfit ? "text-jarvis-green" : "text-jarvis-red",
+          {hasPnl || hasPnlUsd ? (
+            <span className="ml-2">
+              {hasPnlUsd && (
+                <span
+                  className={clsx(
+                    "text-lg font-semibold font-mono transition-colors duration-300",
+                    isProfit ? "text-jarvis-green" : "text-jarvis-red",
+                  )}
+                >
+                  {(pnlUsdt as number) >= 0 ? "+" : ""}
+                  {fmtUsd(pnlUsdt as number)} U
+                </span>
               )}
-            >
-              {isProfit ? "+" : ""}
-              {(pnlPct as number).toFixed(2)}%
+              {hasPnl && (
+                <span
+                  className={clsx(
+                    "font-mono transition-colors duration-300",
+                    hasPnlUsd
+                      ? "ml-1.5 text-xs opacity-80"
+                      : "text-lg font-semibold",
+                    isProfit ? "text-jarvis-green" : "text-jarvis-red",
+                  )}
+                >
+                  {hasPnlUsd ? "(" : ""}
+                  {(pnlPct as number) >= 0 ? "+" : ""}
+                  {(pnlPct as number).toFixed(2)}%{hasPnlUsd ? ")" : ""}
+                </span>
+              )}
             </span>
           ) : (
             <span className="ml-2 text-lg font-semibold font-mono text-jarvis-text-secondary">
@@ -162,15 +285,31 @@ export default function PositionCard({
             </span>
           )}
         </div>
-        {onClose && (
-          <button
-            onClick={onClose}
-            disabled={closing}
-            className="text-xs px-2.5 py-1.5 rounded-lg border border-jarvis-red/40 text-jarvis-red hover:bg-jarvis-red/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {closing ? "平仓中..." : "平仓"}
-          </button>
-        )}
+        <div className="flex items-center gap-1.5">
+          {onNotify && (
+            <button
+              onClick={onNotify}
+              title={notifyOn ? "已开启邮件提醒（点击修改）" : "配置止盈/止损邮件提醒"}
+              className={clsx(
+                "p-1.5 rounded-lg border transition-colors",
+                notifyOn
+                  ? "border-jarvis-yellow/50 text-jarvis-yellow bg-jarvis-yellow/10"
+                  : "border-jarvis-border text-jarvis-text-secondary hover:text-jarvis-yellow hover:border-jarvis-yellow/50",
+              )}
+            >
+              <Bell size={14} />
+            </button>
+          )}
+          {onClose && (
+            <button
+              onClick={onClose}
+              disabled={closing}
+              className="text-xs px-2.5 py-1.5 rounded-lg border border-jarvis-red/40 text-jarvis-red hover:bg-jarvis-red/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {closing ? "平仓中..." : "平仓"}
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );

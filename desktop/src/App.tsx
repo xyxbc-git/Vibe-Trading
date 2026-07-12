@@ -4,6 +4,7 @@ import ErrorBoundary from "./components/common/ErrorBoundary";
 import Dashboard from "./pages/Dashboard";
 import Chart from "./pages/Chart";
 import Trading from "./pages/Trading";
+import FundingArb from "./pages/FundingArb";
 import StrategyLab from "./pages/StrategyLab";
 import AIStrategy from "./pages/AIStrategy";
 import StrategyEvolve from "./pages/StrategyEvolve";
@@ -29,6 +30,7 @@ export default function App() {
         <Route path="chart" element={<PageGuard name="K线图表"><Chart /></PageGuard>} />
         <Route path="trading" element={<PageGuard name="交易中心"><Trading /></PageGuard>} />
         <Route path="trades" element={<PageGuard name="交易记录"><TradeRecords /></PageGuard>} />
+        <Route path="funding-arb" element={<PageGuard name="费率套利"><FundingArb /></PageGuard>} />
         <Route path="strategy" element={<PageGuard name="策略实验室"><StrategyLab /></PageGuard>} />
         <Route path="ai-strategy" element={<PageGuard name="AI 策略工坊"><AIStrategy /></PageGuard>} />
         <Route path="strategy-evolve" element={<PageGuard name="策略自动进化"><StrategyEvolve /></PageGuard>} />

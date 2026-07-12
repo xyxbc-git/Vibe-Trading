@@ -2,6 +2,7 @@ import { usePolling } from "@/hooks/useApi";
 import { useSymbol } from "@/hooks/useSymbol";
 import { api, type ConsensusScope } from "@/api/client";
 import PositionCard from "@/components/cards/PositionCard";
+import { extractCardMetrics } from "@/lib/positionMetrics";
 import HealthStatusCard from "@/components/cards/HealthStatusCard";
 import ConsensusGauge from "@/components/cards/ConsensusGauge";
 import SignalBoard from "@/components/cards/SignalBoard";
@@ -339,30 +340,38 @@ export default function Dashboard() {
           <p className="stat-label mb-4">活跃持仓</p>
           {pos.length > 0 ? (
             <div className="space-y-3">
-              {pos.map((p, i) => (
-                <PositionCard
-                  key={`${String(p.symbol ?? "—")}-${i}`}
-                  symbol={String(p.symbol ?? "—")}
-                  direction={
-                    String(p.direction ?? "long") === "short"
-                      ? "short"
-                      : "long"
-                  }
-                  entryPrice={Number(p.entry_price ?? 0)}
-                  currentPrice={
-                    p.current_price != null
-                      ? Number(p.current_price)
-                      : undefined
-                  }
-                  pnlPct={
-                    p.pnl_pct != null ? Number(p.pnl_pct) : undefined
-                  }
-                  stopLoss={p.stop_loss ? Number(p.stop_loss) : undefined}
-                  takeProfit={
-                    p.take_profit ? Number(p.take_profit) : undefined
-                  }
-                />
-              ))}
+              {pos.map((p, i) => {
+                const metrics = extractCardMetrics(p);
+                return (
+                  <PositionCard
+                    key={`${String(p.symbol ?? "—")}-${i}`}
+                    symbol={String(p.symbol ?? "—")}
+                    direction={
+                      String(p.direction ?? "long") === "short"
+                        ? "short"
+                        : "long"
+                    }
+                    entryPrice={Number(p.entry_price ?? 0)}
+                    currentPrice={
+                      p.current_price != null
+                        ? Number(p.current_price)
+                        : undefined
+                    }
+                    pnlPct={
+                      p.pnl_pct != null ? Number(p.pnl_pct) : undefined
+                    }
+                    pnlUsdt={metrics.pnlUsdt}
+                    stopLoss={p.stop_loss ? Number(p.stop_loss) : undefined}
+                    takeProfit={
+                      p.take_profit ? Number(p.take_profit) : undefined
+                    }
+                    qty={metrics.qty}
+                    marginUsdt={metrics.marginUsdt}
+                    notionalUsdt={metrics.notionalUsdt}
+                    leverage={metrics.leverage}
+                  />
+                );
+              })}
             </div>
           ) : (
             <p className="text-jarvis-text-secondary text-sm">暂无持仓</p>

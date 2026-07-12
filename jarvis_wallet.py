@@ -81,10 +81,19 @@ def init_db() -> None:
                 filled_ts      REAL,
                 cancel_ts      REAL,
                 position_id    INTEGER,
-                note           TEXT
+                note           TEXT,
+                source         TEXT NOT NULL DEFAULT 'system'
             )
             """
         )
+    # 旧库升级：加订单来源列（SQLite 无 ADD COLUMN IF NOT EXISTS，重复加列抛错
+    # 即视为已迁移；pg 后端经 jarvis_db 翻译自动带 IF NOT EXISTS，天然幂等）。
+    # source: 'user-created' = 用户保存交易计划生成的「自创」单；'system' = 系统/手动挂单。
+    try:
+        with jj._conn() as conn:
+            conn.execute("ALTER TABLE limit_orders ADD COLUMN source TEXT NOT NULL DEFAULT 'system'")
+    except Exception:  # noqa: BLE001 — duplicate column = 已升级过
+        pass
 
 
 # ─────────────────────────── 账户 ───────────────────────────
@@ -200,8 +209,12 @@ def unfreeze(symbol: str, amount: float, ref: str | None = None) -> dict:
 
 def place_limit_order(symbol: str, side: str, limit_price: float, qty: float,
                       stop_loss: float | None = None, take_profit: float | None = None,
-                      time_stop_days: int | None = 30, note: str | None = None) -> dict:
-    """登记一笔限价挂单。买单立即冻结 limit_price*qty 资金；余额不足拒单。"""
+                      time_stop_days: int | None = 30, note: str | None = None,
+                      source: str = "system") -> dict:
+    """登记一笔限价挂单。买单立即冻结 limit_price*qty 资金；余额不足拒单。
+
+    source: 订单来源——'user-created'（用户保存交易计划自创）/ 'system'（系统创建，默认）。
+    """
     init_db()
     sym = (symbol if symbol.endswith("USDT") else symbol + "USDT").upper()
     side = side.lower()
@@ -209,6 +222,8 @@ def place_limit_order(symbol: str, side: str, limit_price: float, qty: float,
         return {"ok": False, "reason": "side 必须是 buy 或 sell"}
     if limit_price <= 0 or qty <= 0:
         return {"ok": False, "reason": "价格与数量必须 > 0"}
+    if source not in ("user-created", "system"):
+        source = "system"
 
     notional = round(limit_price * qty, 8)
     if side == "buy":
@@ -221,15 +236,16 @@ def place_limit_order(symbol: str, side: str, limit_price: float, qty: float,
             """
             INSERT INTO limit_orders
               (symbol, side, limit_price, qty, notional_usdt, status, stop_loss, take_profit,
-               time_stop_days, created_date, created_ts, note)
-            VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
+               time_stop_days, created_date, created_ts, note, source)
+            VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)
             """,
             (sym, side, float(limit_price), float(qty), notional, stop_loss, take_profit,
-             time_stop_days, time.strftime("%Y-%m-%d"), time.time(), note),
+             time_stop_days, time.strftime("%Y-%m-%d"), time.time(), note, source),
         )
         oid = cur.lastrowid
     return {"ok": True, "order_id": oid, "symbol": sym, "side": side,
-            "limit_price": float(limit_price), "qty": float(qty), "frozen_usdt": notional}
+            "limit_price": float(limit_price), "qty": float(qty), "frozen_usdt": notional,
+            "source": source}
 
 
 def pending_orders(symbol: str | None = None) -> list:

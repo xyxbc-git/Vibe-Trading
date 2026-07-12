@@ -12,6 +12,8 @@ import {
 } from "lucide-react";
 import { api } from "@/api/client";
 import { usePolling } from "@/hooks/useApi";
+import SentimentPanel from "@/components/cards/SentimentPanel";
+import RegimePanel from "@/components/cards/RegimePanel";
 
 /** 数据源暂不可用（后端拉取失败且无缓存）时的卡片占位 */
 function SourceDownNote({ error }: { error?: string | null }) {
@@ -145,6 +147,16 @@ export default function MarketIntel() {
           </span>
         </div>
       )}
+
+      {/* 牛熊市体制识别：大周期多因子融合（200D MA/周线结构/动量/情绪） */}
+      <div className="mb-4">
+        <RegimePanel />
+      </div>
+
+      {/* 供需情绪综合研判：四因子量化 + 综合分 + 逐因子解释（含预留位） */}
+      <div className="mb-4">
+        <SentimentPanel />
+      </div>
 
       <div className="grid grid-cols-3 gap-4 mb-4">
         {/* 恐慌贪婪指数（alternative.me，真实数据） */}

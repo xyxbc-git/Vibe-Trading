@@ -1,9 +1,11 @@
-import { useState } from "react";
-import { usePolling } from "@/hooks/useApi";
+import { useMemo, useState } from "react";
+import { useApi, usePolling } from "@/hooks/useApi";
 import { useSymbol } from "@/hooks/useSymbol";
 import { api } from "@/api/client";
 import PositionCard from "@/components/cards/PositionCard";
-import { ArrowLeftRight, ShieldCheck, AlertTriangle, Zap, FileText, Radar, Play, RotateCw, TrendingUp, Compass } from "lucide-react";
+import OrderNotifyDialog from "@/components/cards/OrderNotifyDialog";
+import { extractCardMetrics } from "@/lib/positionMetrics";
+import { ArrowLeftRight, ShieldCheck, AlertTriangle, Zap, FileText, Radar, Play, RotateCw, TrendingUp, Compass, Bell, Wallet } from "lucide-react";
 import { clsx } from "clsx";
 
 function fmtUsd(n: number) {
@@ -48,6 +50,10 @@ export default function Trading() {
     amount: "",
     stopLoss: "1.5",
     takeProfit: "3.0",
+    // 邮件提醒（可选）：填邮箱即在挂单成功后为该单开启通知
+    notifyEmail: "",
+    notifyTp: true,
+    notifySl: true,
   });
   const [ordering, setOrdering] = useState(false);
   // 下单结果横幅：成功/失败都要给用户反馈，禁止静默吞错
@@ -57,8 +63,33 @@ export default function Trading() {
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [actionResult, setActionResult] = useState<{ type: string; ok: boolean; msg: string } | null>(null);
 
+  // 订单邮件提醒配置索引（order_id → 配置），铃铛点亮已配置的单
+  const { data: notifyConfigs, refetch: refetchNotify } = useApi(api.orderNotifyList);
+  const notifyMap = useMemo(() => {
+    const m = new Map<string, boolean>();
+    for (const c of notifyConfigs ?? []) m.set(c.order_id, true);
+    return m;
+  }, [notifyConfigs]);
+  const [notifyDialog, setNotifyDialog] = useState<{ orderId: string; title: string } | null>(null);
+
+  // 可用余额（现金，不含挂单冻结）：买单冻结资金，下单金额硬约束 ≤ 可用余额。
+  // 钱包未加载（null）时不放行下单，避免绕过校验。
+  const availableCash = w != null ? Number(w.cash_usdt ?? w.cash ?? 0) : null;
+  const amountNum = parseFloat(orderForm.amount);
+  const amountValid = Number.isFinite(amountNum) && amountNum > 0;
+  const exceedsBalance =
+    amountValid && availableCash != null && amountNum > availableCash + 1e-9;
+  const canSubmit = amountValid && availableCash != null && !exceedsBalance;
+
+  /** 按可用余额的百分比快捷填充金额（向下取 2 位小数，不超余额） */
+  const fillAmountPct = (pct: number) => {
+    if (availableCash == null || availableCash <= 0) return;
+    const v = Math.floor(availableCash * pct * 100) / 100;
+    setOrderForm((f) => ({ ...f, amount: v > 0 ? String(v) : "" }));
+  };
+
   const handleOrder = async () => {
-    if (!orderForm.amount) return;
+    if (!canSubmit) return;
     setOrdering(true);
     setOrderResult(null);
     try {
@@ -70,6 +101,12 @@ export default function Trading() {
       const amount = parseFloat(orderForm.amount);
       if (!Number.isFinite(amount) || amount <= 0) {
         throw new Error("下单金额必须大于 0");
+      }
+      // 与后端 freeze 拒单同口径的前置校验（后端仍是最终裁决，拒单而非静默截断）
+      if (availableCash != null && amount > availableCash + 1e-9) {
+        throw new Error(
+          `下单金额 ${amount.toFixed(2)}U 超过可用余额 ${availableCash.toFixed(2)}U`,
+        );
       }
       const slPct = parseFloat(orderForm.stopLoss) / 100;
       const tpPct = parseFloat(orderForm.takeProfit) / 100;
@@ -87,9 +124,27 @@ export default function Trading() {
           : undefined,
       });
       if (res.ok) {
+        let notifyMsg = "";
+        // 填了邮箱 → 为这笔挂单登记邮件提醒（order-<id>，成交转持仓后仍生效）
+        const email = orderForm.notifyEmail.trim();
+        if (email && res.order_id != null) {
+          try {
+            const nr = await api.orderNotifySet(`order-${res.order_id}`, {
+              email,
+              notify_take_profit: orderForm.notifyTp,
+              notify_stop_loss: orderForm.notifySl,
+            });
+            notifyMsg = nr.ok
+              ? "，邮件提醒已开启"
+              : `，但邮件提醒开启失败：${nr.reason ?? "未知原因"}`;
+            refetchNotify();
+          } catch {
+            notifyMsg = "，但邮件提醒开启失败（后端不可达）";
+          }
+        }
         setOrderResult({
           ok: true,
-          msg: `挂单成功 #${res.order_id}（限价 ${price.toLocaleString()}）`,
+          msg: `挂单成功 #${res.order_id}（限价 ${price.toLocaleString()}）${notifyMsg}`,
         });
         setOrderForm((f) => ({ ...f, amount: "" }));
         refetchOrders();
@@ -220,15 +275,15 @@ export default function Trading() {
               <div className="grid grid-cols-2 gap-3">
                 {pos.map((p, i) => {
                   const posSymbol = String(p.symbol ?? "—");
+                  const posId = Number(p.id ?? 0);
+                  const notifyOrderId = `pos-${posId}`;
+                  const isShort = String(p.direction ?? "long") === "short";
+                  const metrics = extractCardMetrics(p);
                   return (
                     <PositionCard
                       key={`${posSymbol}-${i}`}
                       symbol={posSymbol}
-                      direction={
-                        String(p.direction ?? "long") === "short"
-                          ? "short"
-                          : "long"
-                      }
+                      direction={isShort ? "short" : "long"}
                       entryPrice={Number(p.entry_price ?? 0)}
                       currentPrice={
                         p.current_price != null
@@ -238,12 +293,27 @@ export default function Trading() {
                       pnlPct={
                         p.pnl_pct != null ? Number(p.pnl_pct) : undefined
                       }
+                      pnlUsdt={metrics.pnlUsdt}
                       stopLoss={p.stop_loss ? Number(p.stop_loss) : undefined}
                       takeProfit={
                         p.take_profit ? Number(p.take_profit) : undefined
                       }
+                      qty={metrics.qty}
+                      marginUsdt={metrics.marginUsdt}
+                      notionalUsdt={metrics.notionalUsdt}
+                      leverage={metrics.leverage}
                       onClose={() => handleClosePosition(posSymbol)}
                       closing={closingSymbol === posSymbol}
+                      onNotify={
+                        posId > 0
+                          ? () =>
+                              setNotifyDialog({
+                                orderId: notifyOrderId,
+                                title: `${posSymbol} ${isShort ? "空单" : "多单"} 持仓 #${posId}`,
+                              })
+                          : undefined
+                      }
+                      notifyOn={notifyMap.has(notifyOrderId)}
                     />
                   );
                 })}
@@ -263,6 +333,7 @@ export default function Trading() {
                       <th className="text-left py-2 font-medium">时间</th>
                       <th className="text-left py-2 font-medium">币种</th>
                       <th className="text-left py-2 font-medium">方向</th>
+                      <th className="text-left py-2 font-medium">来源</th>
                       <th className="text-right py-2 font-medium">限价</th>
                       <th className="text-right py-2 font-medium">金额</th>
                       <th className="text-right py-2 font-medium">操作</th>
@@ -274,6 +345,9 @@ export default function Trading() {
                       const orderId = Number((o as Record<string, number>).id ?? 0);
                       const side = String((o as Record<string, string>).side ?? "buy");
                       const createdTs = Number((o as Record<string, number>).created_ts ?? 0);
+                      const userCreated =
+                        String((o as Record<string, string>).source ?? "system") ===
+                        "user-created";
                       return (
                         <tr
                           key={orderId || i}
@@ -304,6 +378,23 @@ export default function Trading() {
                               {side === "sell" ? "卖" : "买"}
                             </span>
                           </td>
+                          <td className="py-2">
+                            <span
+                              title={
+                                userCreated
+                                  ? "保存交易计划时自动生成的用户自创订单"
+                                  : "系统/手动挂单"
+                              }
+                              className={clsx(
+                                "text-xs px-2 py-0.5 rounded-full whitespace-nowrap",
+                                userCreated
+                                  ? "bg-jarvis-purple/15 text-jarvis-purple border border-jarvis-purple/30"
+                                  : "bg-jarvis-border/40 text-jarvis-text-secondary",
+                              )}
+                            >
+                              {userCreated ? "自创" : "系统"}
+                            </span>
+                          </td>
                           <td className="py-2 text-right text-jarvis-text font-mono">
                             ${fmtUsd(Number((o as Record<string, number>).limit_price ?? 0))}
                           </td>
@@ -311,13 +402,37 @@ export default function Trading() {
                             ${fmtUsd(Number((o as Record<string, number>).notional_usdt ?? 0))}
                           </td>
                           <td className="py-2 text-right">
-                            <button
-                              onClick={() => handleCancelOrder(orderId)}
-                              disabled={cancellingId === orderId || !orderId}
-                              className="text-xs px-2 py-1 rounded-md border border-jarvis-red/40 text-jarvis-red hover:bg-jarvis-red/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                            >
-                              {cancellingId === orderId ? "撤销中..." : "撤单"}
-                            </button>
+                            <div className="inline-flex items-center gap-1.5">
+                              <button
+                                onClick={() =>
+                                  setNotifyDialog({
+                                    orderId: `order-${orderId}`,
+                                    title: `${String((o as Record<string, string>).symbol ?? "—")} ${side === "sell" ? "卖" : "买"}单 挂单 #${orderId}`,
+                                  })
+                                }
+                                disabled={!orderId}
+                                title={
+                                  notifyMap.has(`order-${orderId}`)
+                                    ? "已开启邮件提醒（点击修改）"
+                                    : "配置止盈/止损邮件提醒"
+                                }
+                                className={clsx(
+                                  "p-1 rounded-md border transition-colors disabled:opacity-50",
+                                  notifyMap.has(`order-${orderId}`)
+                                    ? "border-jarvis-yellow/50 text-jarvis-yellow bg-jarvis-yellow/10"
+                                    : "border-jarvis-border text-jarvis-text-secondary hover:text-jarvis-yellow hover:border-jarvis-yellow/50",
+                                )}
+                              >
+                                <Bell size={13} />
+                              </button>
+                              <button
+                                onClick={() => handleCancelOrder(orderId)}
+                                disabled={cancellingId === orderId || !orderId}
+                                className="text-xs px-2 py-1 rounded-md border border-jarvis-red/40 text-jarvis-red hover:bg-jarvis-red/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                              >
+                                {cancellingId === orderId ? "撤销中..." : "撤单"}
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       );
@@ -429,9 +544,23 @@ export default function Trading() {
               </div>
 
               <div>
-                <label className="text-xs text-jarvis-text-secondary">
-                  数量 (USDT)
-                </label>
+                <div className="flex items-center justify-between">
+                  <label className="text-xs text-jarvis-text-secondary">
+                    数量 (USDT)
+                  </label>
+                  <span
+                    className="flex items-center gap-1 text-xs text-jarvis-text-secondary"
+                    title="可用现金（不含挂单冻结），买入上限"
+                  >
+                    <Wallet size={11} />
+                    可用
+                    <span className="font-mono text-jarvis-text">
+                      {availableCash != null
+                        ? `$${fmtUsd(availableCash)}`
+                        : "加载中..."}
+                    </span>
+                  </span>
+                </div>
                 <input
                   type="number"
                   value={orderForm.amount}
@@ -439,8 +568,33 @@ export default function Trading() {
                     setOrderForm((f) => ({ ...f, amount: e.target.value }))
                   }
                   placeholder="100"
-                  className="w-full mt-1 px-3 py-2 bg-jarvis-bg border border-jarvis-border rounded-lg text-sm text-jarvis-text font-mono"
+                  max={availableCash ?? undefined}
+                  className={clsx(
+                    "w-full mt-1 px-3 py-2 bg-jarvis-bg border rounded-lg text-sm text-jarvis-text font-mono",
+                    exceedsBalance
+                      ? "border-jarvis-red focus:outline-jarvis-red"
+                      : "border-jarvis-border",
+                  )}
                 />
+                <div className="flex gap-1.5 mt-1.5">
+                  {([0.25, 0.5, 0.75, 1] as const).map((pct) => (
+                    <button
+                      key={pct}
+                      onClick={() => fillAmountPct(pct)}
+                      disabled={availableCash == null || availableCash <= 0}
+                      className="flex-1 py-1 text-xs rounded-md bg-jarvis-bg border border-jarvis-border text-jarvis-text-secondary hover:text-jarvis-text hover:border-jarvis-blue transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                    >
+                      {pct === 1 ? "全部" : `${pct * 100}%`}
+                    </button>
+                  ))}
+                </div>
+                {exceedsBalance && (
+                  <p className="flex items-center gap-1 mt-1.5 text-xs text-jarvis-red">
+                    <AlertTriangle size={12} className="flex-shrink-0" />
+                    超过可用余额 ${fmtUsd(availableCash as number)}
+                    ，请减少金额或先入金
+                  </p>
+                )}
               </div>
 
               <div className="grid grid-cols-2 gap-2">
@@ -478,20 +632,64 @@ export default function Trading() {
                 </div>
               </div>
 
+              <div className="pt-1 border-t border-jarvis-border/60">
+                <label className="text-xs text-jarvis-text-secondary flex items-center gap-1">
+                  <Bell size={12} className="text-jarvis-yellow" />
+                  邮件提醒（可选，填邮箱即开启）
+                </label>
+                <input
+                  type="email"
+                  value={orderForm.notifyEmail}
+                  onChange={(e) =>
+                    setOrderForm((f) => ({ ...f, notifyEmail: e.target.value }))
+                  }
+                  placeholder="you@example.com"
+                  className="w-full mt-1 px-3 py-2 bg-jarvis-bg border border-jarvis-border rounded-lg text-sm text-jarvis-text font-mono"
+                />
+                {orderForm.notifyEmail.trim() && (
+                  <div className="flex gap-4 mt-2">
+                    <label className="flex items-center gap-1.5 text-xs text-jarvis-text cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={orderForm.notifyTp}
+                        onChange={(e) =>
+                          setOrderForm((f) => ({ ...f, notifyTp: e.target.checked }))
+                        }
+                        className="w-3.5 h-3.5 accent-jarvis-blue cursor-pointer"
+                      />
+                      <span className="text-jarvis-green">止盈通知</span>
+                    </label>
+                    <label className="flex items-center gap-1.5 text-xs text-jarvis-text cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={orderForm.notifySl}
+                        onChange={(e) =>
+                          setOrderForm((f) => ({ ...f, notifySl: e.target.checked }))
+                        }
+                        className="w-3.5 h-3.5 accent-jarvis-blue cursor-pointer"
+                      />
+                      <span className="text-jarvis-red">止损通知</span>
+                    </label>
+                  </div>
+                )}
+              </div>
+
               <button
                 onClick={handleOrder}
-                disabled={ordering || !orderForm.amount}
+                disabled={ordering || !canSubmit}
                 className={clsx(
                   "w-full py-2.5 rounded-lg font-medium text-white transition-colors",
                   orderForm.direction === "long"
                     ? "bg-jarvis-green hover:bg-jarvis-green/80"
                     : "bg-jarvis-red hover:bg-jarvis-red/80",
-                  (ordering || !orderForm.amount) && "opacity-50 cursor-not-allowed",
+                  (ordering || !canSubmit) && "opacity-50 cursor-not-allowed",
                 )}
               >
                 {ordering
                   ? "下单中..."
-                  : `确认${orderForm.direction === "long" ? "做多" : "做空"}`}
+                  : exceedsBalance
+                    ? "余额不足"
+                    : `确认${orderForm.direction === "long" ? "做多" : "做空"}`}
               </button>
 
               {orderResult && (
@@ -588,6 +786,15 @@ export default function Trading() {
           </div>
         </div>
       </div>
+
+      {notifyDialog && (
+        <OrderNotifyDialog
+          orderId={notifyDialog.orderId}
+          title={notifyDialog.title}
+          onClose={() => setNotifyDialog(null)}
+          onSaved={refetchNotify}
+        />
+      )}
     </div>
   );
 }

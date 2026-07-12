@@ -38,6 +38,7 @@ import jarvis_alert_center as jac
 import jarvis_executor as jx
 import jarvis_journal as jj
 import jarvis_lessons as jl
+import jarvis_order_notify as jon
 import jarvis_paper_trader as jpt
 import jarvis_price_alert as jpa
 import jarvis_wallet as jw
@@ -628,7 +629,7 @@ def kline(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 200):
     """Binance 公开 K线（免 Key），供 echarts 自绘蜡烛图 + 叠加决策信号。"""
     sym = symbol.upper().replace("-", "").replace("/", "")
     spot = sym if sym.endswith("USDT") else sym + "USDT"
-    allowed = {"1m", "5m", "15m", "1h", "4h", "1d"}
+    allowed = {"1m", "5m", "15m", "30m", "1h", "4h", "1d"}
     iv = interval if interval in allowed else "1h"
     lim = max(20, min(int(limit), 500))
 
@@ -781,6 +782,36 @@ def api_positions(symbol: str | None = None, status: str = "all", limit: int = 0
     if limit and limit > 0:
         rows = rows[:limit]   # all_positions 已按 opened_ts 倒序，截断即取最近 N 笔
 
+    # 自创单（保存交易计划）在 limit_orders.note 里带完整计划快照（kind='trade-plan'，
+    # 含杠杆/保证金/名义仓位），成交后经 position_id 关联持仓。这里反查附加成
+    # plan_leverage / plan_margin_usdt / plan_notional_usdt 列，供前端卡片展示
+    # 杠杆与保证金口径；无快照的系统/手动单由前端按现货全额 1x 回退。
+    open_ids = [r["id"] for r in rows if r.get("status") == "open" and r.get("id") is not None]
+    plan_map: dict = {}
+    if open_ids:
+        try:
+            with jj._conn() as conn:
+                marks = ",".join("?" * len(open_ids))
+                for o in conn.execute(
+                    f"SELECT position_id, note FROM limit_orders "
+                    f"WHERE status='filled' AND note IS NOT NULL AND position_id IN ({marks})",
+                    open_ids,
+                ).fetchall():
+                    try:
+                        meta = json.loads(o["note"])
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(meta, dict) and meta.get("kind") == "trade-plan":
+                        plan_map[o["position_id"]] = meta
+        except Exception:  # noqa: BLE001 — 快照缺失只影响卡片增强列，不阻塞持仓主数据
+            plan_map = {}
+    for r in rows:
+        meta = plan_map.get(r.get("id"))
+        if meta:
+            r["plan_leverage"] = meta.get("leverage")
+            r["plan_margin_usdt"] = meta.get("margin_usdt")
+            r["plan_notional_usdt"] = meta.get("notional_usdt")
+
     # 给所有行补 direction（前端按 long/short 渲染，DB 里只有 buy/sell）
     # 同时给 open 持仓补 current_price / pnl_pct / pnl_usdt
     # （latest_price 走 60s 缓存，避免每次轮询都打外部 API；取价失败 → 字段为 None，前端按缺失态显示）。
@@ -827,11 +858,13 @@ def api_deposit(amount: float):
 
 @app.post("/api/orders/place")
 def api_place_order(symbol: str, side: str, price: float, qty: float,
-                    stop_loss: float | None = None, take_profit: float | None = None):
+                    stop_loss: float | None = None, take_profit: float | None = None,
+                    source: str = "system", note: str | None = None):
     cfg = _trader_cfg()
     jw.ensure_account(cfg.get("account_equity_usdt", 1000.0))
     return JSONResponse(jw.place_limit_order(symbol, side, price, qty,
-                                             stop_loss=stop_loss, take_profit=take_profit))
+                                             stop_loss=stop_loss, take_profit=take_profit,
+                                             note=note, source=source))
 
 
 @app.post("/api/orders/cancel")
@@ -2369,6 +2402,47 @@ def api_alerts_price(symbol: str = "BTCUSDT"):
     return JSONResponse({"symbol": jpa._normalize_symbol(symbol), "price": price})
 
 
+# ─────────────────── 交易订单邮件提醒（按笔配置） ───────────────────
+
+@app.get("/api/order-notify")
+def api_order_notify_list():
+    """全部订单通知配置（前端按 order_id 建索引，渲染各单的配置状态）。"""
+    try:
+        return JSONResponse(jon.list_configs())
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/order-notify/{order_id}")
+def api_order_notify_get(order_id: str):
+    cfg = jon.get_config(order_id)
+    return JSONResponse({"ok": True, "config": cfg})
+
+
+@app.put("/api/order-notify/{order_id}")
+def api_order_notify_put(order_id: str, data: dict):
+    """新建/更新某笔订单的通知配置：{email, notify_take_profit, notify_stop_loss}。"""
+    out = jon.set_config(
+        order_id,
+        str(data.get("email") or ""),
+        notify_take_profit=bool(data.get("notify_take_profit", True)),
+        notify_stop_loss=bool(data.get("notify_stop_loss", True)),
+    )
+    return JSONResponse(out, status_code=200 if out.get("ok") else 400)
+
+
+@app.delete("/api/order-notify/{order_id}")
+def api_order_notify_delete(order_id: str):
+    return JSONResponse(jon.delete_config(order_id))
+
+
+@app.post("/api/order-notify/{order_id}/test")
+def api_order_notify_test(order_id: str, data: dict | None = None):
+    """对某笔配置发送测试邮件（dry_run 时只组装不发信）。始终 HTTP 200，失败原因在 body.reason。"""
+    out = jon.send_test_email(order_id, dry_run=bool((data or {}).get("dry_run")))
+    return JSONResponse(out)
+
+
 @app.on_event("startup")
 def _start_price_alert_monitor():
     """随 dashboard 启动后台价位轮询线程。"""
@@ -3236,7 +3310,8 @@ def api_watchlist_post(data: dict):
 
 # ─────────────────── 十二套技术信号引擎 & 贾维斯自主推理 API ───────────────────
 
-_TWELVE_TFS = ("15m", "1h", "4h")
+# 多周期共识聚合周期集（5m/30m 为短线增强档，权重见 jts.TF_WEIGHTS，低于长周期）
+_TWELVE_TFS = ("5m", "15m", "30m", "1h", "4h")
 
 
 def _twelve_basis(sym: str) -> dict | None:
@@ -3261,7 +3336,7 @@ def api_twelve_signals(symbol: str = "BTCUSDT", tf: str = "4h"):
     sym = symbol.upper().replace("-", "").replace("/", "")
     if not sym.endswith(("USDT", "USDC")):
         sym += "USDT"
-    iv = tf if tf in {"15m", "1h", "4h", "1d"} else "4h"
+    iv = tf if tf in {"5m", "15m", "30m", "1h", "4h", "1d"} else "4h"
 
     def _calc():
         df = jts.fetch_klines_df(sym, iv, 300)
@@ -3273,12 +3348,13 @@ def api_twelve_signals(symbol: str = "BTCUSDT", tf: str = "4h"):
                 "price": round(float(df["close"].iloc[-1]), 6),
                 "signals": out["signals"], "consensus": out["consensus"]}
 
-    return JSONResponse(_cached(f"twelve:sig:{sym}:{iv}", 120, _calc))
+    # 5m 一根 K 线 5 分钟，缓存同比缩短（15m+ 沿用 120s）
+    return JSONResponse(_cached(f"twelve:sig:{sym}:{iv}", 60 if iv == "5m" else 120, _calc))
 
 
 @app.get("/api/twelve/consensus")
 def api_twelve_consensus(symbol: str = "BTCUSDT"):
-    """十二套技术多时间框架（15m/1h/4h）加权共识：看涨/看跌总裁决。"""
+    """十二套技术多时间框架（5m/15m/30m/1h/4h）加权共识：看涨/看跌总裁决。"""
     import jarvis_twelve_systems as jts
     sym = symbol.upper().replace("-", "").replace("/", "")
     if not sym.endswith(("USDT", "USDC")):
@@ -3297,10 +3373,207 @@ def api_twelve_consensus(symbol: str = "BTCUSDT"):
             if tf == "4h" or price is None:
                 price = round(float(df["close"].iloc[-1]), 6)
         merged = jts.consensus_multi_tf(tf_cons)
+        # 供需情绪层（多空比/资金费率/OI/恐贪）：同向增益置信、极端反向降级+警示。
+        # 只附加 sentiment 键与 reasoning 尾注，不改共识原字段；失败不影响共识主体。
+        try:
+            import jarvis_sentiment as jsent
+            senti = jsent.assess(sym)
+            if senti.get("ok"):
+                merged = jsent.apply_to_consensus(merged, senti)
+        except Exception:  # noqa: BLE001
+            pass
+        # 「安全带」确认层（Delta 吸收背离 × 信号方向）：confirmed 小幅加成 /
+        # conflict 降级警示；Delta 引擎（jarvis_delta_flow，MCP-5 并行开发）
+        # 未就绪时 status=unavailable，不影响共识主体。强背离顺带落页内提醒。
+        try:
+            import jarvis_seatbelt as jsb
+            delta_payload = _delta_payload(sym)
+            merged = jsb.apply_to_consensus(merged, delta_payload)
+            jsb.maybe_alert_strong_divergence(sym, delta_payload)
+        except Exception:  # noqa: BLE001
+            pass
         return {"ok": bool(tf_cons), "symbol": sym, "price": price,
                 "tf_available": sorted(tf_cons.keys()), "consensus": merged}
 
     return JSONResponse(_cached(f"twelve:cons:{sym}", 180, _calc))
+
+
+def _delta_payload(sym: str, tf: str = "15m") -> dict | None:
+    """取 Delta 引擎数据供安全带层消费（120s 缓存）。
+
+    引擎模块（jarvis_delta_flow，MCP-5）未就绪 / 入口不匹配 / 取数失败一律
+    返回 None → seatbelt 层显示 unavailable，绝不拖垮共识主体。入口按契约
+    习惯依次探测 get_delta / assess / analyze。
+    """
+    def _calc():
+        try:
+            import jarvis_delta_flow as jdf
+        except Exception:  # noqa: BLE001 — 引擎未就绪
+            return None
+        for entry in ("get_delta", "assess", "analyze"):
+            fn = getattr(jdf, entry, None)
+            if not callable(fn):
+                continue
+            try:
+                out = fn(sym, tf, 200)
+                if isinstance(out, dict):
+                    return out
+            except TypeError:
+                try:
+                    out = fn(symbol=sym, timeframe=tf)
+                    if isinstance(out, dict):
+                        return out
+                except Exception:  # noqa: BLE001
+                    continue
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+
+    return _cached(f"delta:seatbelt:{sym}:{tf}", 120, _calc)
+
+
+# ─────────────────── 走势预测引擎（规则概率 + AI 研判双轨）───────────────────
+
+@app.get("/api/predict")
+def api_predict(symbol: str = "BTCUSDT", timeframe: str = "15m",
+                horizon: int = 16, mock: int = 0, llm: int = 1):
+    """走势预测：方向概率 / 目标区间 / 期望路径 / AI 研判（jarvis_trend_predict）。
+
+    mock=1 返回确定性联调假数据（mock:true，不联网）；
+    llm=0 跳过 AI 轨（纯规则，无外部依赖）。未配 LLM Key 时自动降级规则轨。
+    """
+    import jarvis_trend_predict as jtp
+    if int(mock):
+        return JSONResponse(jtp.mock_predict(symbol, timeframe, horizon))
+    use_llm = bool(int(llm))
+
+    def _calc():
+        try:
+            return jtp.predict(symbol, timeframe, horizon, use_llm=use_llm)
+        except Exception as exc:  # noqa: BLE001 — 预测失败不 500，前端按未就绪降级
+            return {"ok": False, "error": repr(exc)[:200],
+                    "symbol": symbol, "timeframe": timeframe,
+                    "disclaimer": jtp.DISCLAIMER}
+
+    key = f"predict:{jtp._norm_symbol(symbol)}:{jtp._norm_tf(timeframe)}:" \
+          f"{jtp._norm_horizon(horizon)}:{int(use_llm)}"
+    return JSONResponse(_cached(key, 120, _calc))
+
+
+@app.get("/api/predict/backtest")
+def api_predict_backtest(symbol: str = "BTCUSDT", timeframe: str = "15m",
+                         horizon: int = 16, windows: int = 40):
+    """预测准确率回测：逐历史窗口预测 vs 实际，输出方向命中率/区间覆盖率。
+
+    只回测规则轨（可复现）；windows 夹在 5~120。结果缓存 30 分钟。
+    """
+    import jarvis_trend_predict as jtp
+
+    def _calc():
+        try:
+            return jtp.backtest(symbol, timeframe, horizon, windows)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": repr(exc)[:200],
+                    "symbol": symbol, "timeframe": timeframe}
+
+    key = f"predict:bt:{jtp._norm_symbol(symbol)}:{jtp._norm_tf(timeframe)}:" \
+          f"{jtp._norm_horizon(horizon)}:{max(5, min(120, int(windows)))}"
+    return JSONResponse(_cached(key, 1800, _calc))
+
+
+# ─────────────────── Delta/CVD 订单流（吸收背离安全带数据层）───────────────────
+
+@app.get("/api/delta")
+def api_delta(symbol: str = "BTCUSDT", timeframe: str = "15m",
+              limit: int = 200, mock: int = 0):
+    """Delta/CVD 序列 + 吸收背离检测（jarvis_delta_flow；MCP 安全带层消费）。
+
+    mock=1 返回确定性联调假数据（含看涨吸收形态，mock:true，不联网）。
+    """
+    import jarvis_delta_flow as jdf
+    if int(mock):
+        return JSONResponse(jdf.mock_analyze(symbol, timeframe, limit))
+
+    def _calc():
+        try:
+            return jdf.analyze(symbol, timeframe, limit)
+        except Exception as exc:  # noqa: BLE001 — 检测失败不 500，前端按未就绪降级
+            return {"ok": False, "error": repr(exc)[:200],
+                    "symbol": symbol, "timeframe": timeframe,
+                    "disclaimer": jdf.DISCLAIMER}
+
+    key = f"delta:{jdf._norm_symbol(symbol)}:{jdf._norm_tf(timeframe)}:{jdf._norm_limit(limit)}"
+    return JSONResponse(_cached(key, 60, _calc))
+
+
+@app.get("/api/delta/backtest")
+def api_delta_backtest(symbol: str = "BTCUSDT", timeframe: str = "15m",
+                       max_bars: int = 1000):
+    """吸收背离历史胜率回测（16/32 根双口径 + 随机基线；缓存 30 分钟）。"""
+    import jarvis_delta_flow as jdf
+
+    def _calc():
+        try:
+            return jdf.backtest(symbol, timeframe, max_bars=max_bars)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": repr(exc)[:200],
+                    "symbol": symbol, "timeframe": timeframe}
+
+    key = f"delta:bt:{jdf._norm_symbol(symbol)}:{jdf._norm_tf(timeframe)}:{max(200, min(int(max_bars), 1000))}"
+    return JSONResponse(_cached(key, 1800, _calc))
+
+
+# ─────────────────── 资金费率套利模拟盘（阿尔法策略）───────────────────
+
+@app.get("/api/funding-arb/opportunities")
+def api_funding_arb_opportunities(force: int = 0):
+    """套利机会列表：watchlist 币种按当期费率年化降序（模块内 TTL 缓存 120s）。"""
+    import jarvis_funding_arb as jfa
+    try:
+        return JSONResponse(jfa.fetch_opportunities(force=bool(int(force))))
+    except Exception as exc:  # noqa: BLE001 — 机会列表失败不 500，前端按未就绪降级
+        return JSONResponse({"ok": False, "error": repr(exc)[:200],
+                             "opportunities": [], "disclaimer": jfa.DISCLAIMER})
+
+
+@app.get("/api/funding-arb/positions")
+def api_funding_arb_positions(status: str = "all"):
+    """套利持仓列表（两腿详情 + 累计费率收益 + 年化；查询前自动补结欠账费率期）。"""
+    import jarvis_funding_arb as jfa
+    try:
+        return JSONResponse(jfa.list_positions(status))
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:200], "positions": []})
+
+
+@app.post("/api/funding-arb/positions/open")
+def api_funding_arb_open(symbol: str, capital: float, note: str = ""):
+    """模拟建仓：现货多 + 永续 1x 空 两腿等量（delta 中性）。"""
+    import jarvis_funding_arb as jfa
+    try:
+        return JSONResponse(jfa.open_position(symbol, capital, note=note))
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:200]})
+
+
+@app.post("/api/funding-arb/positions/close")
+def api_funding_arb_close(position_id: int):
+    """平仓：补结费率期后按当前两腿价格结算基差损益与总收益。"""
+    import jarvis_funding_arb as jfa
+    try:
+        return JSONResponse(jfa.close_position(position_id))
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:200]})
+
+
+@app.get("/api/funding-arb/pnl")
+def api_funding_arb_pnl():
+    """套利收益总览：open/closed 分组汇总 + 全局累计费率收益与年化。"""
+    import jarvis_funding_arb as jfa
+    try:
+        return JSONResponse(jfa.get_pnl())
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:200]})
 
 
 # ─────────────────── 市场情报页（免 Key 真实数据源）───────────────────
@@ -3317,6 +3590,115 @@ def api_market_intel():
         return JSONResponse(jmi.get_intel())
     except Exception as exc:  # noqa: BLE001 — 情报页失败不应 500，前端按未接入处理
         return JSONResponse({"ok": False, "error": repr(exc)[:200]})
+
+
+@app.get("/api/sentiment")
+def api_sentiment(symbol: str = "BTCUSDT"):
+    """供需情绪综合研判：多空比/资金费率/OI/恐贪四因子 + 综合分（-100~+100）。
+
+    数据复用 market-intel 各源 TTL 缓存；爆仓/链上为预留因子位（key 配置后
+    自动参与计分）。模块内已捕获异常（ok=False），不会 500。
+    """
+    import jarvis_sentiment as jsent
+    return JSONResponse(_cached(f"sentiment:{symbol.upper()}", 60,
+                                lambda: jsent.assess(symbol)))
+
+
+@app.get("/api/regime")
+def api_regime(symbol: str = "BTCUSDT"):
+    """牛熊市体制识别：200D MA / 周线结构 / 长周期动量 / 情绪面多因子融合。
+
+    输出 regime: bull|bear|range + score(-100~100) + confidence + 逐因子解释。
+    大周期数据变化慢，缓存 15 分钟；模块内已捕获异常（ok=False），不会 500。
+    """
+    import jarvis_bull_bear as jbb
+    return JSONResponse(_cached(f"regime:{symbol.upper()}", 900,
+                                lambda: jbb.assess(symbol)))
+
+
+@app.get("/api/volume-profile")
+def api_volume_profile(symbol: str = "BTCUSDT", timeframe: str = "15m",
+                       limit: int = 300, mock: int = 0):
+    """Volume Profile 分布结构（反转四条件之 2+3）：分段 VP + 正态形态识别 +
+    三连分布确认 + 回补目标位。?mock=1 返回确定性假数据；缓存 60s。
+    """
+    import jarvis_volume_profile as jvp
+    if mock:
+        return JSONResponse(jvp.mock_response(symbol, timeframe))
+    key = f"vp:{symbol.upper()}:{timeframe}:{int(limit)}"
+    return JSONResponse(_cached(key, 60,
+                                lambda: jvp.assess(symbol, timeframe, limit)))
+
+
+@app.get("/api/stop-hunt")
+def api_stop_hunt(symbol: str = "BTCUSDT", timeframe: str = "15m",
+                  limit: int = 120, mock: int = 0):
+    """止损扫单检测（反转四条件之 4）：长影线刺破前低/前高快速收回 + 量能尖峰。
+
+    ?mock=1 返回确定性假数据（看涨扫单形态）；缓存 60s。
+    """
+    import jarvis_stop_hunt as jsh
+    if int(mock):
+        return JSONResponse({"ok": True, "symbol": symbol.upper(),
+                             "timeframe": timeframe, "mock": True,
+                             **jsh.mock_result("bullish")})
+
+    def _calc():
+        try:
+            return {"ok": True, "symbol": symbol.upper(), "timeframe": timeframe,
+                    "mock": False, **jsh.detect(symbol, timeframe, limit)}
+        except Exception as exc:  # noqa: BLE001 — 检测失败不 500，前端按未就绪降级
+            return {"ok": False, "error": repr(exc)[:200],
+                    "symbol": symbol.upper(), "timeframe": timeframe}
+
+    return JSONResponse(_cached(f"stophunt:{symbol.upper()}:{timeframe}:{int(limit)}", 60, _calc))
+
+
+@app.get("/api/reversal-score")
+def api_reversal_score(symbol: str = "BTCUSDT", timeframe: str = "15m", mock: int = 0):
+    """高胜率反转四条件叠加评分（MCP-6 反转面板消费）：
+
+    聚合 Delta 背离（/api/delta）+ 多分布/三连确认（/api/volume-profile）+
+    末端止损扫单（jarvis_stop_hunt），按方向投票叠加计分，4/4 = 高概率入场点。
+    任一上游未就绪 → 对应条件标 unavailable 不计入 met，降级不报错；
+    ?mock=1 全链 mock（三源均用确定性假数据）。缓存 60s。
+    """
+    import jarvis_stop_hunt as jsh
+
+    sym = symbol.upper()
+    if int(mock):
+        import jarvis_delta_flow as jdf
+        import jarvis_volume_profile as jvp
+        out = jsh.aggregate_reversal_score(
+            jdf.mock_analyze(sym, timeframe),
+            jvp.mock_response(sym, timeframe),
+            jsh.mock_result("bullish"),
+        )
+        return JSONResponse({**out, "symbol": sym, "timeframe": timeframe, "mock": True})
+
+    def _calc():
+        # 三个上游各自独立降级：失败置 None → 聚合层标 unavailable
+        delta_resp = None
+        try:
+            import jarvis_delta_flow as jdf
+            delta_resp = jdf.analyze(sym, timeframe)
+        except Exception:  # noqa: BLE001
+            delta_resp = None
+        vp_resp = None
+        try:
+            import jarvis_volume_profile as jvp
+            vp_resp = jvp.assess(sym, timeframe)
+        except Exception:  # noqa: BLE001
+            vp_resp = None
+        hunt_resp = None
+        try:
+            hunt_resp = jsh.detect(sym, timeframe)
+        except Exception:  # noqa: BLE001
+            hunt_resp = None
+        out = jsh.aggregate_reversal_score(delta_resp, vp_resp, hunt_resp)
+        return {**out, "symbol": sym, "timeframe": timeframe, "mock": False}
+
+    return JSONResponse(_cached(f"reversal:{sym}:{timeframe}", 60, _calc))
 
 
 # ─────────────────── 合约仓位与风控计算器（Task #3）───────────────────
@@ -3362,7 +3744,7 @@ def api_position_calc(symbol: str = "BTCUSDT", tf: str = "auto",
     sym = symbol.upper().replace("-", "").replace("/", "")
     if not sym.endswith(("USDT", "USDC")):
         sym += "USDT"
-    iv = tf if tf in {"auto", "15m", "1h", "4h", "1d"} else "auto"
+    iv = tf if tf in {"auto", "5m", "15m", "30m", "1h", "4h", "1d"} else "auto"
     cap = capital if capital is not None else jc_mod.get("poscalc_capital_usdt")
     lev = leverage if leverage is not None else jc_mod.get("poscalc_leverage")
     rp = risk_pct if risk_pct is not None else jc_mod.get("poscalc_risk_pct")
@@ -3517,7 +3899,7 @@ def api_twelve_signal_stats(symbol: str | None = None, direction: str | None = N
         return JSONResponse({"ok": True, **jpt.signal_stats(
             symbol,
             direction=_norm(direction, ("long", "short")),
-            tf=_norm(tf, ("15m", "1h", "4h")),
+            tf=_norm(tf, ("5m", "15m", "30m", "1h", "4h")),
             resonance=_norm(resonance, ("1", "2-3", "4+")),
             regime=_norm(regime, ("trending", "ranging", "breakout", "unknown")),
             source=_norm(source, ("realtime", "replay", "all")) or "realtime",
@@ -3579,7 +3961,7 @@ def api_twelve_signal_winrate(symbol: str = "BTCUSDT", tf: str = "4h"):
     sym = symbol.upper().replace("-", "").replace("/", "")
     if not sym.endswith(("USDT", "USDC")):
         sym += "USDT"
-    iv = tf if tf in {"15m", "1h", "4h", "1d"} else "4h"
+    iv = tf if tf in {"5m", "15m", "30m", "1h", "4h", "1d"} else "4h"
     try:
         stats = jsw.get_cached(sym, iv)
         if isinstance(stats, dict) and "trades" in stats:
@@ -3606,7 +3988,7 @@ def api_twelve_signal_winrate_trades(symbol: str = "BTCUSDT", tf: str = "4h",
     sym = symbol.upper().replace("-", "").replace("/", "")
     if not sym.endswith(("USDT", "USDC")):
         sym += "USDT"
-    iv = tf if tf in {"15m", "1h", "4h", "1d"} else "4h"
+    iv = tf if tf in {"5m", "15m", "30m", "1h", "4h", "1d"} else "4h"
     if not system:
         return JSONResponse({"ok": False, "error": "缺少 system 参数"}, status_code=400)
     try:

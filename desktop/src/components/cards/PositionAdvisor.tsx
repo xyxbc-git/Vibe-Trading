@@ -9,6 +9,7 @@ import {
   Save,
   Loader2,
   Undo2,
+  Bell,
 } from "lucide-react";
 import { usePolling } from "@/hooks/useApi";
 import {
@@ -19,6 +20,27 @@ import {
   type SlSafety,
 } from "@/api/client";
 import { SideBadge } from "@/components/cards/SignalBoard";
+import { buildPlanOrder } from "@/lib/planOrder";
+import { isValidEmail } from "@/components/cards/OrderNotifyDialog";
+
+// 内联邮件提醒的邮箱记忆键：上次配置成功的邮箱，下次保存直接复用
+const LAST_EMAIL_KEY = "jarvis.orderNotify.lastEmail";
+
+function loadLastEmail(): string {
+  try {
+    return localStorage.getItem(LAST_EMAIL_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function saveLastEmail(email: string): void {
+  try {
+    localStorage.setItem(LAST_EMAIL_KEY, email);
+  } catch {
+    /* storage 不可用（隐私模式等）——记忆功能静默降级 */
+  }
+}
 
 const SAFETY_META: Record<
   SlSafety,
@@ -125,6 +147,29 @@ export default function PositionAdvisor({ symbol, tf, compact }: PositionAdvisor
   const [entryTouched, setEntryTouched] = useState(false);
   const [saving, setSaving] = useState(false);
   const [savedMsg, setSavedMsg] = useState<string | null>(null);
+
+  // ── 内联邮件提醒（保存生成自创订单时一并写入 order-notify 配置） ──
+  const [mailOn, setMailOn] = useState(false);
+  const [mailEmail, setMailEmail] = useState(loadLastEmail);
+  const [mailTp, setMailTp] = useState(true);
+  const [mailSl, setMailSl] = useState(true);
+  // 发件 SMTP 是否已配置（null = 未知/未拉取）；仅作引导提示，不阻断保存
+  const [smtpReady, setSmtpReady] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (!mailOn || smtpReady !== null) return;
+    let cancelled = false;
+    api
+      .alertConfig()
+      .then((c) => {
+        if (!cancelled) setSmtpReady(Boolean(c?.smtp?.has_password));
+      })
+      .catch(() => {
+        // 配置接口不可达 → 保持未知，不提示不阻断
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mailOn, smtpReady]);
 
   // 首次拉配置作为编辑初值
   useEffect(() => {
@@ -235,6 +280,34 @@ export default function PositionAdvisor({ symbol, tf, compact }: PositionAdvisor
     if (v == null || v <= 0) setEntryTouched(false);
   };
 
+  /** 订单生成成功后串联邮件配置；只返回追加到提示尾部的文案，失败不回滚订单 */
+  const configureOrderMail = async (orderId: number): Promise<string> => {
+    if (!mailOn) return "";
+    const email = mailEmail.trim();
+    if (!isValidEmail(email)) {
+      return " · 邮箱格式不正确，邮件提醒未配置（可去交易中心挂单行点铃铛补配）";
+    }
+    if (!mailTp && !mailSl) {
+      return " · 未勾选通知类型，邮件提醒未配置（可去挂单行铃铛补配）";
+    }
+    try {
+      const nr = await api.orderNotifySet(`order-${orderId}`, {
+        email,
+        notify_take_profit: mailTp,
+        notify_stop_loss: mailSl,
+      });
+      if (nr.ok) {
+        saveLastEmail(email);
+        return smtpReady === false
+          ? " · 邮件提醒已配置（发件 SMTP 未设置，请到「价位提醒」页配好后才能实际发信）"
+          : " · 邮件提醒已配置";
+      }
+      return ` · 邮件配置失败：${nr.reason ?? "未知原因"}（订单已生成，可去挂单行铃铛重配）`;
+    } catch {
+      return " · 邮件配置失败：后端不可达（订单已生成，可去挂单行铃铛重配）";
+    }
+  };
+
   const handleSave = async () => {
     if (!effCfg) return;
     setSaving(true);
@@ -242,9 +315,31 @@ export default function PositionAdvisor({ symbol, tf, compact }: PositionAdvisor
     try {
       const res = await api.updatePositionCalcConfig(effCfg);
       if (res.ok) {
-        setSavedMsg("已保存");
         if (res.config) setSaved(res.config);
         else setSaved(effCfg);
+        // 计划保存成功 → 按当前建议联动生成「自创」订单（无可执行计划则跳过）
+        const order = buildPlanOrder(symbol, tf, resp?.ok ? resp.advice : null);
+        if (order) {
+          try {
+            const or = await api.placeOrder(order);
+            if (or.ok && or.order_id != null) {
+              const mailMsg = await configureOrderMail(or.order_id);
+              setSavedMsg(`已保存 · 自创订单 #${or.order_id} 已生成${mailMsg}`);
+            } else {
+              setSavedMsg(`已保存，订单生成失败：${or.reason ?? "未知原因"}`);
+            }
+          } catch (e) {
+            setSavedMsg(
+              `已保存，订单生成失败：${e instanceof Error ? e.message : "接口不可达"}`,
+            );
+          }
+        } else {
+          setSavedMsg(
+            mailOn
+              ? "已保存（当前无交易计划，未生成订单，邮件配置不生效）"
+              : "已保存（当前无交易计划，未生成订单）",
+          );
+        }
       } else {
         setSavedMsg(`保存失败：${res.reason ?? "未知原因"}`);
       }
@@ -252,7 +347,7 @@ export default function PositionAdvisor({ symbol, tf, compact }: PositionAdvisor
       setSavedMsg(`保存失败：${e instanceof Error ? e.message : "接口不可达"}`);
     } finally {
       setSaving(false);
-      setTimeout(() => setSavedMsg(null), 5000);
+      setTimeout(() => setSavedMsg(null), 8000);
     }
   };
 
@@ -262,6 +357,14 @@ export default function PositionAdvisor({ symbol, tf, compact }: PositionAdvisor
   const advice = resp?.ok ? resp.advice : null;
   const hasAdvice = Boolean(advice?.ok);
   const failed = Boolean(error) || (resp != null && !resp.ok);
+
+  // 当前建议能否生成自创订单（邮件区块置灰判定，与保存时的跳过口径一致）
+  const planOrderAvailable = useMemo(
+    () => buildPlanOrder(symbol, tf, resp?.ok ? resp.advice : null) != null,
+    [symbol, tf, resp],
+  );
+  const mailEmailInvalid =
+    mailOn && mailEmail.trim() !== "" && !isValidEmail(mailEmail);
 
   const safety = advice?.sl?.safety ?? "ok";
   const safetyMeta = SAFETY_META[safety];
@@ -340,7 +443,7 @@ export default function PositionAdvisor({ symbol, tf, compact }: PositionAdvisor
             <button
               onClick={handleSave}
               disabled={saving}
-              title="保存为默认配置（jarvis_config 持久化）"
+              title="保存为默认配置（jarvis_config 持久化），并按当前计划自动生成一笔「自创」订单"
               className="flex items-center gap-1 px-2 py-1.5 rounded border border-jarvis-border text-[10px] text-jarvis-text-secondary hover:text-jarvis-text hover:border-jarvis-blue transition-colors disabled:opacity-50"
             >
               {saving ? (
@@ -359,6 +462,85 @@ export default function PositionAdvisor({ symbol, tf, compact }: PositionAdvisor
               >
                 {savedMsg}
               </span>
+            )}
+          </div>
+
+          {/* ── 内联邮件提醒：保存生成自创订单时一并配置（无计划时置灰） ── */}
+          <div className="mt-2">
+            <div className="flex items-center gap-2 flex-wrap">
+              <button
+                onClick={() => setMailOn((v) => !v)}
+                disabled={!planOrderAvailable}
+                title={
+                  planOrderAvailable
+                    ? "开启后，保存生成的自创订单自动配置止盈/止损邮件提醒，无需再去挂单行点铃铛"
+                    : "当前无交易计划，保存不会生成订单，邮件配置无处挂靠"
+                }
+                className={clsx(
+                  "flex items-center gap-1 px-2 py-1 rounded border text-[10px] transition-colors",
+                  !planOrderAvailable
+                    ? "border-jarvis-border text-jarvis-text-secondary/50 cursor-not-allowed"
+                    : mailOn
+                      ? "border-jarvis-yellow/50 text-jarvis-yellow bg-jarvis-yellow/10"
+                      : "border-jarvis-border text-jarvis-text-secondary hover:text-jarvis-yellow hover:border-jarvis-yellow/50",
+                )}
+              >
+                <Bell size={11} />
+                邮件提醒{mailOn ? "·开" : "·关"}
+              </button>
+              {!planOrderAvailable && (
+                <span className="text-[10px] text-jarvis-text-secondary/70">
+                  无计划不生成订单，邮件配置不生效
+                </span>
+              )}
+              {mailOn && planOrderAvailable && smtpReady === false && (
+                <span className="text-[10px] text-jarvis-yellow">
+                  发件 SMTP 未配置——到「价位提醒」页设置后才能实际发信（提醒登记不受影响）
+                </span>
+              )}
+            </div>
+            {mailOn && planOrderAvailable && (
+              <div className="flex items-center gap-3 flex-wrap mt-1.5">
+                <input
+                  type="email"
+                  value={mailEmail}
+                  onChange={(e) => setMailEmail(e.target.value)}
+                  placeholder="you@example.com"
+                  title="接收止盈/止损通知的邮箱（记住上次配置成功的地址）"
+                  className={clsx(
+                    "w-52 px-2 py-1 bg-jarvis-bg border rounded text-[11px] text-jarvis-text font-mono outline-none transition-colors",
+                    mailEmailInvalid
+                      ? "border-jarvis-red"
+                      : "border-jarvis-border focus:border-jarvis-blue",
+                  )}
+                />
+                <label className="flex items-center gap-1 text-[10px] text-jarvis-text cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={mailTp}
+                    onChange={(e) => setMailTp(e.target.checked)}
+                    className="w-3.5 h-3.5 accent-jarvis-blue cursor-pointer"
+                  />
+                  <span className="text-jarvis-green">止盈通知</span>
+                </label>
+                <label className="flex items-center gap-1 text-[10px] text-jarvis-text cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={mailSl}
+                    onChange={(e) => setMailSl(e.target.checked)}
+                    className="w-3.5 h-3.5 accent-jarvis-blue cursor-pointer"
+                  />
+                  <span className="text-jarvis-red">止损通知</span>
+                </label>
+                {mailEmailInvalid && (
+                  <span className="text-[10px] text-jarvis-red">邮箱格式不正确</span>
+                )}
+                {mailOn && !mailTp && !mailSl && (
+                  <span className="text-[10px] text-jarvis-yellow">
+                    至少勾选一种通知类型
+                  </span>
+                )}
+              </div>
             )}
           </div>
         </div>

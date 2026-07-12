@@ -70,7 +70,9 @@ const FILTER_GROUPS: {
     key: "tf",
     label: "周期",
     options: [
+      { value: "5m", label: "5m" },
       { value: "15m", label: "15m" },
+      { value: "30m", label: "30m" },
       { value: "1h", label: "1h" },
       { value: "4h", label: "4h" },
     ],

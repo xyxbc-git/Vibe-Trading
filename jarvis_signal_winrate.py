@@ -39,9 +39,11 @@ import pandas as pd
 
 WINDOW = 300                  # 信号窗口根数（与线上 fetch_klines_df limit=300 同口径）
 LOW_SAMPLE_N = 30             # 样本量阈值（与 jarvis_paper_trader.LOW_SAMPLE_N 同值）
-_TF_BARS_PER_DAY = {"15m": 96, "1h": 24, "4h": 6, "1d": 1}
+_TF_BARS_PER_DAY = {"5m": 288, "15m": 96, "30m": 48, "1h": 24, "4h": 6, "1d": 1}
 # 观察期 = 实时模拟盘时间止损天数（jarvis_paper_trader._TWELVE_TIME_STOP）换算 bar 数
-_TIME_STOP_DAYS = {"15m": 1, "1h": 3, "4h": 7, "1d": 14}
+# 5m 超短线与 15m 同为 1 天（288 根）：缺省回退 7 天在 5m 下会膨胀到 2016 根，必须显式给；
+# 30m 介于 15m(1天) 与 1h(3天) 之间取 2 天（96 根）
+_TIME_STOP_DAYS = {"5m": 1, "15m": 1, "30m": 2, "1h": 3, "4h": 7, "1d": 14}
 
 CONFIG_DIR = os.path.expanduser("~/.vibe-trading")
 CACHE_PATH = os.path.join(CONFIG_DIR, "signal_winrate.json")

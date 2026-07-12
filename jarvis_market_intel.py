@@ -37,7 +37,7 @@ OI_SYMBOL = "BTCUSDT"
 LS_SYMBOL = "BTCUSDT"
 
 # 各源缓存 TTL（秒）：行情类分钟级，恐贪指数官方日更、小时级足够
-TTL = {"funding": 120, "oi": 300, "long_short": 300, "fng": 3600}
+TTL = {"funding": 120, "oi": 300, "long_short": 300, "fng": 3600, "price_24h": 120}
 
 _LOCK = threading.Lock()
 _REFRESHING = False
@@ -110,8 +110,19 @@ def _fetch_fng() -> dict:
             "index_ts": int(row.get("timestamp") or 0)}
 
 
+def _fetch_price_24h() -> dict:
+    """24h 价格涨跌幅（合约 ticker）。情绪因子里与 OI 变化交叉判断趋势健康度。"""
+    row = _get_json(f"{FAPI}/fapi/v1/ticker/24hr", {"symbol": OI_SYMBOL})
+    if not isinstance(row, dict) or "priceChangePercent" not in row:
+        raise ValueError("ticker/24hr 异常返回")
+    return {"symbol": OI_SYMBOL,
+            "last_price": round(float(row.get("lastPrice") or 0), 6),
+            "change_pct": round(float(row["priceChangePercent"]), 2)}
+
+
 _FETCHERS = {"funding": _fetch_funding, "oi": _fetch_oi,
-             "long_short": _fetch_long_short, "fng": _fetch_fng}
+             "long_short": _fetch_long_short, "fng": _fetch_fng,
+             "price_24h": _fetch_price_24h}
 
 
 def _refresh(parts: list[str]) -> None:
@@ -182,6 +193,7 @@ def get_intel() -> dict:
     oi = snap["oi"]["data"]
     ls = snap["long_short"]["data"]
     fng = snap["fng"]["data"]
+    price24 = snap["price_24h"]["data"]
 
     parts_ts = [t for t in (_ts(n) for n in _FETCHERS) if t]
     errors = {name: snap[name]["error"] for name in _FETCHERS if snap[name]["error"]}
@@ -194,6 +206,7 @@ def get_intel() -> dict:
         "funding_ts": _ts("funding") if funding else None,
         "oi": ({**oi, "ts": _ts("oi")} if oi else None),
         "long_short": ({**ls, "ts": _ts("long_short")} if ls else None),
+        "price_24h": ({**price24, "ts": _ts("price_24h")} if price24 else None),
         # 未接入源：明确原因，前端据此渲染「未接入」占位态，禁止演示假数据
         "liquidations": None,
         "onchain": None,

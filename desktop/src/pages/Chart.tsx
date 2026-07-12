@@ -2,7 +2,8 @@ import { useState, useMemo, useEffect } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useApi, usePolling } from "@/hooks/useApi";
 import { useSymbol } from "@/hooks/useSymbol";
-import { api, type TwelveSignal, type ConsensusTradePlan } from "@/api/client";
+import { useLivePrice } from "@/hooks/usePrice";
+import { api, formatPrice, type TwelveSignal, type ConsensusTradePlan } from "@/api/client";
 import KlineChart from "@/components/charts/KlineChart";
 import { tradesToMarks } from "@/lib/signalTrades";
 import {
@@ -36,6 +37,11 @@ import {
 } from "@/lib/drawingModel";
 import { planToOverlay } from "@/lib/tradePlan";
 import {
+  buildPositionZoneView,
+  positionZoneFromQuery,
+  stripPositionZoneQuery,
+} from "@/lib/positionZone";
+import {
   composeChartView,
   isStaleEcho,
   loadViewMode,
@@ -44,8 +50,18 @@ import {
   type ViewMode,
   type ChartComposition,
 } from "@/lib/chartView";
+import {
+  mockPredict,
+  buildPredictionOverlay,
+  type PredictResponse,
+  type PredictBar,
+} from "@/lib/predict";
+import { mockDelta, type DeltaResponse, type DeltaKline } from "@/lib/deltaFlow";
+import DeltaPane from "@/components/charts/DeltaPane";
 import { CandlestickChart, HelpCircle, Target, X } from "lucide-react";
 import PositionAdvisor from "@/components/cards/PositionAdvisor";
+import PredictionCard from "@/components/cards/PredictionCard";
+import ReversalScorePanel from "@/components/cards/ReversalScorePanel";
 import { clsx } from "clsx";
 import type {
   CandlestickData,
@@ -53,13 +69,14 @@ import type {
   Time,
 } from "lightweight-charts";
 
-const TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"] as const;
+const TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"] as const;
 type Timeframe = (typeof TIMEFRAMES)[number];
 
 const LIMITS: Record<Timeframe, number> = {
   "1m": 300,
   "5m": 200,
   "15m": 200,
+  "30m": 200,
   "1h": 168,
   "4h": 200,
   "1d": 180,
@@ -138,6 +155,16 @@ function saveWarmParams(sym: string, tf: string, params: DrawParams): void {
 
 const ALL_DRAW_MODES: DrawMode[] = ["trend", "sr", "fib", "channel", "rect"];
 
+/** 只删「盈损点」的 sig* 键，保留其它 query（与 pz* 区间图参数可并存互不干扰） */
+function stripSigMarksQuery(q: URLSearchParams): URLSearchParams {
+  const next = new URLSearchParams(q);
+  for (const k of ["sigmarks", "sigtf", "sigside"]) next.delete(k);
+  return next;
+}
+
+/** 预测覆盖的未来 bar 数（与预测引擎契约默认值一致） */
+const PREDICT_HORIZON = 16;
+
 export default function Chart() {
   const [tf, setTf] = useState<Timeframe>("15m");
   // 三档视图（简洁/进阶/专业），选择持久化；细粒度开关只在专业模式生效
@@ -152,8 +179,8 @@ export default function Chart() {
   const [autoTune, setAutoTune] = useState(true);
   const [twelve, setTwelve] = useState(false);
   const [plan, setPlan] = useState(true);
-  // 交易区间带（入场/止损/止盈时间锚定矩形）独立开关，三档视图均可用
-  const [zonesOn, setZonesOn] = useState(true);
+  // 走势预测层（概率锥/路径/研判卡片）独立开关；默认关，避免干扰常规看盘
+  const [predictOn, setPredictOn] = useState(false);
   const { symbol } = useSymbol();
 
   // ── 信号历史盈损标记（信号矩阵「盈损点」跳转携带 query 进入） ──
@@ -169,7 +196,8 @@ export default function Chart() {
   const sigSide: "long" | "short" | undefined =
     rawSigSide === "long" || rawSigSide === "short" ? rawSigSide : undefined;
   const clearSigMarks = () => {
-    setSearchParams({}, { replace: true });
+    // 只清 sig* 键，保留可能并存的多空区间图参数
+    setSearchParams(stripSigMarksQuery(searchParams), { replace: true });
   };
 
   // 进入/切换标记目标时自动对齐周期：胜率样本按 sigTf 回测，标记只有画在
@@ -177,6 +205,32 @@ export default function Chart() {
   useEffect(() => {
     if (sigSystem && sigTf) setTf(sigTf);
   }, [sigSystem, sigTf]);
+
+  // ── 信号多空区间图（信号矩阵「K线区间」跳转携带 pz* query 进入） ──
+  // 三价 + 方向经 query 传递；几何非法（如多单 SL ≥ 入场）解析为 null 不画
+  const zoneParams = useMemo(
+    () => positionZoneFromQuery(searchParams),
+    [searchParams],
+  );
+  const positionZone = useMemo(
+    () => buildPositionZoneView(zoneParams),
+    [zoneParams],
+  );
+  const clearPositionZone = () => {
+    // 只清 pz* 键，保留可能并存的盈损标记参数
+    setSearchParams(stripPositionZoneQuery(searchParams), { replace: true });
+  };
+
+  // 进入区间图时对齐信号周期（一次性：点位按该周期算出，画在同周期图上口径才对；
+  // 之后用户可自由切走周期，区间图价格几何不随周期变化仍然成立）
+  const zoneTf: Timeframe | null =
+    zoneParams?.tf && (TIMEFRAMES as readonly string[]).includes(zoneParams.tf)
+      ? (zoneParams.tf as Timeframe)
+      : null;
+  useEffect(() => {
+    if (positionZone && zoneTf) setTf(zoneTf);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [zoneTf, zoneParams?.entry, zoneParams?.side]);
 
   // 各数据源的实际启用条件：简洁/进阶忽略专业模式的细粒度开关
   const isPro = viewMode === "pro";
@@ -219,6 +273,34 @@ export default function Chart() {
   }, [rawKline]);
 
   const lastCandle = candles.length > 0 ? candles[candles.length - 1] : null;
+
+  // ── 实时价对齐：与顶栏同源的全局 ticker（10s），只认当前币种的报价 ──
+  // kline 链路（前端 60s 轮询 + 后端 60s 缓存）最坏滞后约 2 分钟，图表最新价
+  // 标签与顶栏价格会肉眼可见不一致；把 ticker 补进最后一根未收线蜡烛后两处
+  // 同源同频。画线/信号等计算仍基于 kline 收线数据，不受此补丁影响。
+  const livePrice = useLivePrice();
+  const liveForChart = useMemo(
+    () =>
+      livePrice && livePrice.symbol === symbol
+        ? { price: livePrice.price, timeSec: Math.floor(livePrice.at / 1000) }
+        : null,
+    [livePrice, symbol],
+  );
+
+  // 底部 OHLC 信息条与图表口径一致：收=实时价，高/低随之扩展
+  const displayCandle = useMemo(() => {
+    if (!lastCandle) return null;
+    if (!liveForChart || liveForChart.timeSec < Number(lastCandle.time)) {
+      return lastCandle;
+    }
+    const p = liveForChart.price;
+    return {
+      ...lastCandle,
+      close: p,
+      high: Math.max(lastCandle.high, p),
+      low: Math.min(lastCandle.low, p),
+    };
+  }, [lastCandle, liveForChart]);
 
   // ── 信号盈损标记：拉该系统的逐笔回测明细（与信号矩阵聚合胜率同源） ──
   const { data: sigTradesResp, loading: sigTradesLoading } = useApi(
@@ -532,6 +614,150 @@ export default function Chart() {
     return { tradePlan: tp, direction, state: "ok", meta: bits.join(" · "), watchReason: "" };
   }, [planActive, planRes, planLoading, planError, symbol]);
 
+  // ── 走势预测（预测引擎 GET /api/predict；未就绪/失败回退本地演示推演）──
+  // 开启开关 / 切 symbol / 切周期时重新拉取；bars 从无到有时补拉一次（mock
+  // 推演依赖 K 线）。K 线常规轮询刷新不重拉——overlay 依 generatedAt 锚定，
+  // 新 K 线收线也不漂移。predictSeq 供卡片「重试」手动触发。
+  const [predictResp, setPredictResp] = useState<PredictResponse | null>(null);
+  const [predictLoading, setPredictLoading] = useState(false);
+  const [predictError, setPredictError] = useState<string | null>(null);
+  const [predictSeq, setPredictSeq] = useState(0);
+  const hasBars = candles.length > 0;
+
+  useEffect(() => {
+    if (!predictOn) {
+      setPredictResp(null);
+      setPredictError(null);
+      setPredictLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setPredictLoading(true);
+    setPredictError(null);
+
+    // 引擎不可用（接口未部署/取数失败）→ 本地 mock 推演兜底（卡片带「演示
+    // 数据」角标）；K 线也不足时才落失败态
+    const fallbackToMock = (reason?: string) => {
+      const bars: PredictBar[] = candles.map((c) => ({
+        timeSec: Number(c.time),
+        close: c.close,
+        high: c.high,
+        low: c.low,
+      }));
+      const mock = mockPredict(symbol, tf, PREDICT_HORIZON, bars);
+      if (mock) {
+        setPredictResp(mock);
+        setPredictError(null);
+      } else {
+        setPredictResp(null);
+        setPredictError(reason ?? "预测接口未就绪，K 线数据也不足以生成演示推演");
+      }
+      setPredictLoading(false);
+    };
+
+    (async () => {
+      try {
+        const res = await api.predict(symbol, tf, PREDICT_HORIZON);
+        if (cancelled) return;
+        // 回声校验：慢返回的旧币种/旧周期响应不得写入当前图（防交易误导）
+        if (isStaleEcho(symbol, res?.symbol)) return;
+        if (res?.timeframe && res.timeframe !== tf) return;
+        if (res && res.ok !== false && Array.isArray(res.path)) {
+          setPredictResp(res);
+          setPredictError(null);
+          setPredictLoading(false);
+          return;
+        }
+        fallbackToMock(res?.error);
+      } catch {
+        if (!cancelled) fallbackToMock();
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // candles 内容故意不进依赖：常规轮询刷新不重拉预测（见上方注释）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [predictOn, symbol, tf, hasBars, predictSeq]);
+
+  // 响应 → 图表载荷（bar 逻辑索引 + 价格）；K 线轮询增长时重算投影，
+  // anchor 依 generatedAt 锚定在生成时刻的 bar 上，不随新 K 线漂移
+  const predictOverlay = useMemo(() => {
+    if (!predictOn || !predictResp || candles.length === 0) return null;
+    const bars: PredictBar[] = candles.map((c) => ({
+      timeSec: Number(c.time),
+      close: c.close,
+      high: c.high,
+      low: c.low,
+    }));
+    return buildPredictionOverlay(predictResp, bars);
+  }, [predictOn, predictResp, candles]);
+
+  // ── Delta/CVD 订单流副图（「安全带」层）：引擎 GET /api/delta，未就绪时
+  // 回退 K 线本地演示推演（角标标注），与预测层同一套降级模式 ──
+  const [deltaOn, setDeltaOn] = useState(false);
+  const [deltaResp, setDeltaResp] = useState<DeltaResponse | null>(null);
+  const [deltaLoading, setDeltaLoading] = useState(false);
+  const [deltaError, setDeltaError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!deltaOn) {
+      setDeltaResp(null);
+      setDeltaError(null);
+      setDeltaLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setDeltaLoading(true);
+    setDeltaError(null);
+
+    const klines = (): DeltaKline[] =>
+      candles.map((c, i) => ({
+        timeSec: Number(c.time),
+        open: c.open,
+        close: c.close,
+        high: c.high,
+        low: c.low,
+        volume: volumes[i]?.value,
+      }));
+
+    const fallbackToMock = (reason?: string) => {
+      const mock = mockDelta(symbol, tf, klines());
+      if (mock) {
+        setDeltaResp(mock);
+        setDeltaError(null);
+      } else {
+        setDeltaResp(null);
+        setDeltaError(reason ?? "Delta 引擎未就绪，K 线数据也不足以生成演示推演");
+      }
+      setDeltaLoading(false);
+    };
+
+    (async () => {
+      try {
+        const res = await api.delta(symbol, tf, 200);
+        if (cancelled) return;
+        // 回声校验：慢返回的旧币种/旧周期响应不得写入当前图
+        if (isStaleEcho(symbol, res?.symbol)) return;
+        if (res?.timeframe && res.timeframe !== tf) return;
+        if (res && res.ok !== false && Array.isArray(res.bars) && res.bars.length > 0) {
+          setDeltaResp(res);
+          setDeltaError(null);
+          setDeltaLoading(false);
+          return;
+        }
+        fallbackToMock(res?.error);
+      } catch {
+        if (!cancelled) fallbackToMock();
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // candles 内容故意不进依赖：常规轮询刷新不重拉（与预测层同策略）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deltaOn, symbol, tf, hasBars]);
+
   // ── 三档视图组合：把 计划/智能S·R/画线/关键位 裁剪成最终渲染载荷 + 图例 ──
   const composition = useMemo<ChartComposition>(
     () =>
@@ -710,13 +936,22 @@ export default function Chart() {
           ))}
         </div>
 
-        {/* 区间带：入场/止损/止盈画成时间锚定的半透明矩形（supply/demand zone 风格） */}
+        {/* 预测层：概率锥 + 路径虚线画在 K 线右侧未来区域 + 图上方研判卡片 */}
         <button
-          onClick={() => setZonesOn((v) => !v)}
-          title="把入场/止损/止盈画成半透明矩形（只覆盖最近一段 K 线，垫在 K 线下方不遮挡），悬停显示盈亏比"
-          className={pillCls(zonesOn)}
+          onClick={() => setPredictOn((v) => !v)}
+          title="AI 走势预测：在 K 线右侧未来区域画预测路径（虚线）与目标区间（概率锥），并给出方向概率与研判理由。预测仅供参考，不构成投资建议"
+          className={pillCls(predictOn)}
         >
-          区间带{zonesOn ? "·开" : "·关"}
+          预测{predictOn ? "·开" : "·关"}
+        </button>
+
+        {/* Delta/CVD 副图（「安全带」层）：只有 Delta 与价格背离（吸收证据）才是真反转 */}
+        <button
+          onClick={() => setDeltaOn((v) => !v)}
+          title="Delta/CVD 订单流副图：每根主动买卖差（正绿负红）+ CVD 累计曲线；价格创新低但 CVD 抬高 = 吸收背离（安全带确认信号）。引擎未就绪时显示演示推演"
+          className={pillCls(deltaOn)}
+        >
+          Delta{deltaOn ? "·开" : "·关"}
         </button>
 
         {/* 图例：解释当前模式下每类线的含义 */}
@@ -988,6 +1223,67 @@ export default function Chart() {
         </div>
       )}
 
+      {/* 多空区间图状态条：来自信号矩阵「K线区间」跳转，TradingView position 风格 */}
+      {zoneParams && (
+        <div className="flex items-center gap-2 flex-wrap text-xs bg-jarvis-card border border-jarvis-purple/40 rounded-lg px-3 py-2">
+          <Target size={13} className="text-jarvis-purple shrink-0" />
+          <span className="text-jarvis-text font-medium">
+            「{zoneParams.name || "信号计划"}」多空区间图
+          </span>
+          <span
+            className={clsx(
+              "px-1.5 py-px rounded text-[10px] font-medium text-white",
+              zoneParams.side === "long" ? "bg-jarvis-green" : "bg-jarvis-red",
+            )}
+          >
+            {zoneParams.side === "long" ? "做多" : "做空"}
+          </span>
+          {positionZone ? (
+            <span className="text-jarvis-text-secondary font-mono">
+              入 {formatPrice(positionZone.entry)} · 损{" "}
+              <span className="text-jarvis-red">{formatPrice(positionZone.stopLoss)}</span> · 盈{" "}
+              <span className="text-jarvis-green">{formatPrice(positionZone.takeProfit)}</span>
+              {" "}· 盈亏比 1:{positionZone.rr}
+              <span className="ml-1 text-jarvis-text-secondary/80">
+                （<span className="text-jarvis-green">绿块=盈利目标区</span>、
+                <span className="text-jarvis-red">红块=止损风险区</span>，向右延伸为持仓预期）
+              </span>
+            </span>
+          ) : (
+            <span className="text-jarvis-yellow">
+              点位几何不合法（方向与止损/止盈位置矛盾），不绘制区间
+            </span>
+          )}
+          {zoneTf && tf !== zoneTf && (
+            <button
+              onClick={() => setTf(zoneTf)}
+              title={`点位按 ${zoneTf} 周期信号算出，切回同周期看口径最准`}
+              className="px-1.5 py-px rounded border border-jarvis-yellow/50 text-jarvis-yellow hover:bg-jarvis-yellow/10 transition-colors"
+            >
+              切回 {zoneTf}
+            </button>
+          )}
+          <button
+            onClick={clearPositionZone}
+            title="清除多空区间图"
+            className="ml-auto flex items-center gap-0.5 px-1.5 py-0.5 rounded text-jarvis-text-secondary hover:text-jarvis-red transition-colors"
+          >
+            <X size={12} />
+            清除
+          </button>
+        </div>
+      )}
+
+      {/* AI 走势研判卡片：方向概率 / 信心 / 目标区 / 理由 / 依据信号 / 免责声明 */}
+      {predictOn && (
+        <PredictionCard
+          resp={predictResp}
+          loading={predictLoading}
+          error={predictError}
+          onRetry={() => setPredictSeq((s) => s + 1)}
+        />
+      )}
+
       <div className="card p-0 overflow-hidden">
         {candles.length > 0 ? (
           <KlineChart
@@ -998,8 +1294,10 @@ export default function Chart() {
             drawings={composition.drawings}
             keyLevels={composition.keyLevels.length > 0 ? composition.keyLevels : undefined}
             planLines={composition.planLines.length > 0 ? composition.planLines : undefined}
-            tradeZones={zonesOn && composition.tradeZones.length > 0 ? composition.tradeZones : undefined}
             tradeMarks={sigMarks?.marks}
+            prediction={predictOverlay}
+            positionZone={positionZone}
+            livePrice={liveForChart}
           />
         ) : (
           <div
@@ -1025,42 +1323,50 @@ export default function Chart() {
         )}
       </div>
 
+      {/* ── Delta/CVD 订单流副图（安全带层，可折叠）：吸收背离 = 真反转证据 ── */}
+      {deltaOn && (
+        <DeltaPane resp={deltaResp} loading={deltaLoading} error={deltaError} />
+      )}
+
+      {/* ── 高胜率反转四条件叠加：Delta 背离 + 多分布 + 三连确认 + 止损扫单 ── */}
+      <ReversalScorePanel symbol={symbol} timeframe={tf} />
+
       {/* ── 仓位与风控建议：共识计划 ×（本金/杠杆/风险%）→ 可执行下单参数 ── */}
       <PositionAdvisor
         symbol={symbol}
-        tf={(["15m", "1h", "4h", "1d"] as const).includes(tf as never) ? (tf as "15m" | "1h" | "4h" | "1d") : "auto"}
+        tf={(["5m", "15m", "30m", "1h", "4h", "1d"] as const).includes(tf as never) ? (tf as "5m" | "15m" | "30m" | "1h" | "4h" | "1d") : "auto"}
         compact
       />
 
-      {lastCandle && (
+      {displayCandle && (
         <div className="flex gap-6 text-sm text-jarvis-text-secondary px-1">
           <span>
             开:{" "}
             <span className="text-jarvis-text font-mono">
-              {lastCandle.open.toLocaleString()}
+              {displayCandle.open.toLocaleString()}
             </span>
           </span>
           <span>
             高:{" "}
             <span className="text-jarvis-text font-mono">
-              {lastCandle.high.toLocaleString()}
+              {displayCandle.high.toLocaleString()}
             </span>
           </span>
           <span>
             低:{" "}
             <span className="text-jarvis-text font-mono">
-              {lastCandle.low.toLocaleString()}
+              {displayCandle.low.toLocaleString()}
             </span>
           </span>
           <span>
             收:{" "}
             <span
               className={clsx("font-mono", {
-                "text-jarvis-green": lastCandle.close >= lastCandle.open,
-                "text-jarvis-red": lastCandle.close < lastCandle.open,
+                "text-jarvis-green": displayCandle.close >= displayCandle.open,
+                "text-jarvis-red": displayCandle.close < displayCandle.open,
               })}
             >
-              {lastCandle.close.toLocaleString()}
+              {displayCandle.close.toLocaleString()}
             </span>
           </span>
         </div>

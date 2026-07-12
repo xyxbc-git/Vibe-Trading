@@ -11,6 +11,9 @@ export interface LogLine {
   text: string;
 }
 
+/** 限价单来源（limit_orders.source）：user-created=用户保存交易计划自创 / system=系统创建 */
+export type OrderSource = "user-created" | "system";
+
 async function request<T>(
   endpoint: string,
   options?: RequestInit,
@@ -64,7 +67,10 @@ export const api = {
 
   wallet: () => api.get<Record<string, unknown>>("/wallet"),
 
-  positions: () => api.get<Record<string, unknown>[]>("/positions"),
+  // 活跃持仓（Trading/Dashboard 卡片与仓位统计口径）：只取未平仓。
+  // 后端不带 status 默认返回 all（含已平仓），会把已平仓算进「活跃持仓」
+  // 与持仓市值/风控仓位数（4/3 超限假象即由此而来）。
+  positions: () => api.get<Record<string, unknown>[]>("/positions?status=open"),
 
   orders: () => api.get<Record<string, unknown>[]>("/orders"),
 
@@ -76,6 +82,10 @@ export const api = {
     qty: number;
     stopLoss?: number;
     takeProfit?: number;
+    /** 订单来源：user-created=用户保存交易计划自创；缺省 system=系统创建 */
+    source?: OrderSource;
+    /** 附加上下文（如交易计划快照 JSON），落 limit_orders.note */
+    note?: string;
   }) => {
     const q = new URLSearchParams({
       symbol: p.symbol,
@@ -85,7 +95,9 @@ export const api = {
     });
     if (p.stopLoss != null) q.set("stop_loss", String(p.stopLoss));
     if (p.takeProfit != null) q.set("take_profit", String(p.takeProfit));
-    return api.post<{ ok: boolean; order_id?: number; reason?: string }>(
+    if (p.source) q.set("source", p.source);
+    if (p.note) q.set("note", p.note);
+    return api.post<{ ok: boolean; order_id?: number; reason?: string; source?: OrderSource }>(
       `/orders/place?${q.toString()}`,
     );
   },
@@ -401,6 +413,30 @@ export const api = {
       `/alerts/price?symbol=${encodeURIComponent(symbol)}`,
     ),
 
+  // ─── 交易订单邮件提醒（按笔配置）───
+  // order_id 约定："order-<limit_order_id>" 挂单 / "pos-<position_id>" 持仓
+  orderNotifyList: () => api.get<OrderNotifyConfig[]>("/order-notify"),
+  orderNotifyGet: (orderId: string) =>
+    api.get<{ ok: boolean; config: OrderNotifyConfig | null }>(
+      `/order-notify/${encodeURIComponent(orderId)}`,
+    ),
+  orderNotifySet: (orderId: string, data: OrderNotifyInput) =>
+    api.put<{ ok: boolean; reason?: string; config?: OrderNotifyConfig }>(
+      `/order-notify/${encodeURIComponent(orderId)}`,
+      data,
+    ),
+  orderNotifyDelete: (orderId: string) =>
+    request<{ ok: boolean; deleted?: number }>(
+      `/order-notify/${encodeURIComponent(orderId)}`,
+      { method: "DELETE" },
+    ),
+  orderNotifyTest: (orderId: string) =>
+    request<{ ok: boolean; reason?: string; to?: string[] }>(
+      `/order-notify/${encodeURIComponent(orderId)}/test`,
+      { method: "POST", body: JSON.stringify({}) },
+      25_000,
+    ),
+
   // ─── 贾维斯信号引擎（后端可能未就绪，调用方必须做空态/降级处理）───
   // 响应均为封套结构（含 ok 字段）；ok:false 时 HTTP 仍是 200，调用方须自行判断
   twelveConsensus: (symbol = "BTCUSDT") =>
@@ -475,6 +511,64 @@ export const api = {
 
   // ─── 市场情报页（免 Key 真实数据源；后端 TTL 缓存 + 降级）───
   marketIntel: () => api.get<MarketIntelResponse>("/market-intel"),
+
+  // ─── 供需情绪综合研判（多空比/资金费率/OI/恐贪 四因子 + 综合分）───
+  sentiment: (symbol = "BTCUSDT") =>
+    api.get<SentimentResponse>(`/sentiment?symbol=${encodeURIComponent(symbol)}`),
+
+  // ─── 牛熊市体制识别（200D MA / 周线结构 / 长周期动量 / 情绪面）───
+  regime: (symbol = "BTCUSDT") =>
+    api.get<RegimeResponse>(`/regime?symbol=${encodeURIComponent(symbol)}`),
+
+  // ─── 走势预测（预测引擎；未就绪时调用方回退本地 mock 推演）───
+  // 响应契约见 src/lib/predict.ts 的 PredictResponse（规则概率 + AI 研判）
+  predict: (symbol: string, timeframe: string, horizon = 16) =>
+    request<import("../lib/predict").PredictResponse>(
+      `/predict?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&horizon=${horizon}`,
+      undefined,
+      30_000,
+    ),
+
+  // ─── Delta/CVD 订单流（Delta 引擎；未就绪时调用方回退本地 mock 推演）───
+  // 响应契约见 src/lib/deltaFlow.ts 的 DeltaResponse（每根 Delta + CVD + 吸收背离）
+  delta: (symbol: string, timeframe: string, limit = 200) =>
+    request<import("../lib/deltaFlow").DeltaResponse>(
+      `/delta?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&limit=${limit}`,
+      undefined,
+      30_000,
+    ),
+
+  // ─── 高胜率反转四条件叠加评分（Delta 背离 + 多分布 + 三连确认 + 止损扫单）───
+  reversalScore: (symbol: string, timeframe: string) =>
+    request<ReversalScoreResponse>(
+      `/reversal-score?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}`,
+      undefined,
+      30_000,
+    ),
+
+  // ─── 资金费率套利模拟盘（现货多 + 永续空，delta 中性赚费率）───
+  fundingArbOpportunities: () =>
+    request<FundingArbOpportunitiesResponse>("/funding-arb/opportunities", undefined, 30_000),
+
+  fundingArbPositions: (status: "all" | "open" | "closed" = "all") =>
+    request<FundingArbPositionsResponse>(
+      `/funding-arb/positions?status=${status}`,
+      undefined,
+      30_000,
+    ),
+
+  fundingArbOpen: (symbol: string, capital: number) =>
+    api.post<FundingArbOpenResponse>(
+      `/funding-arb/positions/open?symbol=${encodeURIComponent(symbol)}&capital=${capital}`,
+    ),
+
+  fundingArbClose: (positionId: number) =>
+    api.post<FundingArbCloseResponse>(
+      `/funding-arb/positions/close?position_id=${positionId}`,
+    ),
+
+  fundingArbPnl: () =>
+    request<FundingArbPnlResponse>("/funding-arb/pnl", undefined, 30_000),
 };
 
 // ─── GET /api/market-intel 响应 ───
@@ -500,12 +594,95 @@ export interface MarketIntelResponse {
     ratio: number;
     ts?: number | null;
   } | null;
+  /** 24h 价格涨跌幅（情绪因子里与 OI 交叉判断量价健康度） */
+  price_24h?: {
+    symbol: string;
+    last_price: number;
+    change_pct: number;
+    ts?: number | null;
+  } | null;
   liquidations?: null;
   onchain?: null;
   /** 未接入源 -> 原因说明（前端渲染灰化占位态） */
   unavailable?: Record<string, string> | null;
   /** 拉取失败的源 -> 错误摘要（保留旧缓存时也会带上） */
   errors?: Record<string, string> | null;
+  error?: string;
+}
+
+// ─── GET /api/sentiment 供需情绪研判 ───
+
+export type SentimentBias = "bullish" | "bearish" | "neutral";
+
+/** 单因子研判（多空比/资金费率/OI/恐贪 + 预留的爆仓/链上接口位） */
+export interface SentimentFactor {
+  key: "long_short" | "funding" | "oi" | "fng" | "liquidations" | "onchain";
+  name: string;
+  /** false = 数据源未接入/暂不可用，不参与计分（灰化展示） */
+  available: boolean;
+  value: number | null;
+  display: string;
+  bias: SentimentBias;
+  /** -100～+100，正=偏多 */
+  score: number;
+  weight: number;
+  /** 为什么看多/看空的解释性文案 */
+  note: string;
+}
+
+export interface SentimentResponse {
+  ok: boolean;
+  symbol?: string;
+  /** 综合情绪分 -100～+100（可用因子加权平均） */
+  score?: number;
+  bias?: SentimentBias;
+  /** 一句话结论：综合偏置 + 主导因子 */
+  headline?: string;
+  factors?: SentimentFactor[];
+  /** 极端因子警示（拥挤/逆向风险） */
+  warnings?: string[];
+  /** 情绪极端时的止盈止损收紧建议（仅建议展示，不强制改单） */
+  sl_tp_advice?: string | null;
+  as_of?: number;
+  intel_updated_at?: number | null;
+  unavailable?: Record<string, string> | null;
+  error?: string;
+}
+
+// ─── GET /api/regime 牛熊市体制识别 ───
+
+export type MarketRegime = "bull" | "bear" | "range";
+
+/** 体制因子（结构与 SentimentFactor 同款，渲染逻辑可复用） */
+export interface RegimeFactor {
+  key: "ma200" | "weekly" | "momentum" | "sentiment" | "onchain";
+  name: string;
+  /** false = 数据不足/源未接入，不参与计分（灰化展示） */
+  available: boolean;
+  value: number | null;
+  display: string;
+  bias: SentimentBias;
+  /** -100～+100，正=偏牛 */
+  score: number;
+  weight: number;
+  note: string;
+}
+
+export interface RegimeResponse {
+  ok: boolean;
+  symbol?: string;
+  regime?: MarketRegime;
+  /** 中文判定（含震荡市偏牛/偏熊后缀） */
+  regime_cn?: string;
+  /** 综合体制分 -100～+100（可用因子加权平均） */
+  score?: number;
+  /** 0~0.95：判定强度 × 因子覆盖率 */
+  confidence?: number;
+  /** 一句话结论：主导因子 + 判定 */
+  headline?: string;
+  factors?: RegimeFactor[];
+  disclaimer?: string;
+  updatedAt?: number;
   error?: string;
 }
 
@@ -784,6 +961,26 @@ export interface AlertConfigUpdate {
   recipients?: string[];
   contacts?: AlertContact[];
   poll_interval_s?: number;
+}
+
+// ─── 交易订单邮件提醒（按笔配置）───
+
+export interface OrderNotifyConfig {
+  order_id: string;
+  email: string;
+  notify_take_profit: boolean;
+  notify_stop_loss: boolean;
+  created_at: number;
+  updated_at: number;
+  last_notified_at: number | null;
+  last_notify_type: string | null;
+  last_send_result: string | null;
+}
+
+export interface OrderNotifyInput {
+  email: string;
+  notify_take_profit: boolean;
+  notify_stop_loss: boolean;
 }
 
 export interface AlertCheckResult {
@@ -1149,7 +1346,7 @@ export interface TradingConfig {
 export type SignalDirection = "bullish" | "bearish" | "neutral";
 
 /** 后端支持的单时间框架 */
-export type TwelveTf = "15m" | "1h" | "4h" | "1d";
+export type TwelveTf = "5m" | "15m" | "30m" | "1h" | "4h" | "1d";
 
 /** 驾驶舱共识口径："auto" = 多周期综合，其余 = 单周期 */
 export type ConsensusScope = TwelveTf | "auto";
@@ -1229,6 +1426,39 @@ export function formatPrice(n: number | null | undefined): string {
   return v.toPrecision(6);
 }
 
+/** 「安全带」确认层（jarvis_seatbelt.apply_to_consensus 附加）：
+ *  Delta 吸收背离 × 信号方向 → confirmed=吸收证据确认 / no-evidence=无证据
+ *  谨慎 / conflict=反向背离顶撞 / idle=中性 / unavailable=Delta 引擎未就绪 */
+export interface ConsensusSeatbelt {
+  status: "confirmed" | "no-evidence" | "conflict" | "idle" | "unavailable";
+  status_cn: string;
+  /** 背离强度档（confirmed/conflict 时给） */
+  grade?: "strong" | "moderate" | "weak" | null;
+  /** 确认层对置信度的修正量（confirmed 为正、conflict 为负） */
+  confidence_delta: number;
+  /** 修正后的建议置信度（原 confidence 字段保持不变） */
+  adjusted_confidence: number;
+  note: string;
+  divergence_note?: string | null;
+  absorption?: { detected: boolean; side?: string; note?: string } | null;
+}
+
+/** 共识上的供需情绪叠加层（jarvis_sentiment.apply_to_consensus 附加） */
+export interface ConsensusSentimentOverlay {
+  score: number;
+  bias: SentimentBias;
+  /** aligned=同向共振 / divergent=背离 / neutral=不构成修正 */
+  alignment: "aligned" | "divergent" | "neutral";
+  /** 情绪层对置信度的修正量（同向为正、极端背离为负） */
+  confidence_delta: number;
+  /** 修正后的建议置信度（原 confidence 字段保持不变） */
+  adjusted_confidence: number;
+  headline?: string;
+  warnings?: string[];
+  sl_tp_advice?: string | null;
+  factors?: SentimentFactor[];
+}
+
 export interface TwelveConsensus {
   direction: SignalDirection;
   confidence: number;
@@ -1245,6 +1475,10 @@ export interface TwelveConsensus {
   trade_plan?: ConsensusTradePlan | null;
   /** 计划状态与无计划原因（后端 v3；旧缓存响应可能缺失） */
   plan_status?: PlanStatus | null;
+  /** 供需情绪叠加层（多空比/费率/OI/恐贪；旧缓存响应可能缺失） */
+  sentiment?: ConsensusSentimentOverlay | null;
+  /** 「安全带」确认层（Delta 吸收背离；旧缓存响应可能缺失） */
+  seatbelt?: ConsensusSeatbelt | null;
 }
 
 /** GET /api/twelve/consensus 封套 */
@@ -1382,6 +1616,37 @@ export interface TwelveSignalsResponse {
   error?: string;
 }
 
+// ─── 高胜率反转四条件叠加评分（/api/reversal-score）───
+
+/** 单个反转条件的判定结果 */
+export interface ReversalCondition {
+  met: boolean;
+  note: string;
+  /** 上游数据源未就绪（不计入 met，UI 显示 ⚪ 态） */
+  unavailable?: boolean;
+}
+
+export interface ReversalScoreResponse {
+  ok: boolean;
+  error?: string;
+  symbol?: string;
+  timeframe?: string;
+  direction: "bullish" | "bearish" | "none";
+  conditions: {
+    delta_divergence: ReversalCondition;
+    multi_distribution: ReversalCondition;
+    triple_confirm: ReversalCondition;
+    stop_hunt: ReversalCondition;
+  };
+  satisfied: number;
+  maxScore: number;
+  verdict: "high-probability" | "watch" | "no-signal";
+  note: string;
+  updatedAt?: string;
+  mock?: boolean;
+  disclaimer?: string;
+}
+
 // ─── 合约仓位与风控计算器（Task #3）───
 
 /** 仓位计算器旋钮（jarvis_config 持久化）：本金/杠杆/风险%(legacy)/保证金% */
@@ -1485,6 +1750,122 @@ export interface JarvisReasonResponse {
   consensus?: TwelveConsensus | null;
   reasoning?: JarvisReasonResult;
   cached?: boolean;
+  error?: string;
+}
+
+// ─── 资金费率套利模拟盘 ───
+
+/** 单币套利机会（GET /api/funding-arb/opportunities 列表项） */
+export interface FundingArbOpportunity {
+  symbol: string;
+  mark_price: number;
+  /** 当期 8h 费率（小数，0.0001 = 0.01%） */
+  funding_rate: number;
+  funding_rate_pct: number;
+  /** 当期费率年化 %（×3×365） */
+  apr_now: number;
+  /** 7 日均费率年化 %；历史拉取失败为 null */
+  apr_7d: number | null;
+  /** 下次结算 unix 秒 */
+  next_funding_ts: number;
+  /** 往返手续费回本天数；费率 ≤0 为 null */
+  break_even_days: number | null;
+  fee_roundtrip_pct: number;
+  /** 费率为负等风险提示；无风险为 null */
+  warning: string | null;
+}
+
+export interface FundingArbOpportunitiesResponse {
+  ok: boolean;
+  generated_ts?: number;
+  opportunities: FundingArbOpportunity[];
+  basis?: string;
+  disclaimer?: string;
+  error?: string;
+}
+
+/** 套利持仓（open 态附实时字段；closed 态附平仓结算字段） */
+export interface FundingArbPosition {
+  id: number;
+  symbol: string;
+  qty: number;
+  capital_usdt: number;
+  spot_entry: number;
+  perp_entry: number;
+  opened_ts: number;
+  opened_at?: string;
+  status: "open" | "closed";
+  funding_accrued_usdt: number;
+  settle_count: number;
+  fees_usdt: number;
+  note?: string | null;
+  // open 态实时字段
+  held_days?: number;
+  funding_apr_pct?: number;
+  net_exposure_pct?: number;
+  current_funding_rate?: number | null;
+  next_funding_ts?: number | null;
+  mark_price?: number | null;
+  warning?: string | null;
+  // closed 态结算字段
+  closed_ts?: number | null;
+  closed_at?: string | null;
+  spot_exit?: number | null;
+  perp_exit?: number | null;
+  basis_pnl_usdt?: number | null;
+  total_pnl_usdt?: number | null;
+}
+
+export interface FundingArbPositionsResponse {
+  ok: boolean;
+  positions: FundingArbPosition[];
+  disclaimer?: string;
+  error?: string;
+}
+
+export interface FundingArbOpenResponse {
+  ok: boolean;
+  position_id?: number;
+  symbol?: string;
+  qty?: number;
+  capital_usdt?: number;
+  spot_entry?: number;
+  perp_entry?: number;
+  open_fee_usdt?: number;
+  current_funding_rate?: number;
+  warning?: string | null;
+  error?: string;
+}
+
+export interface FundingArbCloseResponse {
+  ok: boolean;
+  position_id?: number;
+  symbol?: string;
+  funding_accrued_usdt?: number;
+  basis_pnl_usdt?: number;
+  fees_usdt?: number;
+  total_pnl_usdt?: number;
+  held_days?: number;
+  realized_apr_pct?: number;
+  error?: string;
+}
+
+export interface FundingArbPnlResponse {
+  ok: boolean;
+  open?: {
+    count: number;
+    capital_usdt: number;
+    funding_accrued_usdt: number;
+    funding_apr_pct: number;
+  };
+  closed?: {
+    count: number;
+    funding_accrued_usdt: number;
+    total_pnl_usdt: number;
+  };
+  all_time_funding_usdt?: number;
+  basis?: string;
+  disclaimer?: string;
   error?: string;
 }
 

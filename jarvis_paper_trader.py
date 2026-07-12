@@ -337,6 +337,20 @@ def _close_position(pos: dict, exit_price: float, reason: str, cfg: dict) -> dic
 
     _log(f"🔴 {sym} 平仓 #{pos['id']} 现价≈{exit_price} 原因={reason} PnL={pnl_pct}% ({pnl_usdt}U) "
          f"回款{proceeds}U 余额{cash_after}U")
+
+    # 止盈/止损触发 → 按该笔订单的邮件通知配置发信（未配置/失败均不影响平仓主流程）
+    if reason in ("take", "stop"):
+        try:
+            import jarvis_order_notify as jon
+            note = jon.notify_position_closed(pos, exit_price, reason,
+                                              pnl_usdt=pnl_usdt, pnl_pct=pnl_pct)
+            if note.get("sent"):
+                _log(f"📧 {sym} #{pos['id']} {'止盈' if reason == 'take' else '止损'}邮件已发送 → {note.get('to')}")
+            elif note.get("reason"):
+                _log(f"⚠️ {sym} #{pos['id']} 平仓邮件发送失败: {note.get('reason')}"[:200])
+        except Exception as exc:  # noqa: BLE001 — 通知失败不影响平仓
+            _log(f"⚠️ 平仓邮件通知异常（已忽略）: {exc!r}"[:160])
+
     return {"symbol": sym, "position_id": pos["id"], "exit_price": exit_price,
             "reason": reason, "pnl_pct": pnl_pct, "pnl_usdt": pnl_usdt, "order_uid": order_uid,
             "proceeds_usdt": proceeds, "cash_after": cash_after}
@@ -411,7 +425,7 @@ def check_exits(cfg: dict, symbols: list[str] | None = None) -> list:
 # ─────────────────── 12 系统信号矩阵 → 模拟下单 ───────────────────
 
 # 各时间框架信号的默认时间止损（天）；multi 取主周期 4h 的口径
-_TWELVE_TIME_STOP = {"15m": 1, "1h": 3, "4h": 7, "1d": 14}
+_TWELVE_TIME_STOP = {"5m": 1, "15m": 1, "30m": 2, "1h": 3, "4h": 7, "1d": 14}
 TWELVE_MIN_CONFIDENCE = 0.45   # 共识置信度低于此不开仓
 TWELVE_POSITION_PCT_FALLBACK = 10.0   # 计划缺仓位建议时的权益占比兜底
 

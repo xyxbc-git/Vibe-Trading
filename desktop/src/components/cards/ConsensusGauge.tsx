@@ -331,6 +331,36 @@ export default function ConsensusGauge({ symbol, tf }: ConsensusGaugeProps) {
             </p>
           </div>
 
+          {/* 「安全带」确认层：Delta 吸收背离 × 信号方向（confirmed/no-evidence/conflict） */}
+          {data.seatbelt && data.seatbelt.status !== "unavailable" && data.seatbelt.status !== "idle" && (
+            <p
+              title={`${data.seatbelt.note}${data.seatbelt.divergence_note ? `\n背离依据：${data.seatbelt.divergence_note}` : ""}`}
+              className={clsx(
+                "mt-2 flex items-start gap-1.5 text-[11px] leading-relaxed rounded px-2 py-1",
+                data.seatbelt.status === "confirmed"
+                  ? "bg-jarvis-green/10 text-jarvis-green"
+                  : data.seatbelt.status === "conflict"
+                    ? "bg-jarvis-red/15 text-jarvis-red font-medium"
+                    : "bg-jarvis-yellow/10 text-jarvis-yellow",
+              )}
+            >
+              <span className="flex-shrink-0">
+                {data.seatbelt.status === "confirmed" ? "🛡️" : data.seatbelt.status === "conflict" ? "🔴" : "⚠️"}
+              </span>
+              <span>
+                安全带 · {data.seatbelt.status_cn}
+                {data.seatbelt.grade ? `（${data.seatbelt.grade}）` : ""}
+                ：{data.seatbelt.note}
+                {data.seatbelt.confidence_delta !== 0 && (
+                  <span className="font-mono ml-1">
+                    置信度 {data.seatbelt.confidence_delta > 0 ? "+" : ""}
+                    {(data.seatbelt.confidence_delta * 100).toFixed(0)}% → {(data.seatbelt.adjusted_confidence * 100).toFixed(0)}%
+                  </span>
+                )}
+              </span>
+            </p>
+          )}
+
           {/* 12 系统投票分布（votes 和 = 12；TF 级投票见 tf_votes） */}
           <div className="mt-3">
             <p className="text-[10px] text-jarvis-text-secondary mb-1">

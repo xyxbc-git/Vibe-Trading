@@ -2,7 +2,10 @@ import { useEffect, useState } from "react";
 import { usePolling } from "@/hooks/useApi";
 import { api, formatPrice } from "@/api/client";
 import { useSymbol } from "@/hooks/useSymbol";
+import { useLivePrice } from "@/hooks/usePrice";
 import SymbolPicker from "./SymbolPicker";
+import RegimeBadge from "./RegimeBadge";
+import RefreshCountdown from "./RefreshCountdown";
 import {
   Activity,
   Clock,
@@ -23,23 +26,19 @@ interface HeaderQuote {
 export default function Header() {
   const { symbol } = useSymbol();
   const { data: wallet, error } = usePolling(api.wallet, 30_000);
-  // 顶栏现价复用价位提醒的轻量接口（后端 Binance 主源 / OKX 兜底），避免新增重复行情轮询
-  const { data: priceData } = usePolling(
-    () => api.alertPrice(symbol),
-    10_000,
-    [symbol],
-  );
+  // 顶栏现价来自全局共享 ticker（PriceProvider 10s 轮询），与 K 线图最新价同源对齐
+  const livePrice = useLivePrice();
   const connected = !error;
 
   const [quote, setQuote] = useState<HeaderQuote | null>(null);
 
   useEffect(() => {
-    if (priceData?.price == null) return;
-    const { symbol: sym, price } = priceData;
+    if (livePrice == null) return;
+    const { symbol: sym, price, at } = livePrice;
     setQuote((prev) => ({
       symbol: sym,
       price,
-      at: new Date(),
+      at: new Date(at),
       tick:
         prev && prev.symbol === sym
           ? price > prev.price
@@ -49,7 +48,7 @@ export default function Header() {
               : prev.tick
           : null,
     }));
-  }, [priceData]);
+  }, [livePrice]);
 
   // 只显示与当前选中币种匹配的报价，避免切币瞬间残留旧币价格
   const live = quote?.symbol === symbol ? quote : null;
@@ -96,7 +95,10 @@ export default function Header() {
               ? quote.at.toLocaleTimeString("en-GB", { hour12: false })
               : "--:--:--"}
           </span>
+          <RefreshCountdown />
         </div>
+
+        <RegimeBadge />
 
         <SymbolPicker />
 

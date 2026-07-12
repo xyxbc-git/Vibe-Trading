@@ -17,6 +17,7 @@ import {
   History,
   Terminal,
   Settings,
+  Scale,
   PanelLeftClose,
   PanelLeftOpen,
 } from "lucide-react";
@@ -49,6 +50,7 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { to: "/trading", label: "交易", icon: <ArrowLeftRight size={20} /> },
       { to: "/trades", label: "记录", icon: <History size={20} /> },
+      { to: "/funding-arb", label: "套利", icon: <Scale size={20} /> },
       { to: "/scalper", label: "短线", icon: <Zap size={20} /> },
       { to: "/alerts", label: "提醒", icon: <Bell size={20} /> },
     ],

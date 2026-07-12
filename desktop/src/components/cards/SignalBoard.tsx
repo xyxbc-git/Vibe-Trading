@@ -26,6 +26,7 @@ import {
   type TwelveTf,
 } from "@/api/client";
 import SignalExplainDrawer, { type ExplainRequest } from "./SignalExplainDrawer";
+import { positionZoneToQuery } from "@/lib/positionZone";
 
 /** 计划多空：优先后端显式 side 字段；缺失时由 SL/TP 相对入场价派生（多单 SL<入场<TP） */
 export function planSide(plan: {
@@ -194,7 +195,7 @@ function normalizeDirection(d: unknown): SignalDirection {
   return d === "bullish" || d === "bearish" ? d : "neutral";
 }
 
-const TF_OPTIONS: TwelveTf[] = ["15m", "1h", "4h", "1d"];
+const TF_OPTIONS: TwelveTf[] = ["5m", "15m", "30m", "1h", "4h", "1d"];
 
 /** "auto"（综合）口径下信号矩阵的默认取数周期 */
 export const AUTO_SIGNAL_TF: TwelveTf = "4h";
@@ -386,13 +387,52 @@ function RrBadge({ rr }: { rr: number | null | undefined }) {
   );
 }
 
+/** 「K线区间」入口：跳 K 线图画该计划的多空区间图（TradingView position 风格）。
+ *  信号格整体是 <button>，内嵌交互用 span+role 避免非法嵌套（与「盈损点」同模式）。 */
+function ZoneChartEntry({
+  onShowZone,
+  size = "sm",
+}: {
+  onShowZone: () => void;
+  size?: "sm" | "md";
+}) {
+  return (
+    <span
+      role="button"
+      tabIndex={0}
+      onClick={(e) => {
+        e.stopPropagation();
+        onShowZone();
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          e.stopPropagation();
+          onShowZone();
+        }
+      }}
+      title="跳到 K 线图，把这套计划画成多空区间图：绿色=盈利目标区、红色=止损风险区，入/损/盈三线+盈亏比一目了然"
+      className={clsx(
+        "inline-flex items-center gap-0.5 rounded border border-jarvis-blue/40 text-jarvis-blue hover:bg-jarvis-blue/10 transition-colors cursor-pointer",
+        size === "md" ? "text-[10px] px-1.5 py-0.5" : "text-[9px] px-1.5 py-px",
+      )}
+    >
+      <CandlestickChart size={size === "md" ? 10 : 9} />
+      K线区间
+    </span>
+  );
+}
+
 /** 折叠态：多空徽章 + 入场/止损/止盈紧凑 chips 一行 */
 function PlanChips({
   plan,
   mismatch,
+  onShowZone,
 }: {
   plan: SignalTradePlan;
   mismatch: boolean;
+  /** 跳 K 线图画多空区间图；计划方向不可判定时不传（不显示入口） */
+  onShowZone?: () => void;
 }) {
   const side = planSide(plan);
   return (
@@ -408,6 +448,7 @@ function PlanChips({
       <span className="text-[10px] px-1.5 py-0.5 rounded bg-jarvis-green/10 text-jarvis-green font-mono">
         盈 {formatPrice(plan.take_profit)}
       </span>
+      {onShowZone && <ZoneChartEntry onShowZone={onShowZone} />}
     </div>
   );
 }
@@ -417,11 +458,14 @@ function PlanDetail({
   plan,
   mismatch,
   price,
+  onShowZone,
 }: {
   plan: SignalTradePlan;
   mismatch: boolean;
   /** 当前现价（用于追高/追空判定）；缺失时不判定 */
   price?: number | null;
+  /** 跳 K 线图画多空区间图；计划方向不可判定时不传（不显示入口） */
+  onShowZone?: () => void;
 }) {
   const side = planSide(plan);
   return (
@@ -434,7 +478,10 @@ function PlanDetail({
             {entryTypeCn(plan.entry_type, side)}
           </span>
         </span>
-        <RrBadge rr={plan.rr} />
+        <span className="flex items-center gap-1.5">
+          {onShowZone && <ZoneChartEntry onShowZone={onShowZone} size="md" />}
+          <RrBadge rr={plan.rr} />
+        </span>
       </div>
       {side != null && (
         <p className="text-[10px] text-jarvis-text leading-relaxed bg-jarvis-bg rounded px-1.5 py-1">
@@ -475,6 +522,7 @@ function SignalCell({
   price,
   onShowMarks,
   onExplain,
+  onShowZone,
 }: {
   signal: TwelveSignal;
   /** 该 symbol×tf 的胜率回测缓存；null = 尚未回测（不渲染胜率行） */
@@ -486,6 +534,8 @@ function SignalCell({
   onShowMarks?: (system: string, side: "long" | "short") => void;
   /** 一键解读：把该信号解释成大白话（携带当前方向的胜率统计） */
   onExplain?: (signal: TwelveSignal, grade: SignalGradeStats | null) => void;
+  /** 跳 K 线图画该计划的多空区间图（TradingView position 风格） */
+  onShowZone?: (plan: SignalTradePlan, name: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const dir = normalizeDirection(signal.direction);
@@ -592,13 +642,21 @@ function SignalCell({
         />
       )}
 
-      {/* 交易计划：折叠态紧凑 chips / 展开态完整点位（均带醒目多空徽章） */}
+      {/* 交易计划：折叠态紧凑 chips / 展开态完整点位（均带醒目多空徽章 + K线区间入口） */}
       {signal.trade_plan &&
-        (open ? (
-          <PlanDetail plan={signal.trade_plan} mismatch={mismatch} price={price} />
-        ) : (
-          <PlanChips plan={signal.trade_plan} mismatch={mismatch} />
-        ))}
+        (() => {
+          const plan = signal.trade_plan;
+          // 方向可判定才给「K线区间」入口（区间几何要求多空明确）
+          const showZone =
+            onShowZone && planSide(plan) != null
+              ? () => onShowZone(plan, signal.name_cn || signal.system)
+              : undefined;
+          return open ? (
+            <PlanDetail plan={plan} mismatch={mismatch} price={price} onShowZone={showZone} />
+          ) : (
+            <PlanChips plan={plan} mismatch={mismatch} onShowZone={showZone} />
+          );
+        })()}
 
       {open && (signal.key_levels?.length ?? 0) > 0 && (
         <div className="flex flex-wrap gap-1 mt-2">
@@ -634,6 +692,21 @@ export default function SignalBoard({ symbol, tf, onTfChange }: SignalBoardProps
   // 「盈损点」：跳 K 线页并携带 信号系统+回测周期+方向，由 Chart 页拉逐笔明细打标
   const showMarksOnChart = (system: string, side: "long" | "short") => {
     const q = new URLSearchParams({ sigmarks: system, sigtf: dataTf, sigside: side });
+    navigate(`/chart?${q.toString()}`);
+  };
+
+  // 「K线区间」：跳 K 线页画该计划的多空区间图（入/损/盈三价 + 方向经 query 传递）
+  const showZoneOnChart = (plan: SignalTradePlan, name: string) => {
+    const side = planSide(plan);
+    if (side == null) return;
+    const q = positionZoneToQuery({
+      side,
+      entry: plan.entry,
+      stopLoss: plan.stop_loss,
+      takeProfit: plan.take_profit,
+      name,
+      tf: dataTf,
+    });
     navigate(`/chart?${q.toString()}`);
   };
 
@@ -739,6 +812,16 @@ export default function SignalBoard({ symbol, tf, onTfChange }: SignalBoardProps
     data != null &&
     ((data.tf != null && data.tf !== dataTf) ||
       (data.symbol != null && data.symbol !== symbol));
+  // 后端把不认识的周期回退到默认档（如旧进程白名单无 5m/30m → 回声恒为 4h）时，
+  // 响应永远「过期」，按 stale 骨架处理会永久空白。请求已结束（!loading）而回声
+  // tf 仍不匹配 = 本轮最终响应就是回退结果，单独识别为「周期不支持」错误态。
+  const tfRejected =
+    !loading &&
+    data != null &&
+    data.ok !== false &&
+    data.tf != null &&
+    data.tf !== dataTf &&
+    (data.symbol == null || data.symbol === symbol);
   // 封套：{ok, signals:[...], consensus}；ok:false（如 K 线拉取失败）显示失败态而非空态；
   // 过期响应的 ok:false 不算当前口径失败
   const failed = Boolean(error) || (!stale && data != null && !data.ok);
@@ -874,6 +957,15 @@ export default function SignalBoard({ symbol, tf, onTfChange }: SignalBoardProps
               : "等待后端 /api/twelve/signals 就绪后自动恢复"}
           </p>
         </div>
+      ) : tfRejected ? (
+        <div className="py-8 text-center">
+          <p className="text-sm text-jarvis-yellow">
+            后端暂不支持 {dataTf} 周期（响应回退到 {data?.tf}）
+          </p>
+          <p className="text-xs text-jarvis-text-secondary/70 mt-1">
+            运行中的后端进程可能还是旧版本——重启后端服务（jarvis_dashboard.py）后自动恢复
+          </p>
+        </div>
       ) : (loading && !data) || stale ? (
         <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-3 animate-pulse">
           {Array.from({ length: 12 }).map((_, i) => (
@@ -896,6 +988,7 @@ export default function SignalBoard({ symbol, tf, onTfChange }: SignalBoardProps
                 price={data?.price ?? null}
                 onShowMarks={showMarksOnChart}
                 onExplain={explainSignal}
+                onShowZone={showZoneOnChart}
               />
             ))}
           </div>
