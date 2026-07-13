@@ -128,4 +128,46 @@ describe("extractCardMetrics", () => {
     expect(m.notionalUsdt).toBeUndefined();
     expect(m.leverage).toBe(1);
   });
+
+  it("extracts T1.7 companion fields (sl/tp distance + warn + plan status)", () => {
+    const m = extractCardMetrics({
+      qty: 1,
+      entry_price: 100,
+      sl_dist_pct: 7.22,
+      tp_dist_pct: 23.71,
+      sl_remaining_pct: 70,
+      sl_warn: false,
+      plan_status: "valid",
+    });
+    expect(m.slDistPct).toBe(7.22);
+    expect(m.tpDistPct).toBe(23.71);
+    expect(m.slRemainingPct).toBe(70);
+    expect(m.slWarn).toBe(false);
+    expect(m.planStatus).toBe("valid");
+  });
+
+  it("passes through reversed/neutral plan status and warn flag", () => {
+    expect(extractCardMetrics({ plan_status: "reversed", sl_warn: true }).planStatus).toBe(
+      "reversed",
+    );
+    expect(extractCardMetrics({ plan_status: "reversed", sl_warn: true }).slWarn).toBe(true);
+    expect(extractCardMetrics({ plan_status: "neutral" }).planStatus).toBe("neutral");
+  });
+
+  it("leaves companion fields undefined for manual orders / legacy rows", () => {
+    // 手动/限价单 plan_status=null；老行完全没有陪伴字段 → 全部 undefined 不显示
+    const m = extractCardMetrics({ qty: 1, entry_price: 100, plan_status: null });
+    expect(m.slDistPct).toBeUndefined();
+    expect(m.tpDistPct).toBeUndefined();
+    expect(m.slWarn).toBeUndefined();
+    expect(m.planStatus).toBeUndefined();
+    // 非法字符串状态不透传（防后端脏数据渲染成灯）
+    expect(extractCardMetrics({ plan_status: "garbage" }).planStatus).toBeUndefined();
+  });
+
+  it("tolerates negative distances (price breached SL/TP)", () => {
+    const m = extractCardMetrics({ sl_dist_pct: -1.12, tp_dist_pct: -0.5 });
+    expect(m.slDistPct).toBe(-1.12);
+    expect(m.tpDistPct).toBe(-0.5);
+  });
 });

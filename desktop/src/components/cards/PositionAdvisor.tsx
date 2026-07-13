@@ -171,16 +171,20 @@ export default function PositionAdvisor({ symbol, tf, compact }: PositionAdvisor
     };
   }, [mailOn, smtpReady]);
 
+  // [Sprint1 T1.1] 超过该杠杆保存前必须二次确认（后端配置中心下发，回退 20）
+  const [levConfirmAbove, setLevConfirmAbove] = useState(20);
+
   // 首次拉配置作为编辑初值
   useEffect(() => {
     let cancelled = false;
     const fill = (c: PositionCalcConfig) => {
       setSaved(c);
+      if (c.max_leverage_no_confirm != null) setLevConfirmAbove(c.max_leverage_no_confirm);
       setFs((f) => ({
         ...f,
         capital: String(c.poscalc_capital_usdt),
         leverage: String(c.poscalc_leverage),
-        margin: String(c.poscalc_margin_pct ?? 100),
+        margin: String(c.poscalc_margin_pct ?? 10),
       }));
     };
     api
@@ -189,13 +193,13 @@ export default function PositionAdvisor({ symbol, tf, compact }: PositionAdvisor
         if (!cancelled && c) fill(c);
       })
       .catch(() => {
-        // 配置接口不可用时用内置缺省（与后端 DEFAULTS 一致）
+        // 配置接口不可用时用内置缺省（与后端 DEFAULTS 一致：10x 杠杆 / 10% 保证金）
         if (!cancelled)
           fill({
             poscalc_capital_usdt: 130,
-            poscalc_leverage: 100,
+            poscalc_leverage: 10,
             poscalc_risk_pct: 1,
-            poscalc_margin_pct: 100,
+            poscalc_margin_pct: 10,
           });
       });
     return () => {
@@ -310,6 +314,22 @@ export default function PositionAdvisor({ symbol, tf, compact }: PositionAdvisor
 
   const handleSave = async () => {
     if (!effCfg) return;
+    // [Sprint1 T1.1] 超阈杠杆二次确认：明示爆仓亏损额（USDT + 占本金%）
+    const lev = effCfg.poscalc_leverage;
+    if (lev > levConfirmAbove) {
+      const adv = resp?.ok ? resp.advice : null;
+      const cap = effCfg.poscalc_capital_usdt;
+      const liqLoss = adv?.liquidation?.loss_usdt;
+      const liqPrice = adv?.liquidation?.price;
+      const lossLine =
+        liqLoss != null && cap > 0
+          ? `若价格触及爆仓价 ${liqPrice}，将亏损约 ${liqLoss} USDT（占本金 ${((liqLoss / cap) * 100).toFixed(1)}%）。`
+          : "高杠杆下若触及爆仓价，将损失该仓位的全部保证金。";
+      const okGo = window.confirm(
+        `⚠️ 高杠杆确认\n\n当前杠杆 ${lev}x 已超过安全确认阈值 ${levConfirmAbove}x。\n${lossLine}\n\n确认继续以 ${lev}x 保存配置并生成订单？`,
+      );
+      if (!okGo) return;
+    }
     setSaving(true);
     setSavedMsg(null);
     try {

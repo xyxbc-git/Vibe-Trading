@@ -246,6 +246,16 @@ def _open(conn: sqlite3.Connection, pred: dict, cfg: dict, now_ms: int) -> Optio
     stop_dist = abs(entry - stop) / entry
     if stop_dist <= 0:
         return None
+    # [Sprint1 P1-3] 统一开仓门禁：组合熔断 + 冷静期（平仓/回填不经此处不受限）。
+    # 拦截只记日志返回 None，绝不抛出——引擎循环不能因门禁中断。
+    try:
+        import jarvis_circuit_breaker as _cb
+        _g = _cb.guard_new_order()
+        if not _g.get("allow"):
+            _log(f"⛔ {sym} 开仓被统一门禁拦截：{_g.get('reason')}")
+            return None
+    except Exception as exc:  # noqa: BLE001 — 门禁自身异常放行（paper-only，与 guard 内语义一致）
+        _log(f"⚠️ 统一门禁检查异常（放行继续）: {exc!r}")
     equity = float(cfg["account_equity_usdt"])
     risk_usdt = equity * float(cfg["intraday_risk_pct_per_trade"]) / 100.0
     notional = min(risk_usdt / stop_dist, equity * float(cfg["max_position_pct"]) / 100.0)

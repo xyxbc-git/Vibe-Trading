@@ -59,6 +59,17 @@ def _log(msg: str) -> None:
 
 def _thresholds(cfg: dict) -> dict:
     out = dict(DEFAULTS)
+    # [Sprint0] 配置中心 cb_* 键作为基线（默认=内置原值，零回归）；
+    # executor_config.json 里的旧键名仍可覆盖（存量部署兼容）。
+    try:
+        import jarvis_config as jcfg
+        C = jcfg.load()
+        for k in DEFAULTS:
+            v = C.get("cb_" + k)
+            if v is not None:
+                out[k] = float(v)
+    except Exception:  # noqa: BLE001 — 配置中心异常不拖垮熔断器
+        pass
     for k in DEFAULTS:
         v = cfg.get(k)
         if v is not None:
@@ -88,6 +99,63 @@ def _write_state(st: dict) -> None:
 
 def is_tripped() -> bool:
     return bool(_read_state().get("tripped"))
+
+
+# ── [Sprint1 T1.5] 熔断冷静期：触发后锁单 N 小时，已阅归因 + 到期才解锁 ────────
+
+def _cooldown_hours() -> float:
+    """冷静期时长（小时）：配置中心 risk.cooldown_hours，默认 4；0=禁用。"""
+    try:
+        import jarvis_config as jcfg
+        return max(0.0, float(jcfg.get("cooldown_hours")))
+    except Exception:  # noqa: BLE001
+        return 4.0
+
+
+def cooldown_status() -> dict:
+    """冷静期状态：{active, until_ts, remaining_s, acknowledged, reason}。
+
+    active = 尚在锁单窗口内（未到期，或到期但未「已阅」归因摘要）。
+    cooldown_hours=0 或从未触发 → 恒 inactive。
+    """
+    st = _read_state()
+    until = st.get("cooldown_until")
+    if not until:
+        return {"active": False, "until_ts": None, "remaining_s": 0,
+                "acknowledged": bool(st.get("cooldown_acknowledged")), "reason": None}
+    now = time.time()
+    acked = bool(st.get("cooldown_acknowledged"))
+    expired = now >= float(until)
+    active = (not expired) or (expired and not acked)
+    return {
+        "active": active,
+        "until_ts": float(until),
+        "remaining_s": max(0, int(float(until) - now)),
+        "acknowledged": acked,
+        "expired": expired,
+        "reason": st.get("cooldown_reason") or st.get("reason"),
+    }
+
+
+def acknowledge_cooldown() -> dict:
+    """用户「已阅」当日亏损归因摘要（解锁前置条件之一）。"""
+    st = _read_state()
+    st["cooldown_acknowledged"] = True
+    st["cooldown_acked_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    _write_state(st)
+    _log("COOLDOWN: loss attribution acknowledged by user")
+    return cooldown_status()
+
+
+def unlock_cooldown_early() -> dict:
+    """提前解锁冷静期（调用方必须先经用户二次确认）。同时视为已阅。"""
+    st = _read_state()
+    st["cooldown_until"] = time.time()
+    st["cooldown_acknowledged"] = True
+    st["cooldown_unlocked_early_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    _write_state(st)
+    _log("COOLDOWN: unlocked EARLY by user (double-confirmed)")
+    return cooldown_status()
 
 
 def _daily_change_pct(cfg: dict, symbol: str):
@@ -173,8 +241,14 @@ def trip(reason: str, cfg: dict | None = None,
     cfg = cfg or jx.load_config()
     st = _read_state()
     st.update({"tripped": True, "reason": reason, "ts": time.strftime("%Y-%m-%d %H:%M:%S")})
+    # [Sprint1 T1.5] 触发即进入冷静期：锁单 cooldown_hours 小时 + 重置「已阅」
+    ch = _cooldown_hours()
+    if ch > 0:
+        st["cooldown_until"] = time.time() + ch * 3600.0
+        st["cooldown_acknowledged"] = False
+        st["cooldown_reason"] = reason
     _write_state(st)
-    _log("TRIPPED: " + reason)
+    _log("TRIPPED: " + reason + (f" (cooldown {ch:g}h)" if ch > 0 else ""))
     result = {"tripped": True, "reason": reason}
 
     if do_kill:
@@ -206,7 +280,11 @@ def trip(reason: str, cfg: dict | None = None,
 
 
 def reset() -> dict:
-    """Clear halt (manual recovery). Keep peak equity so drawdown stays meaningful."""
+    """Clear halt (manual recovery). Keep peak equity so drawdown stays meaningful.
+
+    [Sprint1 T1.5] 注意：reset 只解除熔断标志，不清冷静期——锁单窗口由
+    「到期+已阅」或 unlock_cooldown_early()（用户二次确认）结束。
+    """
     st = _read_state()
     st.update({"tripped": False, "reason": None, "ts": time.strftime("%Y-%m-%d %H:%M:%S")})
     _write_state(st)
@@ -214,12 +292,74 @@ def reset() -> dict:
     return {"tripped": False}
 
 
+def today_loss_attribution() -> dict:
+    """[Sprint1 T1.5] 当日亏损归因摘要（解锁冷静期的「已阅」内容）。
+
+    从 paper_positions 聚合本地日历日内平仓的交易：总盈亏、按平仓原因分布、
+    按币种分布、亏损最大的前 5 笔。数据缺失时优雅降级返回空摘要。
+    """
+    out = {
+        "date": time.strftime("%Y-%m-%d"),
+        "closed_trades": 0, "total_pnl_usdt": 0.0,
+        "wins": 0, "losses": 0,
+        "by_reason": [], "by_symbol": [], "worst_trades": [],
+    }
+    try:
+        day_start = time.mktime(time.strptime(time.strftime("%Y-%m-%d"), "%Y-%m-%d"))
+        rows = [p for p in jpt.all_positions()
+                if p.get("status") == "closed"
+                and (p.get("signal_source") or "") != "replay"
+                and float(p.get("closed_ts") or 0) >= day_start]
+        out["closed_trades"] = len(rows)
+        pnls = [float(p.get("realized_pnl_usdt") or 0.0) for p in rows]
+        out["total_pnl_usdt"] = round(sum(pnls), 4)
+        out["wins"] = sum(1 for x in pnls if x > 0)
+        out["losses"] = sum(1 for x in pnls if x < 0)
+        by_reason: dict[str, dict] = {}
+        by_symbol: dict[str, dict] = {}
+        for p in rows:
+            pnl = float(p.get("realized_pnl_usdt") or 0.0)
+            r = str(p.get("exit_reason") or "unknown")
+            s = str(p.get("symbol") or "?")
+            by_reason.setdefault(r, {"reason": r, "count": 0, "pnl_usdt": 0.0})
+            by_reason[r]["count"] += 1
+            by_reason[r]["pnl_usdt"] = round(by_reason[r]["pnl_usdt"] + pnl, 4)
+            by_symbol.setdefault(s, {"symbol": s, "count": 0, "pnl_usdt": 0.0})
+            by_symbol[s]["count"] += 1
+            by_symbol[s]["pnl_usdt"] = round(by_symbol[s]["pnl_usdt"] + pnl, 4)
+        out["by_reason"] = sorted(by_reason.values(), key=lambda x: x["pnl_usdt"])
+        out["by_symbol"] = sorted(by_symbol.values(), key=lambda x: x["pnl_usdt"])
+        out["worst_trades"] = [
+            {"symbol": p.get("symbol"), "side": p.get("side"),
+             "entry": p.get("entry_price"), "exit": p.get("exit_price"),
+             "pnl_usdt": round(float(p.get("realized_pnl_usdt") or 0.0), 4),
+             "reason": p.get("exit_reason")}
+            for p in sorted(rows, key=lambda x: float(x.get("realized_pnl_usdt") or 0.0))[:5]
+            if float(p.get("realized_pnl_usdt") or 0.0) < 0
+        ]
+    except Exception as exc:  # noqa: BLE001 — 归因失败不阻塞面板
+        out["error"] = repr(exc)[:200]
+    return out
+
+
 def guard_new_order(cfg: dict | None = None) -> dict:
-    """Gate for order entry points. Returns {'allow': bool, 'reason': str, ...}."""
+    """Gate for order entry points. Returns {'allow': bool, 'reason': str, ...}.
+
+    [Sprint1 T1.5] 拦截顺序：tripped → 冷静期（触发后 cooldown_hours 内，
+    或到期但未「已阅」归因摘要）→ 实时评估。只拦开仓；平仓由调用方直连不经此门。
+    """
     cfg = cfg or jx.load_config()
     if is_tripped():
         st = _read_state()
         return {"allow": False, "reason": "circuit breaker tripped: " + str(st.get("reason"))}
+    cd = cooldown_status()
+    if cd["active"]:
+        if not cd.get("expired"):
+            why = (f"冷静期锁单中（剩余 {cd['remaining_s'] // 60} 分钟，"
+                   f"触发原因: {cd.get('reason')}）；提前解锁需在面板二次确认")
+        else:
+            why = "冷静期已到期，但需先查看当日亏损归因摘要并点击「已阅」才能恢复开仓"
+        return {"allow": False, "reason": why, "cooldown": cd}
     ev = evaluate(cfg)
     if not ev.get("ok"):
         # evaluation failed (e.g. no data); fail-safe is to allow but log, since paper-only

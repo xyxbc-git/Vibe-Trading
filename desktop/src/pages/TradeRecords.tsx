@@ -9,9 +9,11 @@ import {
   TrendingDown,
   ChevronDown,
   FilterX,
+  Tag,
 } from "lucide-react";
 import { usePolling } from "@/hooks/useApi";
 import { api, formatPrice } from "@/api/client";
+import BehaviorTagDialog from "@/components/cards/BehaviorTagDialog";
 import {
   type ClosedTrade,
   type OpenPosition,
@@ -79,6 +81,47 @@ function SystemTags({ raw }: { raw: string | null }) {
   );
 }
 
+/** T1.4 复盘标签徽章：有标签显示彩色标签，无标签显示「补标」引导按钮 */
+function BehaviorTagBadge({
+  tag,
+  onClick,
+}: {
+  tag: string | null | undefined;
+  onClick: () => void;
+}) {
+  if (!tag) {
+    return (
+      <button
+        onClick={onClick}
+        title="给这笔交易补复盘标签"
+        className="inline-flex items-center gap-0.5 text-[11px] px-1.5 py-0.5 rounded-full border border-dashed border-jarvis-border text-jarvis-text-secondary hover:text-jarvis-yellow hover:border-jarvis-yellow/50 transition-colors whitespace-nowrap"
+      >
+        <Tag size={10} />
+        补标
+      </button>
+    );
+  }
+  const plan = tag.includes("按计划");
+  const bad = ["恐慌", "追高", "贪婪"].some((w) => tag.includes(w));
+  return (
+    <button
+      onClick={onClick}
+      title="点击修改复盘标签"
+      className={clsx(
+        "inline-flex items-center gap-0.5 text-[11px] px-1.5 py-0.5 rounded-full transition-opacity hover:opacity-80 whitespace-nowrap",
+        plan
+          ? "bg-jarvis-green/15 text-jarvis-green"
+          : bad
+            ? "bg-jarvis-red/15 text-jarvis-red"
+            : "bg-jarvis-yellow/15 text-jarvis-yellow",
+      )}
+    >
+      <Tag size={10} />
+      {tag}
+    </button>
+  );
+}
+
 function PnlText({
   usdt,
   pct,
@@ -138,6 +181,12 @@ export default function TradeRecords() {
   const [fSource, setFSource] = useState("all");
   const [fSystem, setFSystem] = useState("all");
   const [showCount, setShowCount] = useState(PAGE);
+  // T1.4 补标/改标弹窗（自动平仓的单事后在这里补）
+  const [tagDialog, setTagDialog] = useState<{
+    positionId: number;
+    title: string;
+    currentTag: string | null;
+  } | null>(null);
 
   const open = useMemo(
     () => (openData ?? []).filter((p) => p.signal_source !== "replay"),
@@ -487,6 +536,7 @@ export default function TradeRecords() {
                   <th className={clsx(thCls, "text-right")}>数量</th>
                   <th className={clsx(thCls, "text-right")}>盈亏</th>
                   <th className={thCls}>平仓原因</th>
+                  <th className={thCls}>复盘标签</th>
                   <th className={thCls}>来源</th>
                   <th className={thCls}>依据信号系统</th>
                   <th className={thCls}>共振</th>
@@ -525,6 +575,20 @@ export default function TradeRecords() {
                       <td className={clsx(tdCls, "text-jarvis-text-secondary whitespace-nowrap")}>
                         {REASON_CN[String(t.exit_reason ?? "")] ??
                           String(t.exit_reason ?? "—")}
+                      </td>
+                      <td className={clsx(tdCls, "whitespace-nowrap")}>
+                        <BehaviorTagBadge
+                          tag={t.behavior_tag}
+                          onClick={() =>
+                            setTagDialog({
+                              positionId: t.id,
+                              title: `${t.symbol} ${t.direction === "short" ? "空单" : "多单"} #${t.id} · ${
+                                Number(t.realized_pnl_pct ?? 0) >= 0 ? "+" : ""
+                              }${Number(t.realized_pnl_pct ?? 0).toFixed(2)}%`,
+                              currentTag: t.behavior_tag ?? null,
+                            })
+                          }
+                        />
                       </td>
                       <td className={tdCls}>
                         <SourceBadge source={t.signal_source} tf={t.signal_tf} />
@@ -570,6 +634,16 @@ export default function TradeRecords() {
           </div>
         )}
       </div>
+
+      {tagDialog && (
+        <BehaviorTagDialog
+          positionId={tagDialog.positionId}
+          title={tagDialog.title}
+          currentTag={tagDialog.currentTag}
+          onClose={() => setTagDialog(null)}
+          onSaved={() => refetch()}
+        />
+      )}
     </div>
   );
 }

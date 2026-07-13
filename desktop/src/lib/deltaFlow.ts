@@ -78,6 +78,56 @@ export function strengthGrade(s: number | string | undefined): "strong" | "moder
   return "weak";
 }
 
+// ── 后端响应归一化 ──────────────────────────────────────────────────────
+//
+// 后端引擎（jarvis_delta_flow）的 bars[].t / anchors[].t 输出 ISO 8601 字符串
+// （如 "2026-07-11T04:00:00Z"），而本契约与 lightweight-charts 期望 unix 秒
+// （字符串会被图表按 yyyy-mm-dd BusinessDay 解析而崩溃：
+// 「Invalid date string=..., expected format=yyyy-mm-dd」）。
+// 前端本地 mock 路径生成的 t 已是 number——因此适配层统一在这里做：
+// 进 setDeltaResp 之前所有 t 归一为 unix 秒，非法条目丢弃。
+
+/** ISO 字符串或数值 → unix 秒；无法解析返回 null */
+function toUnixSec(t: unknown): number | null {
+  if (typeof t === "number" && Number.isFinite(t)) {
+    // 兼容毫秒时间戳误传（>1e12 视为 ms）
+    return t > 1e12 ? Math.floor(t / 1000) : Math.floor(t);
+  }
+  if (typeof t === "string") {
+    const ms = Date.parse(t);
+    if (Number.isFinite(ms)) return Math.floor(ms / 1000);
+  }
+  return null;
+}
+
+/** 后端 /api/delta 响应 → 图表可直接消费的规范化结构（t 统一 unix 秒）。
+ *  纯函数：mock（t 已是 number）与真实引擎（t 为 ISO 串）两种形态都安全。 */
+export function normalizeDeltaResponse(resp: DeltaResponse | null): DeltaResponse | null {
+  if (!resp) return resp;
+  const bars: DeltaBar[] = [];
+  for (const b of resp.bars ?? []) {
+    const sec = toUnixSec((b as { t: unknown }).t);
+    if (sec != null) bars.push({ ...b, t: sec });
+  }
+  const normSide = (side: DivergenceSide | undefined): DivergenceSide => {
+    if (!side) return { active: false };
+    const anchors: DivergenceAnchor[] = [];
+    for (const a of side.anchors ?? []) {
+      const sec = toUnixSec((a as { t: unknown }).t);
+      if (sec != null) anchors.push({ ...a, t: sec });
+    }
+    return { ...side, anchors };
+  };
+  return {
+    ...resp,
+    bars,
+    divergence: {
+      bullish: normSide(resp.divergence?.bullish),
+      bearish: normSide(resp.divergence?.bearish),
+    },
+  };
+}
+
 // ── 本地 mock 推演 ──────────────────────────────────────────────────────
 //
 // 每根 Delta ≈ 收阳/收阴方向 × 实体占比 × 成交量（无 tick 数据的近似口径）；

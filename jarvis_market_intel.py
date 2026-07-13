@@ -92,11 +92,23 @@ def _fetch_long_short() -> dict:
     if not isinstance(rows, list) or not rows:
         raise ValueError("globalLongShortAccountRatio 空返回")
     row = rows[-1]
-    return {"symbol": LS_SYMBOL,
-            "long_pct": round(float(row["longAccount"]) * 100, 1),
-            "short_pct": round(float(row["shortAccount"]) * 100, 1),
-            "ratio": round(float(row["longShortRatio"]), 2),
-            "bar_ts": int(row.get("timestamp") or 0)}
+    out = {"symbol": LS_SYMBOL,
+           "long_pct": round(float(row["longAccount"]) * 100, 1),
+           "short_pct": round(float(row["shortAccount"]) * 100, 1),
+           "ratio": round(float(row["longShortRatio"]), 2),
+           "bar_ts": int(row.get("timestamp") or 0)}
+    # 大户多空比（T1.6 背离因子用）：拉取失败不拖垮全网口径，top_* 字段缺失即可
+    try:
+        top = _get_json(f"{FAPI}/futures/data/topLongShortAccountRatio",
+                        {"symbol": LS_SYMBOL, "period": "1h", "limit": 1})
+        if isinstance(top, list) and top:
+            trow = top[-1]
+            out["top_long_pct"] = round(float(trow["longAccount"]) * 100, 1)
+            out["top_short_pct"] = round(float(trow["shortAccount"]) * 100, 1)
+            out["top_ratio"] = round(float(trow["longShortRatio"]), 2)
+    except Exception:  # noqa: BLE001 — 大户口径为增强数据，缺失时背离因子自动降级
+        pass
+    return out
 
 
 def _fetch_fng() -> dict:

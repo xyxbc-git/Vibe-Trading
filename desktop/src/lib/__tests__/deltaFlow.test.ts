@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { mockDelta, strengthGrade, type DeltaKline } from "../deltaFlow";
+import {
+  mockDelta,
+  normalizeDeltaResponse,
+  strengthGrade,
+  type DeltaKline,
+  type DeltaResponse,
+} from "../deltaFlow";
 
 /** 构造一根 K 线（timeSec 按 60s 递增） */
 function bar(i: number, open: number, close: number, high?: number, low?: number, volume = 100): DeltaKline {
@@ -86,5 +92,70 @@ describe("strengthGrade", () => {
     expect(strengthGrade("weak")).toBe("weak");
     expect(strengthGrade("whatever")).toBe("moderate");
     expect(strengthGrade(undefined)).toBe("moderate");
+  });
+});
+
+// s6-bugfix：后端引擎 t 为 ISO 字符串（"2026-07-11T04:00:00Z"），直接喂
+// lightweight-charts 会按 yyyy-mm-dd 解析崩溃——归一化层必须统一转 unix 秒
+describe("normalizeDeltaResponse", () => {
+  const isoResp = {
+    ok: true,
+    symbol: "BTCUSDT",
+    timeframe: "4h",
+    bars: [
+      { t: "2026-07-11T04:00:00Z", delta: 5, cvd: 5, volume: 10 },
+      { t: "2026-07-11T08:00:00Z", delta: -2, cvd: 3, volume: 8 },
+    ],
+    divergence: {
+      bullish: {
+        active: true,
+        strength: "strong",
+        anchors: [
+          { t: "2026-07-11T04:00:00Z", price: 100, cvd: 5 },
+          { t: "2026-07-11T08:00:00Z", price: 95, cvd: 6 },
+        ],
+      },
+      bearish: { active: false },
+    },
+  } as unknown as DeltaResponse;
+
+  it("converts ISO string t to unix seconds for bars and anchors", () => {
+    const norm = normalizeDeltaResponse(isoResp)!;
+    expect(norm.bars[0].t).toBe(Date.parse("2026-07-11T04:00:00Z") / 1000);
+    expect(norm.bars[1].t).toBe(Date.parse("2026-07-11T08:00:00Z") / 1000);
+    expect(typeof norm.bars[0].t).toBe("number");
+    expect(norm.divergence.bullish.anchors![0].t).toBe(
+      Date.parse("2026-07-11T04:00:00Z") / 1000,
+    );
+    // 原始对象不被就地修改
+    expect(typeof (isoResp.bars[0] as { t: unknown }).t).toBe("string");
+  });
+
+  it("keeps numeric t as-is (mock path) and converts ms to seconds", () => {
+    const numResp = {
+      ...isoResp,
+      bars: [
+        { t: 1_700_000_000, delta: 1, cvd: 1, volume: 1 },
+        { t: 1_700_000_060_000, delta: 1, cvd: 2, volume: 1 }, // 毫秒误传
+      ],
+      divergence: { bullish: { active: false }, bearish: { active: false } },
+    } as unknown as DeltaResponse;
+    const norm = normalizeDeltaResponse(numResp)!;
+    expect(norm.bars[0].t).toBe(1_700_000_000);
+    expect(norm.bars[1].t).toBe(1_700_000_060);
+  });
+
+  it("drops unparseable bars and handles null input", () => {
+    const badResp = {
+      ...isoResp,
+      bars: [
+        { t: "not-a-date", delta: 1, cvd: 1, volume: 1 },
+        { t: "2026-07-11T04:00:00Z", delta: 2, cvd: 3, volume: 1 },
+      ],
+      divergence: { bullish: { active: false }, bearish: { active: false } },
+    } as unknown as DeltaResponse;
+    const norm = normalizeDeltaResponse(badResp)!;
+    expect(norm.bars).toHaveLength(1);
+    expect(normalizeDeltaResponse(null)).toBeNull();
   });
 });

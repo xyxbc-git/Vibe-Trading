@@ -1051,14 +1051,21 @@ def _aggregate_trade_plan_ex(direction: str, signals: list[dict],
     # ── 止损：结构锚定优先，成员最保守/2xATR 兜底 ─────────────────────
     bullish = direction == "bullish"
     struct = _structure_stop(direction, df, zone_lo, zone_hi, atr_v)
+    sl_anchor = None
     if struct is not None:
-        sl, anchor = struct
-        sl_basis = (f"摆动{'低' if bullish else '高'}点 {_round_price(anchor)} "
+        sl, sl_anchor = struct
+        sl_basis = (f"摆动{'低' if bullish else '高'}点 {_round_price(sl_anchor)} "
                     f"{'下' if bullish else '上'}方 {SL_STRUCT_BUF_ATR}xATR 缓冲")
     else:
         sl = max(min(sls), entry_mid - 2 * atr_v) if bullish else \
             min(max(sls), entry_mid + 2 * atr_v)
         sl_basis = "同向系统最保守止损与 2xATR 兜底取近（未检出有效摆动结构位）"
+    # [Sprint1 T1.2] 止损隐蔽化：系统默认 SL 避开整数关口/摆动扫单区
+    # （仅调整系统生成值；用户自定义 SL 不经过此链路；entry 传入做方向边界兜底）
+    from jarvis_position_calc import stealth_stop_loss as _stealth
+    sl, _stealth_note = _stealth(sl, direction, atr_v, anchor=sl_anchor, entry=entry_mid)
+    if _stealth_note:
+        sl_basis += f"；隐蔽化：{_stealth_note}"
     # 自洽门禁：SL 必须落在整个入场区间外侧（落进 zone 内=挂单未成交即触发）
     if bullish and not sl < zone_lo:
         return None, {"state": "watch",

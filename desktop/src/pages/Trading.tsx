@@ -1,9 +1,10 @@
 import { useMemo, useState } from "react";
 import { useApi, usePolling } from "@/hooks/useApi";
 import { useSymbol } from "@/hooks/useSymbol";
-import { api } from "@/api/client";
+import { api, ApiError } from "@/api/client";
 import PositionCard from "@/components/cards/PositionCard";
 import OrderNotifyDialog from "@/components/cards/OrderNotifyDialog";
+import BehaviorTagDialog from "@/components/cards/BehaviorTagDialog";
 import { extractCardMetrics } from "@/lib/positionMetrics";
 import { ArrowLeftRight, ShieldCheck, AlertTriangle, Zap, FileText, Radar, Play, RotateCw, TrendingUp, Compass, Bell, Wallet } from "lucide-react";
 import { clsx } from "clsx";
@@ -71,6 +72,39 @@ export default function Trading() {
     return m;
   }, [notifyConfigs]);
   const [notifyDialog, setNotifyDialog] = useState<{ orderId: string; title: string } | null>(null);
+
+  // ── T1.3 下单前计划确认层（不阻断只提示；开关 trading.plan_confirm_enabled）──
+  // 配置读一次（Settings 改配置后重进页面生效）；共识与后端缓存同节奏 3 分钟轮询
+  const { data: confirmCfg } = useApi(api.configCenter);
+  const planConfirmEnabled = confirmCfg?.groups?.trading?.plan_confirm_enabled !== false;
+  const minRrWarning = Number(confirmCfg?.groups?.risk?.min_rr_warning ?? 1.5);
+  const { data: consensusData } = usePolling(
+    () => api.twelveConsensus(symbol),
+    180_000,
+    [symbol],
+  );
+
+  // 盈亏比 = 止盈% / 止损%（多空皆按距离比口径）；输入非法/未填时不校验
+  const rrValue = useMemo(() => {
+    const sl = parseFloat(orderForm.stopLoss);
+    const tp = parseFloat(orderForm.takeProfit);
+    if (!Number.isFinite(sl) || !Number.isFinite(tp) || sl <= 0 || tp <= 0) return null;
+    return tp / sl;
+  }, [orderForm.stopLoss, orderForm.takeProfit]);
+  const rrTooLow = rrValue != null && rrValue < minRrWarning;
+
+  // 逆信号：12 系统共识方向与下单方向相反（中性/无数据不提示）
+  const consensus = consensusData?.ok ? consensusData.consensus : null;
+  const againstConsensus = useMemo(() => {
+    if (!consensus) return null;
+    const dir = consensus.direction;
+    if (dir === "bullish" && orderForm.direction === "short") return consensus;
+    if (dir === "bearish" && orderForm.direction === "long") return consensus;
+    return null;
+  }, [consensus, orderForm.direction]);
+
+  // ── T1.4 平仓复盘打标弹窗（平仓成功后弹出；也可在交易记录页补标）──
+  const [tagDialog, setTagDialog] = useState<{ positionId: number; title: string } | null>(null);
 
   // 可用余额（现金，不含挂单冻结）：买单冻结资金，下单金额硬约束 ≤ 可用余额。
   // 钱包未加载（null）时不放行下单，避免绕过校验。
@@ -152,10 +186,24 @@ export default function Trading() {
         setOrderResult({ ok: false, msg: `下单失败：${res.reason ?? "未知原因"}` });
       }
     } catch (e) {
-      setOrderResult({
-        ok: false,
-        msg: `下单失败：${e instanceof Error ? e.message : "后端服务不可达"}`,
-      });
+      // 423 = 熔断冷静期锁单：展示剩余时间 + 触发原因 + 解锁指引（后端 body 含结构化 cooldown）
+      if (e instanceof ApiError && e.status === 423) {
+        const cd = e.body?.cooldown as { remaining_s?: number; expired?: boolean } | undefined;
+        const remainMin = cd?.remaining_s != null ? Math.ceil(cd.remaining_s / 60) : null;
+        const head =
+          cd?.expired === false || (remainMin != null && remainMin > 0)
+            ? `冷静期锁单中${remainMin != null ? `（剩余约 ${remainMin} 分钟）` : ""}`
+            : "冷静期待确认";
+        setOrderResult({
+          ok: false,
+          msg: `${head}：${e.reason ?? "开仓被风控拦截"} · 去「设置 → 风控」查看当日亏损归因，确认后可解锁`,
+        });
+      } else {
+        setOrderResult({
+          ok: false,
+          msg: `下单失败：${e instanceof Error ? e.message : "后端服务不可达"}`,
+        });
+      }
     } finally {
       setOrdering(false);
     }
@@ -172,6 +220,19 @@ export default function Trading() {
           ? { ok: true, msg: `已平仓 ${posSymbol} × ${n} 笔` }
           : { ok: false, msg: `${posSymbol} 无可平仓位（可能已被止盈/止损平掉）` },
       );
+      // T1.4 平仓成功 → 弹复盘打标（多笔时标第一笔，其余去交易记录页补标）
+      const first = res.closed?.[0] as Record<string, unknown> | undefined;
+      const pid = Number(first?.position_id ?? 0);
+      if (pid > 0) {
+        const pnlPct = first?.pnl_pct != null ? Number(first.pnl_pct) : null;
+        setTagDialog({
+          positionId: pid,
+          title:
+            `${posSymbol} 持仓 #${pid} 已平仓` +
+            (pnlPct != null ? `（${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%）` : "") +
+            (n > 1 ? ` · 另有 ${n - 1} 笔可在交易记录页补标` : ""),
+        });
+      }
       refetchPositions();
     } catch (e) {
       setOrderResult({
@@ -302,6 +363,11 @@ export default function Trading() {
                       marginUsdt={metrics.marginUsdt}
                       notionalUsdt={metrics.notionalUsdt}
                       leverage={metrics.leverage}
+                      slDistPct={metrics.slDistPct}
+                      tpDistPct={metrics.tpDistPct}
+                      slRemainingPct={metrics.slRemainingPct}
+                      slWarn={metrics.slWarn}
+                      planStatus={metrics.planStatus}
                       onClose={() => handleClosePosition(posSymbol)}
                       closing={closingSymbol === posSymbol}
                       onNotify={
@@ -674,6 +740,49 @@ export default function Trading() {
                 )}
               </div>
 
+              {/* T1.3 下单前计划确认层：只提示不阻断（trading.plan_confirm_enabled 可关） */}
+              {planConfirmEnabled && rrTooLow && (
+                <div
+                  role="alert"
+                  className="flex items-start gap-1.5 p-2.5 rounded-lg text-xs bg-jarvis-yellow/10 border border-jarvis-yellow/40 text-jarvis-yellow"
+                >
+                  <AlertTriangle size={13} className="flex-shrink-0 mt-0.5" />
+                  <span>
+                    盈亏比 1:{(rrValue as number).toFixed(2)} 低于建议 1:
+                    {minRrWarning}——止损 {orderForm.stopLoss}% 换止盈{" "}
+                    {orderForm.takeProfit}%，长期期望偏弱，建议拉大止盈或收紧止损
+                  </span>
+                </div>
+              )}
+              {planConfirmEnabled && againstConsensus && (
+                <div
+                  role="alert"
+                  className="flex items-start gap-1.5 p-2.5 rounded-lg text-xs bg-jarvis-yellow/10 border border-jarvis-yellow/40 text-jarvis-yellow"
+                >
+                  <Compass size={13} className="flex-shrink-0 mt-0.5" />
+                  <span>
+                    当前 12 系统共识为
+                    <span className="font-medium">
+                      {againstConsensus.direction === "bullish" ? "看涨" : "看跌"}
+                    </span>
+                    （置信度 {Math.round((againstConsensus.confidence ?? 0) * 100)}%），你在
+                    <span className="font-medium">逆信号交易</span>
+                    ——确认有独立依据再下单
+                  </span>
+                </div>
+              )}
+
+              {/* [M2 s5] 磁吸位提醒：现价逼近清算/止损密集区 → 插针风险 */}
+              {consensus?.seatbelt?.magnet_warning?.near && (
+                <div
+                  role="alert"
+                  className="flex items-start gap-1.5 p-2.5 rounded-lg text-xs bg-jarvis-red/10 border border-jarvis-red/40 text-jarvis-red"
+                >
+                  <AlertTriangle size={13} className="flex-shrink-0 mt-0.5" />
+                  <span>{consensus.seatbelt.magnet_warning.note}</span>
+                </div>
+              )}
+
               <button
                 onClick={handleOrder}
                 disabled={ordering || !canSubmit}
@@ -793,6 +902,14 @@ export default function Trading() {
           title={notifyDialog.title}
           onClose={() => setNotifyDialog(null)}
           onSaved={refetchNotify}
+        />
+      )}
+
+      {tagDialog && (
+        <BehaviorTagDialog
+          positionId={tagDialog.positionId}
+          title={tagDialog.title}
+          onClose={() => setTagDialog(null)}
         />
       )}
     </div>

@@ -292,6 +292,17 @@ def _open_position(
     price: float, balance: float, symbol: str,
 ) -> dict | None:
     """模拟开仓。"""
+    # [Sprint1 P1-3] 统一开仓门禁：组合熔断 + 冷静期（平仓 _close_position 不受限）。
+    # 拦截只记日志返回 None，绝不抛出——15m 引擎永续循环不能因门禁中断。
+    try:
+        import jarvis_circuit_breaker as _cb
+        _g = _cb.guard_new_order()
+        if not _g.get("allow"):
+            _log(f"⛔ {symbol} 开仓被统一门禁拦截：{_g.get('reason')}")
+            return None
+    except Exception as exc:  # noqa: BLE001 — 门禁自身异常放行（paper-only，与 guard 内语义一致）
+        _log(f"⚠️ 统一门禁检查异常（放行继续）: {exc!r}")
+
     risk = cfg.get("risk", {})
     trade_risk = risk.get("single_trade_risk", 0.01)
     position_size = balance * trade_risk

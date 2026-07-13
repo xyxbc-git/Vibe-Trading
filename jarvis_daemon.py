@@ -457,7 +457,14 @@ def install_launchd(symbols: list[str], interval_hours: float, paper_trade: bool
 def main() -> int:
     ap = argparse.ArgumentParser(description="贾维斯 7×24 定时引擎")
     ap.add_argument("--symbols", default="BTCUSDT", help="逗号分隔，如 BTCUSDT,ETHUSDT")
-    ap.add_argument("--interval-hours", type=float, default=24.0, help="循环周期（小时），默认 24")
+    # [Sprint0] 默认周期从配置中心读（daemon_interval_hours，默认 24 零回归）；CLI 显式传参仍最高优先。
+    try:
+        import jarvis_config as _jcfg
+        _default_interval = float(_jcfg.get("daemon_interval_hours") or 24.0)
+    except Exception:  # noqa: BLE001
+        _default_interval = 24.0
+    ap.add_argument("--interval-hours", type=float, default=_default_interval,
+                    help=f"循环周期（小时），默认 {_default_interval:g}（配置中心 daemon_interval_hours）")
     ap.add_argument("--once", action="store_true", help="只跑一轮就退出（cron/launchd 友好）")
     ap.add_argument("--paper-trade", action="store_true",
                     help="每轮额外跑一次模拟跟盘（撮合+盯平仓+按决策开仓）；默认关闭")

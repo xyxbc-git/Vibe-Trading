@@ -14,6 +14,33 @@ export interface LogLine {
 /** 限价单来源（limit_orders.source）：user-created=用户保存交易计划自创 / system=系统创建 */
 export type OrderSource = "user-created" | "system";
 
+/**
+ * 结构化 API 错误：非 2xx 时保留响应体，业务拦截信息不再丢失。
+ * 典型场景：423 冷静期锁单（body 含 reason 剩余分钟/触发原因 + cooldown 结构化字段）。
+ * message 维持「API <status>: <文案>」旧格式（有业务 reason 用 reason，否则 statusText），
+ * 既有 catch 只展示 e.message 的逻辑不受影响。
+ */
+export class ApiError extends Error {
+  /** HTTP 状态码（423=冷静期锁单 / 400=参数错 …） */
+  readonly status: number;
+  /** 响应体里的业务原因（reason/detail/error 字段，可能为空） */
+  readonly reason: string | null;
+  /** 完整响应体（结构化字段如 cooldown 供调用方消费；非 JSON 响应为 null） */
+  readonly body: Record<string, unknown> | null;
+
+  constructor(status: number, statusText: string, body: Record<string, unknown> | null) {
+    const reason =
+      body && typeof body === "object"
+        ? String(body.reason ?? body.detail ?? body.error ?? "") || null
+        : null;
+    super(`API ${status}: ${reason ?? statusText}`);
+    this.name = "ApiError";
+    this.status = status;
+    this.reason = reason;
+    this.body = body;
+  }
+}
+
 async function request<T>(
   endpoint: string,
   options?: RequestInit,
@@ -29,7 +56,9 @@ async function request<T>(
       ...options,
     });
     if (!res.ok) {
-      throw new Error(`API ${res.status}: ${res.statusText}`);
+      // 先尝试解析响应体：423 冷静期等业务拦截的 reason/cooldown 必须带给调用方
+      const body = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+      throw new ApiError(res.status, res.statusText, body);
     }
     return res.json();
   } catch (e) {
@@ -108,10 +137,22 @@ export const api = {
     ),
 
   // 平掉该 symbol 的全部未平仓位：POST /api/positions/close?symbol=BTCUSDT
-  closePosition: (symbol: string) =>
+  // behaviorTag 可选：平仓同时打复盘行为标签（T1.4，标签集走配置 journal_tags）
+  closePosition: (symbol: string, behaviorTag?: string) =>
     api.post<{ closed: Record<string, unknown>[] }>(
-      `/positions/close?symbol=${encodeURIComponent(symbol)}`,
+      `/positions/close?symbol=${encodeURIComponent(symbol)}` +
+        (behaviorTag ? `&behavior_tag=${encodeURIComponent(behaviorTag)}` : ""),
     ),
+
+  // T1.4 平仓复盘打标/补标；tag 传 null 清除标签
+  setBehaviorTag: (positionId: number, tag: string | null) =>
+    api.put<{ ok: boolean; position_id?: number; behavior_tag?: string | null; reason?: string }>(
+      `/positions/${positionId}/behavior-tag`,
+      { tag },
+    ),
+
+  // T1.4 成长页「行为标签分布」：按标签统计笔数/胜率/累计盈亏
+  behaviorStats: () => api.get<BehaviorStatsResponse>("/journal/behavior-stats"),
 
   ledger: () => api.get<Record<string, unknown>[]>("/ledger"),
 
@@ -224,11 +265,41 @@ export const api = {
       "/circuit-breaker/reset",
     ),
 
+  /** [M2 s5] 磁吸位（清算/止损密集区）：庄家扫单/插针目标位预判 */
+  liqMap: (symbol = "BTCUSDT", tf = "15m") =>
+    api.get<LiqMapResponse>(`/liq-map/${encodeURIComponent(symbol)}?tf=${tf}`),
+
+  /** [Sprint1 T1.5] 冷静期状态 + 当日亏损归因摘要 */
+  cbCooldown: () => api.get<CooldownResponse>("/circuit-breaker/cooldown"),
+
+  /** [Sprint1 T1.5] 用户「已阅」当日亏损归因（到期解锁前置条件） */
+  cbCooldownAck: () =>
+    api.post<{ ok: boolean; cooldown?: CooldownState; error?: string }>(
+      "/circuit-breaker/cooldown/acknowledge",
+    ),
+
+  /** [Sprint1 T1.5] 提前解锁冷静期（调用前必须经用户二次确认） */
+  cbCooldownUnlock: () =>
+    api.post<{ ok: boolean; cooldown?: CooldownState; reason?: string; error?: string }>(
+      "/circuit-breaker/cooldown/unlock",
+      { confirm: true },
+    ),
+
   killSwitch: () =>
     request<{ ok: boolean; qd?: unknown; local_cancelled?: unknown[]; error?: string }>(
       "/actions/kill-switch",
       { method: "POST" },
       30_000,
+    ),
+
+  /** [Sprint0] 统一配置中心：全量分组视图 + 字段元数据（默认/范围/枚举） */
+  configCenter: () => api.get<ConfigCenterResponse>("/config-center"),
+
+  /** [Sprint0] 统一配置中心：批量写扁平键 patch，落 config.yaml 即热生效 */
+  updateConfigCenter: (patch: Record<string, unknown>) =>
+    api.put<{ ok: boolean; applied?: Record<string, unknown>; version?: number; reason?: string }>(
+      "/config-center",
+      patch,
     ),
 
   tradingConfig: () => api.get<TradingConfig>("/trading-config"),
@@ -512,6 +583,25 @@ export const api = {
   // ─── 市场情报页（免 Key 真实数据源；后端 TTL 缓存 + 降级）───
   marketIntel: () => api.get<MarketIntelResponse>("/market-intel"),
 
+  // ─── 大单流监控 whale tape（M2 s5：aggTrade 分层聚合，WS 未就绪时 active=false）───
+  whaleSummary: (symbol?: string) =>
+    api.get<WhaleSummaryResponse>(
+      "/whale/summary" + (symbol ? `?symbol=${encodeURIComponent(symbol)}` : ""),
+    ),
+
+  liquidationSummary: (symbol?: string) =>
+    api.get<LiquidationSummary>(
+      `/liquidation/summary${symbol ? `?symbol=${encodeURIComponent(symbol)}` : ""}`,
+    ),
+
+  /** [M2 s7] Delta 面板 AI 解读（force=1 跳过后端缓存强制重算） */
+  deltaAiExplain: (symbol: string, timeframe: string, force = false) =>
+    request<DeltaAiExplainResponse>(
+      `/delta/ai-explain?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}${force ? "&force=1" : ""}`,
+      undefined,
+      90_000, // LLM 生成可能较慢，独立超时
+    ),
+
   // ─── 供需情绪综合研判（多空比/资金费率/OI/恐贪 四因子 + 综合分）───
   sentiment: (symbol = "BTCUSDT") =>
     api.get<SentimentResponse>(`/sentiment?symbol=${encodeURIComponent(symbol)}`),
@@ -610,13 +700,116 @@ export interface MarketIntelResponse {
   error?: string;
 }
 
+// ─── GET /api/delta/ai-explain Delta 面板 AI 解读（M2 s7） ───
+
+/** 结构化解读四段（LLM 与规则降级轨同构，一套渲染） */
+export interface DeltaAiExplainBody {
+  /** 一句话结论 */
+  headline: string;
+  /** 买卖力量对比（基于 Delta 正负与 CVD 趋势） */
+  power: string;
+  /** 关键信号（背离/吸收现象；无异常时说明常态） */
+  signals: string;
+  /** 建议倾向（观望/等回调/等突破 + 盈亏比提醒） */
+  suggestion: string;
+}
+
+export interface DeltaAiExplainResponse {
+  ok: boolean;
+  symbol?: string;
+  timeframe?: string;
+  /** llm=大模型生成 / rule=规则引擎降级（LLM 未配置或失败） */
+  source?: "llm" | "rule";
+  explain?: DeltaAiExplainBody;
+  /** 聚合上下文摘要（调试/透明度展示用） */
+  context_digest?: {
+    price?: number | null;
+    cvd_trend?: "up" | "down" | "flat";
+    has_divergence?: boolean;
+    absorption?: boolean;
+  };
+  /** 生成时间（unix 秒） */
+  generated_at?: number;
+  /** true=命中后端 TTL 缓存（signal.ai_explain_cache_min） */
+  cached?: boolean;
+  /** 配置开关关闭（signal.ai_explain_enabled=false），前端隐藏入口 */
+  disabled?: boolean;
+  disclaimer?: string;
+  error?: string;
+}
+
+// ─── GET /api/liquidation/summary 爆仓流面板（M2 s5） ───
+// （Magnet / LiqMapResponse 类型统一定义在下方「磁吸位 liq map」段，全文件共用一份）
+
+/** 归一化爆仓事件（side_liquidated：long=多头被强平 / short=空头被强平） */
+export interface LiquidationEvent {
+  symbol: string;
+  side: "BUY" | "SELL";
+  side_liquidated: "long" | "short";
+  price: number;
+  qty: number;
+  /** 单笔名义金额（USDT） */
+  notional: number;
+  /** 毫秒时间戳 */
+  trade_time: number;
+}
+
+/** 爆仓簇（短时同向密集强平=行情加速/磁吸位信号） */
+export interface LiquidationCluster {
+  side_liquidated: "long" | "short";
+  count: number;
+  total_usd: number;
+  /** 秒时间戳 */
+  start_ts: number;
+  end_ts: number;
+  symbols: string[];
+  note: string;
+}
+
+export interface LiquidationSummary {
+  ok: boolean;
+  symbol?: string | null;
+  window_min?: number;
+  as_of?: number;
+  stats?: {
+    long_usd: number;
+    short_usd: number;
+    long_count: number;
+    short_count: number;
+    total_usd: number;
+    /** +1=全是多头爆仓（下跌加速）… -1=全是空头爆仓 */
+    dominance: number;
+    series: { ts: number; long_usd: number; short_usd: number }[];
+  };
+  large?: LiquidationEvent[];
+  clusters?: LiquidationCluster[];
+  thresholds?: {
+    large_usd: number;
+    cluster_window_s: number;
+    cluster_min_count: number;
+  };
+  /** forceOrder 实时流降级中（代理丢弃合约域帧/WS 未运行），数据为历史库回退 */
+  degraded?: boolean;
+  /** 降级引导文案（提示把 fstream.binance.com 加入代理放行名单） */
+  guidance?: string | null;
+  history_rows?: number;
+  error?: string;
+}
+
 // ─── GET /api/sentiment 供需情绪研判 ───
 
 export type SentimentBias = "bullish" | "bearish" | "neutral";
 
-/** 单因子研判（多空比/资金费率/OI/恐贪 + 预留的爆仓/链上接口位） */
+/** 单因子研判（多空比/大户背离/资金费率/OI/恐贪 + 预留的爆仓/链上接口位） */
 export interface SentimentFactor {
-  key: "long_short" | "funding" | "oi" | "fng" | "liquidations" | "onchain";
+  key:
+    | "long_short"
+    | "top_divergence"
+    | "funding"
+    | "oi"
+    | "fng"
+    | "liquidations"
+    | "onchain";
   name: string;
   /** false = 数据源未接入/暂不可用，不参与计分（灰化展示） */
   available: boolean;
@@ -628,6 +821,27 @@ export interface SentimentFactor {
   weight: number;
   /** 为什么看多/看空的解释性文案 */
   note: string;
+}
+
+/** 大户 vs 全网多空比背离摘要（T1.6，MarketIntel 背离小卡直取） */
+export interface TopDivergenceSummary {
+  /** 大户多空比数据是否可用（false=接口未返回 top_* 字段，卡片灰化） */
+  available: boolean;
+  /** 是否触发背离信号（反向 + 占比差超阈值） */
+  active: boolean;
+  top_bias: SentimentBias;
+  /** 全网（散户主导）口径方向 */
+  retail_bias: SentimentBias;
+  top_long_pct: number | null;
+  global_long_pct: number | null;
+  /** 大户与全网多头占比差（百分点） */
+  diff_pp: number | null;
+  /** 触发阈值（百分点，jarvis_config signal.divergence_threshold × 100） */
+  threshold_pp: number;
+  score: number;
+  note: string;
+  /** 建议倾向文案（跟随大户方向 / 无背离说明） */
+  suggestion: string;
 }
 
 export interface SentimentResponse {
@@ -643,6 +857,8 @@ export interface SentimentResponse {
   warnings?: string[];
   /** 情绪极端时的止盈止损收紧建议（仅建议展示，不强制改单） */
   sl_tp_advice?: string | null;
+  /** 大户 vs 全网背离状态（T1.6 小卡） */
+  top_divergence?: TopDivergenceSummary | null;
   as_of?: number;
   intel_updated_at?: number | null;
   unavailable?: Record<string, string> | null;
@@ -1325,6 +1541,43 @@ export interface TrackData {
   recent: Record<string, unknown>[];
 }
 
+// ─── [Sprint1 T1.5] 熔断冷静期 ───
+
+export interface CooldownState {
+  active: boolean;
+  until_ts: number | null;
+  remaining_s: number;
+  acknowledged: boolean;
+  expired?: boolean;
+  reason: string | null;
+}
+
+export interface LossAttribution {
+  date: string;
+  closed_trades: number;
+  total_pnl_usdt: number;
+  wins: number;
+  losses: number;
+  by_reason: { reason: string; count: number; pnl_usdt: number }[];
+  by_symbol: { symbol: string; count: number; pnl_usdt: number }[];
+  worst_trades: {
+    symbol: string;
+    side: string;
+    entry: number | null;
+    exit: number | null;
+    pnl_usdt: number;
+    reason: string | null;
+  }[];
+  error?: string;
+}
+
+export interface CooldownResponse {
+  ok: boolean;
+  cooldown?: CooldownState;
+  attribution?: LossAttribution;
+  error?: string;
+}
+
 export interface CircuitBreakerStatus {
   ok: boolean;
   evaluation?: Record<string, unknown>;
@@ -1339,6 +1592,27 @@ export interface TradingConfig {
   min_conviction?: number;
   intraday_enabled?: boolean;
   intraday_max_open_positions?: number;
+}
+
+// ─── [Sprint0] 统一配置中心（config.yaml）───
+
+export type ConfigGroupName = "trading" | "risk" | "signal" | "data" | "notify" | "system";
+
+export interface ConfigFieldMeta {
+  group: string;
+  default: unknown;
+  type: "bool" | "int" | "float" | "list" | "str";
+  min?: number;
+  max?: number;
+  enum?: string[];
+}
+
+export interface ConfigCenterResponse {
+  groups: Record<ConfigGroupName, Record<string, unknown>>;
+  group_comments: Record<string, string>;
+  fields: Record<string, ConfigFieldMeta>;
+  meta: { version?: number; updated_at?: string; source?: string };
+  yaml_path: string;
 }
 
 // ─── 贾维斯信号引擎类型 ───
@@ -1441,6 +1715,10 @@ export interface ConsensusSeatbelt {
   note: string;
   divergence_note?: string | null;
   absorption?: { detected: boolean; side?: string; note?: string } | null;
+  /** 大单流可选因子（M2 s5 whale tape；开关 signal.whale_seatbelt_enabled，无数据缺省） */
+  whale?: SeatbeltWhaleCheck | null;
+  /** [M2 s5] 磁吸位提醒：现价逼近清算/止损密集区（开关 signal.liq_map_seatbelt_enabled） */
+  magnet_warning?: { near: boolean; magnet: Magnet | null; note: string } | null;
 }
 
 /** 共识上的供需情绪叠加层（jarvis_sentiment.apply_to_consensus 附加） */
@@ -1655,6 +1933,10 @@ export interface PositionCalcConfig {
   poscalc_leverage: number;
   poscalc_risk_pct: number;
   poscalc_margin_pct: number;
+  /** [Sprint1 T1.1] 只读：超过该杠杆保存前必须二次确认（改动走配置中心） */
+  max_leverage_no_confirm?: number;
+  /** [Sprint1 T1.1] 只读：下单链路默认杠杆安全基线 */
+  default_leverage?: number;
 }
 
 /** 止损安全等级：ok=边距充足 / warning=距爆仓过近 / danger=止损在爆仓之外 */
@@ -1866,6 +2148,111 @@ export interface FundingArbPnlResponse {
   all_time_funding_usdt?: number;
   basis?: string;
   disclaimer?: string;
+  error?: string;
+}
+
+// ─── 磁吸位 liq map（GET /api/liq-map/{symbol}，M2 s5）───
+
+/** 单个磁吸簇（清算/止损密集区，jarvis_liq_map._fmt 输出） */
+export interface Magnet {
+  kind: "long_liq" | "short_liq" | "stop_cluster";
+  side: "above" | "below";
+  price_mid: number;
+  price_low: number;
+  price_high: number;
+  /** 同类簇内归一强度 0~1 */
+  strength: number;
+  /** forceOrder 校准置信度（未校准基线 0.5） */
+  confidence: number;
+  /** 距现价 %（正=上方） */
+  dist_pct: number;
+  label: string;
+}
+
+export interface LiqMapResponse {
+  ok: boolean;
+  symbol?: string;
+  timeframe?: string;
+  price?: number;
+  /** 合并视图（按距现价排序）；数据不足为空数组 */
+  magnets?: Magnet[];
+  liq_clusters?: Magnet[];
+  stop_clusters?: Magnet[];
+  calibration?: Record<string, unknown> | null;
+  oi_notional_usdt?: number | null;
+  note?: string;
+  error?: string;
+}
+
+// ─── 大单流监控 whale tape（GET /api/whale/summary）───
+
+/** 大单流异常事件：single_super=单笔巨单 / consecutive=同向连续 / divergence=量价背离 */
+export interface WhaleEvent {
+  ts_ms: number;
+  kind: "single_super" | "consecutive" | "divergence";
+  side: "buy" | "sell";
+  note: string;
+  usd: number;
+  price: number;
+}
+
+/** 单币种窗口统计；active=false 表示 WS 未就绪/暂无该币数据（前端占位态） */
+export interface WhaleSymbolSummary {
+  symbol: string;
+  active: boolean;
+  window_min: number;
+  /** 窗口大单净流（买-卖，USD；正=净买入） */
+  net_usd: number;
+  buy_usd: number;
+  sell_usd: number;
+  /** 大单买卖额比（无卖单时为 null） */
+  buy_sell_ratio: number | null;
+  /** 大单成交额占窗口总成交额 % */
+  whale_share_pct: number;
+  whale_n: number;
+  total_usd: number;
+  price_change_pct: number | null;
+  /** 窗口级量价背离（无背离为 null） */
+  divergence: { side: "sell_into_buys" | "buy_into_sells"; note: string } | null;
+  recent_whales: { ts_ms: number; price: number; usd: number; is_buy: boolean }[];
+  events: WhaleEvent[];
+  tier1_usd: number;
+  tier2_usd: number;
+}
+
+export interface WhaleSummaryResponse {
+  ok: boolean;
+  ws_ready?: boolean;
+  window_min?: number;
+  tier1_usd?: number;
+  tier2_usd?: number;
+  symbols?: Record<string, WhaleSymbolSummary>;
+  disclaimer?: string;
+  error?: string;
+}
+
+/** 安全带大单流可选因子（consensus.seatbelt.whale；WS 无数据时缺省） */
+export interface SeatbeltWhaleCheck {
+  status: "against" | "aligned" | "idle";
+  net_usd: number;
+  window_min: number | null;
+  note: string;
+}
+
+// ─── T1.4 平仓复盘行为标签统计（GET /api/journal/behavior-stats）───
+
+export interface BehaviorTagBucket {
+  tag: string;
+  trades: number;
+  wins: number;
+  win_rate_pct: number | null;
+  pnl_usdt: number;
+}
+
+export interface BehaviorStatsResponse {
+  ok: boolean;
+  total_closed?: number;
+  buckets?: BehaviorTagBucket[];
   error?: string;
 }
 

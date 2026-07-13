@@ -345,6 +345,12 @@ def predict_latest(symbol: str = "BTCUSDT", n_splits: int = 5,
             stop, take = price + stop_atr_mult * atr_abs, price - take_atr_mult * atr_abs
         else:
             stop = take = None
+        if stop is not None:
+            # [Sprint1 T1.2] 系统默认 SL 隐蔽化：避开整数关口，远离扫单区
+            # （entry=price 做方向边界兜底，防极端 ATR 推越入场价/负数）
+            from jarvis_position_calc import stealth_stop_loss as _stealth
+            stop, _ = _stealth(stop, "bullish" if cls == 2 else "bearish", atr_abs,
+                               entry=price)
         return {
             "symbol": symbol,
             "as_of_bar_ts": ds["latest_ts"],

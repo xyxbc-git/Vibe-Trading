@@ -1,4 +1,5 @@
-import { Sprout, Trophy, Skull, CheckCircle, XCircle, Clock } from "lucide-react";
+import { Sprout, Trophy, Skull, CheckCircle, XCircle, Clock, Tag } from "lucide-react";
+import { clsx } from "clsx";
 import {
   RadarChart,
   PolarGrid,
@@ -16,7 +17,7 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from "recharts";
-import { api } from "@/api/client";
+import { api, type BehaviorStatsResponse } from "@/api/client";
 import { usePolling, useApi } from "@/hooks/useApi";
 
 interface TimelineEvent {
@@ -53,6 +54,11 @@ export default function Growth() {
   );
   const { data: stats } = usePolling<GrowthStats>(
     () => api.growthStats() as unknown as Promise<GrowthStats>,
+    60_000,
+  );
+  // T1.4 平仓复盘行为标签分布（打标数据随交易积累，60s 轮询足够）
+  const { data: behaviorStats } = usePolling<BehaviorStatsResponse>(
+    api.behaviorStats,
     60_000,
   );
 
@@ -178,6 +184,108 @@ export default function Growth() {
             </p>
           )}
         </div>
+      </div>
+
+      {/* T1.4 行为标签分布：按复盘标签统计胜率/盈亏，照出自己的交易行为模式 */}
+      <div className="card mb-4">
+        <div className="flex items-center gap-2 mb-3">
+          <Tag size={16} className="text-jarvis-yellow" />
+          <p className="stat-label font-medium">行为标签分布（平仓复盘打标）</p>
+          {behaviorStats?.total_closed != null && behaviorStats.total_closed > 0 && (
+            <span className="ml-auto text-xs text-jarvis-text-secondary">
+              已平仓 {behaviorStats.total_closed} 笔
+            </span>
+          )}
+        </div>
+        {behaviorStats?.buckets && behaviorStats.buckets.length > 0 ? (
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="border-b border-jarvis-border text-jarvis-text-secondary text-left">
+                  <th className="pb-2 pr-3 font-medium">标签</th>
+                  <th className="pb-2 pr-3 font-medium text-right">笔数</th>
+                  <th className="pb-2 pr-3 font-medium text-right">胜率</th>
+                  <th className="pb-2 pr-3 font-medium text-right">累计盈亏</th>
+                  <th className="pb-2 font-medium">占比</th>
+                </tr>
+              </thead>
+              <tbody>
+                {behaviorStats.buckets.map((b) => {
+                  const total = behaviorStats.total_closed ?? 0;
+                  const sharePct = total > 0 ? (b.trades / total) * 100 : 0;
+                  const untagged = b.tag === "未打标";
+                  const bad = ["恐慌", "追高", "贪婪"].some((w) => b.tag.includes(w));
+                  return (
+                    <tr
+                      key={b.tag}
+                      className="border-b border-jarvis-border/40 last:border-0"
+                    >
+                      <td className="py-2 pr-3">
+                        <span
+                          className={clsx(
+                            "inline-flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded-full whitespace-nowrap",
+                            untagged
+                              ? "bg-jarvis-border/40 text-jarvis-text-secondary"
+                              : b.tag.includes("按计划")
+                                ? "bg-jarvis-green/15 text-jarvis-green"
+                                : bad
+                                  ? "bg-jarvis-red/15 text-jarvis-red"
+                                  : "bg-jarvis-yellow/15 text-jarvis-yellow",
+                          )}
+                        >
+                          <Tag size={10} />
+                          {b.tag}
+                        </span>
+                      </td>
+                      <td className="py-2 pr-3 text-right font-mono text-jarvis-text">
+                        {b.trades}
+                      </td>
+                      <td className="py-2 pr-3 text-right font-mono text-jarvis-text">
+                        {b.win_rate_pct != null ? `${b.win_rate_pct.toFixed(1)}%` : "—"}
+                      </td>
+                      <td
+                        className={clsx(
+                          "py-2 pr-3 text-right font-mono",
+                          b.pnl_usdt >= 0 ? "text-jarvis-green" : "text-jarvis-red",
+                        )}
+                      >
+                        {b.pnl_usdt >= 0 ? "+" : ""}
+                        {b.pnl_usdt.toFixed(2)}U
+                      </td>
+                      <td className="py-2">
+                        <div className="flex items-center gap-2">
+                          <div className="h-1.5 w-24 bg-jarvis-bg rounded-full overflow-hidden">
+                            <div
+                              className={clsx(
+                                "h-full rounded-full",
+                                untagged
+                                  ? "bg-jarvis-border"
+                                  : bad
+                                    ? "bg-jarvis-red"
+                                    : "bg-jarvis-blue",
+                              )}
+                              style={{ width: `${sharePct}%` }}
+                            />
+                          </div>
+                          <span className="text-jarvis-text-secondary font-mono">
+                            {sharePct.toFixed(0)}%
+                          </span>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+            <p className="mt-2 text-[11px] text-jarvis-text-secondary">
+              「恐慌割肉 / 追高被套 / 贪婪不止盈」占比高说明情绪在替你交易；标签在平仓时弹窗打标，历史单可去交易记录页补标
+            </p>
+          </div>
+        ) : (
+          <p className="text-sm text-jarvis-text-secondary text-center py-8">
+            暂无打标数据 · 平仓时会弹出复盘标签选择，历史单可在交易记录页补标
+          </p>
+        )}
       </div>
 
       {/* 成长曲线 */}

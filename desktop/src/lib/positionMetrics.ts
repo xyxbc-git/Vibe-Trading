@@ -63,6 +63,9 @@ export function fmtQty(qty?: number | null): string {
   return String(Number(qty.toPrecision(4)));
 }
 
+/** 计划状态灯（T1.7）：开仓信号依据 vs 当前 12 系统共识方向 */
+export type PlanStatus = "valid" | "reversed" | "neutral";
+
 /** PositionCard 展示所需的派生指标集合 */
 export interface PositionCardMetrics {
   /** 持仓数量（币数） */
@@ -75,6 +78,16 @@ export interface PositionCardMetrics {
   leverage: number;
   /** 浮盈金额（USDT，后端按现价补列；取价失败缺失） */
   pnlUsdt?: number;
+  /** 现价到止损还差的百分比（相对现价；负=已越过止损，待盯盘平仓） */
+  slDistPct?: number;
+  /** 现价到止盈还差的百分比（相对现价） */
+  tpDistPct?: number;
+  /** 剩余距离占「入场→止损总距离」比例%（开仓=100，到达止损=0） */
+  slRemainingPct?: number;
+  /** 剩余比例低于配置阈值（risk.sl_proximity_warn_pct）→ 预警变色 */
+  slWarn?: boolean;
+  /** 计划状态灯；undefined=手动/限价单无信号依据（不显示灯） */
+  planStatus?: PlanStatus;
 }
 
 /**
@@ -98,11 +111,22 @@ export function extractCardMetrics(
   const planMargin = num(p.plan_margin_usdt);
   const planNotional = num(p.plan_notional_usdt);
   const margin = planMargin ?? spotCost;
+  const planStatus =
+    p.plan_status === "valid" ||
+    p.plan_status === "reversed" ||
+    p.plan_status === "neutral"
+      ? p.plan_status
+      : undefined;
   return {
     qty,
     marginUsdt: margin,
     notionalUsdt: planNotional ?? spotCost,
     leverage: deriveLeverage(num(p.plan_leverage), planNotional, margin),
     pnlUsdt: num(p.pnl_usdt),
+    slDistPct: num(p.sl_dist_pct),
+    tpDistPct: num(p.tp_dist_pct),
+    slRemainingPct: num(p.sl_remaining_pct),
+    slWarn: typeof p.sl_warn === "boolean" ? p.sl_warn : undefined,
+    planStatus,
   };
 }

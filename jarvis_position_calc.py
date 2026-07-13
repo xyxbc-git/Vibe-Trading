@@ -86,6 +86,123 @@ TP_LADDER_RR = (1.5, 2.0, 3.0)
 SAFETY_FACTOR = 1.25
 
 
+# ── [Sprint1 T1.2] 止损隐蔽化：避开整数关口 / 摆动点扫单区 ─────────────────────
+
+def _round_step(price: float) -> float:
+    """整数关口步长：约为价格的 2%，规整到 {1,2,5}×10^n 心理刻度。
+
+    例：BTC 60000 → 1000；ETH 3000 → 50；SOL 96 → 2；DOGE 0.2 → 0.005。
+    规整避免了纯对数量级口径对 9 开头小价位过细（如把 96.5 也当关口）的误伤。
+    """
+    target = price * 0.02
+    n = math.floor(math.log10(target))
+    best, best_diff = None, float("inf")
+    for m in (1.0, 2.0, 5.0):
+        for k in (n, n + 1):
+            c = m * 10.0 ** k
+            d = abs(math.log(c / target))
+            if d < best_diff:
+                best, best_diff = c, d
+    return best or target
+
+
+def _round_levels_near(price: float) -> list[float]:
+    """价格附近的「整数关口」候选：基础步长与更粗一档，各取上下最近关口。"""
+    if not (price and math.isfinite(price) and price > 0):
+        return []
+    base = _round_step(price)
+    out: set[float] = set()
+    for step in (base, base * 2.0):
+        if step <= 0:
+            continue
+        below = math.floor(price / step) * step
+        for lv in (below, below + step):
+            if lv > 0:
+                out.add(round(lv, 10))
+    return sorted(out)
+
+
+def stealth_stop_loss(sl: float, direction: str, atr: float | None,
+                      *, anchor: float | None = None,
+                      entry: float | None = None,
+                      enabled: bool | None = None,
+                      buffer_mult: float | None = None) -> tuple[float, str | None]:
+    """把系统默认止损从「明显扫单位」挪开：整数关口 / 摆动锚点，加 ATR 缓冲远离。
+
+    仅用于**系统生成**的默认 SL；用户自定义 SL 不得经过本函数（调用方保证）。
+
+    参数：
+      sl        原止损价；direction bullish(多，SL 在下)/bearish(空，SL 在上)
+      atr       ATR 绝对值；缺失时用 sl 的 0.5% 兜底（避让幅度退化但不失效）
+      anchor    结构锚点（摆动低/高点价，可选）：确保 SL 距锚点 ≥ buffer
+      entry     入场价（可选）：方向边界兜底——多单 SL 不得 ≥ entry、空单不得 ≤ entry
+      enabled / buffer_mult 缺省时读 jarvis_config（sl_avoid_round_levels /
+      sl_atr_buffer_mult），读取失败回退 True / 0.3——保持纯函数可测性。
+
+    安全兜底（P1-1）：调整后价格 ≤0、非有限数、或越过入场价（止损语义被破坏）
+    时一律放弃调整、回退原 SL——宁可暴露在扫单区，不能让止损静默失效。
+
+    返回 (新止损价, 调整说明|None)。未调整时原样返回 (sl, None)。永不抛出。
+    """
+    try:
+        if enabled is None or buffer_mult is None:
+            try:
+                import jarvis_config as _jc
+                if enabled is None:
+                    enabled = bool(_jc.get("sl_avoid_round_levels"))
+                if buffer_mult is None:
+                    buffer_mult = float(_jc.get("sl_atr_buffer_mult") or 0.3)
+            except Exception:  # noqa: BLE001 — 配置层异常不拖垮信号链
+                enabled = True if enabled is None else enabled
+                buffer_mult = 0.3 if buffer_mult is None else buffer_mult
+        if not enabled or direction not in ("bullish", "bearish"):
+            return sl, None
+        s = _f(sl)
+        if s is None or s <= 0:
+            return sl, None
+        a = _f(atr)
+        buf = (a if a and a > 0 else s * 0.005) * max(0.0, float(buffer_mult))
+        if buf <= 0:
+            return sl, None
+        # 多单 SL 向下避让（挪到扫单区下方），空单向上——远离止损猎杀密集区
+        away = -1.0 if direction == "bullish" else 1.0
+        near_zone = buf * 0.5  # 「贴近」判定半径：缓冲的一半
+        adjusted = s
+        reasons: list[str] = []
+        for lv in _round_levels_near(s):
+            if abs(adjusted - lv) < near_zone:
+                adjusted = lv + away * buf
+                reasons.append(f"避开整数关口 {_round_price(lv)}")
+                break
+        if anchor is not None:
+            an = _f(anchor)
+            if an and an > 0 and abs(adjusted - an) < buf and \
+                    (adjusted - an) * away <= 0:
+                # SL 落在锚点扫单侧且距离不足 → 挪到锚点外侧 buf 处
+                adjusted = an + away * buf
+                reasons.append(f"远离摆动点 {_round_price(an)}")
+        if not reasons or adjusted == s:
+            return sl, None
+        # ── [P1-1] 安全兜底：调整不得破坏止损语义，否则整体放弃回退原 SL ──
+        # 1) 价格必须为正的有限数（极端 ATR 会把多单 SL 推成 ≤0 → 永不触发）
+        if not (math.isfinite(adjusted) and adjusted > 0):
+            return sl, None
+        # 2) 不得越过入场价：多单 SL 必须 < entry，空单 SL 必须 > entry
+        e = _f(entry)
+        if e and e > 0:
+            if direction == "bullish" and adjusted >= e:
+                return sl, None
+            if direction == "bearish" and adjusted <= e:
+                return sl, None
+        # 3) 无 entry 时的对称合理性兜底：调整幅度不得超过原 SL 的 50%
+        #    （关口/锚点避让的合理量级是零点几个 ATR，超过一半价格必为异常输入）
+        if abs(adjusted - s) > s * 0.5:
+            return sl, None
+        return _round_price(adjusted), "；".join(reasons) + f"（缓冲 {buffer_mult:g}×ATR）"
+    except Exception:  # noqa: BLE001 — 隐蔽化失败宁可用原 SL，不断信号链
+        return sl, None
+
+
 def _f(v) -> float | None:
     """温和转 float；非法返回 None。"""
     try:

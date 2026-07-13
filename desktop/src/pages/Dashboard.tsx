@@ -369,6 +369,11 @@ export default function Dashboard() {
                     marginUsdt={metrics.marginUsdt}
                     notionalUsdt={metrics.notionalUsdt}
                     leverage={metrics.leverage}
+                    slDistPct={metrics.slDistPct}
+                    tpDistPct={metrics.tpDistPct}
+                    slRemainingPct={metrics.slRemainingPct}
+                    slWarn={metrics.slWarn}
+                    planStatus={metrics.planStatus}
                   />
                 );
               })}

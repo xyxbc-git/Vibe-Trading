@@ -80,6 +80,9 @@ _ATTRIBUTION_COLS = (
     ("signal_systems", "TEXT"),
     ("signal_tf", "TEXT"),
     ("signal_regime", "TEXT"),
+    # T1.4 平仓复盘行为标签（按计划止盈/恐慌割肉/追高被套…，标签集走配置 journal_tags）；
+    # 平仓时可空，交易记录页可随时补标。
+    ("behavior_tag", "TEXT"),
 )
 
 
@@ -171,6 +174,62 @@ def all_positions(symbol: str | None = None) -> list:
             params.append((symbol if symbol.endswith("USDT") else symbol + "USDT").upper())
         q += " ORDER BY opened_ts DESC"
         return [dict(r) for r in conn.execute(q, params).fetchall()]
+
+
+# ─────────────────────────── T1.4 平仓复盘行为标签 ───────────────────────────
+
+def set_behavior_tag(position_id: int, tag: str | None) -> dict:
+    """给一笔持仓/平仓记录打（或清除）复盘行为标签。
+
+    tag 合法性由调用方按配置 journal_tags 校验（此处只做存储，标签集可扩展）；
+    tag=None/"" 清除标签。返回 {ok, position_id, behavior_tag} 或 {ok:False, reason}。
+    """
+    init_positions_table()
+    clean = (tag or "").strip() or None
+    with jj._conn() as conn:
+        cur = conn.execute(
+            "UPDATE paper_positions SET behavior_tag=? WHERE id=?",
+            (clean, int(position_id)),
+        )
+        if (cur.rowcount or 0) == 0:
+            return {"ok": False, "position_id": position_id, "reason": "持仓不存在"}
+    return {"ok": True, "position_id": position_id, "behavior_tag": clean}
+
+
+def behavior_tag_stats() -> dict:
+    """按行为标签统计已平仓交易的笔数/胜率/累计盈亏（成长页「行为标签分布」卡）。
+
+    只统计已平仓且非 replay 回放样本；未打标记录归入「未打标」桶，
+    让用户看到补标覆盖率。纯读库，不联网。
+    """
+    init_positions_table()
+    with jj._conn() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT behavior_tag, realized_pnl_usdt FROM paper_positions "
+            "WHERE status='closed' AND COALESCE(signal_source,'') != 'replay'"
+        ).fetchall()]
+    buckets: dict[str, dict] = {}
+    for r in rows:
+        tag = (r.get("behavior_tag") or "").strip() or "未打标"
+        b = buckets.setdefault(tag, {"tag": tag, "trades": 0, "wins": 0, "pnl_usdt": 0.0})
+        pnl = float(r.get("realized_pnl_usdt") or 0.0)
+        b["trades"] += 1
+        if pnl >= 0:
+            b["wins"] += 1
+        b["pnl_usdt"] += pnl
+    out = []
+    for b in buckets.values():
+        n = b["trades"]
+        out.append({
+            "tag": b["tag"],
+            "trades": n,
+            "wins": b["wins"],
+            "win_rate_pct": round(100.0 * b["wins"] / n, 1) if n else None,
+            "pnl_usdt": round(b["pnl_usdt"], 4),
+        })
+    # 有标签的按笔数降序在前，「未打标」永远垫底
+    out.sort(key=lambda x: (x["tag"] == "未打标", -x["trades"]))
+    return {"ok": True, "total_closed": len(rows), "buckets": out}
 
 
 # ─────────────────────────── 开仓 ───────────────────────────

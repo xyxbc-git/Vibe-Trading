@@ -1,6 +1,6 @@
-import { useState, useEffect, useCallback } from "react";
-import { Settings as SettingsIcon, Save, RefreshCw, Wifi, Key, Palette, Server, Plug, Download, ShieldAlert, OctagonX, Coins, ChevronDown, Loader2 } from "lucide-react";
-import { api, type QdConfig, type QdConfigTest, type TradingConfig, type CircuitBreakerStatus, type LlmConfig, type LlmTestResult, type LlmUsageResponse, type LlmUsageRecent, type LlmUsageDetail } from "@/api/client";
+import { useState, useEffect, useCallback, useMemo } from "react";
+import { Settings as SettingsIcon, Save, RefreshCw, Wifi, Key, Palette, Server, Plug, Download, ShieldAlert, OctagonX, Coins, ChevronDown, Loader2, SlidersHorizontal } from "lucide-react";
+import { api, type QdConfig, type QdConfigTest, type TradingConfig, type CircuitBreakerStatus, type CooldownResponse, type LlmConfig, type LlmTestResult, type LlmUsageResponse, type LlmUsageRecent, type LlmUsageDetail, type ConfigCenterResponse, type ConfigGroupName, type ConfigFieldMeta } from "@/api/client";
 import { useApi } from "@/hooks/useApi";
 import { useSymbol } from "@/hooks/useSymbol";
 import { ACCENT_THEMES, applyAccent, getAccent } from "@/lib/theme";
@@ -1097,18 +1097,21 @@ function LlmUsageCard() {
 function PaperTradingSafetyCard() {
   const [cfg, setCfg] = useState<TradingConfig>({});
   const [cb, setCb] = useState<CircuitBreakerStatus | null>(null);
+  const [cooldown, setCooldown] = useState<CooldownResponse | null>(null);
   const [saving, setSaving] = useState(false);
   const [busy, setBusy] = useState("");
   const [msg, setMsg] = useState("");
 
   const load = useCallback(async () => {
     try {
-      const [tc, cbr] = await Promise.all([
+      const [tc, cbr, cd] = await Promise.all([
         api.tradingConfig(),
         api.circuitBreaker(),
+        api.cbCooldown().catch(() => null),
       ]);
       setCfg(tc);
       setCb(cbr);
+      setCooldown(cd);
     } catch {
       /* 静默 */
     }
@@ -1162,9 +1165,45 @@ function PaperTradingSafetyCard() {
     }
   };
 
+  // ── [Sprint1 T1.5] 冷静期：已阅归因 / 提前解锁（二次确认）──
+  const handleCooldownAck = async () => {
+    setBusy("ack");
+    try {
+      const res = await api.cbCooldownAck();
+      flash(res.ok ? "归因摘要已确认阅读 ✓" : `操作失败: ${res.error ?? ""}`, res.ok);
+    } catch (e) {
+      flash(e instanceof Error ? e.message : "操作失败", false);
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const handleCooldownUnlock = async () => {
+    const cd = cooldown?.cooldown;
+    const mins = cd ? Math.ceil(cd.remaining_s / 60) : 0;
+    if (
+      !window.confirm(
+        `⚠️ 提前解锁冷静期？\n\n冷静期还剩约 ${mins} 分钟。连续亏损后立即重新开仓，往往是情绪化交易的开始。\n\n确认放弃剩余冷静时间、立即恢复开仓能力？`,
+      )
+    )
+      return;
+    setBusy("unlock");
+    try {
+      const res = await api.cbCooldownUnlock();
+      flash(res.ok ? "冷静期已提前解锁" : `解锁失败: ${res.reason ?? res.error ?? ""}`, res.ok);
+    } catch (e) {
+      flash(e instanceof Error ? e.message : "解锁失败", false);
+    } finally {
+      setBusy("");
+    }
+  };
+
   const tripped = Boolean(
     cb?.state?.tripped ?? cb?.evaluation?.already_tripped,
   );
+  const cd = cooldown?.cooldown;
+  const attribution = cooldown?.attribution;
+  const cooldownActive = Boolean(cd?.active);
 
   return (
     <div className="card mb-4">
@@ -1250,7 +1289,80 @@ function PaperTradingSafetyCard() {
             </span>
           </div>
         )}
+        <div className="flex justify-between">
+          <span className="text-jarvis-text-secondary">冷静期</span>
+          <span className={cooldownActive ? "text-jarvis-yellow" : "text-jarvis-green"}>
+            {cooldownActive
+              ? cd?.expired
+                ? "已到期 · 待确认归因"
+                : `锁单中 · 剩余 ${Math.ceil((cd?.remaining_s ?? 0) / 60)} 分钟`
+              : "未激活"}
+          </span>
+        </div>
       </div>
+
+      {/* [Sprint1 T1.5] 冷静期面板：当日亏损归因摘要 + 已阅 / 提前解锁 */}
+      {cooldownActive && (
+        <div className="mt-2 text-xs bg-jarvis-yellow/5 border border-jarvis-yellow/30 rounded-md p-2 space-y-2">
+          <p className="text-jarvis-yellow font-medium">
+            熔断冷静期锁单中（开仓已拦截，平仓不受限）· 触发原因：{cd?.reason ?? "—"}
+          </p>
+          {attribution && (
+            <div className="space-y-1">
+              <p className="text-jarvis-text">
+                当日复盘（{attribution.date}）：平仓 {attribution.closed_trades} 笔，
+                {attribution.wins} 赢 / {attribution.losses} 亏，
+                合计 <span className={attribution.total_pnl_usdt < 0 ? "text-jarvis-red" : "text-jarvis-green"}>
+                  {attribution.total_pnl_usdt} USDT
+                </span>
+              </p>
+              {attribution.by_reason.length > 0 && (
+                <p className="text-jarvis-text-secondary">
+                  按平仓原因：
+                  {attribution.by_reason
+                    .map((r) => `${r.reason} ×${r.count}（${r.pnl_usdt} U）`)
+                    .join("、")}
+                </p>
+              )}
+              {attribution.worst_trades.length > 0 && (
+                <p className="text-jarvis-text-secondary">
+                  最大亏损：
+                  {attribution.worst_trades
+                    .slice(0, 3)
+                    .map((t) => `${t.symbol} ${t.side} ${t.pnl_usdt} U（${t.reason ?? "—"}）`)
+                    .join("、")}
+                </p>
+              )}
+              {attribution.closed_trades === 0 && (
+                <p className="text-jarvis-text-secondary">当日暂无平仓记录（触发可能来自浮亏/闪崩）。</p>
+              )}
+            </div>
+          )}
+          <div className="flex items-center gap-2">
+            {!cd?.acknowledged && (
+              <button
+                onClick={handleCooldownAck}
+                disabled={busy === "ack"}
+                className="text-xs py-1 px-3 rounded-md border border-jarvis-green/50 text-jarvis-green hover:bg-jarvis-green/10"
+              >
+                {busy === "ack" ? "确认中…" : "已阅归因摘要"}
+              </button>
+            )}
+            {cd?.acknowledged && !cd?.expired && (
+              <span className="text-jarvis-text-secondary">已阅 ✓ · 到期后自动恢复开仓</span>
+            )}
+            {!cd?.expired && (
+              <button
+                onClick={handleCooldownUnlock}
+                disabled={busy === "unlock"}
+                className="text-xs py-1 px-3 rounded-md border border-jarvis-red/50 text-jarvis-red hover:bg-jarvis-red/10"
+              >
+                {busy === "unlock" ? "解锁中…" : "提前解锁（不推荐）"}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {msg && (
         <p
@@ -1258,6 +1370,270 @@ function PaperTradingSafetyCard() {
         >
           {msg}
         </p>
+      )}
+    </div>
+  );
+}
+
+const CONFIG_GROUP_ORDER: ConfigGroupName[] = ["trading", "risk", "signal", "data", "notify", "system"];
+
+const CONFIG_GROUP_LABELS: Record<ConfigGroupName, string> = {
+  trading: "交易执行",
+  risk: "风控红线",
+  signal: "信号决策",
+  data: "数据回测",
+  notify: "通知",
+  system: "系统",
+};
+
+/** 键名 → 中文标签（缺省回退键名本身，保证新增键零维护也能编辑） */
+const CONFIG_KEY_LABELS: Record<string, string> = {
+  watchlist: "币种池",
+  min_conviction: "信心阈值",
+  max_position_pct: "单笔仓位上限 (%)",
+  account_equity_usdt: "账户权益 (USDT)",
+  entry_band_below_pct: "入场带下沿 (%)",
+  entry_band_above_pct: "入场带上沿 (%)",
+  sizing_method: "仓位算法",
+  kelly_fraction: "凯利系数",
+  poscalc_capital_usdt: "合约本金 (USDT)",
+  poscalc_leverage: "目标杠杆 (x)",
+  poscalc_risk_pct: "单笔风险 (%)",
+  poscalc_margin_pct: "保证金占比 (%)",
+  intraday_enabled: "4h 引擎开关",
+  intraday_max_open_positions: "4h 最大持仓数",
+  intraday_cooldown_bars: "4h 冷却根数",
+  max_portfolio_risk_pct: "组合风险红线 (%)",
+  max_effective_pct: "有效敞口上限 (%)",
+  stop_loss_drop_pct: "硬止损幅度 (%)",
+  take_profit_pct: "参考止盈 (%)",
+  time_stop_days: "时间止损 (天)",
+  intraday_risk_pct_per_trade: "4h 单笔风险 (%)",
+  intraday_stop_atr_mult: "4h 止损 ATR 倍数",
+  intraday_take_atr_mult: "4h 止盈 ATR 倍数",
+  intraday_time_stop_bars: "4h 时间止损 (根)",
+  intraday_max_consecutive_losses: "4h 连亏熔断 (笔)",
+  cb_drawdown_halt_pct: "组合回撤熔断 (%)",
+  cb_position_loss_halt_pct: "单仓亏损熔断 (%)",
+  cb_flash_crash_24h_pct: "24h 闪崩熔断 (%)",
+  cb_depeg_deviation_pct: "稳定币脱锚熔断 (%)",
+  plan_min_rr: "计划最低盈亏比 (RR)",
+  intraday_min_prob: "4h 开仓概率门槛",
+  debate_enabled: "多空辩论层",
+  debate_mode: "辩论模式",
+  debate_timeout_sec: "辩论超时 (秒)",
+  backtest_cost_bps: "回测滑点成本 (bps)",
+  notify_timeout_s: "通知超时 (秒)",
+  daemon_interval_hours: "守护进程周期 (小时)",
+  dashboard_host: "后端监听地址",
+  dashboard_port: "后端监听端口",
+};
+
+function ConfigCenterField({
+  k,
+  meta,
+  value,
+  onChange,
+}: {
+  k: string;
+  meta: ConfigFieldMeta;
+  value: unknown;
+  onChange: (v: unknown) => void;
+}) {
+  const label = CONFIG_KEY_LABELS[k] ?? k;
+  const hint = meta.min != null && meta.max != null ? `范围 ${meta.min}~${meta.max}` : undefined;
+  if (meta.type === "bool") {
+    return <ToggleInput label={label} value={Boolean(value)} onChange={(v) => onChange(v)} hint={hint} />;
+  }
+  if (meta.enum) {
+    return (
+      <SelectInput
+        label={label}
+        value={String(value ?? "")}
+        options={meta.enum.map((o) => ({ value: o, label: o }))}
+        onChange={(v) => onChange(v)}
+        hint={hint}
+      />
+    );
+  }
+  if (meta.type === "int" || meta.type === "float") {
+    return (
+      <NumberInput
+        label={label}
+        value={value == null ? undefined : Number(value)}
+        onChange={(v) => onChange(v)}
+        step={meta.type === "int" ? 1 : 0.1}
+        min={meta.min}
+        max={meta.max}
+        hint={hint}
+      />
+    );
+  }
+  // list / str：文本框（list 用逗号分隔）
+  const text = Array.isArray(value) ? (value as unknown[]).join(",") : String(value ?? "");
+  return (
+    <div className="flex items-center justify-between py-2.5 border-b border-jarvis-border/50 last:border-0">
+      <div>
+        <p className="text-sm text-jarvis-text">{label}</p>
+        {meta.type === "list" && <p className="text-xs text-jarvis-text-secondary">逗号分隔</p>}
+      </div>
+      <input
+        type="text"
+        value={text}
+        onChange={(e) =>
+          onChange(meta.type === "list"
+            ? e.target.value.split(",").map((s) => s.trim()).filter(Boolean)
+            : e.target.value)
+        }
+        className="w-56 px-2 py-1 text-sm font-mono text-right bg-jarvis-bg border border-jarvis-border rounded-md text-jarvis-text focus:outline-none focus:border-jarvis-blue"
+      />
+    </div>
+  );
+}
+
+function ConfigCenterCard() {
+  const [data, setData] = useState<ConfigCenterResponse | null>(null);
+  const [values, setValues] = useState<Record<string, unknown>>({});
+  const [dirty, setDirty] = useState<Record<string, unknown>>({});
+  const [openGroup, setOpenGroup] = useState<ConfigGroupName | null>("trading");
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  const load = useCallback(async () => {
+    try {
+      const res = await api.configCenter();
+      setData(res);
+      const flat: Record<string, unknown> = {};
+      for (const g of CONFIG_GROUP_ORDER) {
+        Object.assign(flat, res.groups[g] ?? {});
+      }
+      setValues(flat);
+      setDirty({});
+    } catch {
+      /* 后端未就绪时静默，卡片显示加载态 */
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const groupKeys = useMemo(() => {
+    const byGroup: Partial<Record<ConfigGroupName, string[]>> = {};
+    if (data) {
+      for (const [k, m] of Object.entries(data.fields)) {
+        const g = m.group as ConfigGroupName;
+        (byGroup[g] ??= []).push(k);
+      }
+    }
+    return byGroup;
+  }, [data]);
+
+  const handleChange = (k: string, v: unknown) => {
+    setValues((prev) => ({ ...prev, [k]: v }));
+    setDirty((prev) => ({ ...prev, [k]: v }));
+  };
+
+  const handleSave = async () => {
+    if (!Object.keys(dirty).length) {
+      setMsg("没有修改项");
+      setTimeout(() => setMsg(""), 2500);
+      return;
+    }
+    setSaving(true);
+    try {
+      const res = await api.updateConfigCenter(dirty);
+      if (res.ok) {
+        setMsg(`已保存 ${Object.keys(dirty).length} 项，即时生效 ✓（v${res.version ?? "?"}）`);
+        await load();
+      } else {
+        setMsg(`保存失败: ${res.reason ?? "未知错误"}`);
+      }
+    } catch (e) {
+      setMsg(`保存失败: ${e instanceof Error ? e.message : "网络错误"}`);
+    } finally {
+      setSaving(false);
+      setTimeout(() => setMsg(""), 4000);
+    }
+  };
+
+  const dirtyCount = Object.keys(dirty).length;
+
+  return (
+    <div className="card mb-4">
+      <div className="flex items-center justify-between mb-1">
+        <h3 className="text-sm font-semibold text-jarvis-text flex items-center gap-2">
+          <SlidersHorizontal size={14} />
+          统一配置中心
+        </h3>
+        <div className="flex items-center gap-2">
+          {msg && (
+            <span className={`text-xs ${msg.includes("失败") ? "text-jarvis-red" : "text-jarvis-green"}`}>
+              {msg}
+            </span>
+          )}
+          <button
+            onClick={load}
+            className="text-xs py-1 px-2 rounded-md border border-jarvis-border text-jarvis-text-secondary hover:text-jarvis-text"
+          >
+            重新加载
+          </button>
+          <button
+            onClick={handleSave}
+            disabled={saving || !dirtyCount}
+            className="btn-primary text-xs py-1 px-3 flex items-center gap-1 disabled:opacity-50"
+          >
+            <Save size={12} />
+            {saving ? "保存中…" : dirtyCount ? `保存 ${dirtyCount} 项修改` : "保存"}
+          </button>
+        </div>
+      </div>
+      <p className="text-xs text-jarvis-text-secondary mb-3">
+        写入 ~/.vibe-trading/config.yaml（分组 trading/risk/signal/data/notify/system），保存即热生效无需重启；
+        非法值后端自动夹到安全区间。
+        {data?.meta?.updated_at && ` 最近更新：${data.meta.updated_at}（v${data.meta.version}）`}
+      </p>
+
+      {!data ? (
+        <p className="text-xs text-jarvis-text-secondary py-4 text-center">配置加载中…</p>
+      ) : (
+        CONFIG_GROUP_ORDER.map((g) => {
+          const keys = groupKeys[g] ?? [];
+          if (!keys.length) return null;
+          const open = openGroup === g;
+          return (
+            <div key={g} className="border border-jarvis-border/60 rounded-lg mb-2 overflow-hidden">
+              <button
+                onClick={() => setOpenGroup(open ? null : g)}
+                className="w-full flex items-center justify-between px-3 py-2 bg-jarvis-bg/60 hover:bg-jarvis-bg text-left"
+              >
+                <span className="text-sm font-medium text-jarvis-text">
+                  {CONFIG_GROUP_LABELS[g]}
+                  <span className="ml-2 text-xs text-jarvis-text-secondary">
+                    {data.group_comments[g] ?? ""}
+                  </span>
+                </span>
+                <ChevronDown
+                  size={14}
+                  className={`text-jarvis-text-secondary transition-transform ${open ? "rotate-180" : ""}`}
+                />
+              </button>
+              {open && (
+                <div className="px-3 pb-1">
+                  {keys.map((k) => (
+                    <ConfigCenterField
+                      key={k}
+                      k={k}
+                      meta={data.fields[k]}
+                      value={values[k]}
+                      onChange={(v) => handleChange(k, v)}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })
       )}
     </div>
   );
@@ -1348,6 +1724,8 @@ export default function SettingsPage() {
           </span>
         )}
       </div>
+
+      <ConfigCenterCard />
 
       <PaperTradingSafetyCard />
 

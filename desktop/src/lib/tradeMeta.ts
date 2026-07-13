@@ -25,6 +25,8 @@ export interface ClosedTrade extends TradeRowBase {
   realized_pnl_usdt: number | null;
   realized_pnl_pct: number | null;
   closed_ts: number | null;
+  /** T1.4 平仓复盘行为标签（可空；交易记录页可补标） */
+  behavior_tag?: string | null;
 }
 
 /** 持仓中记录行（/api/positions?status=open 已补现价与浮动盈亏） */

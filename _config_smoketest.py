@@ -1,4 +1,4 @@
-"""离线 smoketest：T-15 统一交易配置中心。不联网。
+"""离线 smoketest：T-15 统一交易配置中心 + Sprint0 配置中心化。不联网。
 
 验证：
   1) 内置默认 = 各脚本改造前硬编码原值（零回归基线）
@@ -8,12 +8,24 @@
   5) 未知键保留（前向兼容）
   6) brief.score_and_plan 接入配置后默认口径 = 原值（0.985/1.005/0.90/1.08/30/40%上限）
   7) brief 改配置后止损/止盈/入场带随配置变化
+  8) [Sprint0] config.yaml 分组加载 / 拍平 / yaml 覆盖 json / env 最高优先
+  9) [Sprint0] 热加载（mtime 变化后无需重启读到新值）
+ 10) [Sprint0] init 模板生成 + save_yaml 往返 + to_grouped 分组视图
+ 11) [Sprint0] 新收编键（熔断/守护进程/端口/通知超时）默认 = 原硬编码
 """
 import os
 import tempfile
 
 import jarvis_config as jcfg
 import jarvis_brief as jb
+
+# 隔离全局 YAML/env：避免用户机器上已存在的 ~/.vibe-trading/config.yaml
+# 或 JARVIS_CFG_* 环境变量污染测试结果（测试自身会另建临时 yaml 验证）。
+_ORIG_YAML_PATH = jcfg.YAML_CONFIG_PATH
+jcfg.YAML_CONFIG_PATH = os.path.join(tempfile.gettempdir(), "_jarvis_smoketest_no_such.yaml")
+for _k in list(os.environ):
+    if _k.startswith(jcfg.ENV_PREFIX):
+        del os.environ[_k]
 
 fails = []
 
@@ -78,10 +90,17 @@ with tempfile.TemporaryDirectory() as td:
     check("未知键保留", jcfg.load(p).get("my_future_key") == "x")
 
 # ── 6. brief 默认口径 = 原硬编码（零回归）──
+# 隔离全局 ~/.vibe-trading/jarvis_config.json：用户机器上若通过 UI 改过参数
+# （如 time_stop_days），无隔离会污染「默认=原值」断言。
 deriv = {"funding": {"funding_7d_avg_8h_pct": 0.0, "funding_regime": "neutral"}, "long_short": {}}
 fac = {"price": 60000.0, "drawdown_from_ath_pct": -35.0, "dd30_signal_active": True,
        "above_ma200": False, "breakout_20d_active": True}
-plan = jb.score_and_plan(deriv, fac, fng_now=18)
+_orig_json_path = jcfg.CONFIG_PATH
+jcfg.CONFIG_PATH = os.path.join(tempfile.gettempdir(), "_jarvis_smoketest_no_such.json")
+try:
+    plan = jb.score_and_plan(deriv, fac, fng_now=18)
+finally:
+    jcfg.CONFIG_PATH = _orig_json_path
 if plan.get("suggested_position_pct", 0) > 0:
     check("brief 默认止损=price*0.90", plan["stop_loss"] == round(60000 * 0.90, 2), str(plan["stop_loss"]))
     check("brief 默认止盈=price*1.08", plan["take_profit_ref"] == round(60000 * 1.08, 2), str(plan["take_profit_ref"]))
@@ -107,6 +126,85 @@ with tempfile.TemporaryDirectory() as td:
             check("改配置 brief 偏多有仓位(前置)", False)
     finally:
         jcfg.CONFIG_PATH = orig
+
+# ── 8. [Sprint0] YAML 分组加载 / 覆盖优先级 ──
+with tempfile.TemporaryDirectory() as td:
+    jp = os.path.join(td, "cfg.json")
+    yp = os.path.join(td, "config.yaml")
+    # json 层写 0.9；yaml 层写 0.95 → yaml 覆盖 json
+    jcfg.save({"min_conviction": 0.9}, path=jp)
+    with open(yp, "w", encoding="utf-8") as f:
+        f.write("trading:\n  min_conviction: 0.95\nrisk:\n  stop_loss_drop_pct: 12\n")
+    cfg = jcfg.load(jp, yaml_path=yp)
+    check("yaml 覆盖 json（min_conviction=0.95）", cfg["min_conviction"] == 0.95, str(cfg["min_conviction"]))
+    check("yaml 分组键拍平（stop_loss_drop_pct=12）", cfg["stop_loss_drop_pct"] == 12.0)
+    check("yaml 未提及键回退 json/默认", cfg["take_profit_pct"] == 8.0)
+    check("meta.source 含 json+yaml", "json" in cfg["meta"]["source"] and "yaml" in cfg["meta"]["source"],
+          cfg["meta"]["source"])
+    # 扁平形态容错（省略分组也认）
+    with open(yp, "w", encoding="utf-8") as f:
+        f.write("min_conviction: 0.85\n")
+    cfg2 = jcfg.load(jp, yaml_path=yp)
+    check("yaml 扁平形态容错", cfg2["min_conviction"] == 0.85)
+    # 损坏 yaml 不拖垮（保留 json 层）
+    with open(yp, "w", encoding="utf-8") as f:
+        f.write("trading: [unclosed\n  bad yaml{{{")
+    cfg3 = jcfg.load(jp, yaml_path=yp)
+    check("损坏 yaml 回退 json 层", cfg3["min_conviction"] == 0.9, cfg3["meta"]["source"])
+
+# ── 9. [Sprint0] env 最高优先 + 热加载 ──
+with tempfile.TemporaryDirectory() as td:
+    jp = os.path.join(td, "cfg.json")
+    yp = os.path.join(td, "config.yaml")
+    with open(yp, "w", encoding="utf-8") as f:
+        f.write("trading:\n  min_conviction: 0.7\n")
+    os.environ["JARVIS_CFG_MIN_CONVICTION"] = "0.99"
+    try:
+        cfg = jcfg.load(jp, yaml_path=yp)
+        check("env 覆盖 yaml（0.99）", cfg["min_conviction"] == 0.99, str(cfg["min_conviction"]))
+        check("meta.source 标注 env", "env:" in cfg["meta"]["source"], cfg["meta"]["source"])
+    finally:
+        del os.environ["JARVIS_CFG_MIN_CONVICTION"]
+    # 热加载：改文件 mtime 后无需重启读到新值
+    cfg_a = jcfg.load(jp, yaml_path=yp)
+    check("热加载前 yaml=0.7", cfg_a["min_conviction"] == 0.7)
+    import time as _t
+    _t.sleep(0.02)
+    with open(yp, "w", encoding="utf-8") as f:
+        f.write("trading:\n  min_conviction: 0.6\n")
+    os.utime(yp, (_t.time() + 2, _t.time() + 2))  # 确保 mtime 前进（低精度文件系统兜底）
+    cfg_b = jcfg.load(jp, yaml_path=yp)
+    check("热加载后读到新值 0.6", cfg_b["min_conviction"] == 0.6, str(cfg_b["min_conviction"]))
+
+# ── 10. [Sprint0] init 模板 + save_yaml 往返 + 分组视图 ──
+with tempfile.TemporaryDirectory() as td:
+    yp = os.path.join(td, "config.yaml")
+    out = jcfg.init_yaml_template(yp)
+    check("init 生成模板", os.path.exists(out))
+    cfg = jcfg.load(os.path.join(td, "no.json"), yaml_path=yp)
+    check("模板加载后=内置默认（零回归）",
+          cfg["min_conviction"] == 0.8 and cfg["cb_drawdown_halt_pct"] == 20.0)
+    saved = jcfg.save_yaml({"cb_drawdown_halt_pct": 15, "dashboard_port": 8899}, yaml_path=yp)
+    check("save_yaml 夹护栏+写入", saved["cb_drawdown_halt_pct"] == 15.0 and saved["dashboard_port"] == 8899)
+    cfg2 = jcfg.load(os.path.join(td, "no.json"), yaml_path=yp)
+    check("save_yaml 往返一致", cfg2["cb_drawdown_halt_pct"] == 15.0 and cfg2["dashboard_port"] == 8899)
+    check("save_yaml version 累加", int(cfg2["meta"]["version"]) >= 1)
+    g = jcfg.to_grouped(cfg2)
+    check("to_grouped 六组齐全",
+          all(k in g for k in ("trading", "risk", "signal", "data", "notify", "system")))
+    check("to_grouped 键归组正确",
+          g["risk"].get("cb_drawdown_halt_pct") == 15.0 and g["system"].get("dashboard_port") == 8899)
+
+# ── 11. [Sprint0] 新收编键默认 = 原硬编码（零回归）──
+check("默认 cb_drawdown_halt_pct=20", d["cb_drawdown_halt_pct"] == 20.0)
+check("默认 cb_position_loss_halt_pct=25", d["cb_position_loss_halt_pct"] == 25.0)
+check("默认 cb_flash_crash_24h_pct=15", d["cb_flash_crash_24h_pct"] == 15.0)
+check("默认 daemon_interval_hours=24", d["daemon_interval_hours"] == 24.0)
+check("默认 dashboard 127.0.0.1:7899",
+      d["dashboard_host"] == "127.0.0.1" and d["dashboard_port"] == 7899)
+check("默认 notify_timeout_s=15", d["notify_timeout_s"] == 15)
+check("每个键都有分组", all(k in jcfg.GROUPS for k in d if k != "meta"),
+      str([k for k in d if k != "meta" and k not in jcfg.GROUPS]))
 
 print()
 if fails:

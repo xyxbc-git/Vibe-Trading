@@ -3,7 +3,7 @@ import { useSearchParams } from "react-router-dom";
 import { useApi, usePolling } from "@/hooks/useApi";
 import { useSymbol } from "@/hooks/useSymbol";
 import { useLivePrice } from "@/hooks/usePrice";
-import { api, formatPrice, type TwelveSignal, type ConsensusTradePlan } from "@/api/client";
+import { api, formatPrice, type TwelveSignal, type ConsensusTradePlan, type KeyLevel, type LiqMapResponse } from "@/api/client";
 import KlineChart from "@/components/charts/KlineChart";
 import { tradesToMarks } from "@/lib/signalTrades";
 import {
@@ -56,8 +56,9 @@ import {
   type PredictResponse,
   type PredictBar,
 } from "@/lib/predict";
-import { mockDelta, type DeltaResponse, type DeltaKline } from "@/lib/deltaFlow";
+import { mockDelta, normalizeDeltaResponse, type DeltaResponse, type DeltaKline } from "@/lib/deltaFlow";
 import DeltaPane from "@/components/charts/DeltaPane";
+import DeltaAiExplainCard from "@/components/cards/DeltaAiExplainCard";
 import { CandlestickChart, HelpCircle, Target, X } from "lucide-react";
 import PositionAdvisor from "@/components/cards/PositionAdvisor";
 import PredictionCard from "@/components/cards/PredictionCard";
@@ -693,6 +694,27 @@ export default function Chart() {
     return buildPredictionOverlay(predictResp, bars);
   }, [predictOn, predictResp, candles]);
 
+  // ── [M2 s5] 磁吸位叠加：清算/止损密集区水平线（priceLine，复用 keyLevels 通道）──
+  const [liqOn, setLiqOn] = useState(false);
+  const { data: liqMap } = usePolling(
+    () => (liqOn ? api.liqMap(symbol, "15m") : Promise.resolve(null)),
+    120_000,
+    [liqOn, symbol],
+  );
+  const liqLevels: KeyLevel[] = useMemo(() => {
+    const d = liqOn ? (liqMap as LiqMapResponse | null) : null;
+    if (!d?.ok || !d.magnets) return [];
+    // 只画强度 ≥0.4 的簇，避免线太多糊图；标签带类型缩写与强度
+    const kindTag = { long_liq: "多清", short_liq: "空清", stop_cluster: "止损" };
+    return d.magnets
+      .filter((m) => m.strength >= 0.4)
+      .slice(0, 8)
+      .map((m) => ({
+        label: `🧲${kindTag[m.kind]} ${(m.strength * 100).toFixed(0)}%`,
+        price: m.price_mid,
+      }));
+  }, [liqOn, liqMap]);
+
   // ── Delta/CVD 订单流副图（「安全带」层）：引擎 GET /api/delta，未就绪时
   // 回退 K 线本地演示推演（角标标注），与预测层同一套降级模式 ──
   const [deltaOn, setDeltaOn] = useState(false);
@@ -741,10 +763,15 @@ export default function Chart() {
         if (isStaleEcho(symbol, res?.symbol)) return;
         if (res?.timeframe && res.timeframe !== tf) return;
         if (res && res.ok !== false && Array.isArray(res.bars) && res.bars.length > 0) {
-          setDeltaResp(res);
-          setDeltaError(null);
-          setDeltaLoading(false);
-          return;
+          // 引擎 bars[].t / anchors[].t 为 ISO 字符串，图表需要 unix 秒——
+          // 不归一会让 lightweight-charts 按 yyyy-mm-dd 解析而崩溃
+          const norm = normalizeDeltaResponse(res);
+          if (norm && norm.bars.length > 0) {
+            setDeltaResp(norm);
+            setDeltaError(null);
+            setDeltaLoading(false);
+            return;
+          }
         }
         fallbackToMock(res?.error);
       } catch {
@@ -952,6 +979,15 @@ export default function Chart() {
           className={pillCls(deltaOn)}
         >
           Delta{deltaOn ? "·开" : "·关"}
+        </button>
+
+        {/* [M2 s5] 磁吸位：清算/止损密集区水平线（庄家扫单/插针目标位预判） */}
+        <button
+          onClick={() => setLiqOn((v) => !v)}
+          title="磁吸位叠加：清算簇（多/空爆仓密集触发区）与止损/整数关口聚集区的水平线。价格倾向被吸向流动性密集处——接近强磁吸位时警惕扫单插针。估算模型：VP 入场分布 × 常见杠杆档 + 摆动点/关口，forceOrder 实时校准"
+          className={pillCls(liqOn)}
+        >
+          磁吸位{liqOn ? "·开" : "·关"}
         </button>
 
         {/* 图例：解释当前模式下每类线的含义 */}
@@ -1292,7 +1328,10 @@ export default function Chart() {
             height={Math.max(400, window.innerHeight - 320)}
             smartLevels={composition.smartLevels}
             drawings={composition.drawings}
-            keyLevels={composition.keyLevels.length > 0 ? composition.keyLevels : undefined}
+            keyLevels={(() => {
+              const merged = [...composition.keyLevels, ...liqLevels];
+              return merged.length > 0 ? merged : undefined;
+            })()}
             planLines={composition.planLines.length > 0 ? composition.planLines : undefined}
             tradeMarks={sigMarks?.marks}
             prediction={predictOverlay}
@@ -1325,7 +1364,13 @@ export default function Chart() {
 
       {/* ── Delta/CVD 订单流副图（安全带层，可折叠）：吸收背离 = 真反转证据 ── */}
       {deltaOn && (
-        <DeltaPane resp={deltaResp} loading={deltaLoading} error={deltaError} />
+        <>
+          <DeltaPane resp={deltaResp} loading={deltaLoading} error={deltaError} />
+          {/* [M2 s7] AI 解读卡：把订单流数据翻译成大白话（默认折叠，点击才请求） */}
+          <div className="mt-3">
+            <DeltaAiExplainCard symbol={symbol} timeframe={tf} />
+          </div>
+        </>
       )}
 
       {/* ── 高胜率反转四条件叠加：Delta 背离 + 多分布 + 三连确认 + 止损扫单 ── */}

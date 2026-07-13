@@ -222,16 +222,85 @@ check("1x 多单爆仓价钳为 0（价格归零不爆）", lq_1x[0] == 0.0 and 
       f"lp={lq_1x[0]} dist={lq_1x[1]}")
 
 # ═══ 配置键落位（jarvis_config）═══
+# [Sprint1 T1.1] 杠杆安全化：默认杠杆 100→10、保证金 100%→10%（告别全押）
 import jarvis_config as jc
-check("配置默认 130/100/风险1%/保证金100%", jc.DEFAULTS["poscalc_capital_usdt"] == 130.0
-      and jc.DEFAULTS["poscalc_leverage"] == 100.0
+check("配置默认 130/10x/风险1%/保证金10%", jc.DEFAULTS["poscalc_capital_usdt"] == 130.0
+      and jc.DEFAULTS["poscalc_leverage"] == 10.0
       and jc.DEFAULTS["poscalc_risk_pct"] == 1.0
-      and jc.DEFAULTS["poscalc_margin_pct"] == 100.0)
+      and jc.DEFAULTS["poscalc_margin_pct"] == 10.0)
 check("杠杆护栏夹紧 1~125", jc.clamp("poscalc_leverage", 300) == 125.0
       and jc.clamp("poscalc_leverage", 0) == 1.0)
 check("风险护栏夹紧 0.1~10", jc.clamp("poscalc_risk_pct", 99) == 10.0)
 check("保证金护栏夹紧 1~100", jc.clamp("poscalc_margin_pct", 500) == 100.0
       and jc.clamp("poscalc_margin_pct", 0) == 1.0)
+check("[T1.1] 新键默认 10x/确认阈 20x", jc.DEFAULTS["default_leverage"] == 10.0
+      and jc.DEFAULTS["max_leverage_no_confirm"] == 20.0)
+
+# ═══ [Sprint1 T1.2] 止损隐蔽化 stealth_stop_loss ═══
+# 多单 SL 恰在整数关口 60000 → 应下移（远离扫单区），带说明
+_sl, _note = jpc.stealth_stop_loss(60000.0, "bullish", 600.0,
+                                   enabled=True, buffer_mult=0.3)
+check("[T1.2] 多单避开 60000 关口向下", _sl < 60000.0 and _note is not None,
+      f"sl={_sl} note={_note}")
+check("[T1.2] 偏移量=0.3xATR", abs(_sl - (60000.0 - 0.3 * 600.0)) < 0.01, str(_sl))
+# 空单 SL 在关口 → 向上避让
+_sl2, _n2 = jpc.stealth_stop_loss(3000.0, "bearish", 30.0,
+                                  enabled=True, buffer_mult=0.3)
+check("[T1.2] 空单避开 3000 关口向上", _sl2 > 3000.0 and _n2 is not None,
+      f"sl={_sl2} note={_n2}")
+# 远离关口的 SL 不动
+_sl3, _n3 = jpc.stealth_stop_loss(59712.0, "bullish", 600.0,
+                                  enabled=True, buffer_mult=0.3)
+check("[T1.2] 非关口 SL 不动", _sl3 == 59712.0 and _n3 is None, f"sl={_sl3}")
+# 开关关闭 → 关口也不动
+_sl4, _n4 = jpc.stealth_stop_loss(60000.0, "bullish", 600.0,
+                                  enabled=False, buffer_mult=0.3)
+check("[T1.2] 开关关闭不调整", _sl4 == 60000.0 and _n4 is None)
+# 摆动锚点过近 → 挪到锚点外侧
+_sl5, _n5 = jpc.stealth_stop_loss(59310.0, "bullish", 600.0, anchor=59300.0,
+                                  enabled=True, buffer_mult=0.3)
+check("[T1.2] 贴锚点多单挪到锚点下方缓冲", _sl5 <= 59300.0 - 0.3 * 600.0 + 0.01,
+      f"sl={_sl5} note={_n5}")
+# 非法输入优雅回退
+check("[T1.2] 非法方向原样返回", jpc.stealth_stop_loss(100.0, "neutral", 1.0,
+      enabled=True, buffer_mult=0.3) == (100.0, None))
+# [P1-1] 安全兜底三场景：极端 ATR 不得把 SL 推成负数/越过入场价
+# 场景 A：多单 SL=100 恰在关口，ATR=500 → 直接调整会得 100-150=-50 → 必须回退原 SL
+_slx, _nx = jpc.stealth_stop_loss(100.0, "bullish", 500.0,
+                                  enabled=True, buffer_mult=0.3)
+check("[P1-1] 极端 ATR 多单不产生负 SL（回退原值）", _slx == 100.0 and _nx is None,
+      f"sl={_slx} note={_nx}")
+# 场景 B：多单调整后越过入场价 → 回退。SL=100(关口) 入场 101，ATR=20 →
+# 调整候选 100-6=94 合法；改用空单验证越界：空单 SL=100，入场 102，ATR=20 →
+# 候选 100+6=106>102 合法不越界；构造真正越界：空单 SL=100 入场 105.5，
+# ATR=20 → 106>105.5 合法。换多单：SL=100 入场 96 → 候选 94 < 96 合法。
+# 越入场价的构造：多单 SL=100 入场 99.5，ATR=2 → near_zone=0.3，
+# 100 是关口，候选 100-0.6=99.4 < 99.5 合法；反向：ATR=-? 不行。
+# 直接构造：空单 SL=100（关口）入场 100.3，ATR=2 → 候选 100+0.6=100.6 > 100.3 ✓合法
+# 多单想越界需 buf > sl-entry 距离为负——多单 SL 本在入场下方且向下挪，
+# 越界只可能发生在「原 SL 已在入场价上方」的脏数据：SL=100 入场 99，候选 99.4>99 → 回退
+_sly, _ny = jpc.stealth_stop_loss(100.0, "bullish", 2.0, entry=99.0,
+                                  enabled=True, buffer_mult=0.3)
+check("[P1-1] 多单调整后仍≥入场价（脏数据）→ 回退", _sly == 100.0 and _ny is None,
+      f"sl={_sly} note={_ny}")
+# 场景 C：空单调整后仍≤入场价（脏数据：原 SL 在入场下方）→ 回退
+_slz, _nz = jpc.stealth_stop_loss(100.0, "bearish", 2.0, entry=101.0,
+                                  enabled=True, buffer_mult=0.3)
+check("[P1-1] 空单调整后仍≤入场价（脏数据）→ 回退", _slz == 100.0 and _nz is None,
+      f"sl={_slz} note={_nz}")
+# 场景 D：正常入场价传入不影响合法调整（多单 60000 关口，入场 61000）
+_slw, _nw = jpc.stealth_stop_loss(60000.0, "bullish", 600.0, entry=61000.0,
+                                  enabled=True, buffer_mult=0.3)
+check("[P1-1] 合法调整不受 entry 兜底影响", _slw == 59820.0 and _nw is not None,
+      f"sl={_slw}")
+# 场景 E：无 entry 时幅度兜底——调整幅度>50% 原价视为异常回退
+_slv, _nv = jpc.stealth_stop_loss(100.0, "bearish", 500.0,
+                                  enabled=True, buffer_mult=0.3)
+check("[P1-1] 无 entry 幅度>50% 回退（空单 100+150=250）", _slv == 100.0 and _nv is None,
+      f"sl={_slv} note={_nv}")
+check("[T1.2] 配置键落位", jc.DEFAULTS["sl_avoid_round_levels"] is True
+      and jc.DEFAULTS["sl_atr_buffer_mult"] == 0.3
+      and jc.DEFAULTS["cooldown_hours"] == 4.0)
 
 print()
 if fails:

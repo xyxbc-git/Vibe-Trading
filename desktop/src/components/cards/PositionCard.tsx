@@ -1,7 +1,22 @@
 import { useEffect, useRef, useState } from "react";
 import { clsx } from "clsx";
-import { TrendingUp, TrendingDown, ArrowUp, ArrowDown, Bell } from "lucide-react";
-import { riskReward, baseAsset, fmtQty } from "@/lib/positionMetrics";
+import {
+  TrendingUp,
+  TrendingDown,
+  ArrowUp,
+  ArrowDown,
+  Bell,
+  ShieldAlert,
+  CircleCheck,
+  CircleAlert,
+  CircleDashed,
+} from "lucide-react";
+import {
+  riskReward,
+  baseAsset,
+  fmtQty,
+  type PlanStatus,
+} from "@/lib/positionMetrics";
 
 interface PositionCardProps {
   symbol: string;
@@ -21,6 +36,17 @@ interface PositionCardProps {
   notionalUsdt?: number;
   /** 杠杆倍数（现货全额记账=1）；不传则不显示杠杆徽标 */
   leverage?: number;
+  /** 现价到止损还差的百分比（负=已越过止损）；T1.7 陪伴条 */
+  slDistPct?: number;
+  /** 现价到止盈还差的百分比 */
+  tpDistPct?: number;
+  /** 剩余距离占入场→止损总距离比例%（预警文案用） */
+  slRemainingPct?: number;
+  /** 止损接近度预警（后端按 risk.sl_proximity_warn_pct 配置判定） */
+  slWarn?: boolean;
+  /** 计划状态灯：valid=共识仍同向 / reversed=信号已反转 / neutral=共识中性；
+      不传=手动/限价单无信号依据（不显示灯） */
+  planStatus?: PlanStatus;
   /** 传入后卡片底部显示「平仓」按钮（Trading 页用；Dashboard 不传则不显示） */
   onClose?: () => void;
   closing?: boolean;
@@ -29,6 +55,30 @@ interface PositionCardProps {
   /** 该单已配置邮件提醒（铃铛点亮） */
   notifyOn?: boolean;
 }
+
+const PLAN_STATUS_META: Record<
+  PlanStatus,
+  { label: string; cls: string; icon: React.ReactNode; hint: string }
+> = {
+  valid: {
+    label: "计划仍有效",
+    cls: "bg-jarvis-green/15 text-jarvis-green",
+    icon: <CircleCheck size={11} />,
+    hint: "当前 12 系统共识与开仓方向一致，按原计划持有（止损止盈不动摇）",
+  },
+  reversed: {
+    label: "信号已反转",
+    cls: "bg-jarvis-yellow/15 text-jarvis-yellow",
+    icon: <CircleAlert size={11} />,
+    hint: "当前 12 系统共识已翻向反方向，建议重新评估该持仓（减仓/收紧止损/离场）",
+  },
+  neutral: {
+    label: "共识中性",
+    cls: "bg-jarvis-border/40 text-jarvis-text-secondary",
+    icon: <CircleDashed size={11} />,
+    hint: "当前 12 系统共识中性或暂不可判，按原计划的止损止盈纪律执行",
+  },
+};
 
 type Flash = "up" | "down" | null;
 
@@ -61,6 +111,11 @@ export default function PositionCard({
   marginUsdt,
   notionalUsdt,
   leverage,
+  slDistPct,
+  tpDistPct,
+  slRemainingPct,
+  slWarn,
+  planStatus,
   onClose,
   closing,
   onNotify,
@@ -95,6 +150,10 @@ export default function PositionCard({
     : hasPnlUsd && (pnlUsdt as number) >= 0;
 
   const rr = riskReward(direction, entryPrice, stopLoss, takeProfit);
+  const hasSlDist = slDistPct !== undefined && Number.isFinite(slDistPct);
+  const hasTpDist = tpDistPct !== undefined && Number.isFinite(tpDistPct);
+  const showCompanion = hasSlDist || hasTpDist || planStatus !== undefined;
+  const slBreached = hasSlDist && (slDistPct as number) < 0;
   const hasQty = qty !== undefined && Number.isFinite(qty) && qty > 0;
   const hasMargin =
     marginUsdt !== undefined && Number.isFinite(marginUsdt) && marginUsdt > 0;
@@ -246,6 +305,58 @@ export default function PositionCard({
           </div>
         )}
       </div>
+
+      {/* ── T1.7 持仓陪伴条：距止损/距止盈 + 计划状态灯（防恐慌割肉/麻痹大意） ── */}
+      {showCompanion && (
+        <div
+          className={clsx(
+            "mt-3 px-2 py-1.5 rounded-lg flex items-center gap-2 flex-wrap text-[11px] font-mono",
+            slWarn ? "bg-jarvis-yellow/10" : "bg-jarvis-bg",
+          )}
+        >
+          {hasSlDist && (
+            <span
+              title={
+                slBreached
+                  ? "现价已越过止损价，等待盯盘引擎按纪律平仓"
+                  : slRemainingPct !== undefined
+                    ? `到止损的剩余空间还剩总距离的 ${slRemainingPct.toFixed(0)}%${slWarn ? "，已低于预警线（可在设置调整 sl_proximity_warn_pct）" : ""}`
+                    : "现价到止损价的距离"
+              }
+              className={clsx(
+                "inline-flex items-center gap-1",
+                slBreached || slWarn ? "text-jarvis-yellow" : "text-jarvis-text-secondary",
+              )}
+            >
+              {(slBreached || slWarn) && <ShieldAlert size={11} />}
+              距止损{" "}
+              <span className={slBreached || slWarn ? "font-semibold" : "text-jarvis-text"}>
+                {slBreached ? "已触及" : `${(slDistPct as number).toFixed(2)}%`}
+              </span>
+            </span>
+          )}
+          {hasTpDist && (
+            <span className="text-jarvis-text-secondary" title="现价到止盈价的距离">
+              距止盈{" "}
+              <span className="text-jarvis-text">
+                {(tpDistPct as number) < 0 ? "已越过" : `${(tpDistPct as number).toFixed(2)}%`}
+              </span>
+            </span>
+          )}
+          {planStatus !== undefined && (
+            <span
+              title={PLAN_STATUS_META[planStatus].hint}
+              className={clsx(
+                "inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full font-medium ml-auto",
+                PLAN_STATUS_META[planStatus].cls,
+              )}
+            >
+              {PLAN_STATUS_META[planStatus].icon}
+              {PLAN_STATUS_META[planStatus].label}
+            </span>
+          )}
+        </div>
+      )}
 
       <div className="mt-3 pt-3 border-t border-jarvis-border flex items-center justify-between">
         <div>

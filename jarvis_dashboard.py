@@ -554,6 +554,46 @@ def api_circuit_breaker_reset():
         return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
 
 
+# ─────────── [Sprint1 T1.5] 熔断冷静期：状态 / 已阅 / 提前解锁 ───────────
+
+@app.get("/api/circuit-breaker/cooldown")
+def api_cb_cooldown_get():
+    """冷静期状态 + 当日亏损归因摘要（解锁前必须展示给用户「已阅」）。"""
+    try:
+        import jarvis_circuit_breaker as _cb
+        return JSONResponse({"ok": True, "cooldown": _cb.cooldown_status(),
+                             "attribution": _cb.today_loss_attribution()})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
+
+
+@app.post("/api/circuit-breaker/cooldown/acknowledge")
+def api_cb_cooldown_ack():
+    """用户点击「已阅」当日亏损归因摘要（冷静期到期后的解锁前置条件）。"""
+    try:
+        import jarvis_circuit_breaker as _cb
+        out = _cb.acknowledge_cooldown()
+        _log_emit("冷静期归因摘要已阅", "info", "circuit-breaker")
+        return JSONResponse({"ok": True, "cooldown": out})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
+
+
+@app.post("/api/circuit-breaker/cooldown/unlock")
+def api_cb_cooldown_unlock(data: dict | None = None):
+    """提前解锁冷静期。必须显式传 {"confirm": true}（前端二次确认后才发送）。"""
+    if not (isinstance(data, dict) and data.get("confirm") is True):
+        return JSONResponse({"ok": False, "reason": "缺少 confirm=true（需前端二次确认）"},
+                            status_code=400)
+    try:
+        import jarvis_circuit_breaker as _cb
+        out = _cb.unlock_cooldown_early()
+        _log_emit("冷静期已被用户提前解锁（二次确认）", "warn", "circuit-breaker")
+        return JSONResponse({"ok": True, "cooldown": out})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
+
+
 @app.post("/api/actions/kill-switch")
 def api_action_kill_switch():
     """急停：撤 QD 模拟挂单 + 取消本地 pending 限价单。"""
@@ -593,6 +633,53 @@ def api_trading_config_put(data: dict):
         return JSONResponse({"ok": False, "reason": "无有效字段"}, status_code=400)
     jc_mod.save(patch, source="desktop-settings", note="trading-config UI")
     return JSONResponse({"ok": True, "config": {k: jc_mod.get(k) for k in allowed}})
+
+
+# ─────────────── [Sprint0] 统一配置中心（config.yaml 分组读写）───────────────
+
+@app.get("/api/config-center")
+def api_config_center_get():
+    """全量配置分组视图 + 每键元数据（默认值/范围/枚举/类型），供 Settings 渲染。"""
+    import jarvis_config as jc_mod
+    cfg = jc_mod.load()
+    grouped = jc_mod.to_grouped(cfg)
+    meta_fields: dict = {}
+    for k, dv in jc_mod.DEFAULTS.items():
+        item: dict = {
+            "group": jc_mod.GROUPS.get(k, "misc"),
+            "default": dv,
+            "type": ("bool" if isinstance(dv, bool)
+                     else "int" if isinstance(dv, int)
+                     else "float" if isinstance(dv, float)
+                     else "list" if isinstance(dv, list) else "str"),
+        }
+        if k in jc_mod.BOUNDS:
+            item["min"], item["max"] = jc_mod.BOUNDS[k]
+        if k in jc_mod.ENUMS:
+            item["enum"] = list(jc_mod.ENUMS[k])
+        meta_fields[k] = item
+    return JSONResponse({
+        "groups": {g: grouped.get(g, {}) for g in ("trading", "risk", "signal", "data", "notify", "system")},
+        "group_comments": jc_mod.GROUP_COMMENTS,
+        "fields": meta_fields,
+        "meta": cfg.get("meta", {}),
+        "yaml_path": jc_mod.YAML_CONFIG_PATH,
+    })
+
+
+@app.put("/api/config-center")
+def api_config_center_put(data: dict):
+    """批量写配置（接受扁平键 patch）：夹护栏落 config.yaml，保存即热生效。"""
+    import jarvis_config as jc_mod
+    patch = {k: v for k, v in (data or {}).items() if k in jc_mod.DEFAULTS}
+    if not patch:
+        return JSONResponse({"ok": False, "reason": "无有效字段"}, status_code=400)
+    try:
+        cfg = jc_mod.save(patch, source="desktop-config-center", note="config-center UI")
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "reason": repr(e)[:300]}, status_code=500)
+    return JSONResponse({"ok": True, "applied": {k: cfg.get(k) for k in patch},
+                         "version": cfg.get("meta", {}).get("version")})
 
 
 @app.get("/api/snapshot")
@@ -816,6 +903,13 @@ def api_positions(symbol: str | None = None, status: str = "all", limit: int = 0
     # 同时给 open 持仓补 current_price / pnl_pct / pnl_usdt
     # （latest_price 走 60s 缓存，避免每次轮询都打外部 API；取价失败 → 字段为 None，前端按缺失态显示）。
     cfg = _trader_cfg()
+    # 预警阈值直读配置中心（jx.load_config 只透传执行手所需键；jarvis_config.get
+    # 自带 mtime 热加载缓存，改 config.yaml 即生效）
+    try:
+        import jarvis_config as _jcfg
+        warn_pct = float(_jcfg.get("sl_proximity_warn_pct") or 30.0)
+    except Exception:  # noqa: BLE001 — 配置读取异常回退默认，不拖垮持仓接口
+        warn_pct = 30.0
     for r in rows:
         side = (r.get("side") or "buy").lower()
         r["direction"] = "long" if side == "buy" else "short"
@@ -836,7 +930,54 @@ def api_positions(symbol: str | None = None, status: str = "all", limit: int = 0
         r["current_price"] = round(float(price), 8)
         r["pnl_pct"] = round((price / entry - 1.0) * 100 * sign, 2)
         r["pnl_usdt"] = round((price - entry) * qty * sign, 4)
+        # T1.7 持仓陪伴条：距止损/止盈 + 止损接近度预警 + 计划状态灯
+        r.update(_position_companion(r, float(price), float(entry), sign, warn_pct))
     return JSONResponse(rows)
+
+
+def _position_companion(r: dict, price: float, entry: float, sign: int,
+                        warn_pct: float) -> dict:
+    """开仓陪伴字段（T1.7）：给持仓卡提供「离计划还有多远」的语境，防恐慌割肉/麻痹大意。
+
+    输出（全部可缺失，前端按缺失态渲染）：
+      sl_dist_pct      现价到止损还差的百分比（相对现价；负=已越过止损待盯盘平仓）
+      tp_dist_pct      现价到止盈还差的百分比（相对现价；负=已越过止盈）
+      sl_remaining_pct 剩余距离占「入场→止损总距离」比例%（开仓=100，到达止损=0）
+      sl_warn          剩余比例 < risk.sl_proximity_warn_pct（配置，默认 30）→ 预警变色
+      plan_status      计划状态灯：valid=共识仍同向 / reversed=信号已反转 /
+                       neutral=共识中性或暂不可判 / None=手动·限价单无信号依据
+    """
+    out: dict = {}
+    sl = r.get("stop_loss")
+    tp = r.get("take_profit")
+    if sl not in (None, 0):
+        sl_f = float(sl)
+        out["sl_dist_pct"] = round((price - sl_f) / price * 100 * sign, 2)
+        total = (entry - sl_f) * sign            # 入场→止损总距离（正=止损在亏损侧）
+        if total > 0:
+            remaining = (price - sl_f) * sign / total * 100
+            out["sl_remaining_pct"] = round(remaining, 1)
+            out["sl_warn"] = bool(remaining < warn_pct)
+    if tp not in (None, 0):
+        out["tp_dist_pct"] = round((float(tp) - price) / price * 100 * sign, 2)
+    # 计划状态灯：只对带信号依据的单判定（与 watch_positions 反转平仓同源口径——
+    # jpt._twelve_consensus 自带 120s 缓存；再包 60s 结果缓存吸收 None 重试风暴）
+    if (r.get("signal_source") or "") in ("twelve", "brief"):
+        sym = str(r.get("symbol"))
+        try:
+            cons = _cached(f"pos_plan_cons:{sym}", 60,
+                           lambda s=sym: jpt._twelve_consensus(s))
+        except Exception:  # noqa: BLE001 — 共识不可得只影响状态灯，不阻塞持仓主数据
+            cons = None
+        direction = (cons or {}).get("direction")
+        if direction in ("bullish", "bearish"):
+            same = (direction == "bullish") == (sign > 0)
+            out["plan_status"] = "valid" if same else "reversed"
+        else:
+            out["plan_status"] = "neutral"
+    else:
+        out["plan_status"] = None
+    return out
 
 
 @app.get("/api/orders")
@@ -861,6 +1002,15 @@ def api_place_order(symbol: str, side: str, price: float, qty: float,
                     stop_loss: float | None = None, take_profit: float | None = None,
                     source: str = "system", note: str | None = None):
     cfg = _trader_cfg()
+    # [Sprint1 T1.5] 手动开仓入口统一过熔断+冷静期门禁（平仓走 /positions/close 不受限）
+    try:
+        import jarvis_circuit_breaker as _cb
+        _g = _cb.guard_new_order(cfg)
+        if not _g.get("allow"):
+            return JSONResponse({"ok": False, "reason": _g.get("reason"),
+                                 "cooldown": _g.get("cooldown")}, status_code=423)
+    except Exception:  # noqa: BLE001 — 门禁自身异常不阻塞 paper 下单（与 guard 内语义一致）
+        pass
     jw.ensure_account(cfg.get("account_equity_usdt", 1000.0))
     return JSONResponse(jw.place_limit_order(symbol, side, price, qty,
                                              stop_loss=stop_loss, take_profit=take_profit,
@@ -878,13 +1028,43 @@ def api_match_orders():
 
 
 @app.post("/api/positions/close")
-def api_close_position(symbol: str):
+def api_close_position(symbol: str, behavior_tag: str | None = None):
+    """手动平仓；可选 behavior_tag 直接带复盘标签（T1.4，标签集走配置 journal_tags）。"""
     cfg = _trader_cfg()
     out = []
     for p in jpt.open_positions(symbol):
         price = jpt.latest_price(cfg, p["symbol"]) or p.get("entry_price")
-        out.append(jpt._close_position(p, price, "manual", cfg))
+        res = jpt._close_position(p, price, "manual", cfg)
+        if behavior_tag and res.get("position_id") is not None:
+            jpt.set_behavior_tag(res["position_id"], behavior_tag)
+            res["behavior_tag"] = behavior_tag
+        out.append(res)
     return JSONResponse({"closed": out})
+
+
+@app.put("/api/positions/{position_id}/behavior-tag")
+def api_set_behavior_tag(position_id: int, data: dict):
+    """T1.4 平仓复盘打标/补标：{tag: "恐慌割肉"}；tag 空串/null 清除标签。
+
+    tag 白名单 = 配置 journal_tags（可扩展）；非法标签拒绝，防脏数据入库。
+    """
+    import jarvis_config as jc_mod
+    tag = (data or {}).get("tag")
+    clean = (str(tag).strip() if tag is not None else "") or None
+    if clean is not None:
+        allowed = [str(t) for t in (jc_mod.get("journal_tags") or [])]
+        if allowed and clean not in allowed:
+            return JSONResponse(
+                {"ok": False, "reason": f"标签不在配置 journal_tags 中: {clean}"},
+                status_code=400,
+            )
+    return JSONResponse(jpt.set_behavior_tag(position_id, clean))
+
+
+@app.get("/api/journal/behavior-stats")
+def api_behavior_stats():
+    """T1.4 成长页「行为标签分布」：按标签统计笔数/胜率/累计盈亏。"""
+    return JSONResponse(jpt.behavior_tag_stats())
 
 
 @app.post("/api/trader/cycle")
@@ -2633,6 +2813,124 @@ def _start_twelve_auto_trader():
         _log_emit(f"12系统自动跟盘启动失败: {e}", level="error", source="twelve-trader")
 
 
+# ─────────── [M2 s4] Binance WebSocket 实时数据地基 ───────────
+
+@app.on_event("startup")
+def _start_ws_stream():
+    """随 dashboard 启动 Binance 合约 WS 客户端（system.ws_enabled 可关）。
+
+    失败只记日志不抛出——WS 是增量地基，REST 轮询链路不受影响。
+    """
+    try:
+        import jarvis_config as jc_mod
+        if not jc_mod.get("ws_enabled"):
+            _log_emit("WS 实时流未启用（system.ws_enabled=false）", "info", "ws-stream")
+            return
+        import jarvis_ws_stream as jws
+        jws.start()
+        _log_emit("Binance WS 实时流客户端已启动（kline/aggTrade/forceOrder/depth）",
+                  "info", "ws-stream")
+        # 大单流监控挂 aggTrade 回调（M2 s5；失败不影响 WS 主链路）
+        try:
+            import jarvis_whale_tape as jwt_mod
+            if jwt_mod.register():
+                _log_emit("whale tape 大单流监控已挂载 aggTrade 流", "info", "whale-tape")
+        except Exception as e:  # noqa: BLE001
+            _log_emit(f"whale tape 挂载失败（不影响 WS）: {e}", "warn", "whale-tape")
+    except Exception as e:  # noqa: BLE001
+        _log_emit(f"WS 实时流启动失败（REST 轮询不受影响）: {e}", "error", "ws-stream")
+
+
+@app.get("/api/ws/health")
+def api_ws_health():
+    """WS 实时流健康度：每流最后消息时间/速率/重连次数/缓冲水位。"""
+    try:
+        import jarvis_config as jc_mod
+        import jarvis_ws_stream as jws
+        return JSONResponse({"ok": True, "enabled": bool(jc_mod.get("ws_enabled")),
+                             **jws.health()})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
+
+
+@app.get("/api/ws/force-orders")
+def api_ws_force_orders(symbol: str | None = None, limit: int = 100):
+    """强平单历史（forceOrder 流落库数据，爆仓面板数据源）。"""
+    try:
+        import jarvis_ws_stream as jws
+        return JSONResponse({"ok": True,
+                             "rows": jws.force_orders_recent(symbol, limit)})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
+
+
+@app.get("/api/liquidation/summary")
+def api_liquidation_summary(symbol: str | None = None):
+    """爆仓流面板（M2 s5）：滚动窗口多空爆仓统计 + 大额事件 + 簇检测。
+
+    forceOrder 降级期（代理丢弃合约域帧 / WS 未运行）degraded=true 并带
+    引导文案，数据回退为历史库已有内容。模块内已捕获异常，不会 500。
+    阈值走配置中心 signal.liq_*，前端 15s 轮询 + 后端 10s 缓存足够实时。
+    """
+    import jarvis_liquidation as jliq
+    key = f"liq:summary:{(symbol or 'ALL').upper()}"
+    return JSONResponse(_cached(key, 10, lambda: jliq.summary(symbol)))
+
+
+@app.get("/api/whale/summary")
+def api_whale_summary(symbol: str | None = None):
+    """大单流窗口统计（M2 s5 whale tape）：净流/买卖比/占比 + 最近异常事件。
+
+    symbol 缺省 = 配置 watchlist 全币种；WS 未启用/无数据时各币 active=false，
+    前端按未就绪占位态渲染（禁止假数据）。
+    """
+    try:
+        import jarvis_config as jc_mod
+        import jarvis_whale_tape as jwt_mod
+        syms = ([symbol.upper()] if symbol
+                else [str(s).upper() for s in (jc_mod.get("watchlist") or ["BTCUSDT"])])
+        ws_ok = False
+        try:
+            import jarvis_ws_stream as jws
+            h = jws.health()
+            ws_ok = bool(h.get("connected")) and h["streams"]["aggTrade"]["msg_count"] > 0
+        except Exception:  # noqa: BLE001
+            pass
+        return JSONResponse({
+            "ok": True,
+            "ws_ready": ws_ok,
+            "window_min": jc_mod.get("whale_window_min"),
+            "tier1_usd": jc_mod.get("whale_tier1_usd"),
+            "tier2_usd": jc_mod.get("whale_tier2_usd"),
+            "symbols": {s: jwt_mod.summary(s) for s in syms},
+            "disclaimer": jwt_mod.DISCLAIMER,
+        })
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
+
+
+# ─────────── [M2 s5] 清算/止损密集区（磁吸位）───────────
+
+@app.get("/api/liq-map/{symbol}")
+def api_liq_map(symbol: str, tf: str = "15m", mock: int = 0):
+    """磁吸位列表：清算簇（上下各 3）+ 止损/关口簇 + forceOrder 校准置信度。
+
+    缓存 120s（VP/OI/K 线三路上游较重）；?mock=1 出确定性假数据供联调。
+    """
+    try:
+        import jarvis_liq_map as jlm
+        if int(mock):
+            return JSONResponse(jlm.mock_assess(symbol))
+        sym = symbol.upper().replace("-", "").replace("/", "")
+        if not sym.endswith(("USDT", "USDC")):
+            sym += "USDT"
+        iv = tf if tf in {"5m", "15m", "30m", "1h", "4h", "1d"} else "15m"
+        out = _cached(f"liqmap:{sym}:{iv}", 120, lambda: jlm.assess(sym, iv))
+        return JSONResponse(out, status_code=200 if out.get("ok") else 503)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
+
+
 # ─────────────────────────── QD 网关配置 API ───────────────────────────
 # 回测子进程 jarvis_scalper_backtest.py 每次运行时重读该文件，故无需重启 dashboard。
 _QD_CONFIG_PATH = os.path.join(os.path.expanduser("~/.vibe-trading"), "scalper_backtest_config.json")
@@ -3392,6 +3690,36 @@ def api_twelve_consensus(symbol: str = "BTCUSDT"):
             jsb.maybe_alert_strong_divergence(sym, delta_payload)
         except Exception:  # noqa: BLE001
             pass
+        # [M2 s5] 磁吸位提醒因子：现价逼近清算/止损密集区 → 插针风险提示
+        # 附加到 seatbelt.magnet_warning，不改共识原字段；失败不影响主体。
+        try:
+            import jarvis_config as jc_mod
+            if jc_mod.get("liq_map_seatbelt_enabled") and isinstance(
+                    merged.get("seatbelt"), dict):
+                import jarvis_liq_map as jlm
+                lm = _cached(f"liqmap:{sym}:15m", 120, lambda: jlm.assess(sym))
+                if lm.get("ok"):
+                    warn_pct = float(jc_mod.get("liq_magnet_warn_pct") or 1.5)
+                    merged["seatbelt"]["magnet_warning"] = jlm.magnet_factor(
+                        lm, warn_pct)
+        except Exception:  # noqa: BLE001
+            pass
+        # [M2 s5] 大单流可选因子（whale tape）：共识方向逆窗口大单净流 → 提醒不阻断。
+        # 开关 signal.whale_seatbelt_enabled；WS 无数据时 whale_check 返回 None 不挂键。
+        try:
+            import jarvis_config as jc_mod
+            if bool(jc_mod.get("whale_seatbelt_enabled")):
+                import jarvis_whale_tape as jwt_mod
+                wc = jwt_mod.whale_check(merged.get("direction") or "neutral",
+                                         jwt_mod.summary(sym))
+                if wc is not None:
+                    sb = merged.get("seatbelt")
+                    if isinstance(sb, dict):
+                        sb["whale"] = wc          # 挂进安全带层（只增不改原字段）
+                    else:
+                        merged["whale_check"] = wc  # 安全带层不可用时顶层保底
+        except Exception:  # noqa: BLE001
+            pass
         return {"ok": bool(tf_cons), "symbol": sym, "price": price,
                 "tf_available": sorted(tf_cons.keys()), "consensus": merged}
 
@@ -3504,6 +3832,19 @@ def api_delta(symbol: str = "BTCUSDT", timeframe: str = "15m",
 
     key = f"delta:{jdf._norm_symbol(symbol)}:{jdf._norm_tf(timeframe)}:{jdf._norm_limit(limit)}"
     return JSONResponse(_cached(key, 60, _calc))
+
+
+@app.get("/api/delta/ai-explain")
+def api_delta_ai_explain(symbol: str = "BTCUSDT", timeframe: str = "15m",
+                         force: int = 0):
+    """Delta 面板 AI 解读卡（M2 s7）：聚合 Delta/CVD/背离/支撑压力/走势概率
+    → LLM 大白话解读；未配置/失败自动降级规则模板。
+
+    模块内置 signal.ai_explain_cache_min 分钟 TTL 缓存防重复烧 token；
+    ?force=1 跳过缓存强制重算（前端刷新按钮）。模块内已捕获异常，不会 500。
+    """
+    import jarvis_delta_explain as jde
+    return JSONResponse(jde.explain(symbol, timeframe, force=bool(int(force))))
 
 
 @app.get("/api/delta/backtest")
@@ -3709,9 +4050,16 @@ _POSCALC_KEYS = ("poscalc_capital_usdt", "poscalc_leverage", "poscalc_risk_pct",
 
 @app.get("/api/position-calc/config")
 def api_poscalc_config_get():
-    """仓位计算器旋钮：本金 / 杠杆 / 风险% / 保证金%（jarvis_config 持久化）。"""
+    """仓位计算器旋钮：本金 / 杠杆 / 风险% / 保证金%（jarvis_config 持久化）。
+
+    [Sprint1 T1.1] 附带只读的 max_leverage_no_confirm / default_leverage，
+    供前端判断「超阈杠杆需二次确认」；修改走 /api/config-center。
+    """
     import jarvis_config as jc_mod
-    return JSONResponse({k: jc_mod.get(k) for k in _POSCALC_KEYS})
+    out = {k: jc_mod.get(k) for k in _POSCALC_KEYS}
+    out["max_leverage_no_confirm"] = jc_mod.get("max_leverage_no_confirm")
+    out["default_leverage"] = jc_mod.get("default_leverage")
+    return JSONResponse(out)
 
 
 @app.put("/api/position-calc/config")
@@ -6304,8 +6652,16 @@ initAlertCenter();
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="贾维斯可视化仪表盘")
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=7899)
+    # [Sprint0] 监听地址/端口默认从配置中心读（dashboard_host/dashboard_port，
+    # 默认 127.0.0.1:7899 零回归）；CLI 显式传参仍最高优先。
+    import jarvis_config as _jcfg0
+    try:
+        _dhost = str(_jcfg0.get("dashboard_host") or "127.0.0.1")
+        _dport = int(_jcfg0.get("dashboard_port") or 7899)
+    except Exception:  # noqa: BLE001
+        _dhost, _dport = "127.0.0.1", 7899
+    ap.add_argument("--host", default=_dhost)
+    ap.add_argument("--port", type=int, default=_dport)
     args = ap.parse_args()
     # access_log=False：逐请求耗时由 _access_timing 中间件统一记录，避免与
     # uvicorn 自带访问日志重复刷屏。

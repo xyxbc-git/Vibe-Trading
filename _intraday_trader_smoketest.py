@@ -32,6 +32,11 @@ jit._notify = lambda text: None
 jit.HALT_PATH = os.path.join(TMP, "halt.json")
 jit.RESUME_PATH = os.path.join(TMP, "resume.json")
 
+# [P1-3] 屏蔽真实组合级门禁（读用户真实钱包会引入环境依赖）；
+# 拦截行为在场景 14 用注入的 fake guard 单独验证。
+import jarvis_circuit_breaker as jcb
+jcb.guard_new_order = lambda cfg=None: {"allow": True, "reason": "smoketest"}
+
 
 def pred_up(sym, prob=0.75):
     return {"symbol": sym, "as_of_bar_ts": NOW - NOW % jit.BAR_MS,
@@ -153,6 +158,36 @@ check("预测抛异常不拖垮 cycle", "error" not in r and not r["opened"],
 # ── 13. report 可渲染 ────────────────────────────────────────────────────
 rep = jit.report(days=365, db_path=DB)
 check("report 输出表格", "| 币种 |" in rep and "熔断" in rep)
+
+# ── 14. [P1-3] 统一门禁（组合熔断/冷静期）拦截开仓，平仓不受限 ────────────
+jcb.guard_new_order = lambda cfg=None: {
+    "allow": False, "reason": "冷静期锁单中（smoketest 注入）"}
+t5 = t4 + 12 * jit.BAR_MS
+r = jit.cycle(["HHHUSDT"], predict_fn=pred_up, price_fn=lambda s: 100.0,
+              now_ms=t5, db_path=DB)
+check("[P1-3] 冷静期门禁拦截开仓", len(r["opened"]) == 0, str(r["opened"]))
+check("[P1-3] 门禁拦截不报错（循环继续）", "error" not in r)
+# 门禁拦截期间已有持仓仍可平仓：先放行开一仓，再锁门禁验证平仓
+jcb.guard_new_order = lambda cfg=None: {"allow": True, "reason": "ok"}
+r = jit.cycle(["IIIUSDT"], predict_fn=pred_up, price_fn=lambda s: 100.0,
+              now_ms=t5 + 1000, db_path=DB)
+check("[P1-3] 放行后正常开仓", len(r["opened"]) == 1)
+jcb.guard_new_order = lambda cfg=None: {
+    "allow": False, "reason": "冷静期锁单中（smoketest 注入）"}
+r = jit.cycle(["IIIUSDT"], predict_fn=pred_up, price_fn=lambda s: 97.0,
+              now_ms=t5 + 2000, db_path=DB)
+# 注意：场景 10 的 EEEUSDT 遗留仓可能同时触发止损，故按 symbol 断言而非计数
+_iii_closed = [c for c in r["closed"] if c["symbol"] == "IIIUSDT"]
+check("[P1-3] 锁单期间平仓不受限", len(_iii_closed) == 1
+      and _iii_closed[0]["reason"] == "stop", str(r["closed"]))
+# 门禁自身抛异常 → 放行不拖垮引擎
+def _guard_boom(cfg=None):
+    raise RuntimeError("guard broken")
+jcb.guard_new_order = _guard_boom
+r = jit.cycle(["JJJUSDT"], predict_fn=pred_up, price_fn=lambda s: 100.0,
+              now_ms=t5 + 3000, db_path=DB)
+check("[P1-3] 门禁异常放行不拖垮", len(r["opened"]) == 1 and "error" not in r)
+jcb.guard_new_order = lambda cfg=None: {"allow": True, "reason": "smoketest"}
 
 print(f"\n{'='*40}\n通过 {PASS} / 失败 {FAIL}")
 raise SystemExit(1 if FAIL else 0)

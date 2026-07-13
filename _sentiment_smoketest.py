@@ -23,6 +23,25 @@ check("多空比 30% 极端挤空→反向看多", f["bias"] == "bullish" and f[
 f = js.score_long_short(None)
 check("多空比缺数据 → 不可用不计分", not f["available"] and f["score"] == 0.0)
 
+# ─── 1.5 大户背离因子（T1.6，阈值显式传参锁定口径） ───
+f = js.score_top_divergence({"long_pct": 42.0, "top_long_pct": 58.5}, 0.15)
+check("大户58.5%多 vs 全网42%多 反向+差16.5pp → 跟大户看多",
+      f["available"] and f["bias"] == "bullish" and f["score"] >= 35, f"score={f['score']}")
+f = js.score_top_divergence({"long_pct": 58.0, "top_long_pct": 41.0}, 0.15)
+check("大户41%多 vs 全网58%多 反向+差17pp → 跟大户看空",
+      f["bias"] == "bearish" and f["score"] <= -35, f"score={f['score']}")
+f = js.score_top_divergence({"long_pct": 55.0, "top_long_pct": 62.0}, 0.15)
+check("同向（均偏多）→ 不触发 0 分", f["available"] and f["score"] == 0.0, f"score={f['score']}")
+f = js.score_top_divergence({"long_pct": 48.0, "top_long_pct": 53.0}, 0.15)
+check("反向但差 5pp 未达阈值 → 不触发 0 分", f["available"] and f["score"] == 0.0,
+      f"score={f['score']}")
+f = js.score_top_divergence({"long_pct": 48.0, "top_long_pct": 53.0}, 0.04)
+check("同数据阈值降到 4pp → 触发（配置可调生效）", f["score"] >= 35, f"score={f['score']}")
+f = js.score_top_divergence({"long_pct": 57.1}, 0.15)
+check("缺大户数据 → 不可用不计分", not f["available"] and f["score"] == 0.0)
+f = js.score_top_divergence(None, 0.15)
+check("多空比整体缺失 → 不可用", not f["available"])
+
 # ─── 2. 资金费率因子 ───
 f = js.score_funding({"BTCUSDT": 0.0001}, "BTCUSDT")
 check("费率 0.01% 中性/温和", f["available"] and abs(f["score"]) <= 10, f"score={f['score']}")
@@ -74,11 +93,26 @@ intel = {
     "fng": {"value": 26, "classification": "Fear"},
     "liquidations": None, "onchain": None,
 }
-s = js.build_factors(intel, "BTCUSDT")
+s = js.build_factors(intel, "BTCUSDT", divergence_threshold=0.15)
 check("综合分在 [-100,100]", -100 <= s["score"] <= 100, f"score={s['score']}")
-check("六因子齐全（含 2 预留）", len(s["factors"]) == 6)
+check("七因子齐全（含 2 预留 + 大户背离）", len(s["factors"]) == 7, f"n={len(s['factors'])}")
 check("预留因子不计分", all(x["score"] == 0.0 for x in s["factors"] if not x["available"]))
 check("headline 非空", bool(s["headline"]), s["headline"])
+check("无大户数据 → top_divergence 摘要不可用",
+      s["top_divergence"]["available"] is False and s["top_divergence"]["active"] is False)
+
+# 大户背离摘要块（前端小卡口径）：反向+超阈值 → active + 建议倾向跟大户
+intel_div = {**intel, "long_short": {"long_pct": 42.0, "short_pct": 58.0, "ratio": 0.72,
+                                     "top_long_pct": 58.5, "top_short_pct": 41.5,
+                                     "top_ratio": 1.41}}
+s_div = js.build_factors(intel_div, "BTCUSDT", divergence_threshold=0.15)
+td = s_div["top_divergence"]
+check("背离激活：active + 大户偏多 + 散户偏空",
+      td["active"] and td["top_bias"] == "bullish" and td["retail_bias"] == "bearish",
+      f"td={td['top_bias']}/{td['retail_bias']}")
+check("背离摘要含差值与阈值（pp）", td["diff_pp"] == 16.5 and td["threshold_pp"] == 15.0,
+      f"diff={td['diff_pp']} thr={td['threshold_pp']}")
+check("背离建议倾向跟随大户", "跟随大户" in td["suggestion"], td["suggestion"][:30])
 
 # 全极端拥挤情景（价涨+OI 降=软弱反弹，四因子齐看空）：应触发警示 + 止盈止损收紧建议
 intel_hot = {

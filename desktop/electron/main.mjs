@@ -10,6 +10,8 @@
 import { app, BrowserWindow, shell } from "electron";
 import { spawn } from "child_process";
 import path from "path";
+import os from "os";
+import fs from "fs";
 import { fileURLToPath } from "url";
 import http from "http";
 
@@ -19,7 +21,27 @@ const isDev = process.env.NODE_ENV === "development";
 let mainWindow = null;
 let pythonProcess = null;
 
-const PYTHON_PORT = 7899;
+/**
+ * [Sprint0] 后端端口从统一配置中心 ~/.vibe-trading/config.yaml 的
+ * system.dashboard_port 读取（轻量行解析，不引入 yaml 依赖）；
+ * 缺失/解析失败回退 7899，与后端 jarvis_config 默认一致。
+ */
+function readDashboardPort() {
+  try {
+    const p = path.join(os.homedir(), ".vibe-trading", "config.yaml");
+    const text = fs.readFileSync(p, "utf-8");
+    const m = text.match(/^\s*dashboard_port:\s*(\d{4,5})\s*(?:#.*)?$/m);
+    if (m) {
+      const port = Number(m[1]);
+      if (port >= 1024 && port <= 65535) return port;
+    }
+  } catch {
+    // 配置不存在或不可读——用默认端口
+  }
+  return 7899;
+}
+
+const PYTHON_PORT = readDashboardPort();
 const VITE_DEV_URL = "http://localhost:5173";
 
 function getVibeTradingDir() {

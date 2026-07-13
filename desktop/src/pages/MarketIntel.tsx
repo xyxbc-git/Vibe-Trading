@@ -14,6 +14,9 @@ import { api } from "@/api/client";
 import { usePolling } from "@/hooks/useApi";
 import SentimentPanel from "@/components/cards/SentimentPanel";
 import RegimePanel from "@/components/cards/RegimePanel";
+import TopDivergenceCard from "@/components/cards/TopDivergenceCard";
+import WhaleTapeCard from "@/components/cards/WhaleTapeCard";
+import LiquidationPanel from "@/components/cards/LiquidationPanel";
 
 /** 数据源暂不可用（后端拉取失败且无缓存）时的卡片占位 */
 function SourceDownNote({ error }: { error?: string | null }) {
@@ -278,7 +281,7 @@ export default function MarketIntel() {
         </div>
       </div>
 
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-4 gap-4">
         {/* 多空比（Binance globalLongShortAccountRatio，真实数据） */}
         <div className="card">
           <p className="stat-label mb-3 flex items-center gap-1.5">
@@ -313,22 +316,11 @@ export default function MarketIntel() {
           )}
         </div>
 
-        {/* 爆仓数据：需 Coinglass key，未接入（灰化占位，不展示假数据） */}
-        <div className="card opacity-60">
-          <p className="stat-label mb-3 flex items-center gap-1.5">
-            <AlertTriangle size={14} />
-            爆仓数据 (24h)
-            <NotConnectedBadge />
-          </p>
-          <div className="py-5 text-center">
-            <p className="text-xs text-jarvis-text-secondary">
-              {unavailable?.liquidations ?? "需第三方 API key，暂未接入"}
-            </p>
-            <p className="text-[10px] text-jarvis-text-secondary/60 mt-1.5">
-              配置 Coinglass key 后可展示多空爆仓金额
-            </p>
-          </div>
-        </div>
+        {/* 大户 vs 散户背离（T1.6：topLongShortAccountRatio × 全网口径） */}
+        <TopDivergenceCard />
+
+        {/* 爆仓流实时面板（M2 s5：forceOrder 流 + 历史库，降级期回退历史数据） */}
+        <LiquidationPanel />
 
         {/* 链上指标：需 Glassnode key，未接入（灰化占位，不展示假数据） */}
         <div className="card opacity-60">
@@ -346,6 +338,11 @@ export default function MarketIntel() {
             </p>
           </div>
         </div>
+      </div>
+
+      {/* 大单流监控（M2 s5 whale tape：WS aggTrade 分层聚合 + 异常事件） */}
+      <div className="grid grid-cols-2 gap-4 mt-4">
+        <WhaleTapeCard />
       </div>
     </div>
   );

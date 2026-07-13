@@ -57,9 +57,13 @@ FNG_EXTREME_GREED = 80
 BIAS_TH = 15.0
 EXTREME_FACTOR_SCORE = 40.0
 
+# 大户 vs 全网背离（T1.6）：占比差阈值默认值（生效值走 jarvis_config
+# signal.divergence_threshold，此常量仅作配置读取失败时的兜底）
+DIVERGENCE_THRESHOLD_DEFAULT = 0.15
+
 # 因子权重（liquidations/onchain 为预留位：数据可用后自动参与加权）
-WEIGHTS = {"long_short": 0.30, "funding": 0.25, "oi": 0.25, "fng": 0.20,
-           "liquidations": 0.15, "onchain": 0.15}
+WEIGHTS = {"long_short": 0.30, "top_divergence": 0.20, "funding": 0.25,
+           "oi": 0.25, "fng": 0.20, "liquidations": 0.15, "onchain": 0.15}
 
 _BIAS_CN = {"bullish": "看多", "bearish": "看空", "neutral": "中性"}
 
@@ -114,6 +118,42 @@ def score_long_short(ls: dict | None) -> dict:
     disp = f"多 {lp:.1f}% / 空 {100 - lp:.1f}%" + (f" · 比值 {ratio:.2f}" if ratio else "")
     return _factor("long_short", "多空比", True, value=ratio or lp, display=disp,
                    score=score, note=note)
+
+
+def score_top_divergence(ls: dict | None, threshold: float | None = None) -> dict:
+    """大户 vs 全网多空比背离（T1.6）：聪明钱与散户反向站队时跟随大户。
+
+    触发条件（同时满足，任务口径）：
+      1. 反向：大户多头占比与全网多头占比分踞 50% 两侧（一方偏多一方偏空）
+      2. 差值：|大户多头占比 - 全网多头占比| ≥ threshold（小数，0.15=15 个百分点）
+    触发后向**大户方向**加分（刚过阈值 ±35，随差值扩大最高 ±60）；
+    未触发时因子可用但 0 分（仅展示两侧占比，供观察拥挤演变）。
+    threshold 显式传参供单测锁定；缺省由 build_factors 从配置中心注入。
+    """
+    if not ls or ls.get("top_long_pct") is None or ls.get("long_pct") is None:
+        return _factor("top_divergence", "大户背离", False,
+                       note="大户多空比数据暂不可用（topLongShortAccountRatio）")
+    thr = DIVERGENCE_THRESHOLD_DEFAULT if threshold is None else float(threshold)
+    top_lp = float(ls["top_long_pct"])
+    glob_lp = float(ls["long_pct"])
+    diff = (top_lp - glob_lp) / 100.0          # 占比差（小数，正=大户更偏多）
+    opposite = (top_lp - 50.0) * (glob_lp - 50.0) < 0   # 分踞 50% 两侧
+    disp = f"大户多 {top_lp:.1f}% / 全网多 {glob_lp:.1f}%"
+    if opposite and abs(diff) >= thr:
+        sign = 1.0 if top_lp > 50.0 else -1.0   # 向大户方向加分
+        score = sign * (35.0 + min((abs(diff) - thr) * 250.0, 25.0))
+        top_cn = "偏多" if sign > 0 else "偏空"
+        retail_cn = "偏空" if sign > 0 else "偏多"
+        note = (f"大户{top_cn}（{top_lp:.1f}%）与全网{retail_cn}（{glob_lp:.1f}%）反向，"
+                f"占比差 {abs(diff) * 100:.1f}pp ≥ 阈值 {thr * 100:.0f}pp——"
+                f"聪明钱与散户背离，跟随大户{top_cn}")
+    else:
+        score = 0.0
+        why = ("大户与全网同向" if not opposite
+               else f"占比差 {abs(diff) * 100:.1f}pp 未达阈值 {thr * 100:.0f}pp")
+        note = f"{why}，无背离信号（大户多 {top_lp:.1f}% / 全网多 {glob_lp:.1f}%）"
+    return _factor("top_divergence", "大户背离", True,
+                   value=round(diff, 4), display=disp, score=score, note=note)
 
 
 def score_funding(funding_rates: dict | None, symbol: str = "BTCUSDT") -> dict:
@@ -244,15 +284,57 @@ def score_onchain(onchain: dict | None) -> dict:
 
 # ═══════════════════════════ 综合研判（纯函数） ═══════════════════════════
 
-def build_factors(intel: dict, symbol: str = "BTCUSDT") -> dict:
+def _divergence_threshold() -> float:
+    """从配置中心读大户背离阈值；任何异常回退内置默认（决策链不被配置拖垮）。"""
+    try:
+        import jarvis_config
+        v = float(jarvis_config.get("divergence_threshold"))
+        return v if 0.0 < v < 1.0 else DIVERGENCE_THRESHOLD_DEFAULT
+    except Exception:  # noqa: BLE001
+        return DIVERGENCE_THRESHOLD_DEFAULT
+
+
+def _top_divergence_summary(ls: dict | None, factor: dict, threshold: float) -> dict:
+    """背离状态摘要块（前端 MarketIntel 背离小卡直取，免于解析因子 note）。"""
+    available = bool(factor.get("available"))
+    active = available and abs(float(factor.get("score") or 0.0)) > 0.0
+    top_lp = float(ls["top_long_pct"]) if available else None
+    glob_lp = float(ls["long_pct"]) if available else None
+    top_bias = ("bullish" if top_lp > 50 else "bearish" if top_lp < 50 else "neutral") \
+        if top_lp is not None else "neutral"
+    retail_bias = ("bullish" if glob_lp > 50 else "bearish" if glob_lp < 50 else "neutral") \
+        if glob_lp is not None else "neutral"
+    diff_pp = round(abs(top_lp - glob_lp), 1) if available else None
+    if active:
+        lean_cn = "偏多" if top_bias == "bullish" else "偏空"
+        suggestion = f"大户与散户反向站队，建议倾向跟随大户{lean_cn}；散户拥挤方向作反指参考"
+    elif available:
+        suggestion = "大户与全网未构成背离，该因子暂不提供方向倾向"
+    else:
+        suggestion = "大户多空比数据暂不可用"
+    return {"available": available, "active": active,
+            "top_bias": top_bias, "retail_bias": retail_bias,
+            "top_long_pct": top_lp, "global_long_pct": glob_lp,
+            "diff_pp": diff_pp, "threshold_pp": round(threshold * 100, 1),
+            "score": factor.get("score", 0.0), "note": factor.get("note", ""),
+            "suggestion": suggestion}
+
+
+def build_factors(intel: dict, symbol: str = "BTCUSDT",
+                  divergence_threshold: float | None = None) -> dict:
     """intel（jarvis_market_intel.get_intel() 返回体）→ 因子集 + 综合情绪分。
 
     多空比/OI/价格为 BTC 口径（大盘情绪基准，山寨与大盘高度联动）；
     资金费率按 symbol 取对应币种（缺失退化为均值）。
+    divergence_threshold 显式传参供单测锁定，缺省读配置中心。
     """
     sym = (symbol if symbol.upper().endswith("USDT") else symbol + "USDT").upper()
+    thr = _divergence_threshold() if divergence_threshold is None else float(divergence_threshold)
+    ls = intel.get("long_short")
+    top_div = score_top_divergence(ls, thr)
     factors = [
-        score_long_short(intel.get("long_short")),
+        score_long_short(ls),
+        top_div,
         score_funding(intel.get("funding_rate"), sym),
         score_oi(intel.get("oi"), intel.get("price_24h")),
         score_fng(intel.get("fng")),
@@ -273,6 +355,7 @@ def build_factors(intel: dict, symbol: str = "BTCUSDT") -> dict:
     warnings = _build_warnings(factors)
     return {"symbol": sym, "score": score, "bias": bias, "headline": headline,
             "factors": factors, "warnings": warnings,
+            "top_divergence": _top_divergence_summary(ls, top_div, thr),
             "sl_tp_advice": _sl_tp_advice(score, factors)}
 
 

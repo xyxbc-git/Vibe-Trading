@@ -53,6 +53,13 @@ def _log(msg: str) -> None:
 
 def load_config(cli: dict | None = None) -> dict:
     cfg = dict(DEFAULTS)
+    # [Sprint0] 渠道 HTTP 超时从配置中心读（notify_timeout_s，默认 15 零回归）；
+    # notify_config.json / 环境变量 / CLI 仍按原优先级覆盖。
+    try:
+        import jarvis_config as jcfg
+        cfg["request_timeout_s"] = int(jcfg.get("notify_timeout_s") or 15)
+    except Exception:  # noqa: BLE001 — 配置中心异常不拖垮通知
+        pass
     try:
         if os.path.exists(CONFIG_PATH):
             with open(CONFIG_PATH, encoding="utf-8") as f:
