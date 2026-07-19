@@ -17,6 +17,8 @@ import Terminal from "./pages/Terminal";
 import PriceAlerts from "./pages/PriceAlerts";
 import TradeRecords from "./pages/TradeRecords";
 import SettingsPage from "./pages/Settings";
+import SignalHistory from "./pages/SignalHistory";
+import DepthView from "./pages/DepthView";
 
 function PageGuard({ children, name }: { children: React.ReactNode; name: string }) {
   return <ErrorBoundary fallbackTitle={`${name} 加载异常`}>{children}</ErrorBoundary>;
@@ -28,6 +30,7 @@ export default function App() {
       <Route element={<Layout />}>
         <Route index element={<PageGuard name="总览"><Dashboard /></PageGuard>} />
         <Route path="chart" element={<PageGuard name="K线图表"><Chart /></PageGuard>} />
+        <Route path="depth" element={<PageGuard name="盘口透视"><DepthView /></PageGuard>} />
         <Route path="trading" element={<PageGuard name="交易中心"><Trading /></PageGuard>} />
         <Route path="trades" element={<PageGuard name="交易记录"><TradeRecords /></PageGuard>} />
         <Route path="funding-arb" element={<PageGuard name="费率套利"><FundingArb /></PageGuard>} />
@@ -38,6 +41,7 @@ export default function App() {
         <Route path="market" element={<PageGuard name="市场情报"><MarketIntel /></PageGuard>} />
         <Route path="ai" element={<PageGuard name="AI 助手"><AIChat /></PageGuard>} />
         <Route path="scalper" element={<PageGuard name="短线数据"><ScalperData /></PageGuard>} />
+        <Route path="signal-history" element={<PageGuard name="信号历史"><SignalHistory /></PageGuard>} />
         <Route path="growth" element={<PageGuard name="成长进度"><Growth /></PageGuard>} />
         <Route path="alerts" element={<PageGuard name="价位提醒"><PriceAlerts /></PageGuard>} />
         <Route path="terminal" element={<PageGuard name="后端终端"><Terminal /></PageGuard>} />

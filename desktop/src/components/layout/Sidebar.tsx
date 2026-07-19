@@ -20,6 +20,8 @@ import {
   Scale,
   PanelLeftClose,
   PanelLeftOpen,
+  BookOpenCheck,
+  GitCommitHorizontal,
 } from "lucide-react";
 
 interface NavItem {
@@ -43,6 +45,7 @@ const NAV_GROUPS: NavGroup[] = [
     title: "图表",
     items: [
       { to: "/chart", label: "K线", icon: <CandlestickChart size={20} /> },
+      { to: "/depth", label: "盘口", icon: <BookOpenCheck size={20} /> },
     ],
   },
   {
@@ -69,6 +72,7 @@ const NAV_GROUPS: NavGroup[] = [
     title: "数据",
     items: [
       { to: "/market", label: "情报", icon: <Globe size={20} /> },
+      { to: "/signal-history", label: "信号历史", icon: <GitCommitHorizontal size={20} /> },
       { to: "/growth", label: "成长", icon: <Sprout size={20} /> },
       { to: "/terminal", label: "终端", icon: <Terminal size={20} /> },
     ],

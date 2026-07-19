@@ -3,7 +3,7 @@ import { useSearchParams } from "react-router-dom";
 import { useApi, usePolling } from "@/hooks/useApi";
 import { useSymbol } from "@/hooks/useSymbol";
 import { useLivePrice } from "@/hooks/usePrice";
-import { api, formatPrice, type TwelveSignal, type ConsensusTradePlan, type KeyLevel, type LiqMapResponse } from "@/api/client";
+import { api, formatPrice, type TwelveSignal, type ConsensusTradePlan, type KeyLevel, type LiqMapResponse, type SignalDirection } from "@/api/client";
 import KlineChart from "@/components/charts/KlineChart";
 import { tradesToMarks } from "@/lib/signalTrades";
 import {
@@ -59,7 +59,8 @@ import {
 import { mockDelta, normalizeDeltaResponse, type DeltaResponse, type DeltaKline } from "@/lib/deltaFlow";
 import DeltaPane from "@/components/charts/DeltaPane";
 import DeltaAiExplainCard from "@/components/cards/DeltaAiExplainCard";
-import { CandlestickChart, HelpCircle, Target, X } from "lucide-react";
+import { CandlestickChart, HelpCircle, Target, Waypoints, X } from "lucide-react";
+import { planSide } from "@/components/cards/SignalBoard";
 import PositionAdvisor from "@/components/cards/PositionAdvisor";
 import PredictionCard from "@/components/cards/PredictionCard";
 import ReversalScorePanel from "@/components/cards/ReversalScorePanel";
@@ -163,6 +164,20 @@ function stripSigMarksQuery(q: URLSearchParams): URLSearchParams {
   return next;
 }
 
+/** 只删「信号结构叠加」的 sys* 键，保留其它 query（与 sig*、pz* 参数可并存互不干扰） */
+function stripSysOverlayQuery(q: URLSearchParams): URLSearchParams {
+  const next = new URLSearchParams(q);
+  for (const k of ["sysoverlay", "systf"]) next.delete(k);
+  return next;
+}
+
+/** 结构叠加关键位颜色：按信号方向取涨绿/跌红/中性灰（与信号矩阵方向色一致） */
+const SYS_OVERLAY_COLORS: Record<SignalDirection, string> = {
+  bullish: "#3fb950",
+  bearish: "#f85149",
+  neutral: "#8b949e",
+};
+
 /** 预测覆盖的未来 bar 数（与预测引擎契约默认值一致） */
 const PREDICT_HORIZON = 16;
 
@@ -232,6 +247,102 @@ export default function Chart() {
     if (positionZone && zoneTf) setTf(zoneTf);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [zoneTf, zoneParams?.entry, zoneParams?.side]);
+
+  // ── 信号结构叠加（信号矩阵「结构」跳转携带 sys* query 进入） ──
+  // sysoverlay=系统slug & systf=信号周期：把该系统的关键位画成水平线、
+  // 交易计划画成多空区间图，方向/强度/理由展示在状态条
+  const sysSystem = searchParams.get("sysoverlay");
+  const rawSysTf = searchParams.get("systf");
+  const sysTf: Timeframe | null =
+    rawSysTf && (TIMEFRAMES as readonly string[]).includes(rawSysTf)
+      ? (rawSysTf as Timeframe)
+      : null;
+  const clearSysOverlay = () => {
+    // 只清 sys* 键，保留可能并存的盈损标记/区间图参数
+    setSearchParams(stripSysOverlayQuery(searchParams), { replace: true });
+  };
+
+  // 进入/切换结构目标时对齐信号周期：关键位与计划按 systf 周期信号算出，
+  // 画在同周期 K 线上口径才一致（之后用户可自由切走周期，价格几何仍成立）
+  useEffect(() => {
+    if (sysSystem && sysTf) setTf(sysTf);
+  }, [sysSystem, sysTf]);
+
+  // 拉该周期的十二套信号并锁定目标系统。useApi 自带请求序号防乱序，再叠加
+  // 回声校验：symbol/tf 与当前请求不一致（慢响应/后端周期回退）一律不采用
+  const { data: sysResp, loading: sysLoading } = useApi(
+    () =>
+      sysSystem && sysTf
+        ? api.twelveSignals(symbol, sysTf)
+        : Promise.resolve(null),
+    [sysSystem, sysTf, symbol],
+  );
+
+  const sysSignal = useMemo<TwelveSignal | null>(() => {
+    if (!sysSystem || !sysTf || !sysResp || sysResp.ok === false) return null;
+    if (isStaleEcho(symbol, sysResp.symbol)) return null;
+    if (sysResp.tf != null && sysResp.tf !== sysTf) return null;
+    return sysResp.signals?.find((s) => s.system === sysSystem) ?? null;
+  }, [sysSystem, sysTf, sysResp, symbol]);
+
+  // 方向归一（后端异常值按中性处理）与强度截断，供关键位配色与状态条共用
+  const sysDir: SignalDirection =
+    sysSignal?.direction === "bullish" || sysSignal?.direction === "bearish"
+      ? sysSignal.direction
+      : "neutral";
+  const sysStrength = Math.max(0, Math.min(1, Number(sysSignal?.strength ?? 0)));
+
+  // 结构画线几何（缠论笔折线/买卖点箭头/中枢框/水平位）。跟随当前显示周期
+  // 取数（tf 进依赖）：折线/框按 bar 开盘时间锚定，只有画在同周期 K 线上
+  // 才对得上；用户切走周期即按新周期重拉重画。
+  const { data: sysStructResp, loading: sysStructLoading } = useApi(
+    () =>
+      sysSystem
+        ? api.twelveStructure(symbol, tf, sysSystem)
+        : Promise.resolve(null),
+    [sysSystem, tf, symbol],
+  );
+
+  // 回声校验：symbol/tf/system 任一与当前请求不符（慢响应/后端回退）一律丢弃
+  const sysStructure = useMemo(() => {
+    if (!sysSystem || !sysStructResp || sysStructResp.ok === false) return null;
+    if (isStaleEcho(symbol, sysStructResp.symbol)) return null;
+    if (sysStructResp.tf != null && sysStructResp.tf !== tf) return null;
+    if (sysStructResp.system != null && sysStructResp.system !== sysSystem) return null;
+    return sysStructResp.drawings ?? null;
+  }, [sysSystem, sysStructResp, symbol, tf]);
+
+  // 该系统的 key_levels → 图上水平线（label 冠系统名缩写，颜色随信号方向）。
+  // 兼容回退：structure 接口 ok 时由 structure.hlines（KlineChart 内渲染）
+  // 替代，此处返回空避免双重画；接口不可用/旧后端时才走本方案。
+  const sysLevels = useMemo<KeyLevel[]>(() => {
+    if (!sysSignal || sysStructure) return [];
+    const color = SYS_OVERLAY_COLORS[sysDir];
+    const abbr = (sysSignal.name_cn || sysSignal.system).slice(0, 4);
+    return (sysSignal.key_levels ?? [])
+      .filter((lv) => Number.isFinite(Number(lv?.price)) && Number(lv.price) > 0)
+      .map((lv) => ({
+        label: `${abbr}·${lv.label}`,
+        price: Number(lv.price),
+        color,
+        width: 1,
+      }));
+  }, [sysSignal, sysStructure, sysDir]);
+
+  // 该系统的 trade_plan → 多空区间图；pz* 显式区间图参数存在时 pz* 优先
+  const sysZone = useMemo(() => {
+    if (!sysSignal?.trade_plan || zoneParams) return null;
+    const plan = sysSignal.trade_plan;
+    const side = planSide(plan);
+    if (side == null) return null;
+    return buildPositionZoneView({
+      side,
+      entry: plan.entry,
+      stopLoss: plan.stop_loss,
+      takeProfit: plan.take_profit,
+      name: sysSignal.name_cn || sysSignal.system,
+    });
+  }, [sysSignal, zoneParams]);
 
   // 各数据源的实际启用条件：简洁/进阶忽略专业模式的细粒度开关
   const isPro = viewMode === "pro";
@@ -1259,6 +1370,82 @@ export default function Chart() {
         </div>
       )}
 
+      {/* 信号结构叠加状态条：来自信号矩阵「结构」跳转，把该系统关键位+计划区间画上图 */}
+      {sysSystem && (
+        <div className="flex items-center gap-2 flex-wrap text-xs bg-jarvis-card border border-jarvis-blue/40 rounded-lg px-3 py-2">
+          <Waypoints size={13} className="text-jarvis-blue shrink-0" />
+          <span className="text-jarvis-text font-medium">
+            「{sysSignal?.name_cn || sysSystem}」趋势结构叠加
+          </span>
+          {sysLoading ? (
+            <span className="text-jarvis-text-secondary">加载信号结构…</span>
+          ) : sysSignal ? (
+            <>
+              <span
+                className={clsx(
+                  "px-1.5 py-px rounded text-[10px] font-medium text-white",
+                  sysDir === "bullish"
+                    ? "bg-jarvis-green"
+                    : sysDir === "bearish"
+                      ? "bg-jarvis-red"
+                      : "bg-jarvis-text-secondary/60",
+                )}
+              >
+                {sysDir === "bullish" ? "看涨" : sysDir === "bearish" ? "看跌" : "中性"}
+              </span>
+              <span className="text-jarvis-text-secondary font-mono">
+                强度 {(sysStrength * 100).toFixed(0)}%
+              </span>
+              <span className="text-jarvis-text-secondary font-mono">
+                关键位 {sysStructure ? (sysStructure.hlines?.length ?? 0) : sysLevels.length} 条
+                {sysZone ? " · 含计划区间" : ""}
+              </span>
+              {sysStructure ? (
+                <span
+                  className="text-jarvis-text-secondary font-mono"
+                  title="结构画线来自 /api/twelve/structure：笔/线段折线、买卖点箭头标注、中枢框区域"
+                >
+                  已画 {sysStructure.polylines?.length ?? 0} 条结构线 ·{" "}
+                  {sysStructure.markers?.length ?? 0} 个标注 ·{" "}
+                  {sysStructure.boxes?.length ?? 0} 个区域
+                </span>
+              ) : sysStructLoading ? (
+                <span className="text-jarvis-text-secondary">结构画线加载中…</span>
+              ) : (
+                <span
+                  className="text-jarvis-yellow"
+                  title="GET /api/twelve/structure 不可用或返回失败——后端升级后自动出现笔折线/买卖点/中枢框"
+                >
+                  后端未升级，仅显示关键位水平线
+                </span>
+              )}
+              {sysSignal.reasoning && (
+                <span
+                  className="text-jarvis-text-secondary truncate max-w-[32rem] cursor-help"
+                  title={sysSignal.reasoning}
+                >
+                  {sysSignal.reasoning}
+                </span>
+              )}
+            </>
+          ) : (
+            <span className="text-jarvis-yellow">
+              {sysTf
+                ? `未取到「${sysSystem}」在 ${sysTf} 周期的信号（可能后端未就绪或系统名不识别）`
+                : "systf 周期参数不合法，无法叠加结构"}
+            </span>
+          )}
+          <button
+            onClick={clearSysOverlay}
+            title="清除结构叠加"
+            className="ml-auto flex items-center gap-0.5 px-1.5 py-0.5 rounded text-jarvis-text-secondary hover:text-jarvis-red transition-colors"
+          >
+            <X size={12} />
+            清除
+          </button>
+        </div>
+      )}
+
       {/* 多空区间图状态条：来自信号矩阵「K线区间」跳转，TradingView position 风格 */}
       {zoneParams && (
         <div className="flex items-center gap-2 flex-wrap text-xs bg-jarvis-card border border-jarvis-purple/40 rounded-lg px-3 py-2">
@@ -1329,13 +1516,15 @@ export default function Chart() {
             smartLevels={composition.smartLevels}
             drawings={composition.drawings}
             keyLevels={(() => {
-              const merged = [...composition.keyLevels, ...liqLevels];
+              const merged = [...composition.keyLevels, ...liqLevels, ...sysLevels];
               return merged.length > 0 ? merged : undefined;
             })()}
             planLines={composition.planLines.length > 0 ? composition.planLines : undefined}
             tradeMarks={sigMarks?.marks}
             prediction={predictOverlay}
-            positionZone={positionZone}
+            positionZone={positionZone ?? sysZone}
+            structure={sysStructure}
+            structMarkers={sysStructure?.markers}
             livePrice={liveForChart}
           />
         ) : (

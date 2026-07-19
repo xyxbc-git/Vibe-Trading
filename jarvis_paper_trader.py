@@ -817,8 +817,15 @@ def match_limit_orders(cfg: dict) -> list:
             tp = o["take_profit"] if o["take_profit"] else round(fill_price * 1.08, 2)
             pid = _insert_position(sym, o["qty"], time.strftime("%Y-%m-%d"), fill_price,
                                    None, sl, tp, o["time_stop_days"] or 30, None,
-                                   signal_source="limit")
+                                   signal_source="limit",
+                                   signal_tf=(o.get("signal_tf") or None))
             jw.mark_filled(o["id"], fill_price, pid)
+            # 生命周期钩子：记录入场 + 发「入场信号」邮件（失败只记日志，绝不阻断成交）
+            try:
+                import jarvis_order_lifecycle as jol
+                jol.on_order_filled(o, pid, fill_price)
+            except Exception as exc:  # noqa: BLE001
+                _log(f"⚠️ 生命周期入场钩子异常（已忽略）: {exc!r}"[:160])
             _log(f"✅ 限价买单 #{o['id']} {sym} @ {fill_price} 成交 → 持仓 #{pid}（现价 {price}）")
             filled.append({"order_id": o["id"], "side": "buy", "symbol": sym,
                            "fill_price": fill_price, "position_id": pid})
@@ -1007,6 +1014,8 @@ def main() -> int:
     p_lim.add_argument("--stop-loss", type=float, default=None)
     p_lim.add_argument("--take-profit", type=float, default=None)
     p_lim.add_argument("--time-stop-days", type=int, default=30)
+    p_lim.add_argument("--signal-tf", default=None,
+                       help="参考的信号时间框架（如 30m/1h/4h），用于生命周期追踪")
 
     p_ord = sub.add_parser("orders", help="查看限价挂单簿")
     p_ord.add_argument("--symbol", default=None)
@@ -1074,6 +1083,15 @@ def main() -> int:
                                    stop_loss=args.stop_loss, take_profit=args.take_profit,
                                    time_stop_days=args.time_stop_days)
         if res.get("ok"):
+            # 生命周期周期打标（可选；失败只提示不影响挂单）
+            if getattr(args, "signal_tf", None):
+                try:
+                    import jarvis_order_lifecycle as jol
+                    tag = jol.tag_order_tf(res["order_id"], args.signal_tf)
+                    if not tag.get("ok"):
+                        print(f"⚠️ 周期打标失败：{tag.get('reason')}")
+                except Exception as exc:  # noqa: BLE001
+                    print(f"⚠️ 周期打标异常（挂单不受影响）：{exc!r}"[:120])
             print(f"✅ 已挂{('买' if args.side == 'buy' else '卖')}单 #{res['order_id']}: "
                   f"{res['symbol']} {res['qty']} @ {res['limit_price']}"
                   + (f"（冻结 {res['frozen_usdt']}U）" if args.side == "buy" else ""))

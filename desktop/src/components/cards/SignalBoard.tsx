@@ -12,6 +12,9 @@ import {
   Loader2,
   CandlestickChart,
   Sparkles,
+  Clock,
+  GitCommitHorizontal,
+  Waypoints,
 } from "lucide-react";
 import { usePolling } from "@/hooks/useApi";
 import {
@@ -151,6 +154,62 @@ function MismatchWarn() {
       <AlertTriangle size={9} />
       方向矛盾
     </span>
+  );
+}
+
+/** 相对时间：<60s「刚刚」/ <1h「X分钟前」/ <24h「X小时前」/ 其余「X天前」 */
+export function relTime(unixSec: number | null | undefined): string {
+  if (unixSec == null || !Number.isFinite(Number(unixSec))) return "—";
+  const diff = Date.now() / 1000 - Number(unixSec);
+  if (diff < 0) return "刚刚";
+  if (diff < 60) return "刚刚";
+  if (diff < 3600) return `${Math.floor(diff / 60)}分钟前`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}小时前`;
+  return `${Math.floor(diff / 86400)}天前`;
+}
+
+/** 绝对时钟（悬停提示用）：本地时区 MM-DD HH:mm:ss */
+export function clockTime(unixSec: number | null | undefined): string {
+  if (unixSec == null || !Number.isFinite(Number(unixSec))) return "—";
+  const d = new Date(Number(unixSec) * 1000);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+/** 信号更新/变更时间徽章行（需求 1：记录每个信号的最新更新时间与上次变更） */
+function SignalTimeLine({
+  updatedAt,
+  changedAt,
+}: {
+  updatedAt: number | null | undefined;
+  changedAt: number | null | undefined;
+}) {
+  if (updatedAt == null && changedAt == null) return null;
+  return (
+    <p className="flex items-center gap-2 text-[9px] text-jarvis-text-secondary/80 font-mono mt-1.5 flex-wrap">
+      {updatedAt != null && (
+        <span
+          className="inline-flex items-center gap-0.5 cursor-help"
+          title={`最近一次信号计算：${clockTime(updatedAt)}`}
+        >
+          <Clock size={8} />
+          更新 {relTime(updatedAt)}
+        </span>
+      )}
+      {changedAt != null ? (
+        <span
+          className="inline-flex items-center gap-0.5 cursor-help text-jarvis-blue/80"
+          title={`最近一次实质变更（方向/强度/计划）：${clockTime(changedAt)}`}
+        >
+          <GitCommitHorizontal size={8} />
+          变更 {relTime(changedAt)}
+        </span>
+      ) : updatedAt != null ? (
+        <span className="text-jarvis-text-secondary/50" title="有记录以来该信号尚未发生实质变更">
+          无变更记录
+        </span>
+      ) : null}
+    </p>
   );
 }
 
@@ -523,6 +582,7 @@ function SignalCell({
   onShowMarks,
   onExplain,
   onShowZone,
+  onShowStructure,
 }: {
   signal: TwelveSignal;
   /** 该 symbol×tf 的胜率回测缓存；null = 尚未回测（不渲染胜率行） */
@@ -536,6 +596,8 @@ function SignalCell({
   onExplain?: (signal: TwelveSignal, grade: SignalGradeStats | null) => void;
   /** 跳 K 线图画该计划的多空区间图（TradingView position 风格） */
   onShowZone?: (plan: SignalTradePlan, name: string) => void;
+  /** 跳 K 线图叠加该系统的趋势结构（关键位 + 区间 + 方向标注） */
+  onShowStructure?: (signal: TwelveSignal) => void;
 }) {
   const [open, setOpen] = useState(false);
   const dir = normalizeDirection(signal.direction);
@@ -585,8 +647,30 @@ function SignalCell({
           强度 {(strength * 100).toFixed(0)}%
         </span>
         <span className="flex items-center gap-1.5">
-          {onExplain && (
+          {onShowStructure && (signal.key_levels?.length ?? 0) > 0 && (
             // 信号格整体是 <button>，内嵌交互用 span+role 避免非法嵌套
+            <span
+              role="button"
+              tabIndex={0}
+              onClick={(e) => {
+                e.stopPropagation();
+                onShowStructure(signal);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onShowStructure(signal);
+                }
+              }}
+              title="跳到 K 线图，把该系统的趋势结构画上去：它的关键价位（突破位/回撤位/中枢等）+ 交易计划区间 + 当前方向标注"
+              className="inline-flex items-center gap-0.5 text-[9px] px-1.5 py-px rounded border border-jarvis-blue/40 text-jarvis-blue hover:bg-jarvis-blue/10 transition-colors cursor-pointer"
+            >
+              <Waypoints size={9} />
+              结构
+            </span>
+          )}
+          {onExplain && (
             <span
               role="button"
               tabIndex={0}
@@ -630,6 +714,9 @@ function SignalCell({
           {signal.reasoning}
         </p>
       )}
+
+      {/* 更新/变更时间徽章（需求 1：每个信号的最新更新时间 + 上次变更时间） */}
+      <SignalTimeLine updatedAt={signal.updated_at} changedAt={signal.last_change_at} />
 
       {/* 历史胜率：方向信号 + 已有回测缓存时展示「近 N 次胜率 x%」+ 盈损点入口 */}
       {grade !== undefined && (
@@ -692,6 +779,12 @@ export default function SignalBoard({ symbol, tf, onTfChange }: SignalBoardProps
   // 「盈损点」：跳 K 线页并携带 信号系统+回测周期+方向，由 Chart 页拉逐笔明细打标
   const showMarksOnChart = (system: string, side: "long" | "short") => {
     const q = new URLSearchParams({ sigmarks: system, sigtf: dataTf, sigside: side });
+    navigate(`/chart?${q.toString()}`);
+  };
+
+  // 「结构」：跳 K 线页叠加该系统的趋势结构（关键位水平线 + 计划区间 + 方向状态条）
+  const showStructureOnChart = (signal: TwelveSignal) => {
+    const q = new URLSearchParams({ sysoverlay: signal.system, systf: dataTf });
     navigate(`/chart?${q.toString()}`);
   };
 
@@ -912,6 +1005,14 @@ export default function SignalBoard({ symbol, tf, onTfChange }: SignalBoardProps
             {wrBusy ? "回测中…" : "胜率回测"}
           </button>
           <button
+            onClick={() => navigate(`/signal-history?symbol=${symbol}&tf=${dataTf}`)}
+            title="查看该币种该周期 12 套信号的变更流水：谁翻多翻空、强度/计划怎么变的，逐条可追溯"
+            className="flex items-center gap-1 text-xs px-2 py-1 rounded-md border border-jarvis-blue/40 text-jarvis-blue hover:bg-jarvis-blue/10 transition-colors mr-1"
+          >
+            <GitCommitHorizontal size={11} />
+            变更历史
+          </button>
+          <button
             onClick={() => onTfChange("auto")}
             className={clsx(
               "text-xs px-2.5 py-1 rounded-md transition-colors",
@@ -989,6 +1090,7 @@ export default function SignalBoard({ symbol, tf, onTfChange }: SignalBoardProps
                 onShowMarks={showMarksOnChart}
                 onExplain={explainSignal}
                 onShowZone={showZoneOnChart}
+                onShowStructure={showStructureOnChart}
               />
             ))}
           </div>

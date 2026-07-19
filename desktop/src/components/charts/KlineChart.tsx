@@ -11,9 +11,12 @@ import {
   LineStyle,
   type CandlestickData,
   type HistogramData,
+  type SeriesMarker,
+  type SeriesMarkerShape,
   type Time,
 } from "lightweight-charts";
 import type { DrawingResult, SmartLevels, KeyLevel, DrawLineStyle, DrawHLine } from "@/lib/drawings";
+import type { StructureDrawings, StructureMarker } from "@/api/client";
 import type { TradeMark } from "@/lib/signalTrades";
 import type { PredictionOverlay } from "@/lib/predict";
 import { positionZoneWindow, type PositionZoneView } from "@/lib/positionZone";
@@ -39,6 +42,17 @@ interface KlineChartProps {
   prediction?: PredictionOverlay | null;
   /** 信号多空区间图（TradingView position 风格，同时只显一个），由 buildPositionZoneView 生成；null/undefined 不渲染。 */
   positionZone?: PositionZoneView | null;
+  /**
+   * 信号结构画线（缠论笔折线 / 中枢框 / 关键水平位），来自 /api/twelve/structure。
+   * polylines → LineSeries 全点列；boxes → 上下两条 dashed 边缘线；hlines →
+   * keyLevels 通道同风格的 dotted priceLine。null/undefined 不渲染。
+   */
+  structure?: StructureDrawings | null;
+  /**
+   * 信号结构买卖点标注 → 原生 candleSeries.setMarkers（替换式，卸载/清空时
+   * 重设为空数组）；与 tradeMarks 的 canvas 自绘 primitive 互不干扰。
+   */
+  structMarkers?: StructureMarker[] | null;
   /**
    * 实时最新价（与顶栏同源的 ticker 报价）。存在时把最后一根未收线蜡烛的
    * close 流式更新为该价（high/low 相应扩展），使图表右侧最新价标签与顶栏
@@ -82,6 +96,8 @@ export default function KlineChart({
   tradeMarks,
   prediction,
   positionZone,
+  structure,
+  structMarkers,
   livePrice,
 }: KlineChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -299,6 +315,50 @@ export default function KlineChart({
     }
   }, [tradeMarks, initVersion]);
 
+  // 信号结构买卖点标注 → 原生 setMarkers。替换式 API：prop 变化整组重设，
+  // 清空/未传时重设为空数组；库要求按 time 升序，窗口外的标注直接丢弃。
+  useEffect(() => {
+    if (disposedRef.current) return;
+    const series = candleSeriesRef.current;
+    if (!series) return;
+    try {
+      if (!structMarkers || structMarkers.length === 0 || data.length === 0) {
+        series.setMarkers([]);
+        return;
+      }
+      const firstTs = Number(data[0].time);
+      const lastTs = Number(data[data.length - 1].time);
+      const shapeMap: Record<StructureMarker["shape"], SeriesMarkerShape> = {
+        arrow_up: "arrowUp",
+        arrow_down: "arrowDown",
+        circle: "circle",
+        square: "square",
+      };
+      const markers: SeriesMarker<Time>[] = structMarkers
+        .filter((m) => {
+          const t = Number(m?.ts);
+          return Number.isFinite(t) && t >= firstTs && t <= lastTs;
+        })
+        .sort((a, b) => Number(a.ts) - Number(b.ts))
+        .map((m) => ({
+          time: Number(m.ts) as Time,
+          position: m.position === "above" ? ("aboveBar" as const) : ("belowBar" as const),
+          shape: shapeMap[m.shape] ?? "circle",
+          color:
+            m.color ??
+            (m.shape === "arrow_up"
+              ? "#3fb950"
+              : m.shape === "arrow_down"
+                ? "#f85149"
+                : "#8b949e"),
+          text: m.text,
+        }));
+      series.setMarkers(markers);
+    } catch {
+      // chart may have been disposed between render and effect
+    }
+  }, [structMarkers, data, initVersion]);
+
   // 信号多空区间图：view + 时间窗口（最新 K 线向右延伸固定根数）灌进独立
   // primitive；切换信号即整体替换（同时只显一个），传 null 即清除。
   useEffect(() => {
@@ -464,7 +524,120 @@ export default function KlineChart({
         );
       }
     }
-  }, [data, smartLevels, drawings, keyLevels, planLines, initVersion]);
+
+    // 7 · 信号结构画线（缠论笔折线 / 中枢框 / 关键水平位）。ts 与 K 线开盘时间
+    // 同源，直接作 Time；窗口外的点裁剪掉，防止把共享时间轴撑出可见范围。
+    if (structure) {
+      const firstTs = Number(data[0].time);
+      const lastTs = Number(data[lastIdx].time);
+
+      // 把任意 ts 夹进窗口后吸附到最近 bar 开盘时间（正常契约即命中，兜底容错）
+      const snapTs = (ts: number): number => {
+        const t = Math.min(Math.max(ts, firstTs), lastTs);
+        let lo = 0;
+        let hi = lastIdx;
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1;
+          if (Number(data[mid].time) < t) lo = mid + 1;
+          else hi = mid;
+        }
+        const cur = Number(data[lo].time);
+        const prev = lo > 0 ? Number(data[lo - 1].time) : cur;
+        return t - prev <= cur - t ? prev : cur;
+      };
+
+      // 时间锚定的水平线段（中枢框上下边缘）；与 addSegment 的 bar 索引口径不同
+      const addTimeSegment = (
+        t1: number,
+        t2: number,
+        price: number,
+        color: string,
+        title?: string,
+      ) => {
+        if (!(t1 < t2) || !Number.isFinite(price)) return;
+        try {
+          const ls = chart.addLineSeries({
+            color,
+            lineWidth: 1,
+            lineStyle: LineStyle.Dashed,
+            priceLineVisible: false,
+            lastValueVisible: false,
+            crosshairMarkerVisible: false,
+            title: title ?? "",
+            autoscaleInfoProvider: () => null,
+          });
+          ls.setData([
+            { time: t1 as Time, value: price },
+            { time: t2 as Time, value: price },
+          ]);
+          overlaySeriesRef.current.push(ls);
+        } catch {
+          // chart disposed between render and effect
+        }
+      };
+
+      // 7a · 笔/线段折线：全点列 LineSeries；窗口外点丢弃，去重保证严格升序
+      for (const poly of structure.polylines ?? []) {
+        const pts: { time: Time; value: number }[] = [];
+        const sorted = [...(poly.points ?? [])]
+          .filter((p) => {
+            const t = Number(p?.ts);
+            const v = Number(p?.price);
+            return Number.isFinite(t) && Number.isFinite(v) && t >= firstTs && t <= lastTs;
+          })
+          .sort((a, b) => Number(a.ts) - Number(b.ts));
+        for (const p of sorted) {
+          const t = Number(p.ts);
+          if (pts.length > 0 && t <= Number(pts[pts.length - 1].time)) continue;
+          pts.push({ time: t as Time, value: Number(p.price) });
+        }
+        if (pts.length < 2) continue;
+        try {
+          const ls = chart.addLineSeries({
+            color: poly.color ?? "#58a6ff",
+            lineWidth: clampWidth(poly.width ?? 2),
+            lineStyle: poly.style === "dashed" ? LineStyle.Dashed : LineStyle.Solid,
+            priceLineVisible: false,
+            lastValueVisible: false,
+            crosshairMarkerVisible: false,
+            title: poly.label ?? "",
+            autoscaleInfoProvider: () => null,
+          });
+          ls.setData(pts);
+          overlaySeriesRef.current.push(ls);
+        } catch {
+          // chart disposed between render and effect
+        }
+      }
+
+      // 7b · 中枢框：上下两条 dashed 边缘线（仿 bands top/bottom 模式），
+      // ts1/ts2 吸附到窗口内最近 bar；label 挂 top 线 title
+      for (const b of structure.boxes ?? []) {
+        if (![b?.ts1, b?.ts2, b?.price_lo, b?.price_hi].every((v) => Number.isFinite(Number(v)))) {
+          continue;
+        }
+        const t1 = snapTs(Number(b.ts1));
+        const t2 = snapTs(Number(b.ts2));
+        const color = b.color ?? "#d29922";
+        const top = Math.max(Number(b.price_lo), Number(b.price_hi));
+        const bottom = Math.min(Number(b.price_lo), Number(b.price_hi));
+        addTimeSegment(t1, t2, top, color, b.label);
+        addTimeSegment(t1, t2, bottom, color);
+      }
+
+      // 7c · 结构关键水平位：与外部关键位（keyLevels 通道）同风格 dotted priceLine
+      for (const hl of structure.hlines ?? []) {
+        if (!Number.isFinite(Number(hl?.price))) continue;
+        addPriceLine(
+          Number(hl.price),
+          hl.color ?? "#8b949e",
+          hl.label ?? "",
+          hl.style === "dashed" ? LineStyle.Dashed : LineStyle.Dotted,
+          1,
+        );
+      }
+    }
+  }, [data, smartLevels, drawings, keyLevels, planLines, structure, initVersion]);
 
   return (
     <div className="relative">

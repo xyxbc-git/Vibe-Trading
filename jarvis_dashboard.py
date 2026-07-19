@@ -1000,7 +1000,8 @@ def api_deposit(amount: float):
 @app.post("/api/orders/place")
 def api_place_order(symbol: str, side: str, price: float, qty: float,
                     stop_loss: float | None = None, take_profit: float | None = None,
-                    source: str = "system", note: str | None = None):
+                    source: str = "system", note: str | None = None,
+                    signal_tf: str | None = None):
     cfg = _trader_cfg()
     # [Sprint1 T1.5] 手动开仓入口统一过熔断+冷静期门禁（平仓走 /positions/close 不受限）
     try:
@@ -1012,9 +1013,22 @@ def api_place_order(symbol: str, side: str, price: float, qty: float,
     except Exception:  # noqa: BLE001 — 门禁自身异常不阻塞 paper 下单（与 guard 内语义一致）
         pass
     jw.ensure_account(cfg.get("account_equity_usdt", 1000.0))
-    return JSONResponse(jw.place_limit_order(symbol, side, price, qty,
-                                             stop_loss=stop_loss, take_profit=take_profit,
-                                             note=note, source=source))
+    res = jw.place_limit_order(symbol, side, price, qty,
+                               stop_loss=stop_loss, take_profit=take_profit,
+                               note=note, source=source)
+    # 生命周期：挂单参考了某时间框架推荐点位时打周期标（缺省 null 不打标；
+    # 打标失败只回显不影响挂单结果）
+    if res.get("ok") and signal_tf:
+        try:
+            import jarvis_order_lifecycle as jol
+            tag = jol.tag_order_tf(res["order_id"], signal_tf)
+            res["signal_tf_tagged"] = bool(tag.get("ok"))
+            if not tag.get("ok"):
+                res["signal_tf_reason"] = tag.get("reason")
+        except Exception as exc:  # noqa: BLE001 — 打标异常绝不影响下单主链路
+            res["signal_tf_tagged"] = False
+            res["signal_tf_reason"] = repr(exc)[:120]
+    return JSONResponse(res)
 
 
 @app.post("/api/orders/cancel")
@@ -2837,6 +2851,22 @@ def _start_ws_stream():
                 _log_emit("whale tape 大单流监控已挂载 aggTrade 流", "info", "whale-tape")
         except Exception as e:  # noqa: BLE001
             _log_emit(f"whale tape 挂载失败（不影响 WS）: {e}", "warn", "whale-tape")
+        # 成交流主体分类挂 aggTrade 回调（盘口透视页；失败不影响 WS 主链路）
+        try:
+            import jarvis_tape_classify as jtc_mod
+            if jtc_mod.register():
+                _log_emit("tape classify 成交流主体分类已挂载 aggTrade 流",
+                          "info", "tape-classify")
+                # 分钟聚合持久化（成交流 K 线复盘）：后台线程 30s flush，14 天保留
+                try:
+                    if jtc_mod.start_persist():
+                        _log_emit("tape 分钟聚合持久化线程已启动（30s flush / 14 天保留）",
+                                  "info", "tape-classify")
+                except Exception as e:  # noqa: BLE001
+                    _log_emit(f"tape 分钟聚合持久化启动失败（不影响实时流）: {e}",
+                              "warn", "tape-classify")
+        except Exception as e:  # noqa: BLE001
+            _log_emit(f"tape classify 挂载失败（不影响 WS）: {e}", "warn", "tape-classify")
     except Exception as e:  # noqa: BLE001
         _log_emit(f"WS 实时流启动失败（REST 轮询不受影响）: {e}", "error", "ws-stream")
 
@@ -3642,8 +3672,21 @@ def api_twelve_signals(symbol: str = "BTCUSDT", tf: str = "4h"):
             return {"ok": False, "error": "K线数据不足或拉取失败", "symbol": sym,
                     "tf": iv, "signals": [], "consensus": None}
         out = jts.analyze(df, basis_data=_twelve_basis(sym))
-        return {"ok": True, "symbol": sym, "tf": iv,
-                "price": round(float(df["close"].iloc[-1]), 6),
+        px = round(float(df["close"].iloc[-1]), 6)
+        # 信号快照/变更历史落库（需求：记录每个信号的上次更新时间与变动经历）。
+        # 只在缓存未命中的真实重算路径执行，与「信号刷新」天然同频；失败不拖垮主链路。
+        try:
+            import jarvis_signal_history as jsh
+            meta = jsh.record_batch(sym, iv, out["signals"], price=px)
+            for s in out["signals"]:
+                m = meta.get(s.get("system"))
+                if m:
+                    s["updated_at"] = m["updated_at"]
+                    s["last_change_at"] = m["changed_at"]
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": True, "symbol": sym, "tf": iv, "as_of": time.time(),
+                "price": px,
                 "signals": out["signals"], "consensus": out["consensus"]}
 
     # 5m 一根 K 线 5 分钟，缓存同比缩短（15m+ 沿用 120s）
@@ -3670,6 +3713,13 @@ def api_twelve_consensus(symbol: str = "BTCUSDT"):
             tf_cons[tf] = out["consensus"]
             if tf == "4h" or price is None:
                 price = round(float(df["close"].iloc[-1]), 6)
+            # 多周期共识每轮重算顺带落各 TF 信号快照（变更历史更完整；失败忽略）
+            try:
+                import jarvis_signal_history as jsh
+                jsh.record_batch(sym, tf, out["signals"],
+                                 price=round(float(df["close"].iloc[-1]), 6))
+            except Exception:  # noqa: BLE001
+                pass
         merged = jts.consensus_multi_tf(tf_cons)
         # 供需情绪层（多空比/资金费率/OI/恐贪）：同向增益置信、极端反向降级+警示。
         # 只附加 sentiment 键与 reasoning 尾注，不改共识原字段；失败不影响共识主体。
@@ -3724,6 +3774,138 @@ def api_twelve_consensus(symbol: str = "BTCUSDT"):
                 "tf_available": sorted(tf_cons.keys()), "consensus": merged}
 
     return JSONResponse(_cached(f"twelve:cons:{sym}", 180, _calc))
+
+
+# ─────────────────── 信号变更历史（快照/流水/管理界面 API）───────────────────
+
+@app.get("/api/twelve/signal-history")
+def api_twelve_signal_history(symbol: str | None = None, tf: str | None = None,
+                              system: str | None = None,
+                              since: float | None = None,
+                              until: float | None = None,
+                              limit: int = 100, offset: int = 0):
+    """信号变更流水（管理界面数据源）：按 币种/周期/系统/时间段 过滤，倒序分页。"""
+    try:
+        import jarvis_signal_history as jsh
+        sym = symbol.upper().replace("-", "").replace("/", "") if symbol else None
+        if sym and not sym.endswith(("USDT", "USDC")):
+            sym += "USDT"
+        return JSONResponse(jsh.history(sym, tf, system, since, until, limit, offset))
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
+
+
+@app.get("/api/twelve/signal-history/state")
+def api_twelve_signal_history_state(symbol: str = "BTCUSDT", tf: str = "4h"):
+    """每系统当前态：最近计算时间 / 最近变更时间（信号矩阵时间徽章数据源）。"""
+    try:
+        import jarvis_signal_history as jsh
+        sym = symbol.upper().replace("-", "").replace("/", "")
+        if not sym.endswith(("USDT", "USDC")):
+            sym += "USDT"
+        return JSONResponse(jsh.state(sym, tf))
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
+
+
+@app.post("/api/twelve/signal-history/delete")
+async def api_twelve_signal_history_delete(request: Request):
+    """删除变更记录：{ids:[...]} 按 id；或 {symbol/tf/system/before} 条件批量。"""
+    try:
+        import jarvis_signal_history as jsh
+        d = await request.json()
+        ids = d.get("ids")
+        sym = d.get("symbol")
+        if sym:
+            sym = str(sym).upper().replace("-", "").replace("/", "")
+            if not sym.endswith(("USDT", "USDC")):
+                sym += "USDT"
+        out = jsh.delete_changes(
+            ids=[int(i) for i in ids] if isinstance(ids, list) else None,
+            symbol=sym, tf=d.get("tf") or None, system=d.get("system") or None,
+            before=float(d["before"]) if d.get("before") is not None else None)
+        return JSONResponse(out, status_code=200 if out.get("ok") else 400)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
+
+
+@app.get("/api/twelve/structure")
+def api_twelve_structure(symbol: str = "BTCUSDT", tf: str = "4h",
+                         system: str = "chanlun"):
+    """十二系统信号结构几何载荷：笔折线/中枢框/买卖点箭头/通道/缺口框/时间窗等。
+
+    与 /api/twelve/signals 同源取数（fetch_klines_df 300 根）；drawings 的 ts 为
+    bar 开盘 epoch 秒，与 /api/kline rows 的 ts/1000 对齐，前端直接叠加蜡烛图。
+    """
+    import jarvis_twelve_systems as jts
+    sym = symbol.upper().replace("-", "").replace("/", "")
+    if not sym.endswith(("USDT", "USDC")):
+        sym += "USDT"
+    iv = tf if tf in {"5m", "15m", "30m", "1h", "4h", "1d"} else "4h"
+    sys_key = (system or "").strip().lower()
+
+    def _calc():
+        if sys_key not in jts.SIGNAL_FUNCS:
+            return {"ok": False, "symbol": sym, "tf": iv, "system": sys_key,
+                    "drawings": None,
+                    "error": f"未知信号系统 {sys_key}（可选：{'/'.join(jts.SIGNAL_FUNCS)}）"}
+        df = jts.fetch_klines_df(sym, iv, 300)
+        if df is None or len(df) < 30:
+            return {"ok": False, "symbol": sym, "tf": iv, "system": sys_key,
+                    "drawings": None, "error": "K线数据不足或拉取失败"}
+        import jarvis_signal_structure as jss
+        sig = jts.SIGNAL_FUNCS[sys_key](df)   # martingale/arbitrage 缺省参降级中性
+        out = jss.build(sys_key, df)
+        resp = {"ok": True, "symbol": sym, "tf": iv, "system": sys_key,
+                "name_cn": sig.get("name_cn"), "direction": sig.get("direction"),
+                "as_of": time.time(), "drawings": out["drawings"]}
+        if out.get("note"):
+            resp["note"] = out["note"]
+        return resp
+
+    return JSONResponse(_cached(f"twelve:struct:{sym}:{iv}:{sys_key}", 60, _calc))
+
+
+# ─────────────────── 盘口深度透视 + 成交流主体分类（需求 2）───────────────────
+
+@app.get("/api/depth/orderbook")
+def api_depth_orderbook(symbol: str = "BTCUSDT", limit: int = 500,
+                        bucket: float | None = None, max_buckets: int = 30):
+    """盘口深度快照（REST 合约优先/现货回退）：价格桶聚合 DOM 阶梯 + 买卖失衡。
+
+    3s 缓存：前端 3s 轮询与缓存同频，多开页面不放大上游压力。
+    """
+    import jarvis_depth_view as jdv
+    sym = symbol.upper().replace("-", "").replace("/", "")
+    if not sym.endswith(("USDT", "USDC")):
+        sym += "USDT"
+    key = f"depth:ob:{sym}:{int(limit)}:{bucket or 0}:{int(max_buckets)}"
+    return JSONResponse(_cached(
+        key, 3, lambda: jdv.orderbook(sym, limit, bucket, max_buckets)))
+
+
+@app.get("/api/tape/flow")
+def api_tape_flow(symbol: str = "BTCUSDT", window_min: int = 15):
+    """成交流主体画像：散户/机构/做市商份额 + 指纹聚合表 + 主力行为判定。
+
+    数据源为 WS aggTrade 内存态（jarvis_tape_classify）；WS 未就绪时 active=false。
+    """
+    try:
+        import jarvis_tape_classify as jtc
+        sym = symbol.upper().replace("-", "").replace("/", "")
+        if not sym.endswith(("USDT", "USDC")):
+            sym += "USDT"
+        ws_ok = False
+        try:
+            import jarvis_ws_stream as jws
+            h = jws.health()
+            ws_ok = bool(h.get("connected")) and h["streams"]["aggTrade"]["msg_count"] > 0
+        except Exception:  # noqa: BLE001
+            pass
+        return JSONResponse({"ok": True, "ws_ready": ws_ok,
+                             **jtc.summary(sym, window_min=window_min)})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
 
 
 def _delta_payload(sym: str, tf: str = "15m") -> dict | None:
@@ -6648,6 +6830,63 @@ initAlertCenter();
 </body>
 </html>
 """
+
+
+# ─────────────── 模拟下单全生命周期追踪 API（周期打标/到点回录/阈值邮件） ───────────────
+# 说明：下单打标入口在 /api/orders/place 的可选 signal_tf 参数；成交入场邮件钩子在
+# jarvis_paper_trader.match_limit_orders；这里只挂查询路由 + 后台巡检线程。
+
+import jarvis_order_lifecycle as jol
+
+
+@app.get("/api/order-lifecycle")
+def api_order_lifecycle_list(limit: int = 50):
+    """生命周期列表：全部打过周期标的挂单/持仓，带快照与事件计数。"""
+    try:
+        return JSONResponse(jol.lifecycle_list(limit))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
+
+
+@app.get("/api/order-lifecycle/status")
+def api_order_lifecycle_status():
+    """后台巡检线程状态（默认 60s 周期：到点回录 + 盈亏阈值扫描）。"""
+    return JSONResponse({"ok": True, "monitor": jol.monitor_status()})
+
+
+@app.post("/api/order-lifecycle/sweep")
+def api_order_lifecycle_sweep():
+    """手动触发一轮巡检（调试用；生产由后台线程自动跑）。"""
+    try:
+        return JSONResponse({"ok": True, **jol.run_sweep()})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
+
+
+@app.get("/api/order-lifecycle/{ref}")
+def api_order_lifecycle_show(ref: str):
+    """单条完整生命周期时间线（下单→周期快照→成交→阈值事件→平仓）。
+
+    ref 支持 order-<挂单id> / pos-<持仓id> / 纯数字（按持仓 id 查）。
+    注意：本路由须注册在 /status、/sweep 之后（FastAPI 按注册序匹配路径）。
+    """
+    try:
+        out = jol.lifecycle_of(ref)
+        return JSONResponse(out, status_code=200 if out.get("ok") else 404)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
+
+
+@app.on_event("startup")
+def _start_order_lifecycle_monitor():
+    """随 dashboard 启动订单生命周期巡检线程（到点回录 + 盈亏阈值邮件）。"""
+    try:
+        jol.ensure_schema()
+        jol.start_monitor()
+        _log_emit("订单生命周期巡检已启动（到点回录+阈值邮件，默认 60s 周期）",
+                  level="info", source="order-lifecycle")
+    except Exception as e:  # noqa: BLE001
+        _log_emit(f"订单生命周期巡检启动失败: {e}", level="error", source="order-lifecycle")
 
 
 def main() -> int:

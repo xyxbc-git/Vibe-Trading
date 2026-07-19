@@ -518,6 +518,11 @@ export const api = {
     api.get<TwelveSignalsResponse>(
       `/twelve/signals?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(tf)}`,
     ),
+  // 单系统结构画线几何（缠论笔折线/买卖点箭头/中枢框/关键水平位；K 线结构叠加用）
+  twelveStructure: (symbol: string, tf: string, system: string) =>
+    api.get<SignalStructureResponse>(
+      `/twelve/structure?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(tf)}&system=${encodeURIComponent(system)}`,
+    ),
   // 单信号级历史胜率（缓存读取；null = 尚未回测过该 symbol×tf）
   twelveSignalWinrate: (symbol = "BTCUSDT", tf = "4h") =>
     api.get<SignalWinrateResponse>(
@@ -634,6 +639,62 @@ export const api = {
       `/reversal-score?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}`,
       undefined,
       30_000,
+    ),
+
+  // ─── 信号变更历史（快照/流水/管理界面）───
+  twelveSignalHistory: (p: {
+    symbol?: string;
+    tf?: string;
+    system?: string;
+    /** unix 秒 */
+    since?: number;
+    until?: number;
+    limit?: number;
+    offset?: number;
+  }) => {
+    const q = new URLSearchParams();
+    if (p.symbol) q.set("symbol", p.symbol);
+    if (p.tf) q.set("tf", p.tf);
+    if (p.system) q.set("system", p.system);
+    if (p.since != null) q.set("since", String(p.since));
+    if (p.until != null) q.set("until", String(p.until));
+    if (p.limit != null) q.set("limit", String(p.limit));
+    if (p.offset != null) q.set("offset", String(p.offset));
+    return api.get<SignalHistoryResponse>(`/twelve/signal-history?${q.toString()}`);
+  },
+  twelveSignalHistoryState: (symbol: string, tf: string) =>
+    api.get<SignalHistoryStateResponse>(
+      `/twelve/signal-history/state?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(tf)}`,
+    ),
+  twelveSignalHistoryDelete: (payload: {
+    ids?: number[];
+    symbol?: string;
+    tf?: string;
+    system?: string;
+    /** 删除早于该时间（unix 秒）的记录 */
+    before?: number;
+  }) =>
+    api.post<{ ok: boolean; deleted?: number; error?: string }>(
+      "/twelve/signal-history/delete",
+      payload,
+    ),
+
+  // ─── 盘口深度透视（REST 快照聚合 DOM 阶梯）───
+  depthOrderbook: (symbol: string, limit = 500, maxBuckets = 30) =>
+    api.get<DepthOrderbookResponse>(
+      `/depth/orderbook?symbol=${encodeURIComponent(symbol)}&limit=${limit}&max_buckets=${maxBuckets}`,
+    ),
+
+  // ─── 成交流主体画像（散户/机构/做市商 + 指纹聚合 + 主力行为判定）───
+  tapeFlow: (symbol: string, windowMin = 15) =>
+    api.get<TapeFlowResponse>(
+      `/tape/flow?symbol=${encodeURIComponent(symbol)}&window_min=${windowMin}`,
+    ),
+
+  // ─── 成交流 K 线柱（主动买卖额按周期聚合，盘口页柱状图视图）───
+  tapeBars: (symbol: string, interval = "1m", limit = 200) =>
+    api.get<TapeBarsResponse>(
+      `/tape/bars?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${limit}`,
     ),
 
   // ─── 资金费率套利模拟盘（现货多 + 永续空，delta 中性赚费率）───
@@ -1788,6 +1849,278 @@ export interface TwelveSignal {
   trade_plan?: SignalTradePlan | null;
   /** 静态画像；旧缓存响应可能缺失 */
   explain?: SignalExplain | null;
+  /** 该信号最近一次计算时间（unix 秒；旧后端缺失） */
+  updated_at?: number | null;
+  /** 该信号最近一次实质变更时间（unix 秒；从未变更/旧后端为 null） */
+  last_change_at?: number | null;
+}
+
+// ─── 信号变更历史（GET /api/twelve/signal-history*）───
+
+/** 单条变更流水（prev/new_json 为变更前后完整参数快照） */
+export interface SignalChangeRow {
+  id: number;
+  /** unix 秒 */
+  ts: number;
+  symbol: string;
+  tf: string;
+  system: string;
+  name_cn: string | null;
+  prev_direction: SignalDirection | null;
+  new_direction: SignalDirection;
+  prev_strength: number | null;
+  new_strength: number;
+  /** 变更类型：direction / strength / plan / levels */
+  change_kinds: string[] | null;
+  summary: string;
+  prev_json: {
+    direction?: string | null;
+    strength?: number | null;
+    trade_plan?: SignalTradePlan | null;
+    key_levels?: KeyLevel[];
+  } | null;
+  new_json: {
+    direction?: string;
+    strength?: number;
+    trade_plan?: SignalTradePlan | null;
+    key_levels?: KeyLevel[];
+    reasoning?: string;
+  } | null;
+  price: number | null;
+}
+
+export interface SignalHistoryResponse {
+  ok: boolean;
+  total: number;
+  rows: SignalChangeRow[];
+  error?: string;
+}
+
+export interface SignalHistoryStateRow {
+  system: string;
+  name_cn: string | null;
+  direction: SignalDirection;
+  strength: number;
+  updated_ts: number | null;
+  changed_ts: number | null;
+}
+
+// ─── 信号结构画线（GET /api/twelve/structure）───
+// ts 均为 bar 开盘 epoch 秒，与 api.kline rows 的 ts/1000 同源对齐
+
+/** 结构折线（缠论笔/线段等）：按时间升序的点列 */
+export interface StructurePolyline {
+  points: { ts: number; price: number }[];
+  color?: string;
+  style?: "solid" | "dashed";
+  width?: number;
+  label?: string;
+}
+
+/** 结构标注（买卖点箭头等）：锚定单根 bar，由图表原生 marker 渲染 */
+export interface StructureMarker {
+  ts: number;
+  price?: number;
+  position: "above" | "below";
+  shape: "arrow_up" | "arrow_down" | "circle" | "square";
+  color?: string;
+  text?: string;
+}
+
+/** 结构区域（中枢框等）：时间 × 价格矩形，渲染为上下两条边缘虚线 */
+export interface StructureBox {
+  ts1: number;
+  ts2: number;
+  price_lo: number;
+  price_hi: number;
+  color?: string;
+  label?: string;
+}
+
+/** 结构关键水平位（与 KeyLevel 通道同风格渲染） */
+export interface StructureHLine {
+  price: number;
+  color?: string;
+  label?: string;
+  style?: string;
+}
+
+export interface StructureDrawings {
+  polylines: StructurePolyline[];
+  markers: StructureMarker[];
+  boxes: StructureBox[];
+  hlines: StructureHLine[];
+}
+
+/** GET /api/twelve/structure 封套；无几何的系统 drawings 各数组为空 */
+export interface SignalStructureResponse {
+  ok: boolean;
+  symbol?: string;
+  tf?: string;
+  system?: string;
+  name_cn?: string;
+  direction?: SignalDirection;
+  as_of?: number;
+  drawings?: StructureDrawings;
+  error?: string;
+}
+
+export interface SignalHistoryStateResponse {
+  ok: boolean;
+  rows: SignalHistoryStateRow[];
+  error?: string;
+}
+
+// ─── 盘口深度透视（GET /api/depth/orderbook）───
+
+/** 单个价格桶（qty=币量 usd=名义额 cum_usd=向外累计深度） */
+export interface DepthBucket {
+  price: number;
+  qty: number;
+  usd: number;
+  cum_usd: number;
+}
+
+export interface DepthOrderbookResponse {
+  ok: boolean;
+  symbol?: string;
+  /** futures=合约簿 / spot=现货簿（合约域不可达时回退） */
+  market?: "futures" | "spot";
+  ts?: number;
+  mid?: number;
+  best_bid?: number | null;
+  best_ask?: number | null;
+  spread_pct?: number | null;
+  /** 价格桶宽 */
+  bucket?: number;
+  /** 买盘（价格降序） */
+  bids?: DepthBucket[];
+  /** 卖盘（价格升序） */
+  asks?: DepthBucket[];
+  imbalance?: { bid_usd_10: number; ask_usd_10: number; ratio: number | null };
+  /** true = 本次快照拉取失败，返回的是上一次成功结果 */
+  stale?: boolean;
+  error?: string;
+}
+
+// ─── 成交流主体画像（GET /api/tape/flow）───
+
+export type TapeActor = "retail" | "mid" | "inst" | "maker";
+
+export interface TapeActorStat {
+  actor: TapeActor;
+  actor_cn: string;
+  usd: number;
+  buy_usd: number;
+  sell_usd: number;
+  net_usd: number;
+  n: number;
+  pct: number;
+}
+
+/** 数量指纹聚合组（同一数量反复成交 = 疑似同一主体拆单） */
+export interface TapeFingerprint {
+  fp: string;
+  qty: number;
+  n: number;
+  buy_n: number;
+  sell_n: number;
+  avg_usd: number;
+  total_usd: number;
+  net_usd: number;
+  cls: TapeActor;
+  cls_cn: string;
+  first_ts: number;
+  last_ts: number;
+  last_price: number;
+}
+
+export interface TapeTrade {
+  ts_ms: number;
+  price: number;
+  qty: number;
+  usd: number;
+  is_buy: boolean;
+  fp: string;
+  tier: "retail" | "mid" | "whale";
+  cls: TapeActor;
+  cls_cn: string;
+  /** 同指纹累计笔数 */
+  fp_n: number;
+}
+
+export interface TapeVerdict {
+  dominant: TapeActor;
+  dominant_cn: string;
+  non_retail_share_pct: number;
+  inst_net_usd: number;
+  /** 砸盘 / 拉盘/操盘 / 吸筹 / 派发/出货 / 中性 */
+  action: string;
+  note: string;
+  burst: { side: "buy" | "sell"; usd: number; note: string } | null;
+  /** 砸盘力度减弱时的入场时机提示 */
+  entry_hint: string | null;
+}
+
+export interface TapeFlowResponse {
+  ok: boolean;
+  ws_ready?: boolean;
+  symbol?: string;
+  active?: boolean;
+  window_min?: number;
+  price_change_pct?: number | null;
+  breakdown?: { total_usd: number; actors: Record<TapeActor, TapeActorStat> };
+  verdict?: TapeVerdict;
+  fingerprints?: TapeFingerprint[];
+  recent?: TapeTrade[];
+  series?: {
+    ts: number;
+    buy: number;
+    sell: number;
+    nr_buy: number;
+    nr_sell: number;
+    price: number;
+  }[];
+  tier1_usd?: number;
+  retail_max_usd?: number;
+  disclaimer?: string;
+  error?: string;
+}
+
+// ─── 成交流 K 线柱（GET /api/tape/bars）───
+
+/** 单根成交流柱：周期内主动买/卖名义额聚合 + 非散户口径 + 价格 OHLC */
+export interface TapeBar {
+  /** 柱开始时间（unix 秒） */
+  ts: number;
+  /** 全部主动买入额（USD） */
+  buy: number;
+  /** 全部主动卖出额（USD） */
+  sell: number;
+  /** buy - sell */
+  net: number;
+  /** 非散户（单笔 ≥ 阈值）买入额 */
+  nr_buy: number;
+  /** 非散户卖出额 */
+  nr_sell: number;
+  /** nr_buy - nr_sell */
+  nr_net: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  /** 周期内成交笔数 */
+  trades: number;
+}
+
+export interface TapeBarsResponse {
+  ok: boolean;
+  symbol?: string;
+  interval?: string;
+  bars?: TapeBar[];
+  /** 数据来源标注（如 ws_agg / kline_approx） */
+  source?: string;
+  error?: string;
 }
 
 // ─── 单信号级历史胜率统计 ───
