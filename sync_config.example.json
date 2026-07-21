@@ -1,0 +1,35 @@
+{
+  "_readme": "贾维斯→RuoYi 同步器配置模板。使用：mkdir -p ~/.vibe-trading/sync && cp sync_config.example.json ~/.vibe-trading/sync/sync_config.json && chmod 600 ~/.vibe-trading/sync/sync_config.json，然后把 mysql.password 换成真实密码（真实 config 含密码，严禁提交进 git）。切云库=只改 mysql 段（host/port/user/password，ssl_mode 改 REQUIRED）后 launchctl kickstart -k gui/$UID/com.jarvis.sync，零代码改动。调试可用环境变量 JARVIS_SYNC_MYSQL_URL=mysql://user:pass@host:3306/db 临时覆盖 mysql 段。",
+  "mysql": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "user": "jarvis_sync",
+    "password": "<32位随机密码>",
+    "database": "jiaweisi",
+    "ssl_mode": "PREFERRED",
+    "connect_timeout": 5
+  },
+  "dashboard_base_url": "http://127.0.0.1:7899",
+  "symbols": null,
+  "table_prefix": "jarvis_",
+  "groups": {
+    "fast": { "enabled": true, "period_s": 5 },
+    "mid": { "enabled": true, "period_s": 60 },
+    "api": { "enabled": true, "period_s": 180 },
+    "market_snapshot": { "enabled": true, "period_s": 300 }
+  },
+  "batch_size": 5000,
+  "exec_batch": 500,
+  "retention_days": {
+    "jarvis_signal_change": 180,
+    "jarvis_tape_bar": 90,
+    "jarvis_market_snapshot": 90,
+    "jarvis_reco_plan": 365
+  },
+  "http_timeout_s": 10,
+  "log": {
+    "path": "~/.vibe-trading/sync/sync.log",
+    "max_mb": 20,
+    "backups": 3
+  }
+}

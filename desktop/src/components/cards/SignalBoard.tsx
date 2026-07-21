@@ -15,6 +15,10 @@ import {
   Clock,
   GitCommitHorizontal,
   Waypoints,
+  Bell,
+  BellRing,
+  Mail,
+  X,
 } from "lucide-react";
 import { usePolling } from "@/hooks/useApi";
 import {
@@ -579,6 +583,9 @@ function SignalCell({
   winrate,
   currentTf,
   price,
+  alertOn,
+  alertEmail,
+  onToggleAlert,
   onShowMarks,
   onExplain,
   onShowZone,
@@ -590,6 +597,12 @@ function SignalCell({
   currentTf: string;
   /** 当前现价（追高/追空警示用） */
   price?: number | null;
+  /** 该信号（symbol×tf×system）是否已开邮件提醒 */
+  alertOn?: boolean;
+  /** 全局收件邮箱（悬停提示用；空 = 未配置） */
+  alertEmail?: string;
+  /** 铃铛开关：开/关该信号的变更邮件提醒 */
+  onToggleAlert?: (system: string, next: boolean) => void;
   /** 跳 K 线图标记该信号历史盈损点（system + 方向） */
   onShowMarks?: (system: string, side: "long" | "short") => void;
   /** 一键解读：把该信号解释成大白话（携带当前方向的胜率统计） */
@@ -629,9 +642,43 @@ function SignalCell({
         <span className="text-xs font-medium text-jarvis-text truncate">
           {signal.name_cn || signal.system}
         </span>
-        <span className={clsx("flex items-center gap-0.5 text-xs", meta.text)}>
-          {meta.icon}
-          {meta.label}
+        <span className="flex items-center gap-1.5 shrink-0">
+          <span className={clsx("flex items-center gap-0.5 text-xs", meta.text)}>
+            {meta.icon}
+            {meta.label}
+          </span>
+          {onToggleAlert && (
+            // 信号格整体是 <button>，内嵌交互用 span+role 避免非法嵌套
+            <span
+              role="switch"
+              aria-checked={alertOn}
+              tabIndex={0}
+              onClick={(e) => {
+                e.stopPropagation();
+                onToggleAlert(signal.system, !alertOn);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onToggleAlert(signal.system, !alertOn);
+                }
+              }}
+              title={
+                alertOn
+                  ? `已开启：该信号变化时发邮件到 ${alertEmail || "价位提醒通讯录"}（点击关闭）`
+                  : "点击开启：该信号发生实质变化（方向翻转/强度大变/计划调整）时发邮件提醒"
+              }
+              className={clsx(
+                "inline-flex items-center rounded p-0.5 transition-colors cursor-pointer",
+                alertOn
+                  ? "text-jarvis-yellow hover:bg-jarvis-yellow/15"
+                  : "text-jarvis-text-secondary/50 hover:text-jarvis-text-secondary hover:bg-white/5",
+              )}
+            >
+              {alertOn ? <BellRing size={12} /> : <Bell size={12} />}
+            </span>
+          )}
         </span>
       </div>
 
@@ -810,6 +857,76 @@ export default function SignalBoard({ symbol, tf, onTfChange }: SignalBoardProps
     60_000,
     [symbol, dataTf],
   );
+
+  // 信号邮件提醒订阅状态（低频轮询保持"今日已发"等元数据新鲜）
+  const { data: alertState, refetch: refetchAlerts } = usePolling(
+    () => api.signalAlerts(),
+    120_000,
+    [],
+  );
+  const alertKeys = new Set(
+    (alertState?.ok ? alertState.subs : [])
+      .filter((s) => s.enabled)
+      .map((s) => `${s.symbol}|${s.tf}|${s.system}`),
+  );
+  // 首次开启且未配置全局邮箱 → 弹输入框；记住待开启的 system
+  const [emailPromptFor, setEmailPromptFor] = useState<string | null>(null);
+  const [emailInput, setEmailInput] = useState("");
+  const [alertBusy, setAlertBusy] = useState(false);
+  const [alertMsg, setAlertMsg] = useState("");
+
+  const flashAlertMsg = (msg: string) => {
+    setAlertMsg(msg);
+    window.setTimeout(() => setAlertMsg(""), 5_000);
+  };
+
+  const toggleAlert = async (system: string, next: boolean) => {
+    if (alertBusy) return;
+    // 首次开启且全局邮箱未配置：先收邮箱（价位提醒通讯录也可兜底，但按需求引导配置）
+    if (next && alertState?.ok && !alertState.email) {
+      setEmailInput("");
+      setEmailPromptFor(system);
+      return;
+    }
+    setAlertBusy(true);
+    try {
+      const res = await api.updateSignalAlerts({
+        sub: { symbol, tf: dataTf, system, enabled: next },
+      });
+      if (!res.ok) flashAlertMsg(res.error ?? "提醒开关设置失败");
+      else if (next)
+        flashAlertMsg(`已开启：该信号变化时发邮件到 ${res.email || "价位提醒通讯录"}`);
+      refetchAlerts();
+    } catch (e) {
+      flashAlertMsg(e instanceof Error ? e.message : "提醒开关设置失败");
+    } finally {
+      setAlertBusy(false);
+    }
+  };
+
+  const submitEmailAndEnable = async () => {
+    const email = emailInput.trim();
+    if (!email || !email.includes("@")) {
+      flashAlertMsg("请输入有效邮箱地址");
+      return;
+    }
+    if (emailPromptFor == null) return;
+    setAlertBusy(true);
+    try {
+      const res = await api.updateSignalAlerts({
+        email,
+        sub: { symbol, tf: dataTf, system: emailPromptFor, enabled: true },
+      });
+      if (!res.ok) flashAlertMsg(res.error ?? "设置失败");
+      else flashAlertMsg(`已开启提醒，变化时发邮件到 ${email}`);
+      setEmailPromptFor(null);
+      refetchAlerts();
+    } catch (e) {
+      flashAlertMsg(e instanceof Error ? e.message : "设置失败");
+    } finally {
+      setAlertBusy(false);
+    }
+  };
 
   // 单信号级历史胜率缓存（低频轮询即可；后端读 JSON 缓存，无重计算开销）
   const { data: wrResp, refetch: refetchWinrate } = usePolling(
@@ -1046,6 +1163,12 @@ export default function SignalBoard({ symbol, tf, onTfChange }: SignalBoardProps
           {wrMsg}
         </p>
       )}
+      {alertMsg && (
+        <p className="text-xs text-jarvis-yellow mb-2 bg-jarvis-yellow/10 rounded-md px-2.5 py-1.5 flex items-center gap-1.5">
+          <Bell size={11} className="shrink-0" />
+          {alertMsg}
+        </p>
+      )}
 
       {failed ? (
         <div className="py-8 text-center">
@@ -1087,6 +1210,9 @@ export default function SignalBoard({ symbol, tf, onTfChange }: SignalBoardProps
                 winrate={winrate}
                 currentTf={dataTf}
                 price={data?.price ?? null}
+                alertOn={alertKeys.has(`${symbol}|${dataTf}|${s.system}`)}
+                alertEmail={alertState?.ok ? alertState.email : ""}
+                onToggleAlert={toggleAlert}
                 onShowMarks={showMarksOnChart}
                 onExplain={explainSignal}
                 onShowZone={showZoneOnChart}
@@ -1113,6 +1239,63 @@ export default function SignalBoard({ symbol, tf, onTfChange }: SignalBoardProps
 
       {/* 一键解读抽屉（单信号 / 整体分歧共用） */}
       <SignalExplainDrawer request={explainReq} onClose={() => setExplainReq(null)} />
+
+      {/* 首次开启信号提醒：全局收件邮箱设置弹窗 */}
+      {emailPromptFor != null && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
+          onClick={() => setEmailPromptFor(null)}
+        >
+          <div
+            className="w-[360px] max-w-[90vw] rounded-xl border border-jarvis-border bg-jarvis-card p-4 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center gap-2 mb-2">
+              <Mail size={15} className="text-jarvis-blue" />
+              <span className="text-sm font-medium text-jarvis-text">
+                设置提醒收件邮箱
+              </span>
+              <button
+                onClick={() => setEmailPromptFor(null)}
+                className="ml-auto p-1 rounded text-jarvis-text-secondary hover:bg-white/10"
+                aria-label="关闭"
+              >
+                <X size={14} />
+              </button>
+            </div>
+            <p className="text-xs text-jarvis-text-secondary mb-3 leading-relaxed">
+              首次开启信号邮件提醒，请设置收件邮箱（全局一个，所有信号提醒共用）。
+              发件账号复用「提醒」页的 SMTP 配置。
+            </p>
+            <input
+              autoFocus
+              type="email"
+              value={emailInput}
+              onChange={(e) => setEmailInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") submitEmailAndEnable();
+              }}
+              placeholder="you@example.com"
+              className="w-full rounded-md border border-jarvis-border bg-jarvis-bg px-2.5 py-1.5 text-sm text-jarvis-text outline-none focus:border-jarvis-blue/60 mb-3"
+            />
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setEmailPromptFor(null)}
+                className="text-xs px-3 py-1.5 rounded-md text-jarvis-text-secondary hover:bg-white/5"
+              >
+                取消
+              </button>
+              <button
+                onClick={submitEmailAndEnable}
+                disabled={alertBusy}
+                className="text-xs px-3 py-1.5 rounded-md bg-jarvis-blue/20 text-jarvis-blue hover:bg-jarvis-blue/30 disabled:opacity-60"
+              >
+                {alertBusy ? "保存中…" : "保存并开启提醒"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

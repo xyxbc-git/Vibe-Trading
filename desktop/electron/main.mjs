@@ -7,11 +7,12 @@
  *  3. 应用退出时优雅关闭 Python 进程
  */
 
-import { app, BrowserWindow, shell } from "electron";
+import { app, BrowserWindow, session, shell } from "electron";
 import { spawn } from "child_process";
 import path from "path";
 import os from "os";
 import fs from "fs";
+import net from "net";
 import { fileURLToPath } from "url";
 import http from "http";
 
@@ -43,6 +44,53 @@ function readDashboardPort() {
 
 const PYTHON_PORT = readDashboardPort();
 const VITE_DEV_URL = "http://localhost:5173";
+
+/**
+ * Renderer 直连外部行情源（币安合约 REST/WSS）的代理自愈。
+ *
+ * 背景：足迹图数据层在 renderer 内直连 fapi.binance.com / fstream.binance.com；
+ * 该域在无代理网络下不可达，而用户跑的是 xray/clash 这类本地代理（不写系统
+ * 代理设置，Chromium 感知不到）。与后端 jarvis_net.py 的探测逻辑同款：枚举
+ * 常见本地代理端口，探到即把 renderer 会话代理指过去；本地地址（Python 后端
+ * 7899 / vite 5173）直连不受影响。探不到则保持直连（海外直连网络本来就通）。
+ */
+const PROXY_CANDIDATES = [
+  { port: 10809, scheme: "http" },   // xray / v2rayN 默认 http 入站
+  { port: 7890, scheme: "http" },    // clash mixed/http
+  { port: 1087, scheme: "http" },    // V2rayU / ShadowsocksX-NG http
+  { port: 10808, scheme: "socks5" }, // xray / v2rayN socks
+  { port: 7891, scheme: "socks5" },  // clash socks
+  { port: 1080, scheme: "socks5" },  // 通用 socks5
+];
+
+function probeLocalPort(port, timeoutMs = 400) {
+  return new Promise((resolve) => {
+    const sock = net.connect({ host: "127.0.0.1", port });
+    const done = (ok) => {
+      sock.destroy();
+      resolve(ok);
+    };
+    sock.setTimeout(timeoutMs);
+    sock.once("connect", () => done(true));
+    sock.once("timeout", () => done(false));
+    sock.once("error", () => done(false));
+  });
+}
+
+async function configureRendererProxy() {
+  for (const { port, scheme } of PROXY_CANDIDATES) {
+    if (await probeLocalPort(port)) {
+      const rules = `${scheme}://127.0.0.1:${port}`;
+      await session.defaultSession.setProxy({
+        proxyRules: rules,
+        proxyBypassRules: "localhost;127.0.0.1;<local>",
+      });
+      console.log(`[JARVIS] Renderer proxy enabled: ${rules} (local addresses bypassed)`);
+      return;
+    }
+  }
+  console.log("[JARVIS] No local proxy detected, renderer uses direct connection");
+}
 
 function getVibeTradingDir() {
   return path.resolve(__dirname, "..", "..");
@@ -156,6 +204,7 @@ async function createWindow() {
 
 app.whenReady().then(async () => {
   startPythonBackend();
+  await configureRendererProxy();
 
   try {
     console.log("[JARVIS] Waiting for Python backend...");

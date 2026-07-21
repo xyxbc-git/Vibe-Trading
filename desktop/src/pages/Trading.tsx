@@ -1,11 +1,27 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useApi, usePolling } from "@/hooks/useApi";
 import { useSymbol } from "@/hooks/useSymbol";
+import { useLivePrice } from "@/hooks/usePrice";
 import { api, ApiError } from "@/api/client";
 import PositionCard from "@/components/cards/PositionCard";
 import OrderNotifyDialog from "@/components/cards/OrderNotifyDialog";
 import BehaviorTagDialog from "@/components/cards/BehaviorTagDialog";
+import RiskPreviewCard from "@/components/cards/RiskPreviewCard";
+import AiAdviceCard from "@/components/cards/AiAdviceCard";
 import { extractCardMetrics } from "@/lib/positionMetrics";
+import {
+  calcRisk,
+  marginPctForRisk,
+  LEVERAGE_STEPS,
+  RISK_PRESETS,
+  type RiskPreset,
+} from "@/lib/riskCalc";
+import {
+  runAiTradeAdvice,
+  SIGNAL_SOURCES,
+  type AiTradeAdvice,
+  type SignalSourceKey,
+} from "@/lib/aiTradeAdvice";
 import { ArrowLeftRight, ShieldCheck, AlertTriangle, Zap, FileText, Radar, Play, RotateCw, TrendingUp, Compass, Bell, Wallet } from "lucide-react";
 import { clsx } from "clsx";
 
@@ -35,7 +51,8 @@ async function runTwelveCycle(): Promise<Record<string, unknown>> {
 }
 
 export default function Trading() {
-  const { symbol } = useSymbol();
+  const { symbol, setSymbol, supported } = useSymbol();
+  const livePrice = useLivePrice();
   const { data: positions, refetch: refetchPositions } = usePolling(api.positions, 3_000);
   const { data: orders, refetch: refetchOrders } = usePolling(api.orders, 15_000);
   const { data: wallet } = usePolling(api.wallet, 30_000);
@@ -56,6 +73,19 @@ export default function Trading() {
     notifyTp: true,
     notifySl: true,
   });
+  // ── 合约参数（本金/下单比例/杠杆/风险档/参考信号）──
+  // amount（下单金额=保证金）与 pct 双向联动：最后编辑的一侧改写另一侧
+  const [contract, setContract] = useState({
+    capital: "",
+    pct: "10",
+    leverage: "10",
+    riskPreset: "balanced" as RiskPreset,
+    sources: ["consensus", "sentiment"] as SignalSourceKey[],
+  });
+  // 本金是否被用户手动接管（未接管时跟随可用余额自动填充）
+  const [capitalTouched, setCapitalTouched] = useState(false);
+  const [aiAdvice, setAiAdvice] = useState<AiTradeAdvice | null>(null);
+  const [aiLoading, setAiLoading] = useState(false);
   const [ordering, setOrdering] = useState(false);
   // 下单结果横幅：成功/失败都要给用户反馈，禁止静默吞错
   const [orderResult, setOrderResult] = useState<{ ok: boolean; msg: string } | null>(null);
@@ -115,15 +145,161 @@ export default function Trading() {
     amountValid && availableCash != null && amountNum > availableCash + 1e-9;
   const canSubmit = amountValid && availableCash != null && !exceedsBalance;
 
-  /** 按可用余额的百分比快捷填充金额（向下取 2 位小数，不超余额） */
-  const fillAmountPct = (pct: number) => {
-    if (availableCash == null || availableCash <= 0) return;
-    const v = Math.floor(availableCash * pct * 100) / 100;
-    setOrderForm((f) => ({ ...f, amount: v > 0 ? String(v) : "" }));
+  // 本金未被接管时跟随可用余额；金额随比例同步初始化
+  useEffect(() => {
+    if (capitalTouched || availableCash == null || availableCash <= 0) return;
+    const cap = Math.floor(availableCash * 100) / 100;
+    setContract((c) => (c.capital === String(cap) ? c : { ...c, capital: String(cap) }));
+    setOrderForm((f) => {
+      if (f.amount !== "") return f;
+      const pct = parseFloat(contract.pct);
+      if (!Number.isFinite(pct) || pct <= 0) return f;
+      return { ...f, amount: String(Math.floor(((cap * pct) / 100) * 100) / 100) };
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [availableCash, capitalTouched]);
+
+  const capitalNum = parseFloat(contract.capital);
+  const capitalValid = Number.isFinite(capitalNum) && capitalNum > 0;
+  const leverageNum = parseFloat(contract.leverage);
+  const pctNum = parseFloat(contract.pct);
+
+  /** 改比例 → 金额跟随（金额 = 本金 × 比例%，向下取 2 位小数） */
+  const setPctLinked = (pctStr: string) => {
+    setContract((c) => ({ ...c, pct: pctStr }));
+    const pct = parseFloat(pctStr);
+    if (capitalValid && Number.isFinite(pct) && pct > 0) {
+      const v = Math.floor(((capitalNum * pct) / 100) * 100) / 100;
+      setOrderForm((f) => ({ ...f, amount: v > 0 ? String(v) : "" }));
+    }
   };
+
+  /** 改金额 → 比例跟随（比例 = 金额 / 本金 × 100） */
+  const setAmountLinked = (amountStr: string) => {
+    setOrderForm((f) => ({ ...f, amount: amountStr }));
+    const v = parseFloat(amountStr);
+    if (capitalValid && Number.isFinite(v) && v > 0) {
+      setContract((c) => ({
+        ...c,
+        pct: String(Math.round((v / capitalNum) * 100 * 100) / 100),
+      }));
+    }
+  };
+
+  /** 改本金 → 金额按当前比例重算 */
+  const setCapitalLinked = (capStr: string) => {
+    setCapitalTouched(true);
+    setContract((c) => ({ ...c, capital: capStr }));
+    const cap = parseFloat(capStr);
+    if (Number.isFinite(cap) && cap > 0 && Number.isFinite(pctNum) && pctNum > 0) {
+      const v = Math.floor(((cap * pctNum) / 100) * 100) / 100;
+      setOrderForm((f) => ({ ...f, amount: v > 0 ? String(v) : "" }));
+    }
+  };
+
+  /** 切风险档：按公式反推下单比例（比例 = 风险% / (杠杆 × 止损距离%)） */
+  const applyRiskPreset = (preset: RiskPreset) => {
+    setContract((c) => ({ ...c, riskPreset: preset }));
+    const slPct = parseFloat(orderForm.stopLoss);
+    if (!Number.isFinite(leverageNum) || leverageNum <= 0) return;
+    const pct = marginPctForRisk(RISK_PRESETS[preset].riskPct, leverageNum, slPct);
+    if (pct != null) setPctLinked(String(pct));
+  };
+
+  // ── 实时风控预览（本地纯函数，不依赖 AI/后端）──
+  // 入场价用全局实时现价；切币瞬间残留旧币报价时跳过计算
+  const entryPrice =
+    livePrice != null && livePrice.symbol === symbol ? livePrice.price : null;
+  const riskResult = useMemo(() => {
+    if (!capitalValid || entryPrice == null) return null;
+    return calcRisk({
+      capital: capitalNum,
+      pctOfCapital: pctNum,
+      leverage: leverageNum,
+      direction: orderForm.direction,
+      entryPrice,
+      slPct: parseFloat(orderForm.stopLoss),
+      tpPct: parseFloat(orderForm.takeProfit),
+    });
+  }, [
+    capitalValid,
+    capitalNum,
+    pctNum,
+    leverageNum,
+    entryPrice,
+    orderForm.direction,
+    orderForm.stopLoss,
+    orderForm.takeProfit,
+  ]);
+
+  /** AI 推荐：组装用户参数 + 勾选信号上下文 → LLM → 失败回落本地规则 */
+  const handleAiAdvise = async () => {
+    setAiLoading(true);
+    try {
+      const advice = await runAiTradeAdvice({
+        symbol,
+        price: entryPrice,
+        capital: capitalValid ? capitalNum : 0,
+        pctOfCapital: Number.isFinite(pctNum) ? pctNum : 0,
+        leverage: Number.isFinite(leverageNum) ? leverageNum : 10,
+        riskPreset: contract.riskPreset,
+        sources: contract.sources,
+        consensusCache: consensus,
+      });
+      setAiAdvice(advice);
+    } finally {
+      setAiLoading(false);
+    }
+  };
+
+  /** 一键填入：方向/止损/止盈（换算成相对现价的距离%）/杠杆/下单比例 */
+  const applyAdvice = (a: AiTradeAdvice) => {
+    if (a.side === "wait") return;
+    const dir = a.side;
+    setOrderForm((f) => {
+      const next = { ...f, direction: dir };
+      if (entryPrice != null && entryPrice > 0) {
+        // 方向自洽才填：做多止损在现价下方 / 做空在上方；止盈反之
+        if (a.stopLoss != null) {
+          const ok = dir === "long" ? a.stopLoss < entryPrice : a.stopLoss > entryPrice;
+          if (ok) {
+            next.stopLoss = (
+              (Math.abs(entryPrice - a.stopLoss) / entryPrice) * 100
+            ).toFixed(2);
+          }
+        }
+        if (a.takeProfit1 != null) {
+          const ok = dir === "long" ? a.takeProfit1 > entryPrice : a.takeProfit1 < entryPrice;
+          if (ok) {
+            next.takeProfit = (
+              (Math.abs(a.takeProfit1 - entryPrice) / entryPrice) * 100
+            ).toFixed(2);
+          }
+        }
+      }
+      return next;
+    });
+    setContract((c) => ({
+      ...c,
+      leverage: a.leverage != null ? String(a.leverage) : c.leverage,
+    }));
+    if (a.positionPct != null) setPctLinked(String(a.positionPct));
+  };
+
+  // 换币种：AI 建议作废（点位是币种强相关的）
+  useEffect(() => {
+    setAiAdvice(null);
+  }, [symbol]);
 
   const handleOrder = async () => {
     if (!canSubmit) return;
+    // ── 危险拦截：止损在强平外/单笔亏损超上限/杠杆超安全值 → 下单前必须确认 ──
+    if (riskResult && riskResult.dangers.length > 0) {
+      const okGo = window.confirm(
+        `⚠️ 风控警告\n\n${riskResult.dangers.map((d) => `• ${d.message}`).join("\n\n")}\n\n确认仍要下单吗？`,
+      );
+      if (!okGo) return;
+    }
     setOrdering(true);
     setOrderResult(null);
     try {
@@ -145,6 +321,30 @@ export default function Trading() {
       const slPct = parseFloat(orderForm.stopLoss) / 100;
       const tpPct = parseFloat(orderForm.takeProfit) / 100;
       const isLong = orderForm.direction === "long";
+      // 杠杆 > 1 时以 trade-plan 快照落 note（qty 仍按保证金口径换算，钱包按
+      // 现货全额冻结；杠杆/名义仓位供持仓卡与下游展示），与 PositionAdvisor
+      // 自创单同构；1x 不带 note/source，与旧手动单行为完全一致
+      const useLeverage =
+        Number.isFinite(leverageNum) && leverageNum > 1 && riskResult != null;
+      const planNote = useLeverage
+        ? JSON.stringify({
+            kind: "trade-plan",
+            tf: "manual",
+            capital_usdt: capitalValid ? capitalNum : null,
+            leverage: leverageNum,
+            margin_pct: Number.isFinite(pctNum) ? pctNum : null,
+            margin_usdt: amount,
+            notional_usdt: riskResult.notionalUsdt,
+            qty_coin: riskResult.qtyCoin,
+            entry: price,
+            stop_loss: riskResult.slPrice,
+            take_profits: [{ rr: riskResult.rr ?? 0, price: riskResult.tpPrice }],
+            liquidation: riskResult.liqPrice,
+            ai_advice: aiAdvice
+              ? { source: aiAdvice.source, side: aiAdvice.side, risk: aiAdvice.riskLevel }
+              : null,
+          })
+        : undefined;
       const res = await api.placeOrder({
         symbol,
         side: isLong ? "buy" : "sell",
@@ -156,6 +356,7 @@ export default function Trading() {
         takeProfit: Number.isFinite(tpPct) && tpPct > 0
           ? price * (isLong ? 1 + tpPct : 1 - tpPct)
           : undefined,
+        ...(planNote ? { source: "user-created" as const, note: planNote } : {}),
       });
       if (res.ok) {
         let notifyMsg = "";
@@ -578,8 +779,32 @@ export default function Trading() {
           </div>
 
           <div className="card">
-            <p className="stat-label mb-4">手动下单（模拟盘）</p>
+            <p className="stat-label mb-4">手动下单（模拟盘 · 合约）</p>
             <div className="space-y-3">
+              {/* ── 币种：跟随全局选择器，此处也可独立切换 ── */}
+              <div className="flex items-center gap-2">
+                <label className="text-xs text-jarvis-text-secondary flex-shrink-0">
+                  币种
+                </label>
+                <select
+                  value={symbol}
+                  onChange={(e) => setSymbol(e.target.value)}
+                  className="flex-1 px-2 py-1.5 bg-jarvis-bg border border-jarvis-border rounded-lg text-sm text-jarvis-text font-mono cursor-pointer"
+                >
+                  {supported.map((s) => (
+                    <option key={s.value} value={s.value}>
+                      {s.label}
+                    </option>
+                  ))}
+                </select>
+                <span
+                  className="text-xs font-mono text-jarvis-text whitespace-nowrap"
+                  title="实时现价（10s 轮询，与顶栏同源）"
+                >
+                  {entryPrice != null ? `$${fmtUsd(entryPrice)}` : "价格加载中"}
+                </span>
+              </div>
+
               <div className="flex gap-2">
                 <button
                   onClick={() =>
@@ -609,10 +834,40 @@ export default function Trading() {
                 </button>
               </div>
 
+              {/* ── 本金：默认跟随可用余额，可手动接管 ── */}
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="text-xs text-jarvis-text-secondary">
+                    本金 (USDT){capitalTouched ? "" : " · 跟随余额"}
+                  </label>
+                  <input
+                    type="number"
+                    value={contract.capital}
+                    onChange={(e) => setCapitalLinked(e.target.value)}
+                    placeholder="1000"
+                    title="用于风控计算的账户本金；默认取可用余额，可手动修改"
+                    className="w-full mt-1 px-3 py-2 bg-jarvis-bg border border-jarvis-border rounded-lg text-sm text-jarvis-text font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-jarvis-text-secondary">
+                    下单比例 (%本金)
+                  </label>
+                  <input
+                    type="number"
+                    value={contract.pct}
+                    onChange={(e) => setPctLinked(e.target.value)}
+                    placeholder="10"
+                    title="下单金额 = 本金 × 该比例；与下方金额双向联动"
+                    className="w-full mt-1 px-3 py-2 bg-jarvis-bg border border-jarvis-border rounded-lg text-sm text-jarvis-text font-mono"
+                  />
+                </div>
+              </div>
+
               <div>
                 <div className="flex items-center justify-between">
                   <label className="text-xs text-jarvis-text-secondary">
-                    数量 (USDT)
+                    下单金额 (USDT · 保证金)
                   </label>
                   <span
                     className="flex items-center gap-1 text-xs text-jarvis-text-secondary"
@@ -630,9 +885,7 @@ export default function Trading() {
                 <input
                   type="number"
                   value={orderForm.amount}
-                  onChange={(e) =>
-                    setOrderForm((f) => ({ ...f, amount: e.target.value }))
-                  }
+                  onChange={(e) => setAmountLinked(e.target.value)}
                   placeholder="100"
                   max={availableCash ?? undefined}
                   className={clsx(
@@ -643,14 +896,19 @@ export default function Trading() {
                   )}
                 />
                 <div className="flex gap-1.5 mt-1.5">
-                  {([0.25, 0.5, 0.75, 1] as const).map((pct) => (
+                  {([25, 50, 75, 100] as const).map((pct) => (
                     <button
                       key={pct}
-                      onClick={() => fillAmountPct(pct)}
-                      disabled={availableCash == null || availableCash <= 0}
-                      className="flex-1 py-1 text-xs rounded-md bg-jarvis-bg border border-jarvis-border text-jarvis-text-secondary hover:text-jarvis-text hover:border-jarvis-blue transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                      onClick={() => setPctLinked(String(pct))}
+                      disabled={!capitalValid}
+                      className={clsx(
+                        "flex-1 py-1 text-xs rounded-md bg-jarvis-bg border transition-colors disabled:opacity-40 disabled:cursor-not-allowed",
+                        contract.pct === String(pct)
+                          ? "border-jarvis-blue text-jarvis-blue"
+                          : "border-jarvis-border text-jarvis-text-secondary hover:text-jarvis-text hover:border-jarvis-blue",
+                      )}
                     >
-                      {pct === 1 ? "全部" : `${pct * 100}%`}
+                      {pct === 100 ? "全部" : `${pct}%`}
                     </button>
                   ))}
                 </div>
@@ -661,6 +919,57 @@ export default function Trading() {
                     ，请减少金额或先入金
                   </p>
                 )}
+              </div>
+
+              {/* ── 杠杆：滑杆 + 常用档 ── */}
+              <div>
+                <div className="flex items-center justify-between">
+                  <label className="text-xs text-jarvis-text-secondary">杠杆</label>
+                  <span
+                    className={clsx(
+                      "text-xs font-mono",
+                      riskResult != null && leverageNum > riskResult.maxSafeLeverage
+                        ? "text-jarvis-red"
+                        : "text-jarvis-text",
+                    )}
+                  >
+                    {Number.isFinite(leverageNum) ? `${leverageNum}x` : "—"}
+                    {riskResult != null && (
+                      <span className="text-jarvis-text-secondary ml-1.5">
+                        安全上限 {riskResult.maxSafeLeverage}x
+                      </span>
+                    )}
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min={1}
+                  max={125}
+                  step={1}
+                  value={Number.isFinite(leverageNum) ? leverageNum : 10}
+                  onChange={(e) =>
+                    setContract((c) => ({ ...c, leverage: e.target.value }))
+                  }
+                  className="w-full mt-1 accent-jarvis-blue cursor-pointer"
+                />
+                <div className="flex gap-1.5 mt-1">
+                  {LEVERAGE_STEPS.map((lev) => (
+                    <button
+                      key={lev}
+                      onClick={() =>
+                        setContract((c) => ({ ...c, leverage: String(lev) }))
+                      }
+                      className={clsx(
+                        "flex-1 py-1 text-xs rounded-md bg-jarvis-bg border transition-colors",
+                        contract.leverage === String(lev)
+                          ? "border-jarvis-blue text-jarvis-blue"
+                          : "border-jarvis-border text-jarvis-text-secondary hover:text-jarvis-text hover:border-jarvis-blue",
+                      )}
+                    >
+                      {lev}x
+                    </button>
+                  ))}
+                </div>
               </div>
 
               <div className="grid grid-cols-2 gap-2">
@@ -697,6 +1006,81 @@ export default function Trading() {
                   />
                 </div>
               </div>
+
+              {/* ── 风险偏好三档：切档按公式自动调下单比例 ── */}
+              <div>
+                <label className="text-xs text-jarvis-text-secondary">
+                  风险偏好（切换自动按止损距离反推下单比例）
+                </label>
+                <div className="flex gap-1.5 mt-1">
+                  {(Object.keys(RISK_PRESETS) as RiskPreset[]).map((key) => (
+                    <button
+                      key={key}
+                      onClick={() => applyRiskPreset(key)}
+                      title={RISK_PRESETS[key].desc}
+                      className={clsx(
+                        "flex-1 py-1.5 text-xs rounded-md bg-jarvis-bg border transition-colors",
+                        contract.riskPreset === key
+                          ? "border-jarvis-blue text-jarvis-blue font-medium"
+                          : "border-jarvis-border text-jarvis-text-secondary hover:text-jarvis-text hover:border-jarvis-blue",
+                      )}
+                    >
+                      {RISK_PRESETS[key].label} {RISK_PRESETS[key].riskPct}%
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* ── 实时风控预览（本地计算，输入即算） ── */}
+              <RiskPreviewCard result={riskResult} direction={orderForm.direction} />
+              <p className="text-[9px] text-jarvis-text-secondary/70 leading-relaxed">
+                注：模拟盘按保证金现货口径记账（杠杆盈亏放大不计入模拟盘净值）；
+                上方强平价/亏损额按真实合约近似公式估算，供实盘参考。
+              </p>
+
+              {/* ── 参考信号多选 + AI 推荐 ── */}
+              <div>
+                <label className="text-xs text-jarvis-text-secondary">
+                  AI 参考信号（勾选后作为推荐上下文）
+                </label>
+                <div className="flex flex-wrap gap-x-3 gap-y-1.5 mt-1.5">
+                  {SIGNAL_SOURCES.map((s) => (
+                    <label
+                      key={s.key}
+                      title={s.desc}
+                      className="flex items-center gap-1.5 text-xs text-jarvis-text cursor-pointer"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={contract.sources.includes(s.key)}
+                        onChange={(e) =>
+                          setContract((c) => ({
+                            ...c,
+                            sources: e.target.checked
+                              ? [...c.sources, s.key]
+                              : c.sources.filter((k) => k !== s.key),
+                          }))
+                        }
+                        className="w-3.5 h-3.5 accent-jarvis-purple cursor-pointer"
+                      />
+                      {s.label}
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <AiAdviceCard
+                advice={aiAdvice}
+                loading={aiLoading}
+                onRun={handleAiAdvise}
+                onApply={applyAdvice}
+                current={{
+                  leverage: Number.isFinite(leverageNum) ? leverageNum : null,
+                  positionPct: Number.isFinite(pctNum) ? pctNum : null,
+                  stopLossPrice: riskResult?.slPrice ?? null,
+                  takeProfitPrice: riskResult?.tpPrice ?? null,
+                }}
+              />
 
               <div className="pt-1 border-t border-jarvis-border/60">
                 <label className="text-xs text-jarvis-text-secondary flex items-center gap-1">

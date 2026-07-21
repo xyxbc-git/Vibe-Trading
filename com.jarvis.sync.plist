@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  贾维斯 → RuoYi MySQL 同步器常驻（KeepAlive 自愈拉起）。
+  安装：cp com.jarvis.sync.plist ~/Library/LaunchAgents/ && launchctl load ~/Library/LaunchAgents/com.jarvis.sync.plist
+  重启：launchctl kickstart -k gui/$(id -u)/com.jarvis.sync
+  卸载：launchctl unload ~/Library/LaunchAgents/com.jarvis.sync.plist
+  说明：路径按本机仓库位置写死（与 jarvis_daemon --install-launchd 生成风格一致）；
+        仓库迁移时同步修改下方三处绝对路径。密码在 ~/.vibe-trading/sync/sync_config.json
+        （chmod 600），plist 内不含任何密钥。
+        StandardOut/Err 仅兜底捕获 Python 起不来的裸错误；业务日志由进程自写
+        ~/.vibe-trading/sync/sync.log（20MB×3 轮转），两者不共用文件。
+-->
+<dict>
+  <key>Label</key><string>com.jarvis.sync</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/jolly/MyselfProject/TwosZiyan/AILiangH/Vibe-Trading/.venv/bin/python</string>
+    <string>/Users/jolly/MyselfProject/TwosZiyan/AILiangH/Vibe-Trading/jarvis_sync.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/jolly/MyselfProject/TwosZiyan/AILiangH/Vibe-Trading</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/tmp/com.jarvis.sync.launchd.log</string>
+  <key>StandardErrorPath</key><string>/tmp/com.jarvis.sync.launchd.log</string>
+</dict>
+</plist>

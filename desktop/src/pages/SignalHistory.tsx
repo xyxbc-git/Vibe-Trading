@@ -22,8 +22,30 @@ import {
 import { usePolling } from "@/hooks/useApi";
 import { useSymbol } from "@/hooks/useSymbol";
 
-/** 每页条数（服务端 limit/offset 分页） */
-const PAGE = 50;
+/** 每页条数档位（服务端 limit/offset 分页） */
+const PAGE_SIZE_OPTIONS = [10, 20, 50] as const;
+const DEFAULT_PAGE_SIZE = 50;
+/** 每页条数偏好持久化键 */
+const PAGE_SIZE_KEY = "jarvis.signalHistory.pageSize";
+
+function loadPageSize(): number {
+  try {
+    const v = parseInt(localStorage.getItem(PAGE_SIZE_KEY) ?? "", 10);
+    return (PAGE_SIZE_OPTIONS as readonly number[]).includes(v)
+      ? v
+      : DEFAULT_PAGE_SIZE;
+  } catch {
+    return DEFAULT_PAGE_SIZE;
+  }
+}
+
+function savePageSize(n: number): void {
+  try {
+    localStorage.setItem(PAGE_SIZE_KEY, String(n));
+  } catch {
+    /* storage 不可用（隐私模式等）——偏好记忆静默降级 */
+  }
+}
 
 /** 周期筛选项（与后端 TwelveTf 对齐） */
 const TF_OPTIONS = ["5m", "15m", "30m", "1h", "4h", "1d"] as const;
@@ -421,6 +443,8 @@ export default function SignalHistory() {
   const [fSince, setFSince] = useState("");
   const [fUntil, setFUntil] = useState("");
   const [page, setPage] = useState(1);
+  // 每页条数（10/20/50），初值读 localStorage 偏好
+  const [pageSize, setPageSize] = useState<number>(loadPageSize);
 
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [expandedId, setExpandedId] = useState<number | null>(null);
@@ -439,16 +463,16 @@ export default function SignalHistory() {
         system: fSystem !== "all" ? fSystem : undefined,
         since,
         until,
-        limit: PAGE,
-        offset: (page - 1) * PAGE,
+        limit: pageSize,
+        offset: (page - 1) * pageSize,
       }),
     30_000,
-    [fSymbol, fTf, fSystem, since, until, page],
+    [fSymbol, fTf, fSystem, since, until, page, pageSize],
   );
 
   const rows = useMemo(() => data?.rows ?? [], [data]);
   const total = data?.total ?? 0;
-  const totalPages = Math.max(1, Math.ceil(total / PAGE));
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
   // 传输层错误或业务层 ok=false 都按错误态处理
   const apiError = error ?? (data && !data.ok ? (data.error ?? "接口返回异常") : null);
 
@@ -489,6 +513,15 @@ export default function SignalHistory() {
 
   function goPage(p: number) {
     setPage(Math.min(Math.max(1, p), totalPages));
+    setSelected(new Set());
+    setExpandedId(null);
+  }
+
+  /** 切每页条数：回第一页重新拉取，并持久化偏好 */
+  function changePageSize(n: number) {
+    savePageSize(n);
+    setPageSize(n);
+    setPage(1);
     setSelected(new Set());
     setExpandedId(null);
   }
@@ -581,7 +614,7 @@ export default function SignalHistory() {
           信号变更历史
         </h1>
         <div className="flex items-center gap-3 text-xs text-jarvis-text-secondary">
-          <span>{PAGE} 条/页 · 30s 自动刷新</span>
+          <span>{pageSize} 条/页 · 30s 自动刷新</span>
           <button
             onClick={refetch}
             className="flex items-center gap-1 px-2 py-1 rounded-md border border-jarvis-border hover:text-jarvis-text hover:border-jarvis-blue transition-colors"
@@ -825,11 +858,27 @@ export default function SignalHistory() {
             </table>
 
             {/* 分页控制（服务端 limit/offset） */}
-            <div className="flex items-center justify-between pt-3 border-t border-jarvis-border/40 mt-1">
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-3 border-t border-jarvis-border/40 mt-1">
               <span className="text-xs text-jarvis-text-secondary">
                 共 {total} 条 · 第 {page}/{totalPages} 页
               </span>
               <div className="flex items-center gap-2">
+                <label className="flex items-center gap-1.5 text-xs text-jarvis-text-secondary">
+                  每页
+                  <select
+                    value={pageSize}
+                    onChange={(e) => changePageSize(Number(e.target.value))}
+                    disabled={loading}
+                    className={selectCls}
+                    title="每页显示条数（记住偏好）"
+                  >
+                    {PAGE_SIZE_OPTIONS.map((n) => (
+                      <option key={n} value={n}>
+                        {n} 条
+                      </option>
+                    ))}
+                  </select>
+                </label>
                 <button
                   onClick={() => goPage(page - 1)}
                   disabled={page <= 1 || loading}

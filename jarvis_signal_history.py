@@ -232,6 +232,7 @@ def record_batch(symbol: str, tf: str, signals: list[dict],
         ts = float(now if now is not None else time.time())
         sym = (symbol or "").upper()
         out: dict[str, dict] = {}
+        changed_events: list[dict] = []  # 供邮件提醒钩子（jarvis_signal_alert）
         with _conn() as conn:
             cur = conn.execute(
                 "SELECT system, direction, strength, plan_json, levels_json, changed_ts "
@@ -304,8 +305,23 @@ def record_batch(symbol: str, tf: str, signals: list[dict],
                          json.dumps(prev_snapshot, ensure_ascii=False),
                          json.dumps(new_snapshot, ensure_ascii=False),
                          price))
+                    changed_events.append({
+                        "symbol": sym, "tf": tf, "system": system,
+                        "name_cn": sig.get("name_cn"), "summary": summary,
+                        "prev_direction": prev.get("direction") if prev else None,
+                        "new_direction": sig.get("direction"),
+                        "prev_strength": prev.get("strength") if prev else None,
+                        "new_strength": sig.get("strength"), "price": price,
+                    })
 
                 out[system] = {"updated_at": ts, "changed_at": changed_ts}
+        # 邮件提醒钩子：变更落库后检查订阅命中（独立 try，失败绝不拖垮主链路）
+        if changed_events:
+            try:
+                import jarvis_signal_alert as jsa
+                jsa.maybe_notify(changed_events)
+            except Exception:  # noqa: BLE001
+                pass
         # 小时级节流自动裁剪，防流水无界增长
         global _LAST_PRUNE
         if ts - _LAST_PRUNE > _PRUNE_INTERVAL_S:

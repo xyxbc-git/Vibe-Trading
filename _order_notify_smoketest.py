@@ -64,8 +64,17 @@ jon.set_config("pos-99999", "new@example.com",
 r = jon.notify_position_closed(pos, 57900.0, "stop", dry_run=True)
 check("未勾选止损则跳过", not r.get("sent") and "未勾选" in str(r.get("skipped")))
 
+# [风控篇 P0-3] 行为变化：notify_all_closes（默认 true）下 manual 平仓也发信；
+# 锁定该键为 true 隔离本机 config.yaml，保持断言确定性
+import jarvis_config as _jc  # noqa: E402
+
+_og_get = _jc.get
+_jc.get = lambda k, d=None, path=None: (
+    True if k == "notify_all_closes" else _og_get(k, d, path))
 r = jon.notify_position_closed(pos, 61000.0, "manual", dry_run=True)
-check("manual 平仓不触发", not r.get("sent"))
+check("manual 平仓也通知（P0-3 notify_all_closes=true）",
+      r.get("sent") and r.get("to") == "new@example.com", str(r))
+_jc.get = _og_get
 
 r = jon.notify_position_closed({"id": 88888, "symbol": "ETHUSDT"}, 3000.0,
                                "take", dry_run=True)

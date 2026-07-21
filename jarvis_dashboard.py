@@ -2596,6 +2596,46 @@ def api_alerts_price(symbol: str = "BTCUSDT"):
     return JSONResponse({"symbol": jpa._normalize_symbol(symbol), "price": price})
 
 
+# ─────────────────── 12 系统信号变更邮件提醒（逐信号开关） ───────────────────
+
+@app.get("/api/signal-alerts")
+def api_signal_alerts_get():
+    """订阅列表 + 全局邮箱/总开关/冷却/日上限 + 今日已发封数。"""
+    try:
+        import jarvis_signal_alert as jsa
+        return JSONResponse(jsa.get_state())
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.put("/api/signal-alerts")
+def api_signal_alerts_put(data: dict):
+    """增删改订阅 / 改全局邮箱 / 总开关 / 冷却 / 日上限（按需提供）。
+
+    body 支持：
+      {"sub": {"symbol","tf","system","enabled"}}   单个开关（信号卡铃铛）
+      {"subs_off": [{"symbol","tf","system"}, ...]} 批量关闭（提醒页）
+      {"email" / "enabled" / "cooldown_s" / "daily_limit"} 全局设置
+    """
+    try:
+        import jarvis_signal_alert as jsa
+        sub = data.get("sub")
+        if isinstance(sub, dict):
+            out = jsa.set_sub(sub.get("symbol", ""), sub.get("tf", ""),
+                              sub.get("system", ""), bool(sub.get("enabled")))
+            if not out.get("ok"):
+                return JSONResponse(out, status_code=400)
+        if isinstance(data.get("subs_off"), list):
+            jsa.batch_off(data["subs_off"])
+        if any(k in data for k in ("email", "enabled", "cooldown_s", "daily_limit")):
+            out = jsa.update_state(data)
+            if not out.get("ok"):
+                return JSONResponse(out, status_code=400)
+        return JSONResponse(jsa.get_state())
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
 # ─────────────────── 交易订单邮件提醒（按笔配置） ───────────────────
 
 @app.get("/api/order-notify")
@@ -3904,6 +3944,47 @@ def api_tape_flow(symbol: str = "BTCUSDT", window_min: int = 15):
             pass
         return JSONResponse({"ok": True, "ws_ready": ws_ok,
                              **jtc.summary(sym, window_min=window_min)})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
+
+
+@app.get("/api/tape/bars")
+def api_tape_bars(symbol: str = "BTCUSDT", interval: str = "1m", limit: int = 200):
+    """成交流多周期 K 线柱（盘口透视页复盘视图）。
+
+    数据源 = tape_minute_bars 落库历史（14 天）+ 内存未落盘分钟（含当前未完结
+    分钟），按 interval（1m/5m/15m/30m/1h/4h/1d）服务端聚合；5s 缓存。
+    """
+    try:
+        import jarvis_tape_classify as jtc
+        sym = symbol.upper().replace("-", "").replace("/", "")
+        if not sym.endswith(("USDT", "USDC")):
+            sym += "USDT"
+        lim = max(1, min(int(limit), 500))
+        key = f"tape:bars:{sym}:{interval}:{lim}"
+        return JSONResponse(_cached(key, 5, lambda: jtc.bars(sym, interval, lim)))
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
+
+
+@app.get("/api/tape/footprint")
+def api_tape_footprint(symbol: str = "BTCUSDT", interval: str = "1m",
+                       limit: int = 30, buckets: int = 40):
+    """足迹图（Footprint）：每 bar 按价格档拆开的「卖×买」聚合 + 主体多空统计。
+
+    数据源为 WS aggTrade 内存足迹桶（约近 4 小时）；interval 支持 1m/5m/15m/30m，
+    limit 上限 60、buckets 上限 60（超出向边缘归并）；3s 缓存。
+    """
+    try:
+        import jarvis_tape_classify as jtc
+        sym = symbol.upper().replace("-", "").replace("/", "")
+        if not sym.endswith(("USDT", "USDC")):
+            sym += "USDT"
+        lim = max(1, min(int(limit), 60))
+        bkt = max(5, min(int(buckets), 60))
+        key = f"tape:fp:{sym}:{interval}:{lim}:{bkt}"
+        return JSONResponse(_cached(
+            key, 3, lambda: jtc.footprint(sym, interval, lim, bkt)))
     except Exception as exc:  # noqa: BLE001
         return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
 

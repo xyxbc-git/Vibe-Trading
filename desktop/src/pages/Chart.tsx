@@ -57,9 +57,16 @@ import {
   type PredictBar,
 } from "@/lib/predict";
 import { mockDelta, normalizeDeltaResponse, type DeltaResponse, type DeltaKline } from "@/lib/deltaFlow";
+import {
+  computeIchimoku,
+  ichimokuReadout,
+  ichimokuTipAt,
+  type IchimokuBar,
+} from "@/lib/ichimoku";
+import type { IchimokuOverlay } from "@/components/charts/KlineChart";
 import DeltaPane from "@/components/charts/DeltaPane";
 import DeltaAiExplainCard from "@/components/cards/DeltaAiExplainCard";
-import { CandlestickChart, HelpCircle, Target, Waypoints, X } from "lucide-react";
+import { CandlestickChart, Cloudy, HelpCircle, Target, Waypoints, X } from "lucide-react";
 import { planSide } from "@/components/cards/SignalBoard";
 import PositionAdvisor from "@/components/cards/PositionAdvisor";
 import PredictionCard from "@/components/cards/PredictionCard";
@@ -181,6 +188,26 @@ const SYS_OVERLAY_COLORS: Record<SignalDirection, string> = {
 /** 预测覆盖的未来 bar 数（与预测引擎契约默认值一致） */
 const PREDICT_HORIZON = 16;
 
+/** 云图开关持久化键（跨会话记住用户偏好） */
+const ICHIMOKU_KEY = "jarvis.chart.ichimoku";
+
+/** 云图状态提示条的色调样式（多绿/空红/震荡灰，与信号方向色一致） */
+const ICHIMOKU_TONE_CLS = {
+  bullish: "border-jarvis-green/40 text-jarvis-green",
+  bearish: "border-jarvis-red/40 text-jarvis-red",
+  neutral: "border-jarvis-border text-jarvis-text-secondary",
+} as const;
+
+/** 图例弹层里的「云图怎么看」速览（开启云图时追加展示） */
+const ICHIMOKU_LEGEND: { name: string; color: string; dashed?: boolean; explain: string }[] = [
+  { name: "绿云（看涨云）", color: "#3fb950", explain: "先行带A在B上方。价格站在云上=多头格局，云带是脚下支撑区；云越厚支撑越强" },
+  { name: "红云（看跌云）", color: "#f85149", explain: "先行带A在B下方。价格压在云下=空头格局，云带是头顶压力区；反弹进云易受阻" },
+  { name: "基准线 Kijun(26)", color: "#39c5cf", explain: "中期多空分水岭（青线）。价在线上偏多、线下偏空；也是回调常见的支撑/阻力" },
+  { name: "转换线 Tenkan(9)", color: "#d29922", explain: "短期动量线。上穿基准线=金叉（转强），下穿=死叉（转弱）" },
+  { name: "迟行线 Chikou", color: "#bc8cff", dashed: true, explain: "收盘价后移26根，与历史价格比对确认趋势；在K线上方助涨、下方助跌" },
+  { name: "未来云（右侧淡色区）", color: "#8b949e", dashed: true, explain: "云图独有的前瞻区：未来26根的云已经画好——云变薄或翻色=趋势可能转变。风险提醒：云图是趋势工具，震荡市信号质量下降，勿单独作为下单依据" },
+];
+
 export default function Chart() {
   const [tf, setTf] = useState<Timeframe>("15m");
   // 三档视图（简洁/进阶/专业），选择持久化；细粒度开关只在专业模式生效
@@ -197,6 +224,22 @@ export default function Chart() {
   const [plan, setPlan] = useState(true);
   // 走势预测层（概率锥/路径/研判卡片）独立开关；默认关，避免干扰常规看盘
   const [predictOn, setPredictOn] = useState(false);
+  // 云图（一目均衡表）开关：localStorage 记住偏好，默认关
+  const [ichimokuOn, setIchimokuOnState] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(ICHIMOKU_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const setIchimokuOn = (v: boolean) => {
+    setIchimokuOnState(v);
+    try {
+      localStorage.setItem(ICHIMOKU_KEY, v ? "1" : "0");
+    } catch {
+      /* storage unavailable — 开关仍生效，只是不持久化 */
+    }
+  };
   const { symbol } = useSymbol();
 
   // ── 信号历史盈损标记（信号矩阵「盈损点」跳转携带 query 进入） ──
@@ -413,6 +456,37 @@ export default function Chart() {
       low: Math.min(lastCandle.low, p),
     };
   }, [lastCandle, liveForChart]);
+
+  // ── 云图（一目均衡表 9/26/52）：K 线 → 五线 + 双色云带 + 人话解读 ──
+  // 纯本地计算（幅度 O(n·52)，n≤300 毫秒级），随 K 线轮询自动重算；
+  // 切周期/切币种由 candles 变化天然驱动，无需额外请求。
+  const ichimokuData = useMemo(() => {
+    if (!ichimokuOn || candles.length === 0) return null;
+    const bars: IchimokuBar[] = candles.map((c) => ({
+      high: c.high,
+      low: c.low,
+      close: c.close,
+    }));
+    const r = computeIchimoku(bars);
+    if (r.cloud.length === 0) return null; // 窗口不足（需 ≥78 根）
+    const toPts = (arr: (number | null)[]) =>
+      arr.flatMap((v, i) => (v === null ? [] : [{ time: candles[i].time, value: v }]));
+    const tipByTime = new Map<number, string>();
+    for (let i = 0; i < candles.length; i++) {
+      const tip = ichimokuTipAt(r, i);
+      if (tip) tipByTime.set(Number(candles[i].time), tip);
+    }
+    const overlay: IchimokuOverlay = {
+      tenkan: toPts(r.tenkan),
+      kijun: toPts(r.kijun),
+      chikou: toPts(r.chikou),
+      cloud: r.cloud,
+      futureStart: r.futureStart,
+      displacement: r.params.displacement,
+      tipByTime,
+    };
+    return { overlay, readout: ichimokuReadout(bars, r) };
+  }, [ichimokuOn, candles]);
 
   // ── 信号盈损标记：拉该系统的逐笔回测明细（与信号矩阵聚合胜率同源） ──
   const { data: sigTradesResp, loading: sigTradesLoading } = useApi(
@@ -1083,6 +1157,20 @@ export default function Chart() {
           预测{predictOn ? "·开" : "·关"}
         </button>
 
+        {/* 云图（一目均衡表）：五线 + 双色云带 + 未来 26 根云延伸，自动算自动画 */}
+        <button
+          onClick={() => setIchimokuOn(!ichimokuOn)}
+          title="云图（一目均衡表 9/26/52）：自动计算并画出转换线/基准线/迟行线与红绿双色云带，未来 26 根云提前画好。云上偏多、云下偏空、云中观望；云带就是支撑/压力区，不用自己找点位"
+          className={pillCls(ichimokuOn)}
+        >
+          云图{ichimokuOn ? "·开" : "·关"}
+        </button>
+        {ichimokuOn && candles.length > 0 && !ichimokuData && (
+          <span className="text-xs text-jarvis-yellow" title="一目均衡表需要至少 78 根 K 线（52 周期窗口 + 26 根前移）">
+            K 线数不足，云未生成
+          </span>
+        )}
+
         {/* Delta/CVD 副图（「安全带」层）：只有 Delta 与价格背离（吸收证据）才是真反转 */}
         <button
           onClick={() => setDeltaOn((v) => !v)}
@@ -1118,10 +1206,10 @@ export default function Chart() {
           </button>
           {legendOpen && (
             <div
-              className="absolute top-full left-0 mt-1 z-50 bg-jarvis-card border border-jarvis-border rounded-lg shadow-lg p-3 w-80"
+              className="absolute top-full left-0 mt-1 z-50 bg-jarvis-card border border-jarvis-border rounded-lg shadow-lg p-3 w-80 max-h-96 overflow-y-auto"
               onMouseLeave={() => setLegendOpen(false)}
             >
-              {composition.legend.length === 0 ? (
+              {composition.legend.length === 0 && !(ichimokuOn && ichimokuData) ? (
                 <p className="text-xs text-jarvis-text-secondary">当前没有叠加线（等待数据或计划生成）</p>
               ) : (
                 <div className="space-y-2">
@@ -1139,6 +1227,27 @@ export default function Chart() {
                       </div>
                     </div>
                   ))}
+                  {ichimokuOn && ichimokuData && (
+                    <>
+                      <p className="text-[10px] text-jarvis-text-secondary pt-1 border-t border-jarvis-border">
+                        云图怎么看（一目均衡表）
+                      </p>
+                      {ICHIMOKU_LEGEND.map((e) => (
+                        <div key={e.name} className="flex items-start gap-2">
+                          <span
+                            className="mt-1.5 inline-block w-5 shrink-0"
+                            style={{
+                              borderTop: `2px ${e.dashed ? "dashed" : "solid"} ${e.color}`,
+                            }}
+                          />
+                          <div className="min-w-0">
+                            <p className="text-xs text-jarvis-text font-medium">{e.name}</p>
+                            <p className="text-xs text-jarvis-text-secondary">{e.explain}</p>
+                          </div>
+                        </div>
+                      ))}
+                    </>
+                  )}
                 </div>
               )}
               <p className="text-[10px] text-jarvis-text-secondary mt-2 pt-2 border-t border-jarvis-border">
@@ -1507,6 +1616,24 @@ export default function Chart() {
         />
       )}
 
+      {/* 云图状态提示条：价与云位置的人话解读（多绿/空红/震荡灰），悬停看五线组成 */}
+      {ichimokuOn && ichimokuData?.readout && (
+        <div
+          className={clsx(
+            "flex items-center gap-2 flex-wrap text-xs bg-jarvis-card border rounded-lg px-3 py-2",
+            ICHIMOKU_TONE_CLS[ichimokuData.readout.tone],
+          )}
+        >
+          <Cloudy size={13} className="shrink-0" />
+          <span className="font-medium cursor-help" title={ichimokuData.readout.detail}>
+            {ichimokuData.readout.text}
+          </span>
+          <span className="ml-auto text-jarvis-text-secondary/80">
+            悬停看解读依据 · 图上悬停 K 线看五线数值
+          </span>
+        </div>
+      )}
+
       <div className="card p-0 overflow-hidden">
         {candles.length > 0 ? (
           <KlineChart
@@ -1526,6 +1653,7 @@ export default function Chart() {
             structure={sysStructure}
             structMarkers={sysStructure?.markers}
             livePrice={liveForChart}
+            ichimoku={ichimokuData?.overlay ?? null}
           />
         ) : (
           <div

@@ -22,6 +22,7 @@ import {
   PanelLeftOpen,
   BookOpenCheck,
   GitCommitHorizontal,
+  Footprints,
 } from "lucide-react";
 
 interface NavItem {
@@ -46,6 +47,7 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { to: "/chart", label: "K线", icon: <CandlestickChart size={20} /> },
       { to: "/depth", label: "盘口", icon: <BookOpenCheck size={20} /> },
+      { to: "/footprint", label: "足迹", icon: <Footprints size={20} /> },
     ],
   },
   {

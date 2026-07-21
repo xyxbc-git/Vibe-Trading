@@ -44,7 +44,30 @@ import jarvis_price_alert as jpa
 NOTIFY_TAKE = "take"
 NOTIFY_STOP = "stop"
 
+# [风控篇 P0-3] 平仓原因中文文案（邮件标题/正文用；未知原因原样显示）
+_REASON_CN = {
+    "take": "止盈", "stop": "止损", "time": "持有到期", "signal": "信号反转",
+    "manual": "手动平仓", "limit_sell": "限价卖出",
+}
+
 _LOCK = threading.RLock()
+
+
+def _notify_all_closes() -> bool:
+    """[风控篇 P0-3] 是否所有平仓原因都发邮件（jarvis_config.notify_all_closes，默认 True）。"""
+    try:
+        import jarvis_config as jc_mod
+        return bool(jc_mod.get("notify_all_closes", True))
+    except Exception:  # noqa: BLE001 — 配置层异常按开启处理（宁多发不漏发）
+        return True
+
+
+def _global_recipients() -> list:
+    """[风控篇 P0-3] 全局兜底收件人：复用价位提醒通讯录。失败返回空列表。"""
+    try:
+        return list(jpa.load_config().get("recipients") or [])
+    except Exception:  # noqa: BLE001
+        return []
 
 
 # ─────────────────────────── 表结构 ───────────────────────────
@@ -209,17 +232,23 @@ def _format_close_mail(pos: dict, exit_price: float, reason: str,
     sym = pos.get("symbol") or "—"
     side = (pos.get("side") or "buy").lower()
     side_cn = "空单" if side == "sell" else "多单"
-    kind_cn = "止盈" if reason == NOTIFY_TAKE else "止损"
+    kind_cn = _REASON_CN.get(reason, str(reason))
     pid = pos.get("id")
 
-    subject = f"【贾维斯交易提醒】{sym} {side_cn}{kind_cn}触发"
+    # take/stop 保留原「触发」措辞；其它平仓原因用「已平仓（原因）」
+    if reason in (NOTIFY_TAKE, NOTIFY_STOP):
+        subject = f"【贾维斯交易提醒】{sym} {side_cn}{kind_cn}触发"
+    else:
+        subject = f"【贾维斯交易提醒】{sym} {side_cn}已平仓（{kind_cn}）"
     pnl_line = "盈亏：—"
     if pnl_pct is not None or pnl_usdt is not None:
         sign = "+" if (pnl_pct or 0) >= 0 else ""
         pnl_line = (f"盈亏：{sign}{_fmt_num(pnl_pct)}%"
                     f"（{sign}{_fmt_num(pnl_usdt)} USDT）")
+    head = (f"订单 #{pid} 已{kind_cn}平仓" if reason in (NOTIFY_TAKE, NOTIFY_STOP)
+            else f"订单 #{pid} 已平仓（{kind_cn}）")
     lines = [
-        f"订单 #{pid} 已{kind_cn}平仓",
+        head,
         "",
         f"币种：{sym}（{side_cn}）",
         f"入场价：{_fmt_num(pos.get('entry_price'))}",
@@ -242,30 +271,44 @@ def notify_position_closed(pos: dict, exit_price: float, reason: str,
                            dry_run: bool = False) -> dict:
     """持仓平仓后的邮件通知钩子（jarvis_paper_trader._close_position 调用）。
 
-    只处理 take/stop 两种平仓原因；未配置、类型未勾选、发送失败都不外抛，
-    返回摘要 dict 供日志记录。
+    [风控篇 P0-3] 覆盖与兜底规则：
+      - notify_all_closes=True（默认）时所有平仓原因都发；False 时仅 take/stop。
+      - 有每单配置：take/stop 按勾选项过滤，其它原因视为需要知情直接发到该邮箱。
+      - 无每单配置：回退价位提醒全局通讯录（recipients）；通讯录也空才跳过。
+    未配置、发送失败都不外抛，返回摘要 dict 供日志记录。
     """
-    if reason not in (NOTIFY_TAKE, NOTIFY_STOP):
-        return {"sent": False, "skipped": f"平仓原因 {reason} 不触发通知"}
+    all_closes = _notify_all_closes()
+    if reason not in (NOTIFY_TAKE, NOTIFY_STOP) and not all_closes:
+        return {"sent": False, "skipped": f"平仓原因 {reason} 不触发通知（notify_all_closes=False）"}
     pid = pos.get("id")
     if pid is None:
         return {"sent": False, "skipped": "持仓缺 id"}
     cfg = config_for_position(pid)
-    if not cfg:
-        return {"sent": False, "skipped": "该单未配置邮件提醒"}
-    want = (cfg.get("notify_take_profit") if reason == NOTIFY_TAKE
-            else cfg.get("notify_stop_loss"))
-    if not want:
-        kind_cn = "止盈" if reason == NOTIFY_TAKE else "止损"
-        return {"sent": False, "skipped": f"该单未勾选{kind_cn}通知"}
+    used_fallback = False
+    if cfg:
+        if reason in (NOTIFY_TAKE, NOTIFY_STOP):
+            want = (cfg.get("notify_take_profit") if reason == NOTIFY_TAKE
+                    else cfg.get("notify_stop_loss"))
+            if not want:
+                kind_cn = "止盈" if reason == NOTIFY_TAKE else "止损"
+                return {"sent": False, "skipped": f"该单未勾选{kind_cn}通知"}
+        to_list = [cfg["email"]]
+    else:
+        # [P0-3] 无每单配置 → 全局通讯录兜底（不再静默）
+        to_list = _global_recipients()
+        used_fallback = True
+        if not to_list:
+            return {"sent": False, "skipped": "该单未配置邮件提醒且全局通讯录为空"}
 
     subject, body = _format_close_mail(pos, exit_price, reason,
                                        pnl_usdt=pnl_usdt, pnl_pct=pnl_pct)
-    send = jpa.send_email(subject, body, [cfg["email"]], dry_run=dry_run)
+    send = jpa.send_email(subject, body, to_list, dry_run=dry_run)
     result = "ok" if send.get("ok") else str(send.get("reason") or "发送失败")[:200]
-    if not dry_run:
+    if cfg and not dry_run:
         _mark_sent(cfg["order_id"], reason, result)
-    return {"sent": bool(send.get("ok")), "to": cfg["email"],
+    return {"sent": bool(send.get("ok")),
+            "to": (to_list if used_fallback else cfg["email"]),
+            "fallback": used_fallback,
             "notify_type": reason, "reason": send.get("reason")}
 
 

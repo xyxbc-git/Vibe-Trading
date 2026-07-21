@@ -15,6 +15,10 @@ import jarvis_wallet as jw
 cfg = jx.load_config()
 cfg["account_equity_usdt"] = 1000.0
 cfg["agent_token"] = ""  # 隔离真实 token：纯离线撮合，平仓用传入价而非真实下单
+# [风控篇 P0-2] 本用例验证的是钱包记账数学，摩擦归零保持确定性断言
+# （手续费/滑点数学在 _risk_fixes_smoketest.py 单独覆盖）
+cfg["paper_fee_pct"] = 0.0
+cfg["paper_slippage_pct"] = 0.0
 fails = []
 
 

@@ -209,11 +209,16 @@ def evaluate(cfg: dict | None = None) -> dict:
                          "value_pct": drawdown_pct, "limit_pct": -th["drawdown_halt_pct"]})
 
     for d in s.get("open_detail", []):
-        entry, cur = d.get("entry_price"), d.get("cur_price")
+        # [风控篇 P0-1] ① 兼容键名：旧版 open_detail 只有 'entry'（'entry_price' 恒缺失，
+        # 单仓亏损熔断从未生效过）；② 亏损口径按持仓方向镜像（空单价格涨=亏）。
+        entry = d.get("entry_price") or d.get("entry")
+        cur = d.get("cur_price")
         if entry and cur:
-            chg = round((cur / entry - 1.0) * 100, 2)
+            sign = -1.0 if str(d.get("side") or "buy").lower() == "sell" else 1.0
+            chg = round((cur / entry - 1.0) * 100 * sign, 2)
             if chg <= -th["position_loss_halt_pct"]:
                 triggers.append({"type": "position_loss", "symbol": d.get("symbol"),
+                                 "side": d.get("side") or "buy",
                                  "value_pct": chg, "limit_pct": -th["position_loss_halt_pct"]})
 
     for d in s.get("open_detail", []):

@@ -1,4 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
 import { clsx } from "clsx";
 import {
   Activity,
@@ -6,6 +12,7 @@ import {
   BarChart3,
   BookOpenCheck,
   Fingerprint,
+  LayoutGrid,
   List,
   Radio,
   Target,
@@ -19,10 +26,13 @@ import {
   formatPrice,
   type DepthBucket,
   type DepthOrderbookResponse,
+  type FootprintActors,
+  type FootprintRow,
   type TapeActor,
   type TapeBarsResponse,
   type TapeFingerprint,
   type TapeFlowResponse,
+  type TapeFootprintResponse,
   type TapeTrade,
 } from "@/api/client";
 import KlineChart from "@/components/charts/KlineChart";
@@ -56,8 +66,12 @@ type Timeframe = (typeof TIMEFRAMES)[number];
 const TAPE_INTERVALS = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"] as const;
 type TapeInterval = (typeof TAPE_INTERVALS)[number];
 
-/** 成交流区视图（柱状图 | 列表），localStorage 持久 */
-type TapeView = "bars" | "list";
+/** 足迹图独立周期（档数×柱数渲染开销大，只开短周期） */
+const FP_INTERVALS = ["1m", "5m", "15m", "30m"] as const;
+type FootprintInterval = (typeof FP_INTERVALS)[number];
+
+/** 成交流区视图（足迹图 | 柱状图 | 列表），localStorage 持久 */
+type TapeView = "footprint" | "bars" | "list";
 const TAPE_VIEW_KEY = "jarvis.depth.tapeView";
 /** 柱状图口径（全部成交 | 仅非散户），localStorage 持久 */
 type TapeScope = "all" | "nr";
@@ -879,6 +893,468 @@ function TapeBarsPane({
   );
 }
 
+/* ────────────────────────── ④ 成交流足迹图（canvas 自绘） ────────────────────────── */
+
+/** 足迹单元格文本用紧凑数字（无 $ 前缀，节省格宽） */
+function fmtCompact(v: number): string {
+  const a = Math.abs(v);
+  if (a >= 1e9) return `${(v / 1e9).toFixed(1)}B`;
+  if (a >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
+  if (a >= 1e3) return `${(v / 1e3).toFixed(0)}K`;
+  return v.toFixed(0);
+}
+
+// 足迹图绘制常量（CSS 像素）
+const FP_CELL_W = 96; // 每柱列宽
+const FP_CELL_H = 16; // 每价格档行高
+const FP_HEADER_H = 20; // 顶部时间行高
+const FP_AXIS_W = 76; // 右侧价格轴 / 统计标签列宽
+const FP_STAT_N = 5; // 底部统计行数（Total/买/卖/Δ/CVD）
+const FP_FOOTER_H = FP_STAT_N * FP_CELL_H + 6;
+const FP_MAX_ROWS = 600; // 全局价格档数安全上限（异常数据防护）
+
+/** 足迹图布局：全局价格轴（各柱档位跨柱对齐，同一价位同一行） */
+interface FpLayout {
+  step: number;
+  maxPrice: number;
+  nRows: number;
+  /** 每柱：全局行号 → 档数据 */
+  slots: Map<number, FootprintRow>[];
+  width: number;
+  height: number;
+}
+
+/**
+ * 足迹图（Footprint，canvas 自绘——档数×柱数多，DOM 渲染会卡）：
+ *   每柱一列，列内按全局价格档从高到低排格；每格文本「卖 × 买」（$K 缩写），
+ *   背景浓度 = max(买,卖)/该柱最大档，买强蓝系/卖强红系；失衡档黄描边黄字；
+ *   收盘价档白描边；列顶 HH:mm；底部对齐 Total/买/卖/Δ/CVD 五行统计；
+ *   悬停格 tooltip（价/买/卖/失衡倍数）；横向滚动查旧柱（默认贴最新）。
+ */
+function FootprintPane({
+  resp,
+  loading,
+  error,
+}: {
+  resp: TapeFootprintResponse | null;
+  loading: boolean;
+  error: string | null;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  // 贴右缘跟随最新柱：用户左滚查旧柱后轮询刷新不再拉回
+  const stickRightRef = useRef(true);
+  const [tip, setTip] = useState<{ x: number; y: number; lines: string[] } | null>(
+    null,
+  );
+
+  const bars = useMemo(() => resp?.bars ?? [], [resp]);
+
+  // 全局价格轴布局：桶宽优先接口 bucket，缺失时从相邻档价差推导
+  const layout = useMemo<FpLayout | null>(() => {
+    if (bars.length === 0) return null;
+    let step = resp?.bucket ?? 0;
+    if (!(step > 0)) {
+      for (const b of bars) {
+        for (let i = 1; i < b.rows.length; i++) {
+          const d = Math.abs(b.rows[i - 1].price - b.rows[i].price);
+          if (d > 0) step = step > 0 ? Math.min(step, d) : d;
+        }
+        if (step > 0) break;
+      }
+    }
+    if (!(step > 0)) step = 1;
+    let maxPrice = -Infinity;
+    let minPrice = Infinity;
+    for (const b of bars) {
+      for (const r of b.rows) {
+        if (r.price > maxPrice) maxPrice = r.price;
+        if (r.price < minPrice) minPrice = r.price;
+      }
+    }
+    if (!Number.isFinite(maxPrice) || !Number.isFinite(minPrice)) return null;
+    // 超上限的低价档直接裁掉（防异常数据把 canvas 撑爆）
+    const nRows = Math.min(
+      FP_MAX_ROWS,
+      Math.round((maxPrice - minPrice) / step) + 1,
+    );
+    const slots = bars.map((b) => {
+      const m = new Map<number, FootprintRow>();
+      for (const r of b.rows) {
+        const idx = Math.round((maxPrice - r.price) / step);
+        if (idx >= 0 && idx < nRows) m.set(idx, r);
+      }
+      return m;
+    });
+    return {
+      step,
+      maxPrice,
+      nRows,
+      slots,
+      width: bars.length * FP_CELL_W + FP_AXIS_W,
+      height: FP_HEADER_H + nRows * FP_CELL_H + FP_FOOTER_H,
+    };
+  }, [bars, resp?.bucket]);
+
+  // 切币/切周期后恢复贴右缘（跟随最新柱）
+  const dataKey = `${resp?.symbol ?? ""}|${resp?.interval ?? ""}`;
+  useEffect(() => {
+    stickRightRef.current = true;
+  }, [dataKey]);
+
+  // 主绘制：数据/布局变化时整幅重画（30 柱 × ≤600 档，canvas 开销可忽略）
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !layout) return;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(layout.width * dpr);
+    canvas.height = Math.round(layout.height * dpr);
+    canvas.style.width = `${layout.width}px`;
+    canvas.style.height = `${layout.height}px`;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, layout.width, layout.height);
+    ctx.font = "9px 'SF Mono', Menlo, monospace";
+    ctx.textBaseline = "middle";
+
+    const { nRows, slots, step, maxPrice } = layout;
+    const gridY = FP_HEADER_H + nRows * FP_CELL_H;
+
+    bars.forEach((b, ci) => {
+      const x0 = ci * FP_CELL_W;
+      // 浓度归一化分母：该柱最大单档额
+      let barMax = 0;
+      for (const r of b.rows) barMax = Math.max(barMax, r.buy, r.sell);
+
+      // 列顶时间（最新柱白色高亮）
+      ctx.textAlign = "center";
+      ctx.fillStyle = ci === bars.length - 1 ? "#e6edf3" : "#8b949e";
+      ctx.fillText(timeHm(toSec(b.ts) * 1000), x0 + FP_CELL_W / 2, FP_HEADER_H / 2);
+
+      // 单元格：背景浓度 + 「卖 × 买」双色文本 + 失衡黄描边
+      slots[ci].forEach((r, ri) => {
+        const y0 = FP_HEADER_H + ri * FP_CELL_H;
+        const v = barMax > 0 ? Math.max(r.buy, r.sell) / barMax : 0;
+        const alpha = 0.1 + 0.5 * v;
+        ctx.fillStyle =
+          r.buy >= r.sell
+            ? `rgba(56, 132, 255, ${alpha})` // 买强：蓝系
+            : `rgba(248, 81, 73, ${alpha})`; // 卖强：红系
+        ctx.fillRect(x0 + 1, y0 + 0.5, FP_CELL_W - 2, FP_CELL_H - 1);
+        if (r.flag) {
+          ctx.strokeStyle = "#d29922";
+          ctx.lineWidth = 1;
+          ctx.strokeRect(x0 + 1.5, y0 + 1, FP_CELL_W - 3, FP_CELL_H - 2);
+        }
+        const cx = x0 + FP_CELL_W / 2;
+        const cy = y0 + FP_CELL_H / 2;
+        ctx.textAlign = "center";
+        ctx.fillStyle = "#8b949e";
+        ctx.fillText("×", cx, cy);
+        ctx.textAlign = "right";
+        ctx.fillStyle = r.flag === "sell_imb" ? "#e3b341" : "#f97583";
+        ctx.fillText(fmtCompact(r.sell), cx - 5, cy);
+        ctx.textAlign = "left";
+        ctx.fillStyle = r.flag === "buy_imb" ? "#e3b341" : "#56d364";
+        ctx.fillText(fmtCompact(r.buy), cx + 5, cy);
+      });
+
+      // 收盘价档白描边（标记该柱收在哪个价位）
+      const closeIdx = Math.round((maxPrice - b.close) / step);
+      if (closeIdx >= 0 && closeIdx < nRows) {
+        const y0 = FP_HEADER_H + closeIdx * FP_CELL_H;
+        ctx.strokeStyle = "#e6edf3";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(x0 + 0.5, y0 + 0.5, FP_CELL_W - 1, FP_CELL_H - 1);
+      }
+
+      // 列分隔线
+      ctx.strokeStyle = "rgba(48, 54, 61, 0.6)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x0 + FP_CELL_W + 0.5, 0);
+      ctx.lineTo(x0 + FP_CELL_W + 0.5, layout.height);
+      ctx.stroke();
+
+      // 底部统计五行（与列对齐）：Total/买/卖/Δ/CVD
+      const stats: { v: string; c: string }[] = [
+        { v: fmtCompact(b.total), c: "#8b949e" },
+        { v: fmtCompact(b.buy), c: "#56d364" },
+        { v: fmtCompact(b.sell), c: "#f97583" },
+        {
+          v: `${b.delta >= 0 ? "+" : ""}${fmtCompact(b.delta)}`,
+          c: b.delta >= 0 ? "#56d364" : "#f97583",
+        },
+        { v: fmtCompact(b.cvd), c: "#e6edf3" },
+      ];
+      ctx.textAlign = "center";
+      for (let si = 0; si < stats.length; si++) {
+        ctx.fillStyle = stats[si].c;
+        ctx.fillText(
+          stats[si].v,
+          x0 + FP_CELL_W / 2,
+          gridY + 4 + si * FP_CELL_H + FP_CELL_H / 2,
+        );
+      }
+    });
+
+    // 右侧轴列：价格标签 + 统计行标签
+    const axisX = bars.length * FP_CELL_W;
+    ctx.textAlign = "left";
+    for (let ri = 0; ri < nRows; ri++) {
+      ctx.fillStyle = "#8b949e";
+      ctx.fillText(
+        formatPrice(maxPrice - ri * step),
+        axisX + 6,
+        FP_HEADER_H + ri * FP_CELL_H + FP_CELL_H / 2,
+      );
+    }
+    const statLabels: { t: string; c: string }[] = [
+      { t: "Total", c: "#8b949e" },
+      { t: "买", c: "#56d364" },
+      { t: "卖", c: "#f97583" },
+      { t: "Δ", c: "#8b949e" },
+      { t: "CVD", c: "#e6edf3" },
+    ];
+    for (let si = 0; si < statLabels.length; si++) {
+      ctx.fillStyle = statLabels[si].c;
+      ctx.fillText(
+        statLabels[si].t,
+        axisX + 6,
+        gridY + 4 + si * FP_CELL_H + FP_CELL_H / 2,
+      );
+    }
+    // header 下缘 / footer 上缘横向分隔线
+    ctx.strokeStyle = "#30363d";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, FP_HEADER_H - 0.5);
+    ctx.lineTo(layout.width, FP_HEADER_H - 0.5);
+    ctx.moveTo(0, gridY + 1.5);
+    ctx.lineTo(layout.width, gridY + 1.5);
+    ctx.stroke();
+  }, [bars, layout]);
+
+  // 数据更新后：仍贴右缘时自动滚到最新柱
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !layout) return;
+    if (stickRightRef.current) el.scrollLeft = el.scrollWidth;
+  }, [layout]);
+
+  const onScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    stickRightRef.current =
+      el.scrollWidth - el.clientWidth - el.scrollLeft < 48;
+  };
+
+  // 悬停命中：像素 → 列号/行号 → 档数据
+  const onMouseMove = (e: ReactMouseEvent<HTMLCanvasElement>) => {
+    if (!layout) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    const ci = Math.floor(x / FP_CELL_W);
+    const ri = Math.floor((y - FP_HEADER_H) / FP_CELL_H);
+    if (ci < 0 || ci >= bars.length || ri < 0 || ri >= layout.nRows) {
+      setTip(null);
+      return;
+    }
+    const r = layout.slots[ci]?.get(ri);
+    if (!r) {
+      setTip(null);
+      return;
+    }
+    const hi = Math.max(r.buy, r.sell);
+    const lo = Math.max(Math.min(r.buy, r.sell), 1);
+    const flagCn =
+      r.flag === "buy_imb"
+        ? "（买方失衡档）"
+        : r.flag === "sell_imb"
+          ? "（卖方失衡档）"
+          : "";
+    setTip({
+      x,
+      y,
+      lines: [
+        `价 ${formatPrice(r.price)}`,
+        `买 ${fmtUsd(r.buy)} · 卖 ${fmtUsd(r.sell)}`,
+        `失衡 ${(hi / lo).toFixed(1)}×${flagCn}`,
+      ],
+    });
+  };
+
+  // 占位态：接口不可用（404/抛错）/ ok:false / WS 未积累 / 空柱
+  const placeholder = !resp
+    ? loading
+      ? "loading"
+      : "后端未升级或 WS 数据积累中（GET /api/tape/footprint 不可用）"
+    : resp.ok === false
+      ? `接口异常：${resp.error ?? "未知错误"}（后端未升级或 WS 数据积累中）`
+      : resp.active === false
+        ? "后端未升级或 WS 数据积累中（需开启 ws_enabled）"
+        : bars.length === 0
+          ? "暂无足迹数据（WS 数据积累中，稍候自动刷新）"
+          : null;
+
+  return (
+    <div>
+      <div className="flex items-center justify-between gap-2 px-1 pb-1 flex-wrap">
+        <span className="text-[10px] text-jarvis-text-secondary font-mono truncate">
+          每格「卖 × 买」 · 浓度 = 该档额 / 柱内最大档 · 黄框 = 失衡档 · 白框 = 收盘档
+        </span>
+        {resp?.source && (
+          <span
+            className="text-[9px] px-1.5 py-0.5 rounded border bg-jarvis-border/30 text-jarvis-text-secondary border-jarvis-border whitespace-nowrap"
+            title="数据来源"
+          >
+            {resp.source}
+          </span>
+        )}
+      </div>
+      {placeholder ? (
+        <div
+          className="flex flex-col items-center justify-center text-jarvis-text-secondary"
+          style={{ height: 320 }}
+          title={error ?? undefined}
+        >
+          {placeholder === "loading" ? (
+            <div className="w-5 h-5 border-2 border-jarvis-blue border-t-transparent rounded-full animate-spin" />
+          ) : (
+            <>
+              <LayoutGrid size={20} className="mb-2 text-jarvis-text-secondary/60" />
+              <p className="text-xs">{placeholder}</p>
+            </>
+          )}
+        </div>
+      ) : (
+        <div
+          ref={scrollRef}
+          onScroll={onScroll}
+          className="overflow-auto max-h-[560px]"
+        >
+          <div className="relative inline-block">
+            <canvas
+              ref={canvasRef}
+              onMouseMove={onMouseMove}
+              onMouseLeave={() => setTip(null)}
+            />
+            {tip && (
+              <div
+                className="pointer-events-none absolute z-10 px-2 py-1 rounded border border-jarvis-border bg-jarvis-card/95 text-[10px] text-jarvis-text whitespace-nowrap shadow-lg font-mono"
+                style={{
+                  left: Math.min(tip.x + 12, (layout?.width ?? 0) - 190),
+                  top: tip.y + 12,
+                }}
+              >
+                {tip.lines.map((l) => (
+                  <p key={l}>{l}</p>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** 主体多空统计卡的四行元信息（名称沿用成交流画像口径） */
+const FP_ACTOR_META: { key: TapeActor; label: string }[] = [
+  { key: "retail", label: "散户" },
+  { key: "mid", label: "中户" },
+  { key: "inst", label: "机构大户" },
+  { key: "maker", label: "做市商" },
+];
+
+/**
+ * 主体多空统计卡（谁在做多/做空）：
+ *   overall 大字结论 + 四主体「做多占比」水平条（>55% 偏多绿 / <45% 偏空红 / 其间均衡灰）。
+ *   口径为 taker 主动方向启发式（主动买≈做多意愿），非真实持仓——脚注声明。
+ */
+function ActorBiasCard({
+  actors,
+  disclaimer,
+}: {
+  actors: FootprintActors;
+  disclaimer?: string;
+}) {
+  const o = actors.overall;
+  const overallCls =
+    o.delta > 0
+      ? "text-jarvis-green"
+      : o.delta < 0
+        ? "text-jarvis-red"
+        : "text-jarvis-text-secondary";
+  return (
+    <div className="card p-4">
+      <p className="stat-label mb-2 flex items-center gap-1.5 text-xs">
+        <Users size={14} />
+        主体多空结构（谁在做多 / 做空）
+      </p>
+      <p className={clsx("text-lg font-semibold leading-snug", overallCls)}>
+        {o.verdict_cn}
+      </p>
+      <p className="text-[10px] text-jarvis-text-secondary font-mono mt-0.5 mb-3">
+        主动买 {fmtUsd(o.buy)} · 主动卖 {fmtUsd(o.sell)} · Δ {fmtSignedUsd(o.delta)}
+      </p>
+      <div className="space-y-2">
+        {FP_ACTOR_META.map(({ key, label }) => {
+          const s = actors[key];
+          if (!s) return null;
+          const pct = Math.max(0, Math.min(100, s.long_pct));
+          const bias = pct > 55 ? "long" : pct < 45 ? "short" : "flat";
+          const biasCls =
+            bias === "long"
+              ? "text-jarvis-green"
+              : bias === "short"
+                ? "text-jarvis-red"
+                : "text-jarvis-text-secondary";
+          return (
+            <div
+              key={key}
+              title={`买 ${fmtUsd(s.buy)} / 卖 ${fmtUsd(s.sell)} / 净 ${fmtSignedUsd(s.net)}`}
+            >
+              <div className="flex items-center justify-between text-[10px] mb-0.5">
+                <span className="flex items-center gap-1.5">
+                  <span
+                    className={clsx("w-2 h-2 rounded-sm", ACTOR_STYLE[key].bar)}
+                  />
+                  <span className="text-jarvis-text">{label}</span>
+                </span>
+                <span className={clsx("font-mono", biasCls)}>
+                  做多 {pct.toFixed(0)}% · {s.verdict_cn}
+                </span>
+              </div>
+              {/* 做多占比条：绿色填充 = 多方份额，余下红底 = 空方份额，中线 50% 分界 */}
+              <div className="relative h-1.5 bg-jarvis-red/25 rounded-full overflow-hidden">
+                <div
+                  className={clsx(
+                    "h-full rounded-full",
+                    bias === "long"
+                      ? "bg-jarvis-green"
+                      : bias === "short"
+                        ? "bg-jarvis-red"
+                        : "bg-gray-500",
+                  )}
+                  style={{ width: `${pct}%` }}
+                />
+                <div className="absolute inset-y-0 left-1/2 w-px bg-jarvis-text/40" />
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <p className="text-[9px] text-jarvis-text-secondary/60 mt-3 leading-snug">
+        {disclaimer ??
+          "口径：按 taker 主动方向启发式归类（主动买≈做多意愿、主动卖≈做空/出货意愿），非真实持仓数据，仅供情绪参考。"}
+      </p>
+    </div>
+  );
+}
+
 /* ────────────────────────── 页面主组件 ────────────────────────── */
 
 export default function DepthView() {
@@ -941,9 +1417,9 @@ export default function DepthView() {
   const wsActive =
     tape?.ok === true && tape.ws_ready !== false && tape.active !== false;
 
-  // ④ 成交流区视图（柱状图|列表）与柱状图口径，localStorage 持久
+  // ④ 成交流区视图（足迹图|柱状图|列表）与柱状图口径，localStorage 持久
   const [tapeView, setTapeView] = useState<TapeView>(() =>
-    readStored(TAPE_VIEW_KEY, ["bars", "list"] as const, "bars"),
+    readStored(TAPE_VIEW_KEY, ["footprint", "bars", "list"] as const, "bars"),
   );
   const [tapeScope, setTapeScope] = useState<TapeScope>(() =>
     readStored(TAPE_SCOPE_KEY, ["all", "nr"] as const, "all"),
@@ -983,6 +1459,25 @@ export default function DepthView() {
     if (d.interval && d.interval !== barTf) return null;
     return d;
   }, [barsPoll.data, symbol, barTf]);
+
+  // 足迹图独立周期 + 取数：仅足迹图视图激活时请求；1m 档 3s 轮询，其它 10s
+  const [fpTf, setFpTf] = useState<FootprintInterval>("1m");
+  const fpPoll = usePolling(
+    () =>
+      tapeView === "footprint"
+        ? api.tapeFootprint(symbol, fpTf, 30, 40)
+        : Promise.resolve(null),
+    fpTf === "1m" ? 3_000 : 10_000,
+    [tapeView, symbol, fpTf],
+  );
+  // 回声校验同柱状图：旧币种/旧周期的慢响应直接丢弃
+  const footprint = useMemo(() => {
+    const d = fpPoll.data;
+    if (!d) return null;
+    if (isStaleEcho(symbol, d.symbol)) return null;
+    if (d.interval && d.interval !== fpTf) return null;
+    return d;
+  }, [fpPoll.data, symbol, fpTf]);
 
   return (
     <div className="space-y-4">
@@ -1050,9 +1545,11 @@ export default function DepthView() {
       <div className="flex items-center gap-2 flex-wrap">
         <p className="stat-label mb-0 flex items-center gap-1.5">
           <Activity size={14} />
-          {tapeView === "bars"
-            ? "成交流柱状图"
-            : `成交流画像（${tape?.window_min ?? 15}min 窗口）`}
+          {tapeView === "footprint"
+            ? "成交流足迹图"
+            : tapeView === "bars"
+              ? "成交流柱状图"
+              : `成交流画像（${tape?.window_min ?? 15}min 窗口）`}
         </p>
         <span
           className={clsx(
@@ -1077,6 +1574,26 @@ export default function DepthView() {
         )}
 
         <div className="ml-auto flex items-center gap-2 flex-wrap">
+          {/* 足迹图专属：独立周期胶囊（短周期档） */}
+          {tapeView === "footprint" && (
+            <div className="flex gap-0.5 bg-jarvis-card border border-jarvis-border rounded-lg p-0.5">
+              {FP_INTERVALS.map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setFpTf(t)}
+                  className={clsx(
+                    "px-2 py-0.5 text-xs rounded-md transition-colors",
+                    t === fpTf
+                      ? "bg-jarvis-blue text-jarvis-accent-fg"
+                      : "text-jarvis-text-secondary hover:text-jarvis-text",
+                  )}
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
+          )}
+
           {/* 柱状图专属：口径切换（全部|仅非散户）+ 独立周期胶囊 */}
           {tapeView === "bars" && (
             <>
@@ -1125,10 +1642,11 @@ export default function DepthView() {
             </>
           )}
 
-          {/* 视图切换：柱状图 | 列表（localStorage 持久） */}
+          {/* 视图切换：足迹图 | 柱状图 | 列表（localStorage 持久） */}
           <div className="flex gap-0.5 bg-jarvis-card border border-jarvis-border rounded-lg p-0.5">
             {(
               [
+                ["footprint", "足迹图", LayoutGrid],
                 ["bars", "柱状图", BarChart3],
                 ["list", "列表", List],
               ] as const
@@ -1150,6 +1668,25 @@ export default function DepthView() {
           </div>
         </div>
       </div>
+
+      {/* ④-足迹图视图：主体多空统计卡 + canvas 足迹图 */}
+      {tapeView === "footprint" && (
+        <>
+          {footprint?.ok && footprint.actors && (
+            <ActorBiasCard
+              actors={footprint.actors}
+              disclaimer={footprint.disclaimer}
+            />
+          )}
+          <div className="card p-3">
+            <FootprintPane
+              resp={footprint}
+              loading={fpPoll.loading}
+              error={fpPoll.error}
+            />
+          </div>
+        </>
+      )}
 
       {/* ④-柱状图视图：买卖额镜像柱 + 净额线（独立小图） */}
       {tapeView === "bars" && (

@@ -484,6 +484,11 @@ export const api = {
       `/alerts/price?symbol=${encodeURIComponent(symbol)}`,
     ),
 
+  // ─── 12 系统信号变更邮件提醒（逐信号开关）───
+  signalAlerts: () => api.get<SignalAlertState>("/signal-alerts"),
+  updateSignalAlerts: (data: SignalAlertUpdate) =>
+    api.put<SignalAlertState>("/signal-alerts", data),
+
   // ─── 交易订单邮件提醒（按笔配置）───
   // order_id 约定："order-<limit_order_id>" 挂单 / "pos-<position_id>" 持仓
   orderNotifyList: () => api.get<OrderNotifyConfig[]>("/order-notify"),
@@ -695,6 +700,12 @@ export const api = {
   tapeBars: (symbol: string, interval = "1m", limit = 200) =>
     api.get<TapeBarsResponse>(
       `/tape/bars?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${limit}`,
+    ),
+
+  // ─── 成交流足迹图（每柱按价格档拆分买卖额 + 主体多空统计，盘口页足迹图视图）───
+  tapeFootprint: (symbol: string, interval = "1m", limit = 30, buckets = 40) =>
+    api.get<TapeFootprintResponse>(
+      `/tape/footprint?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${limit}&buckets=${buckets}`,
     ),
 
   // ─── 资金费率套利模拟盘（现货多 + 永续空，delta 中性赚费率）───
@@ -1238,6 +1249,40 @@ export interface AlertConfigUpdate {
   recipients?: string[];
   contacts?: AlertContact[];
   poll_interval_s?: number;
+}
+
+// ─── 12 系统信号变更邮件提醒（逐信号开关）───
+
+export interface SignalAlertSub {
+  symbol: string;
+  tf: string;
+  system: string;
+  enabled: boolean;
+  last_sent_at: number | null;
+  sent_count: number;
+}
+
+export interface SignalAlertState {
+  ok: boolean;
+  error?: string;
+  enabled: boolean;
+  /** 全局收件邮箱；空 = 未配置（回退价位提醒通讯录） */
+  email: string;
+  cooldown_s: number;
+  daily_limit: number;
+  today_sent: number;
+  subs: SignalAlertSub[];
+}
+
+export interface SignalAlertUpdate {
+  /** 单个开关（信号卡铃铛） */
+  sub?: { symbol: string; tf: string; system: string; enabled: boolean };
+  /** 批量关闭（提醒页） */
+  subs_off?: { symbol: string; tf: string; system: string }[];
+  email?: string;
+  enabled?: boolean;
+  cooldown_s?: number;
+  daily_limit?: number;
 }
 
 // ─── 交易订单邮件提醒（按笔配置）───
@@ -2120,6 +2165,69 @@ export interface TapeBarsResponse {
   bars?: TapeBar[];
   /** 数据来源标注（如 ws_agg / kline_approx） */
   source?: string;
+  error?: string;
+}
+
+// ─── 成交流足迹图（GET /api/tape/footprint）───
+
+/** 足迹图单价格档：该价位主动买/卖名义额 + 失衡标记 */
+export interface FootprintRow {
+  price: number;
+  buy: number;
+  sell: number;
+  /** buy_imb=买方失衡 / sell_imb=卖方失衡 / null=正常 */
+  flag: "buy_imb" | "sell_imb" | null;
+}
+
+/** 足迹图单柱：OHLC + 汇总统计 + 价格档明细（price 降序） */
+export interface FootprintBar {
+  /** 柱开始时间（unix 秒） */
+  ts: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  /** 周期内总成交额（USD） */
+  total: number;
+  buy: number;
+  sell: number;
+  /** buy - sell */
+  delta: number;
+  /** 窗口内累计 delta */
+  cvd: number;
+  rows: FootprintRow[];
+}
+
+/** 单主体多空口径统计（taker 主动方向启发式，非真实持仓） */
+export interface FootprintActorStat {
+  buy: number;
+  sell: number;
+  net: number;
+  /** 主动买占比 0~100（做多情绪代理） */
+  long_pct: number;
+  verdict_cn: string;
+}
+
+export interface FootprintActors {
+  retail: FootprintActorStat;
+  mid: FootprintActorStat;
+  inst: FootprintActorStat;
+  maker: FootprintActorStat;
+  overall: { buy: number; sell: number; delta: number; verdict_cn: string };
+}
+
+export interface TapeFootprintResponse {
+  ok: boolean;
+  symbol?: string;
+  interval?: string;
+  /** 价格桶宽（rows 价格按此步长对齐） */
+  bucket?: number;
+  bars?: FootprintBar[];
+  actors?: FootprintActors;
+  /** false = WS 数据未积累，暂无足迹 */
+  active?: boolean;
+  source?: string;
+  disclaimer?: string;
   error?: string;
 }
 

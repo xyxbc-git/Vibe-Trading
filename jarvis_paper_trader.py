@@ -56,6 +56,44 @@ LOG_PATH = os.path.join(LOG_DIR, "jarvis_paper_trader.log")
 LONG_PREFIX = "偏多"
 
 
+# ─────────────────── [风控篇 P0-2] 模拟盘成交摩擦（手续费+滑点） ───────────────────
+
+def _friction(cfg: dict | None = None) -> tuple[float, float]:
+    """读 (单边手续费%, 单边滑点%)：cfg 显式键 > jarvis_config > 内置默认 0.05/0.02。
+
+    双边生效（开/平各收一次）；设 0 关闭。cfg 优先便于测试注入与临时覆盖。
+    """
+    fee, slip = 0.05, 0.02
+    try:
+        import jarvis_config as jc_mod
+        fee = float(jc_mod.get("paper_fee_pct", fee))
+        slip = float(jc_mod.get("paper_slippage_pct", slip))
+    except Exception:  # noqa: BLE001 — 配置层异常回退默认，不拖垮交易链路
+        pass
+    if cfg:
+        try:
+            if cfg.get("paper_fee_pct") is not None:
+                fee = float(cfg["paper_fee_pct"])
+            if cfg.get("paper_slippage_pct") is not None:
+                slip = float(cfg["paper_slippage_pct"])
+        except (TypeError, ValueError):
+            pass
+    return max(0.0, fee), max(0.0, slip)
+
+
+def _slip_price(price: float, side: str, slip_pct: float) -> float:
+    """市价单成交价按方向变差：买单上浮、卖单下浮 slip_pct%（限价单不经此函数）。"""
+    if not slip_pct:
+        return price
+    sign = 1.0 if str(side).lower() == "buy" else -1.0
+    return price * (1.0 + sign * slip_pct / 100.0)
+
+
+def _pos_sign(side) -> int:
+    """持仓方向符号：多=+1，空=-1（[风控篇 P0-1] 所有盈亏/市值口径统一走这里）。"""
+    return -1 if str(side or "buy").lower() == "sell" else 1
+
+
 def _log(msg: str) -> None:
     os.makedirs(LOG_DIR, exist_ok=True)
     line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
@@ -290,13 +328,17 @@ def open_from_decision(symbol: str, cfg: dict, dry_run: bool = False) -> dict:
         except Exception as exc:  # noqa: BLE001
             _log(f"⚠️ {sym} 开仓下单异常（仍按决策价登记持仓）: {exc!r}"[:160])
 
-    eff_entry = float(fill) if fill is not None else entry_price
+    # [风控篇 P0-2] 无真实成交回报时按方向加滑点（买上浮/卖下浮）；网关回报价不再加
+    fee_pct, slip_pct = _friction(cfg)
+    eff_entry = float(fill) if fill is not None else _slip_price(entry_price, trade_side, slip_pct)
     notional = round(guard["qty"] * eff_entry, 8)
 
     # 钱包扣款（做多做空都冻结保证金）
     deb = jw.debit_buy(sym, notional, ref=f"open-{trade_side}-{sym}-{as_of}")
     if not deb.get("ok"):
         return {"action": "skip", "symbol": sym, "reason": deb.get("reason")}
+    # [风控篇 P0-2] 开仓手续费（单边；费率 0 时跳过）
+    jw.charge_fee(sym, notional * fee_pct / 100.0, ref=f"open-fee-{sym}-{as_of}")
 
     pid = _insert_position(sym, guard["qty"], as_of, eff_entry, order_uid,
                            guard["stop_loss"], guard["take_profit"],
@@ -350,13 +392,20 @@ def _insert_position(sym: str, qty: float, entry_date: str, entry_price: float,
 
 # ─────────────────────────── 平仓 ───────────────────────────
 
-def _close_position(pos: dict, exit_price: float, reason: str, cfg: dict) -> dict:
-    """平掉一个持仓：下反向单 + 算 realized PnL + 落库。"""
+def _close_position(pos: dict, exit_price: float, reason: str, cfg: dict,
+                    *, is_limit_fill: bool = False) -> dict:
+    """平掉一个持仓：下反向单 + 算 realized PnL（含摩擦）+ 落库。
+
+    is_limit_fill=True 表示按限价单成交平仓（价格受限价保护），不加滑点；
+    市价平仓（盯盘止损/止盈/手动等）按平仓方向加滑点。手续费两种都收。
+    """
     sym = pos["symbol"]
     qty = pos["qty"]
     open_side = (pos.get("side") or "buy").lower()
     close_side = "buy" if open_side == "sell" else "sell"
+    fee_pct, slip_pct = _friction(cfg)
     order_uid = None
+    gw_filled = False
     if cfg.get("agent_token"):
         try:
             resp = jx.place_paper_order(cfg, sym, {"side": close_side, "qty": qty},
@@ -365,15 +414,26 @@ def _close_position(pos: dict, exit_price: float, reason: str, cfg: dict) -> dic
             order_uid = data.get("order_uid")
             if data.get("fill_price") is not None:
                 exit_price = float(data["fill_price"])
+                gw_filled = True
         except Exception as exc:  # noqa: BLE001
             _log(f"⚠️ {sym} 平仓下单异常（仍按现价登记）: {exc!r}"[:160])
 
+    # [风控篇 P0-2] 市价平仓且无真实成交回报 → 按平仓方向加滑点（限价成交不加）
+    if exit_price and not gw_filled and not is_limit_fill:
+        exit_price = _slip_price(exit_price, close_side, slip_pct)
+
     entry = float(pos["entry_price"]) if pos.get("entry_price") else None
+    sign = _pos_sign(open_side)
     pnl_usdt = pnl_pct = None
+    gross_pnl = None
+    fee_close = 0.0
     if entry and exit_price and entry > 0:
-        sign = -1 if open_side == "sell" else 1
-        pnl_usdt = round((exit_price - entry) * qty * sign, 4)
-        pnl_pct = round((exit_price / entry - 1.0) * 100 * sign, 2)
+        # [风控篇 P0-2] realized PnL 为净值口径：毛盈亏 − 开平双边手续费
+        gross_pnl = (exit_price - entry) * qty * sign
+        fee_open = entry * qty * fee_pct / 100.0
+        fee_close = exit_price * qty * fee_pct / 100.0
+        pnl_usdt = round(gross_pnl - fee_open - fee_close, 4)
+        pnl_pct = round(pnl_usdt / (entry * qty) * 100.0, 2)
 
     with jj._conn() as conn:
         conn.execute(
@@ -387,28 +447,38 @@ def _close_position(pos: dict, exit_price: float, reason: str, cfg: dict) -> dic
              pnl_usdt, pnl_pct, time.time(), pos["id"]),
         )
 
-    # 钱包回款：卖出所得回到可用现金
-    proceeds = round((exit_price or 0) * qty, 8)
+    # [风控篇 P0-1] 钱包回款做空镜像：回款 = 开仓冻结名义 + 毛盈亏
+    # （多头等价于旧口径 exit×qty；空头修正为 entry×qty + (entry−exit)×qty，
+    #  逐仓不倒欠 → 钳到 ≥0）。历史已平仓台账不重算。
+    if entry and entry > 0 and gross_pnl is not None:
+        proceeds = round(max(0.0, entry * qty + gross_pnl), 8)
+    else:
+        proceeds = round((exit_price or 0) * qty, 8)
     cash_after = None
     if proceeds > 0:
         cr = jw.credit_sell(sym, proceeds, ref=f"close-{sym}-{pos['id']}")
         cash_after = cr.get("cash_after")
+    # [风控篇 P0-2] 平仓手续费（单边；开仓侧已在开仓时收）
+    if fee_close > 0:
+        fr = jw.charge_fee(sym, fee_close, ref=f"close-fee-{sym}-{pos['id']}")
+        cash_after = fr.get("cash_after", cash_after)
 
-    _log(f"🔴 {sym} 平仓 #{pos['id']} 现价≈{exit_price} 原因={reason} PnL={pnl_pct}% ({pnl_usdt}U) "
+    _log(f"🔴 {sym} 平仓 #{pos['id']} 成交≈{exit_price} 原因={reason} PnL={pnl_pct}% ({pnl_usdt}U 含费) "
          f"回款{proceeds}U 余额{cash_after}U")
 
-    # 止盈/止损触发 → 按该笔订单的邮件通知配置发信（未配置/失败均不影响平仓主流程）
-    if reason in ("take", "stop"):
-        try:
-            import jarvis_order_notify as jon
-            note = jon.notify_position_closed(pos, exit_price, reason,
-                                              pnl_usdt=pnl_usdt, pnl_pct=pnl_pct)
-            if note.get("sent"):
-                _log(f"📧 {sym} #{pos['id']} {'止盈' if reason == 'take' else '止损'}邮件已发送 → {note.get('to')}")
-            elif note.get("reason"):
-                _log(f"⚠️ {sym} #{pos['id']} 平仓邮件发送失败: {note.get('reason')}"[:200])
-        except Exception as exc:  # noqa: BLE001 — 通知失败不影响平仓
-            _log(f"⚠️ 平仓邮件通知异常（已忽略）: {exc!r}"[:160])
+    # [风控篇 P0-3] 平仓邮件通知：所有平仓原因都尝试（是否发/发给谁由
+    # jarvis_order_notify 按每单配置 + notify_all_closes + 全局通讯录兜底判定）；
+    # 未配置/发送失败均不影响平仓主流程。
+    try:
+        import jarvis_order_notify as jon
+        note = jon.notify_position_closed(pos, exit_price, reason,
+                                          pnl_usdt=pnl_usdt, pnl_pct=pnl_pct)
+        if note.get("sent"):
+            _log(f"📧 {sym} #{pos['id']} 平仓邮件（{reason}）已发送 → {note.get('to')}")
+        elif note.get("reason"):
+            _log(f"⚠️ {sym} #{pos['id']} 平仓邮件发送失败: {note.get('reason')}"[:200])
+    except Exception as exc:  # noqa: BLE001 — 通知失败不影响平仓
+        _log(f"⚠️ 平仓邮件通知异常（已忽略）: {exc!r}"[:160])
 
     return {"symbol": sym, "position_id": pos["id"], "exit_price": exit_price,
             "reason": reason, "pnl_pct": pnl_pct, "pnl_usdt": pnl_usdt, "order_uid": order_uid,
@@ -550,13 +620,45 @@ def _twelve_consensus(symbol: str) -> dict | None:
         return None
 
 
+def _last_close_ts(sym: str) -> float | None:
+    """该币最近一次平仓时间（replay 回放样本除外）；无记录返回 None。"""
+    init_positions_table()
+    with jj._conn() as conn:
+        row = conn.execute(
+            "SELECT MAX(closed_ts) AS t FROM paper_positions "
+            "WHERE symbol=? AND status='closed' "
+            "AND COALESCE(signal_source,'') != 'replay'", (sym,)).fetchone()
+    return float(row["t"]) if row and row["t"] else None
+
+
+def _twelve_limits(cfg: dict) -> tuple[int, float]:
+    """[风控篇 P0-4] 读 (总持仓数上限, 同币冷却分钟)：cfg 显式键 > jarvis_config > 默认 4/60。"""
+    max_open, cooldown_min = 4, 60.0
+    try:
+        import jarvis_config as jc_mod
+        max_open = int(jc_mod.get("twelve_max_open_positions", max_open) or max_open)
+        cooldown_min = float(jc_mod.get("twelve_reopen_cooldown_min", cooldown_min) or 0)
+    except Exception:  # noqa: BLE001 — 配置层异常用默认，不拖垮跟盘
+        pass
+    try:
+        if cfg.get("twelve_max_open_positions") is not None:
+            max_open = int(cfg["twelve_max_open_positions"])
+        if cfg.get("twelve_reopen_cooldown_min") is not None:
+            cooldown_min = float(cfg["twelve_reopen_cooldown_min"])
+    except (TypeError, ValueError):
+        pass
+    return max(1, max_open), max(0.0, cooldown_min)
+
+
 def open_from_twelve(symbol: str, cfg: dict, dry_run: bool = False,
                      consensus: dict | None = None,
                      regime: str | None = None) -> dict:
     """按 12 系统信号矩阵共识开模拟仓，并记录来源信号系统（归因）。
 
     条件：共识方向明确（bullish/bearish）+ 置信度达标 + 有共识交易计划 +
-    该币无未平仓持仓 + 熔断未触发 + 钱包余额充足。
+    该币无未平仓持仓 + 熔断未触发 + 总持仓数未达上限 + 同币冷却已过 +
+    钱包余额充足。仓位经 [风控篇 P0-4] 与执行手同款红线封顶
+    （max_position_pct 单笔上限 + max_portfolio_risk_pct 组合风险缩仓）。
     consensus / regime 参数供测试注入；生产传 None 自动计算。
     """
     sym = (symbol if symbol.endswith("USDT") else symbol + "USDT").upper()
@@ -572,6 +674,22 @@ def open_from_twelve(symbol: str, cfg: dict, dry_run: bool = False,
                         "reason": "熔断生效：" + str(_g.get("reason"))}
         except Exception:  # noqa: BLE001
             pass
+
+    # [风控篇 P0-4] 总持仓数上限（含全部未平仓，非仅 twelve 来源）+ 同币平仓冷却。
+    # 触顶/冷却只记日志跳过，绝不抛异常。
+    max_open, cooldown_min = _twelve_limits(cfg)
+    n_open = len(open_positions())
+    if n_open >= max_open:
+        _log(f"⛔ {sym} 12系统开仓跳过：当前总持仓 {n_open} ≥ 上限 {max_open}")
+        return {"action": "skip", "symbol": sym,
+                "reason": f"总持仓数 {n_open} 已达上限 {max_open}"}
+    if cooldown_min > 0:
+        last_close = _last_close_ts(sym)
+        if last_close and (time.time() - last_close) < cooldown_min * 60.0:
+            remain_min = int((cooldown_min * 60.0 - (time.time() - last_close)) // 60) + 1
+            _log(f"⛔ {sym} 12系统开仓跳过：同币平仓后冷却中（剩余≈{remain_min} 分钟）")
+            return {"action": "skip", "symbol": sym,
+                    "reason": f"同币平仓后冷却中（剩余≈{remain_min} 分钟 / 共 {cooldown_min:g} 分钟）"}
 
     cons = consensus if consensus is not None else _twelve_consensus(sym)
     if not cons:
@@ -608,15 +726,39 @@ def open_from_twelve(symbol: str, cfg: dict, dry_run: bool = False,
     equity = float(cfg.get("account_equity_usdt", 1000.0))
     pos_pct = float(plan.get("position_pct") or TWELVE_POSITION_PCT_FALLBACK)
     pos_pct = max(0.1, min(100.0, pos_pct))
+
+    # [风控篇 P0-4] 与 evaluate_guardrails 同款红线封顶：
+    #   1) 单笔仓位 ≤ max_position_pct（默认 40%）
+    #   2) 组合风险 = 仓位% × 止损距离% ≤ max_portfolio_risk_pct（默认 1.5%），超了缩仓
+    capped = False
+    max_pos_pct = float(cfg.get("max_position_pct", 40.0) or 40.0)
+    if pos_pct > max_pos_pct:
+        pos_pct = max_pos_pct
+        capped = True
+    sl_dist_pct = abs(price - float(sl)) / price * 100.0
+    max_risk = float(cfg.get("max_portfolio_risk_pct", 1.5) or 1.5)
+    projected_risk = pos_pct * sl_dist_pct / 100.0
+    if sl_dist_pct > 0 and projected_risk > max_risk:
+        pos_pct = round(max_risk / sl_dist_pct * 100.0, 2)
+        capped = True
+    if capped:
+        _log(f"🪢 {sym} 12系统仓位经红线封顶 → {pos_pct}%"
+             f"（单笔上限 {max_pos_pct}% / 组合风险上限 {max_risk}%，止损距离 {sl_dist_pct:.2f}%）")
+    if pos_pct <= 0:
+        return {"action": "skip", "symbol": sym, "reason": "红线缩仓后仓位≈0"}
+
+    # [风控篇 P0-2] 市价开仓按方向加滑点；数量按滑点后成交价换算
+    fee_pct, slip_pct = _friction(cfg)
+    eff_entry = _slip_price(price, side, slip_pct)
     notional_plan = equity * pos_pct / 100.0
-    qty = round(notional_plan / price, 8)
+    qty = round(notional_plan / eff_entry, 8)
     if qty <= 0:
         return {"action": "skip", "symbol": sym, "reason": "仓位换算数量为 0"}
 
     tf = str(plan.get("source_tf") or cons.get("primary_tf") or "4h")
     systems = [s for s in (plan.get("basis") or []) if s in _TWELVE_NAME_CN]
     time_stop = _TWELVE_TIME_STOP.get(tf, 7)
-    est_notional = round(qty * price, 2)
+    est_notional = round(qty * eff_entry, 2)
     # 开仓时打标市场状态（测试可注入；分类失败为 None，统计归 'unknown'）
     eff_regime = regime if regime in REGIMES else (
         None if regime is not None else _classify_regime(sym))
@@ -624,32 +766,35 @@ def open_from_twelve(symbol: str, cfg: dict, dry_run: bool = False,
     wal = jw.ensure_account(equity)
     if dry_run:
         return {"action": "would_open", "symbol": sym, "side": side, "qty": qty,
-                "entry_price": price, "stop_loss": sl, "take_profit": tp,
+                "entry_price": eff_entry, "stop_loss": sl, "take_profit": tp,
                 "confidence": confidence, "systems": systems, "tf": tf,
                 "regime": eff_regime, "est_notional_usdt": est_notional,
+                "position_pct": pos_pct, "capped": capped,
                 "cash_available_usdt": round(wal["cash_usdt"], 2)}
     if est_notional > wal["cash_usdt"] + 1e-9:
         return {"action": "skip", "symbol": sym,
                 "reason": f"钱包余额不足：需≈{est_notional}U，可用 {round(wal['cash_usdt'], 2)}U"}
 
     as_of = time.strftime("%Y-%m-%d")
-    notional = round(qty * price, 8)
+    notional = round(qty * eff_entry, 8)
     deb = jw.debit_buy(sym, notional, ref=f"twelve-open-{side}-{sym}-{as_of}")
     if not deb.get("ok"):
         return {"action": "skip", "symbol": sym, "reason": deb.get("reason")}
+    # [风控篇 P0-2] 开仓手续费（单边；费率 0 时跳过）
+    jw.charge_fee(sym, notional * fee_pct / 100.0, ref=f"twelve-open-fee-{sym}-{as_of}")
 
-    pid = _insert_position(sym, qty, as_of, price, None, sl, tp, time_stop,
+    pid = _insert_position(sym, qty, as_of, eff_entry, None, sl, tp, time_stop,
                            confidence, side=side, signal_source="twelve",
                            signal_systems=systems, signal_tf=tf,
                            signal_regime=eff_regime)
     side_label = "🔴 做空" if side == "sell" else "🟢 做多"
-    _log(f"{side_label} {sym} 12系统开仓 #{pid} qty={qty} 名义{notional}U 入场≈{price} "
+    _log(f"{side_label} {sym} 12系统开仓 #{pid} qty={qty} 名义{notional}U 入场≈{eff_entry} "
          f"SL {sl} TP {tp} 置信 {confidence:.2f} 依据 {','.join(systems) or '—'} "
          f"状态 {eff_regime or '未知'} 余额{deb.get('cash_after')}U")
     return {"action": "opened", "symbol": sym, "side": side, "position_id": pid,
-            "qty": qty, "entry_price": price, "stop_loss": sl, "take_profit": tp,
+            "qty": qty, "entry_price": eff_entry, "stop_loss": sl, "take_profit": tp,
             "confidence": confidence, "systems": systems, "tf": tf,
-            "regime": eff_regime,
+            "regime": eff_regime, "position_pct": pos_pct, "capped": capped,
             "notional_usdt": notional, "cash_after": deb.get("cash_after")}
 
 
@@ -796,8 +941,14 @@ def signal_stats(symbol: str | None = None, direction: str | None = None,
 # ─────────────────────────── 限价挂单撮合 ───────────────────────────
 
 def match_limit_orders(cfg: dict) -> list:
-    """撮合所有 pending 限价单：买单现价≤限价 → 成交建仓；卖单现价≥限价 → 成交平仓。"""
+    """撮合所有 pending 限价单（[风控篇 P0-2] 穿透成交口径）。
+
+    买单：现价**严格低于**限价才成交（穿透）；卖单镜像（现价严格高于限价）。
+    「碰价不成」——真实市场 touch ≠ fill（排队/流动性），旧的 ≤/≥ 口径会让
+    模拟成交率与胜率虚高。成交价仍按限价（限价保护），不加滑点，但收手续费。
+    """
     filled = []
+    fee_pct, _ = _friction(cfg)
     for o in jw.pending_orders():
         sym = o["symbol"]
         price = latest_price(cfg, sym)
@@ -805,7 +956,7 @@ def match_limit_orders(cfg: dict) -> list:
             _log(f"⏸ 限价单 #{o['id']} {sym} 无现价，跳过撮合")
             continue
         side = o["side"]
-        if side == "buy" and price <= float(o["limit_price"]):
+        if side == "buy" and price < float(o["limit_price"]):
             fill_price = float(o["limit_price"])  # 限价单不会比挂价更差
             notional = round(fill_price * o["qty"], 8)
             deb = jw.debit_buy(sym, notional, ref=f"limit-fill-{o['id']}",
@@ -813,6 +964,8 @@ def match_limit_orders(cfg: dict) -> list:
             if not deb.get("ok"):
                 _log(f"⚠️ 限价买单 #{o['id']} 扣款失败：{deb.get('reason')}")
                 continue
+            # [风控篇 P0-2] 限价成交同样收开仓手续费（滑点不加：限价保护）
+            jw.charge_fee(sym, notional * fee_pct / 100.0, ref=f"limit-fill-fee-{o['id']}")
             sl = o["stop_loss"] if o["stop_loss"] else round(fill_price * 0.90, 2)
             tp = o["take_profit"] if o["take_profit"] else round(fill_price * 1.08, 2)
             pid = _insert_position(sym, o["qty"], time.strftime("%Y-%m-%d"), fill_price,
@@ -829,7 +982,7 @@ def match_limit_orders(cfg: dict) -> list:
             _log(f"✅ 限价买单 #{o['id']} {sym} @ {fill_price} 成交 → 持仓 #{pid}（现价 {price}）")
             filled.append({"order_id": o["id"], "side": "buy", "symbol": sym,
                            "fill_price": fill_price, "position_id": pid})
-        elif side == "sell" and price >= float(o["limit_price"]):
+        elif side == "sell" and price > float(o["limit_price"]):
             fill_price = float(o["limit_price"])
             poss = open_positions(sym)
             if not poss:
@@ -837,7 +990,8 @@ def match_limit_orders(cfg: dict) -> list:
                 _log(f"ℹ️ 限价卖单 #{o['id']} {sym} 无持仓可平 → 撤销")
                 continue
             target = poss[-1]  # 最早开的先平
-            res = _close_position(target, fill_price, "limit_sell", cfg)
+            res = _close_position(target, fill_price, "limit_sell", cfg,
+                                  is_limit_fill=True)
             jw.mark_filled(o["id"], fill_price, target["id"])
             _log(f"✅ 限价卖单 #{o['id']} {sym} @ {fill_price} 成交 → 平仓 #{target['id']}（现价 {price}）")
             filled.append({"order_id": o["id"], "side": "sell", "symbol": sym,
@@ -912,18 +1066,28 @@ def stats(cfg: dict | None = None, symbol: str | None = None) -> dict:
     win_rate = round(100 * len(wins) / len(closed), 1) if closed else None
 
     # 未平仓浮盈 + 持仓市值（需现价）
+    # [风控篇 P0-1] 浮盈亏与市值按持仓方向镜像：
+    #   浮盈亏 = (现价 − 入场) × qty × 方向符号（空单价格跌=赚）
+    #   市值   = 开仓冻结名义 + 浮盈亏（多头等价于旧口径 现价×qty；空头修正为
+    #            entry×qty + (entry−现价)×qty，逐仓不倒欠 → 钳到 ≥0）
     unrealized = 0.0
     holdings_value = 0.0
     open_detail = []
     for p in opens:
         price = latest_price(cfg, p["symbol"]) if cfg.get("agent_token") else None
+        side = (p.get("side") or "buy").lower()
+        sign = _pos_sign(side)
         upnl = None
         if price and p.get("entry_price"):
-            upnl = round((price - p["entry_price"]) * p["qty"], 4)
+            upnl = round((price - p["entry_price"]) * p["qty"] * sign, 4)
             unrealized += upnl
         if price:
-            holdings_value += price * p["qty"]
+            if p.get("entry_price"):
+                holdings_value += max(0.0, p["entry_price"] * p["qty"] + (upnl or 0.0))
+            else:
+                holdings_value += price * p["qty"]   # 无入场价的脏数据行退回旧口径
         open_detail.append({"symbol": p["symbol"], "id": p["id"], "entry": p.get("entry_price"),
+                            "entry_price": p.get("entry_price"), "side": side,
                             "qty": p["qty"], "cur_price": price, "unrealized_usdt": upnl})
 
     cash = round(wal["cash_usdt"], 2)

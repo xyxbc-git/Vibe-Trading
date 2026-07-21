@@ -19,10 +19,33 @@ import type { DrawingResult, SmartLevels, KeyLevel, DrawLineStyle, DrawHLine } f
 import type { StructureDrawings, StructureMarker } from "@/api/client";
 import type { TradeMark } from "@/lib/signalTrades";
 import type { PredictionOverlay } from "@/lib/predict";
+import type { CloudPoint } from "@/lib/ichimoku";
 import { positionZoneWindow, type PositionZoneView } from "@/lib/positionZone";
 import { TradeMarkersPrimitive } from "./TradeMarkersPrimitive";
 import { PredictionPrimitive } from "./PredictionPrimitive";
 import { PositionZonePrimitive } from "./PositionZonePrimitive";
+import { IchimokuCloudPrimitive } from "./IchimokuCloudPrimitive";
+
+/** 云图叠加载荷：三条线走 LineSeries，云带（含未来段）走 primitive */
+export interface IchimokuOverlay {
+  /** 转换线（橙）/ 基准线（青）/ 迟行线（紫虚线）的 time 对齐点列 */
+  tenkan: { time: Time; value: number }[];
+  kijun: { time: Time; value: number }[];
+  chikou: { time: Time; value: number }[];
+  cloud: CloudPoint[];
+  futureStart: number | null;
+  /** 云前移根数（右侧留白滚动量） */
+  displacement: number;
+  /** 悬停某根 K 线（time 秒）时的五线数值文案 */
+  tipByTime: Map<number, string>;
+}
+
+/** 云图三条线的主题色：基准线青色对齐用户照片，转换橙、迟行紫与既有色板区分 */
+const ICHIMOKU_LINE_COLORS = {
+  tenkan: "#d29922",
+  kijun: "#39c5cf",
+  chikou: "#bc8cff",
+} as const;
 
 interface KlineChartProps {
   data: CandlestickData<Time>[];
@@ -59,6 +82,12 @@ interface KlineChartProps {
    * 价格一致；null/undefined 时保持 kline 轮询数据原样。
    */
   livePrice?: { price: number; timeSec: number } | null;
+  /**
+   * 一目均衡表云图叠加（buildIchimokuOverlay 生成）：转换/基准/迟行三条
+   * LineSeries + SpanA/SpanB 双色云带 primitive（含未来 26 根延伸段）。
+   * null/undefined 不渲染。
+   */
+  ichimoku?: IchimokuOverlay | null;
 }
 
 function fmtPrice(v: number): string {
@@ -99,6 +128,7 @@ export default function KlineChart({
   structure,
   structMarkers,
   livePrice,
+  ichimoku,
 }: KlineChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -106,12 +136,17 @@ export default function KlineChart({
   const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const priceLinesRef = useRef<IPriceLine[]>([]);
   const overlaySeriesRef = useRef<ISeriesApi<"Line">[]>([]);
+  const ichimokuSeriesRef = useRef<ISeriesApi<"Line">[]>([]);
   const marksPrimitiveRef = useRef<TradeMarkersPrimitive | null>(null);
   const predictionPrimitiveRef = useRef<PredictionPrimitive | null>(null);
   const positionZonePrimitiveRef = useRef<PositionZonePrimitive | null>(null);
+  const ichimokuPrimitiveRef = useRef<IchimokuCloudPrimitive | null>(null);
   // 预测视口右扩去重：同一份预测（genKey）只扩一次，用户随后缩放/平移不被打断
   const predictionRef = useRef<PredictionOverlay | null>(null);
   const appliedGenKeyRef = useRef<string | null>(null);
+  // 云图载荷（悬停 tip / 数据刷新后的右侧留白重算共用）；开关去重同预测层模式
+  const ichimokuRef = useRef<IchimokuOverlay | null>(null);
+  const ichimokuOnRef = useRef(false);
   const disposedRef = useRef(false);
   // 悬停命中（盈损徽章 / 预测层）时的浮层文案；null = 隐藏
   const [zoneTip, setZoneTip] = useState<{ x: number; y: number; text: string } | null>(null);
@@ -174,6 +209,9 @@ export default function KlineChart({
     // 信号多空区间图（TradingView position 风格）：独立图元，与预测层互不影响
     const positionZonePrimitive = new PositionZonePrimitive();
     candleSeries.attachPrimitive(positionZonePrimitive);
+    // 一目均衡表云带（双色 Kumo + 未来延伸段）：normal 层垫在蜡烛下
+    const ichimokuPrimitive = new IchimokuCloudPrimitive();
+    candleSeries.attachPrimitive(ichimokuPrimitive);
 
     // 悬停浮层（两类命中共用一个浮层，徽章 > 预测层）：
     //   1. 信号盈损 L/S 徽章 / 出场圆点：像素坐标命中测试 → 每笔详情
@@ -191,7 +229,16 @@ export default function KlineChart({
         return;
       }
       const predictTip = predictionPrimitive.predictionAt(pt.x, pt.y);
-      setZoneTip(predictTip ? { x: pt.x, y: pt.y, text: predictTip } : null);
+      if (predictTip) {
+        setZoneTip({ x: pt.x, y: pt.y, text: predictTip });
+        return;
+      }
+      // 云图五线数值：悬停在某根 K 线上且该 bar 有指标值时展示
+      const ichiTip =
+        param.time !== undefined
+          ? ichimokuRef.current?.tipByTime.get(Number(param.time))
+          : undefined;
+      setZoneTip(ichiTip ? { x: pt.x, y: pt.y, text: ichiTip } : null);
     };
     chart.subscribeCrosshairMove(handleCrosshair);
 
@@ -201,8 +248,10 @@ export default function KlineChart({
     marksPrimitiveRef.current = marksPrimitive;
     predictionPrimitiveRef.current = predictionPrimitive;
     positionZonePrimitiveRef.current = positionZonePrimitive;
+    ichimokuPrimitiveRef.current = ichimokuPrimitive;
     priceLinesRef.current = [];
     overlaySeriesRef.current = [];
+    ichimokuSeriesRef.current = [];
     // 重建后的图表实例 rightOffset 归零，同一份预测需重新扩一次视野
     appliedGenKeyRef.current = null;
     setInitVersion(v => v + 1);
@@ -223,8 +272,10 @@ export default function KlineChart({
       marksPrimitiveRef.current = null;
       predictionPrimitiveRef.current = null;
       positionZonePrimitiveRef.current = null;
+      ichimokuPrimitiveRef.current = null;
       priceLinesRef.current = [];
       overlaySeriesRef.current = [];
+      ichimokuSeriesRef.current = [];
       chartRef.current = null;
       setZoneTip(null);
       chart.remove();
@@ -242,13 +293,18 @@ export default function KlineChart({
       }
       if (chartRef.current && data.length > 0) {
         chartRef.current.timeScale().fitContent();
-        // 预测层开启时：fitContent 会把视口收到最后一根 K 线，右侧未来区域
-        // （概率锥/路径所在）被挤出画面——刷新后滚出 horizon+2 根右侧留白。
-        // 数据轮询本来就周期性 fitContent 重置视口，这里跟随同一节奏，不额外
-        // 打断用户手动缩放/平移。
+        // 预测层/云图未来段开启时：fitContent 会把视口收到最后一根 K 线，
+        // 右侧未来区域（概率锥/未来云所在）被挤出画面——刷新后滚出对应
+        // 根数的右侧留白（两层同开取较大者）。数据轮询本来就周期性
+        // fitContent 重置视口，这里跟随同一节奏，不额外打断用户手动缩放/平移。
         const pred = predictionRef.current;
-        if (pred) {
-          chartRef.current.timeScale().scrollToPosition(pred.horizon + 2, false);
+        const ichi = ichimokuRef.current;
+        const offset = Math.max(
+          pred ? pred.horizon + 2 : 0,
+          ichi && ichi.futureStart !== null ? ichi.displacement + 2 : 0,
+        );
+        if (offset > 0) {
+          chartRef.current.timeScale().scrollToPosition(offset, false);
         }
       }
     } catch {
@@ -303,6 +359,73 @@ export default function KlineChart({
       // chart may have been disposed between render and effect
     }
   }, [prediction, data.length, initVersion]);
+
+  // 一目均衡表云图：三条线（转换/基准/迟行）走 LineSeries，云带（含未来
+  // 26 根延伸段）走 primitive。开启时滚出右侧未来云留白（与预测层同款
+  // 去重：只在开关翻转时调整一次视野，不打断用户后续缩放/平移）。
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (disposedRef.current || !chart) return;
+    ichimokuRef.current = ichimoku ?? null;
+
+    for (const s of ichimokuSeriesRef.current) {
+      try {
+        chart.removeSeries(s);
+      } catch {
+        // chart already disposed
+      }
+    }
+    ichimokuSeriesRef.current = [];
+
+    try {
+      ichimokuPrimitiveRef.current?.setCloud(
+        ichimoku?.cloud ?? [],
+        ichimoku?.futureStart ?? null,
+      );
+
+      if (ichimoku) {
+        const addLine = (
+          pts: { time: Time; value: number }[],
+          color: string,
+          width: LineWidth,
+          style: LineStyle,
+          title: string,
+        ) => {
+          if (pts.length < 2) return;
+          const ls = chart.addLineSeries({
+            color,
+            lineWidth: width,
+            lineStyle: style,
+            priceLineVisible: false,
+            lastValueVisible: false,
+            crosshairMarkerVisible: false,
+            title,
+            // 指标线不得撑大蜡烛价格轴（与画线引擎同约束）
+            autoscaleInfoProvider: () => null,
+          });
+          ls.setData(pts);
+          ichimokuSeriesRef.current.push(ls);
+        };
+        addLine(ichimoku.tenkan, ICHIMOKU_LINE_COLORS.tenkan, 1, LineStyle.Solid, "转换线9");
+        addLine(ichimoku.kijun, ICHIMOKU_LINE_COLORS.kijun, 2, LineStyle.Solid, "基准线26");
+        addLine(ichimoku.chikou, ICHIMOKU_LINE_COLORS.chikou, 1, LineStyle.Dashed, "迟行线");
+      }
+
+      // 视野调整只在开关翻转时做一次
+      const on = !!ichimoku && ichimoku.futureStart !== null;
+      if (on !== ichimokuOnRef.current && data.length > 0) {
+        ichimokuOnRef.current = on;
+        const pred = predictionRef.current;
+        const offset = Math.max(
+          pred ? pred.horizon + 2 : 0,
+          on && ichimoku ? ichimoku.displacement + 2 : 0,
+        );
+        chart.timeScale().scrollToPosition(offset, false);
+      }
+    } catch {
+      // chart may have been disposed between render and effect
+    }
+  }, [ichimoku, data.length, initVersion]);
 
   // 信号历史盈损标记：L/S 字母徽章（入场）+ 出场圆点，选中信号变化时整组重设；
   // 传空/未传即清空。悬停命中直接查 primitive 的投影结果。

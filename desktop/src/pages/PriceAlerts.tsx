@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import {
   Bell,
+  BellRing,
   Mail,
   Plus,
   Trash2,
@@ -18,6 +19,8 @@ import {
   type AlertContact,
   type AlertPlan,
   type AlertDirection,
+  type SignalAlertState,
+  type SignalAlertUpdate,
 } from "@/api/client";
 import { useApi } from "@/hooks/useApi";
 import { useSymbol } from "@/hooks/useSymbol";
@@ -904,6 +907,179 @@ function PlanRow({
   );
 }
 
+/* ─────────────────── 12 系统信号邮件提醒总览 ─────────────────── */
+function SignalAlertCard() {
+  const { data: state, refetch } = useApi<SignalAlertState>(() => api.signalAlerts());
+  const [busy, setBusy] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [emailEdit, setEmailEdit] = useState("");
+  const [editingEmail, setEditingEmail] = useState(false);
+
+  const subs = state?.ok ? state.subs.filter((s) => s.enabled) : [];
+  const keyOf = (s: { symbol: string; tf: string; system: string }) =>
+    `${s.symbol}|${s.tf}|${s.system}`;
+
+  const toggleSelect = (k: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(k)) next.delete(k);
+      else next.add(k);
+      return next;
+    });
+  };
+
+  const mutate = async (body: SignalAlertUpdate) => {
+    setBusy(true);
+    try {
+      await api.updateSignalAlerts(body);
+      refetch();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const batchOff = async () => {
+    const targets = subs
+      .filter((s) => selected.has(keyOf(s)))
+      .map(({ symbol, tf, system }) => ({ symbol, tf, system }));
+    if (targets.length === 0) return;
+    await mutate({ subs_off: targets });
+    setSelected(new Set());
+  };
+
+  const saveEmail = async () => {
+    const email = emailEdit.trim();
+    if (email && !email.includes("@")) return;
+    await mutate({ email });
+    setEditingEmail(false);
+  };
+
+  return (
+    <div className="card">
+      <h3 className="text-sm font-semibold text-jarvis-text mb-1 flex items-center gap-2">
+        <BellRing size={14} />
+        信号邮件提醒（{subs.length}）
+        {state?.ok && (
+          <span className="ml-auto flex items-center gap-3 text-xs font-normal text-jarvis-text-secondary">
+            <span title={`当日上限 ${state.daily_limit} 封（防轰炸）`}>
+              今日已发 {state.today_sent}/{state.daily_limit}
+            </span>
+            <button
+              onClick={() => mutate({ enabled: !state.enabled })}
+              disabled={busy}
+              title={state.enabled ? "总开关：点击暂停全部信号提醒" : "总开关：点击恢复"}
+              className={`p-1.5 rounded-md border transition-colors ${
+                state.enabled
+                  ? "border-jarvis-green/40 text-jarvis-green hover:bg-jarvis-green/10"
+                  : "border-jarvis-border text-jarvis-text-secondary hover:text-jarvis-text"
+              }`}
+            >
+              <Power size={13} />
+            </button>
+          </span>
+        )}
+      </h3>
+      <p className="text-xs text-jarvis-text-secondary mb-2">
+        在总览页「12 系统信号矩阵」点信号卡右上角铃铛即可订阅；开了的信号发生实质变化
+        （方向翻转/强度大变/计划调整）时发邮件，同一信号 {Math.round((state?.cooldown_s ?? 600) / 60)} 分钟内只发一封。
+      </p>
+      <p className="text-xs text-jarvis-text-secondary mb-3 flex items-center gap-1.5 flex-wrap">
+        <Mail size={11} />
+        收件邮箱：
+        {editingEmail ? (
+          <>
+            <input
+              value={emailEdit}
+              onChange={(e) => setEmailEdit(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && saveEmail()}
+              placeholder="you@example.com"
+              className="rounded border border-jarvis-border bg-jarvis-bg px-2 py-0.5 text-xs text-jarvis-text outline-none focus:border-jarvis-blue/60 w-52"
+            />
+            <button onClick={saveEmail} disabled={busy} className="text-jarvis-blue hover:underline">
+              保存
+            </button>
+            <button onClick={() => setEditingEmail(false)} className="hover:underline">
+              取消
+            </button>
+          </>
+        ) : (
+          <>
+            <span className={state?.email ? "text-jarvis-text" : "text-jarvis-yellow"}>
+              {state?.email || "未设置（回退价位提醒通讯录）"}
+            </span>
+            <button
+              onClick={() => {
+                setEmailEdit(state?.email ?? "");
+                setEditingEmail(true);
+              }}
+              className="text-jarvis-blue hover:underline"
+            >
+              修改
+            </button>
+          </>
+        )}
+      </p>
+
+      {subs.length === 0 ? (
+        <p className="text-sm text-jarvis-text-secondary py-4 text-center">
+          还没有订阅任何信号，去总览页信号矩阵点铃铛开启吧。
+        </p>
+      ) : (
+        <>
+          <div className="flex items-center justify-between mb-1.5">
+            <label className="flex items-center gap-1.5 text-xs text-jarvis-text-secondary cursor-pointer">
+              <input
+                type="checkbox"
+                checked={selected.size === subs.length && subs.length > 0}
+                onChange={(e) =>
+                  setSelected(e.target.checked ? new Set(subs.map(keyOf)) : new Set())
+                }
+              />
+              全选
+            </label>
+            <button
+              onClick={batchOff}
+              disabled={busy || selected.size === 0}
+              className="text-xs px-2 py-1 rounded-md border border-jarvis-red/40 text-jarvis-red hover:bg-jarvis-red/10 transition-colors disabled:opacity-50"
+            >
+              批量关闭（{selected.size}）
+            </button>
+          </div>
+          <div className="max-h-64 overflow-y-auto divide-y divide-jarvis-border/50">
+            {subs.map((s) => (
+              <div key={keyOf(s)} className="flex items-center gap-2 py-1.5">
+                <input
+                  type="checkbox"
+                  checked={selected.has(keyOf(s))}
+                  onChange={() => toggleSelect(keyOf(s))}
+                />
+                <span className="text-xs font-mono text-jarvis-text">
+                  {s.symbol} · {s.tf}
+                </span>
+                <span className="text-xs text-jarvis-text-secondary">{s.system}</span>
+                <span className="ml-auto text-[10px] text-jarvis-text-secondary font-mono">
+                  已发 {s.sent_count} 封
+                  {s.last_sent_at != null && ` · 最近 ${fmtTs(s.last_sent_at)}`}
+                </span>
+                <button
+                  onClick={() =>
+                    mutate({ sub: { symbol: s.symbol, tf: s.tf, system: s.system, enabled: false } })
+                  }
+                  disabled={busy}
+                  title="关闭该信号提醒"
+                  className="p-1 rounded text-jarvis-text-secondary hover:text-jarvis-red transition-colors"
+                >
+                  <Trash2 size={13} />
+                </button>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 /* ─────────────────── 页面 ─────────────────── */
 export default function PriceAlertsPage() {
   const { data: config, refetch: refetchConfig } = useApi<AlertConfig>(
@@ -965,6 +1141,10 @@ export default function PriceAlertsPage() {
       <div className="grid grid-cols-2 gap-4 mb-4">
         <SmtpCard config={config} onSaved={refetchConfig} />
         <ContactsCard config={config} onSaved={refetchConfig} />
+      </div>
+
+      <div className="mb-4">
+        <SignalAlertCard />
       </div>
 
       <div className="grid grid-cols-2 gap-4 items-start">

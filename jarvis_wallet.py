@@ -186,6 +186,24 @@ def credit_sell(symbol: str, proceeds: float, ref: str | None = None) -> dict:
     return {"ok": True, "cash_after": get_wallet()["cash_usdt"]}
 
 
+def charge_fee(symbol: str, amount: float, ref: str | None = None) -> dict:
+    """[风控篇 P0-2] 收取手续费：从可用现金扣除并记 fee 流水。
+
+    模拟盘口径：现金不足时扣到 0 为止（逐仓不倒欠），差额记入流水 note 提示。
+    amount ≤ 0 直接跳过（费率关闭）。
+    """
+    if amount is None or amount <= 0:
+        return {"ok": True, "charged": 0.0}
+    w = ensure_account()
+    charged = min(float(amount), w["cash_usdt"])
+    _update_wallet(w["cash_usdt"] - charged, w["frozen_usdt"])
+    note = "手续费" if charged >= float(amount) - 1e-12 else \
+        f"手续费（现金不足，应收 {round(float(amount), 8)} 实收 {round(charged, 8)}）"
+    _add_ledger("fee", symbol, -charged, ref=ref, note=note)
+    return {"ok": True, "charged": round(charged, 8),
+            "cash_after": get_wallet()["cash_usdt"]}
+
+
 def freeze(symbol: str, amount: float, ref: str | None = None) -> dict:
     """限价买单挂单：把资金从可用现金移到冻结。余额不足返回 ok=False。"""
     w = ensure_account()

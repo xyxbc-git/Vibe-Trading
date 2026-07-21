@@ -85,7 +85,10 @@ def load_config(cli: dict | None = None) -> dict:
         C = jcfg.load()
         for k in ("max_position_pct", "max_portfolio_risk_pct", "min_conviction",
                   "stop_loss_drop_pct", "account_equity_usdt",
-                  "sizing_method", "kelly_fraction"):
+                  "sizing_method", "kelly_fraction",
+                  # [风控篇 P0-2/P0-4] 模拟盘摩擦与 12 系统跟盘红线（paper_trader 消费）
+                  "paper_fee_pct", "paper_slippage_pct",
+                  "twelve_max_open_positions", "twelve_reopen_cooldown_min"):
             if k in C:
                 cfg[k] = C[k]
     except Exception as exc:  # noqa: BLE001 — 配置中心异常不拖垮执行手

@@ -27,6 +27,12 @@ jpt._classify_regime = lambda s: "trending"
 cfg = jx.load_config()
 cfg["account_equity_usdt"] = 1000.0
 cfg["agent_token"] = ""   # 纯离线：不打真实网关
+# [风控篇 P0-2/P0-4] 本用例验证信号→开平仓→归因链路，摩擦归零 + 红线放宽保持
+# 原有确定性断言（摩擦数学与红线拦截在 _risk_fixes_smoketest.py 单独覆盖）
+cfg["paper_fee_pct"] = 0.0
+cfg["paper_slippage_pct"] = 0.0
+cfg["twelve_max_open_positions"] = 99
+cfg["twelve_reopen_cooldown_min"] = 0
 fails = []
 
 
@@ -201,6 +207,8 @@ check("置 NULL 后 ranging 为 0 笔", st_rng["overall"]["closed_trades"] == 0)
 
 # 10. 非 twelve 来源不进统计：手动限价单成交后平仓
 jw.place_limit_order("SOLUSDT", "buy", 100.0, 1.0)
+# [风控篇 P0-2] 穿透成交口径：现价须严格低于限价才成交（碰价不成）
+jpt.latest_price = lambda c, s: {"ADAUSDT": 94.0, "BNBUSDT": 87.0}.get(s, 99.9)
 jpt.match_limit_orders(cfg)
 for p in jpt.open_positions("SOLUSDT"):
     jpt._close_position(p, 120.0, "manual", cfg)

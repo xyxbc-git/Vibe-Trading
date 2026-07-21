@@ -19,6 +19,7 @@ import TradeRecords from "./pages/TradeRecords";
 import SettingsPage from "./pages/Settings";
 import SignalHistory from "./pages/SignalHistory";
 import DepthView from "./pages/DepthView";
+import FootprintChart from "./components/FootprintChart/FootprintChart";
 
 function PageGuard({ children, name }: { children: React.ReactNode; name: string }) {
   return <ErrorBoundary fallbackTitle={`${name} 加载异常`}>{children}</ErrorBoundary>;
@@ -31,6 +32,7 @@ export default function App() {
         <Route index element={<PageGuard name="总览"><Dashboard /></PageGuard>} />
         <Route path="chart" element={<PageGuard name="K线图表"><Chart /></PageGuard>} />
         <Route path="depth" element={<PageGuard name="盘口透视"><DepthView /></PageGuard>} />
+        <Route path="footprint" element={<PageGuard name="足迹图"><div className="h-full min-h-0"><FootprintChart /></div></PageGuard>} />
         <Route path="trading" element={<PageGuard name="交易中心"><Trading /></PageGuard>} />
         <Route path="trades" element={<PageGuard name="交易记录"><TradeRecords /></PageGuard>} />
         <Route path="funding-arb" element={<PageGuard name="费率套利"><FundingArb /></PageGuard>} />

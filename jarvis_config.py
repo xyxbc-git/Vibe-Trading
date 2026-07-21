@@ -165,6 +165,14 @@ DEFAULTS: dict = {
     "ws_reconnect_base_s": 1.0,       # 重连指数退避起始秒
     "ws_reconnect_max_s": 60.0,       # 重连退避封顶秒
     "ws_force_order_persist": True,   # forceOrder 是否落 SQLite 保留历史
+    # ── [风控篇 P0-2] 模拟盘成交摩擦（jarvis_paper_trader，双边生效，0=关闭）────
+    "paper_fee_pct": 0.05,            # 单边手续费%（taker 近似；开/平各收一次）
+    "paper_slippage_pct": 0.02,       # 单边滑点%（市价单成交价按方向变差；限价单不加）
+    # ── [风控篇 P0-3] 平仓通知兜底 ─────────────────────────────────────────
+    "notify_all_closes": True,        # True=所有平仓原因都发邮件（time/signal/manual 等）
+    # ── [风控篇 P0-4] 12 系统自动跟盘红线 ──────────────────────────────────
+    "twelve_max_open_positions": 4,   # 总持仓数上限（含全部未平仓，非仅 twelve 来源）
+    "twelve_reopen_cooldown_min": 60, # 同币平仓后再开仓冷却（分钟；0=关闭）
 }
 
 # ── YAML 分组 schema：key → 组名（trading/risk/signal/data/notify/system）────────
@@ -190,6 +198,10 @@ GROUPS: dict[str, str] = {
     "max_leverage_no_confirm": "trading",
     "plan_confirm_enabled": "trading",
     "journal_tags": "trading",
+    "paper_fee_pct": "trading",
+    "paper_slippage_pct": "trading",
+    "twelve_max_open_positions": "trading",
+    "twelve_reopen_cooldown_min": "trading",
     # risk——风控红线
     "max_portfolio_risk_pct": "risk",
     "max_effective_pct": "risk",
@@ -244,6 +256,7 @@ GROUPS: dict[str, str] = {
     "ws_force_order_persist": "data",
     # notify——通知
     "notify_timeout_s": "notify",
+    "notify_all_closes": "notify",
     # system——进程/端口
     "daemon_interval_hours": "system",
     "dashboard_host": "system",
@@ -315,6 +328,10 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "ws_reconnect_base_s": (0.5, 30.0),
     "ws_reconnect_max_s": (5.0, 600.0),
     "liq_magnet_warn_pct": (0.1, 10.0),
+    "paper_fee_pct": (0.0, 1.0),             # 单边费率%（0=关闭；>1% 不现实）
+    "paper_slippage_pct": (0.0, 2.0),        # 单边滑点%（0=关闭）
+    "twelve_max_open_positions": (1, 20),
+    "twelve_reopen_cooldown_min": (0, 1440),  # 0=关闭 ~ 24 小时
 }
 
 # 允许的枚举键。
