@@ -9,7 +9,6 @@ import { clsx } from "clsx";
 import {
   Activity,
   AlertTriangle,
-  BarChart3,
   BookOpenCheck,
   Fingerprint,
   LayoutGrid,
@@ -21,6 +20,7 @@ import {
 import { usePolling } from "@/hooks/useApi";
 import { useSymbol } from "@/hooks/useSymbol";
 import { isStaleEcho } from "@/lib/chartView";
+import { calcMACD } from "@/lib/indicators";
 import {
   api,
   formatPrice,
@@ -29,13 +29,21 @@ import {
   type FootprintActors,
   type FootprintRow,
   type TapeActor,
-  type TapeBarsResponse,
   type TapeFingerprint,
   type TapeFlowResponse,
   type TapeFootprintResponse,
   type TapeTrade,
 } from "@/api/client";
 import KlineChart from "@/components/charts/KlineChart";
+import TrapReasonCard from "@/components/cards/TrapReasonCard";
+import {
+  mockTrapSignals,
+  buildTrapMarks,
+  TRAP_TOGGLE_KEY,
+  type TrapSignalsResponse,
+  type TrapBar,
+  type TrapMark,
+} from "@/lib/trapSignals";
 import {
   createChart,
   ColorType,
@@ -44,38 +52,54 @@ import {
   type HistogramData,
   type IChartApi,
   type ISeriesApi,
-  type MouseEventParams,
   type Time,
 } from "lightweight-charts";
 
 /**
  * 盘口透视页（/depth）：
- *   ② 左主区 K 线（复用 KlineChart，不加 overlay）
+ *   ② 左主区 K 线（复用 KlineChart，不加 overlay）+ 可折叠 MACD(12,26,9) 副图
  *   ③ 右侧 DOM 深度阶梯（REST 快照聚合价格桶，一行一桶：左红卖 / 右绿买）
  *   ④ 下方成交流画像（柱状图视图：买卖额镜像柱 + 净额线；列表视图：主力判定 + 指纹聚合 + 实时成交列表）
- * 币种跟随全局 useSymbol（Header 已有切币器），周期本页独立切换。
+ * 币种跟随全局 useSymbol（Header 已有切币器）。
+ * 周期强制一致：全页只有顶部一个主周期开关（1m~1d 七档），足迹图周期与
+ * 成交流画像窗口始终跟随主周期（足迹图超 30m 回退 30m），不提供独立周期
+ * 入口，杜绝上下面板周期不一致的状态。
  */
 
 /* ────────────────────────── 常量与工具 ────────────────────────── */
 
-/** 本页支持的 K 线周期（盘口微观结构看短周期为主） */
-const TIMEFRAMES = ["1m", "5m", "15m", "1h"] as const;
+/** 本页支持的 K 线周期（完整档位；主图/MACD 直接透传交易所标准 interval） */
+const TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"] as const;
 type Timeframe = (typeof TIMEFRAMES)[number];
 
-/** 成交流柱状图独立周期（与上方 K 线 tf 互不影响） */
-const TAPE_INTERVALS = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"] as const;
-type TapeInterval = (typeof TAPE_INTERVALS)[number];
-
-/** 足迹图独立周期（档数×柱数渲染开销大，只开短周期） */
+/** 足迹图支持的周期档（档数×柱数渲染开销大，只开短周期） */
 const FP_INTERVALS = ["1m", "5m", "15m", "30m"] as const;
 type FootprintInterval = (typeof FP_INTERVALS)[number];
 
-/** 成交流区视图（足迹图 | 柱状图 | 列表），localStorage 持久 */
-type TapeView = "footprint" | "bars" | "list";
+/** 成交流画像窗口（分钟）随主周期的映射：周期放大 → 观察窗口放大。
+ * 后端 /tape/flow 对 window_min 有 240min 硬上限（实测超限被钳回 240），
+ * 故 4h/1d 档直接映射上限值，标题展示与实际生效保持一致。 */
+const TF_WINDOW_MIN: Record<Timeframe, number> = {
+  "1m": 15,
+  "5m": 30,
+  "15m": 60,
+  "30m": 120,
+  "1h": 240,
+  "4h": 240,
+  "1d": 240,
+};
+/** 足迹图只开到 30m（渲染开销）：跟随主周期遇 1h/4h/1d 回退到 30m */
+function fpFollow(tf: Timeframe): FootprintInterval {
+  return (FP_INTERVALS as readonly string[]).includes(tf)
+    ? (tf as FootprintInterval)
+    : "30m";
+}
+
+/** 成交流区视图（足迹图 | 列表），localStorage 持久（历史存的 "bars" 自动回退默认值） */
+type TapeView = "footprint" | "list";
 const TAPE_VIEW_KEY = "jarvis.depth.tapeView";
-/** 柱状图口径（全部成交 | 仅非散户），localStorage 持久 */
-type TapeScope = "all" | "nr";
-const TAPE_SCOPE_KEY = "jarvis.depth.tapeScope";
+/** MACD 副图开关，localStorage 持久（默认关，零开销） */
+const MACD_KEY = "jarvis.depth.macd";
 
 function readStored<T extends string>(key: string, valid: readonly T[], fallback: T): T {
   try {
@@ -683,217 +707,12 @@ function RecentTradeList({ trades }: { trades: TapeTrade[] }) {
   );
 }
 
-/* ────────────────────────── ④ 成交流 K 线柱状图 ────────────────────────── */
+/* ────────────────────────── ④ 成交流足迹图（canvas 自绘） ────────────────────────── */
 
 /** ts 归一为 unix 秒：兼容后端可能返回毫秒（>1e12 视为 ms） */
 function toSec(ts: number): number {
   return ts > 1e12 ? Math.floor(ts / 1000) : ts;
 }
-
-/**
- * 成交流柱状图（lightweight-charts 自建小图，不动 KlineChart.tsx）：
- *   买入额正向绿柱 + 卖出额负向红柱（上下镜像）+ 净额白色折线（独立隐藏轴）；
- *   scope=nr 时切换为非散户口径（nr_buy/nr_sell/nr_net）；
- *   悬停 tooltip：时间 / 买 / 卖 / 净额 / 笔数 / OHLC。
- */
-function TapeBarsPane({
-  resp,
-  loading,
-  error,
-  scope,
-  height = 260,
-}: {
-  resp: TapeBarsResponse | null;
-  loading: boolean;
-  error: string | null;
-  scope: TapeScope;
-  height?: number;
-}) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const chartRef = useRef<IChartApi | null>(null);
-  const buySeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
-  const sellSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
-  const netSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
-  const [hover, setHover] = useState<string | null>(null);
-
-  const bars = useMemo(() => resp?.bars ?? [], [resp]);
-
-  // 初始化图实例（一次；height 变更时重建）
-  useEffect(() => {
-    const el = containerRef.current;
-    if (!el) return;
-    const chart = createChart(el, {
-      width: el.clientWidth,
-      height,
-      layout: {
-        background: { type: ColorType.Solid, color: "transparent" },
-        textColor: "#8b949e",
-        fontSize: 10,
-      },
-      grid: {
-        vertLines: { color: "rgba(48, 54, 61, 0.4)" },
-        horzLines: { color: "rgba(48, 54, 61, 0.4)" },
-      },
-      crosshair: { mode: CrosshairMode.Magnet },
-      rightPriceScale: { borderColor: "#30363d" },
-      timeScale: {
-        borderColor: "#30363d",
-        timeVisible: true,
-        secondsVisible: false,
-      },
-    });
-    // 买卖两根柱共用右轴（同量纲），镜像展示：买正绿 / 卖负红
-    const buySeries = chart.addHistogramSeries({
-      priceFormat: { type: "volume" },
-      priceScaleId: "right",
-      lastValueVisible: false,
-      priceLineVisible: false,
-    });
-    const sellSeries = chart.addHistogramSeries({
-      priceFormat: { type: "volume" },
-      priceScaleId: "right",
-      lastValueVisible: false,
-      priceLineVisible: false,
-    });
-    // 净额线与柱同轴（同为 USD 量纲，净额必然落在 ±max(买,卖) 区间内）
-    const netSeries = chart.addLineSeries({
-      color: "#e6edf3",
-      lineWidth: 1,
-      priceScaleId: "right",
-      lastValueVisible: false,
-      priceLineVisible: false,
-      crosshairMarkerVisible: true,
-    });
-
-    chartRef.current = chart;
-    buySeriesRef.current = buySeries;
-    sellSeriesRef.current = sellSeries;
-    netSeriesRef.current = netSeries;
-
-    const ro = new ResizeObserver(() =>
-      chart.applyOptions({ width: el.clientWidth }),
-    );
-    ro.observe(el);
-    return () => {
-      ro.disconnect();
-      chart.remove();
-      chartRef.current = null;
-      buySeriesRef.current = null;
-      sellSeriesRef.current = null;
-      netSeriesRef.current = null;
-    };
-  }, [height]);
-
-  // 数据/口径更新：全部 vs 仅非散户
-  useEffect(() => {
-    const chart = chartRef.current;
-    const buySeries = buySeriesRef.current;
-    const sellSeries = sellSeriesRef.current;
-    const netSeries = netSeriesRef.current;
-    if (!chart || !buySeries || !sellSeries || !netSeries) return;
-
-    buySeries.setData(
-      bars.map((b) => ({
-        time: toSec(b.ts) as Time,
-        value: scope === "all" ? b.buy : b.nr_buy,
-        color: "rgba(63, 185, 80, 0.65)",
-      })),
-    );
-    sellSeries.setData(
-      bars.map((b) => ({
-        time: toSec(b.ts) as Time,
-        value: -(scope === "all" ? b.sell : b.nr_sell),
-        color: "rgba(248, 81, 73, 0.65)",
-      })),
-    );
-    netSeries.setData(
-      bars.map((b) => ({
-        time: toSec(b.ts) as Time,
-        value: scope === "all" ? b.net : b.nr_net,
-      })),
-    );
-    chart.timeScale().fitContent();
-  }, [bars, scope]);
-
-  // 悬停 tooltip：时间 / 买 / 卖 / 净 / 笔数 / OHLC
-  useEffect(() => {
-    const chart = chartRef.current;
-    if (!chart) return;
-    const byTime = new Map(bars.map((b) => [toSec(b.ts), b]));
-    const onMove = (param: MouseEventParams) => {
-      const t = param.time as number | undefined;
-      const b = t != null ? byTime.get(t) : undefined;
-      if (!b) {
-        setHover(null);
-        return;
-      }
-      const dt = new Date(toSec(b.ts) * 1000).toLocaleString("zh-CN", {
-        month: "2-digit",
-        day: "2-digit",
-        hour: "2-digit",
-        minute: "2-digit",
-      });
-      const buy = scope === "all" ? b.buy : b.nr_buy;
-      const sell = scope === "all" ? b.sell : b.nr_sell;
-      const net = scope === "all" ? b.net : b.nr_net;
-      setHover(
-        `${dt} · 买 ${fmtUsd(buy)} · 卖 ${fmtUsd(sell)} · 净 ${fmtSignedUsd(net)} · ${b.trades} 笔 · ` +
-          `O ${formatPrice(b.open)} H ${formatPrice(b.high)} L ${formatPrice(b.low)} C ${formatPrice(b.close)}`,
-      );
-    };
-    chart.subscribeCrosshairMove(onMove);
-    return () => chart.unsubscribeCrosshairMove(onMove);
-  }, [bars, scope]);
-
-  // 占位态：首载 loading / 接口 404 抛错（后端未升级）/ ok:false / 有响应但暂无柱
-  const placeholder = !resp
-    ? loading
-      ? "loading"
-      : "后端未升级或数据积累中（GET /api/tape/bars 不可用）"
-    : resp.ok === false
-      ? `接口异常：${resp.error ?? "未知错误"}（后端未升级或数据积累中）`
-      : bars.length === 0
-        ? "暂无成交流柱数据（WS 数据积累中，稍候自动刷新）"
-        : null;
-
-  return (
-    <div>
-      <div className="flex items-center justify-between gap-2 px-1 pb-1 flex-wrap">
-        <span className="text-[10px] text-jarvis-text-secondary font-mono truncate">
-          {hover ??
-            "绿柱 = 主动买入额 · 红柱（向下）= 主动卖出额 · 白线 = 净额（买-卖）"}
-        </span>
-        {resp?.source && (
-          <span
-            className="text-[9px] px-1.5 py-0.5 rounded border bg-jarvis-border/30 text-jarvis-text-secondary border-jarvis-border whitespace-nowrap"
-            title="数据来源"
-          >
-            {resp.source}
-          </span>
-        )}
-      </div>
-      {/* 占位层（图容器常驻 DOM 供 chart 初始化，占位时用 hidden 隐藏） */}
-      {placeholder && (
-        <div
-          className="flex flex-col items-center justify-center text-jarvis-text-secondary"
-          style={{ height }}
-        >
-          {placeholder === "loading" ? (
-            <div className="w-5 h-5 border-2 border-jarvis-blue border-t-transparent rounded-full animate-spin" />
-          ) : (
-            <>
-              <BarChart3 size={20} className="mb-2 text-jarvis-text-secondary/60" />
-              <p className="text-xs">{placeholder}</p>
-            </>
-          )}
-        </div>
-      )}
-      <div ref={containerRef} className={clsx(placeholder && "hidden")} />
-    </div>
-  );
-}
-
-/* ────────────────────────── ④ 成交流足迹图（canvas 自绘） ────────────────────────── */
 
 /** 足迹单元格文本用紧凑数字（无 $ 前缀，节省格宽） */
 function fmtCompact(v: number): string {
@@ -971,6 +790,13 @@ function FootprintPane({
         if (r.price > maxPrice) maxPrice = r.price;
         if (r.price < minPrice) minPrice = r.price;
       }
+      // 降级柱（rows=[] 只有量价汇总，档位明细未覆盖时段）用 OHLC 撑起
+      // 价格轴：否则其价格区间落在明细范围外时简化柱画不进画面，甚至
+      // 全部柱降级时整个面板误判为「暂无数据」
+      if (b.rows.length === 0 && b.high > 0 && b.low > 0) {
+        if (b.high > maxPrice) maxPrice = b.high;
+        if (b.low < minPrice) minPrice = b.low;
+      }
     }
     if (!Number.isFinite(maxPrice) || !Number.isFinite(minPrice)) return null;
     // 超上限的低价档直接裁掉（防异常数据把 canvas 撑爆）
@@ -1031,6 +857,33 @@ function FootprintPane({
       ctx.textAlign = "center";
       ctx.fillStyle = ci === bars.length - 1 ? "#e6edf3" : "#8b949e";
       ctx.fillText(timeHm(toSec(b.ts) * 1000), x0 + FP_CELL_W / 2, FP_HEADER_H / 2);
+
+      // 简化柱：rows=[] 但有量价汇总（档位明细未覆盖的历史时段）。原先
+      // 整列只剩收盘白框，观感像坏了——改画 high~low 范围的半透明双色带，
+      // 左卖红右买蓝按买卖额占比分宽（与单元格「卖 × 买」左右语义一致），
+      // 虚线描边 + 中央「简化」字样与正常柱区分；汇总数字看底部统计行。
+      const summaryOnly =
+        b.rows.length === 0 && (b.total > 0 || b.buy > 0 || b.sell > 0);
+      if (summaryOnly && b.high > 0 && b.low > 0) {
+        const hiIdx = Math.max(0, Math.min(nRows - 1, Math.round((maxPrice - b.high) / step)));
+        const loIdx = Math.max(0, Math.min(nRows - 1, Math.round((maxPrice - b.low) / step)));
+        const yTop = FP_HEADER_H + Math.min(hiIdx, loIdx) * FP_CELL_H;
+        const hPx = (Math.abs(loIdx - hiIdx) + 1) * FP_CELL_H;
+        const sum = b.buy + b.sell;
+        const sellW = Math.round((FP_CELL_W - 2) * (sum > 0 ? b.sell / sum : 0.5));
+        ctx.fillStyle = "rgba(248, 81, 73, 0.14)";
+        ctx.fillRect(x0 + 1, yTop + 0.5, sellW, hPx - 1);
+        ctx.fillStyle = "rgba(56, 132, 255, 0.14)";
+        ctx.fillRect(x0 + 1 + sellW, yTop + 0.5, FP_CELL_W - 2 - sellW, hPx - 1);
+        ctx.strokeStyle = "rgba(139, 148, 158, 0.45)";
+        ctx.lineWidth = 1;
+        ctx.setLineDash([3, 3]);
+        ctx.strokeRect(x0 + 1.5, yTop + 1, FP_CELL_W - 3, hPx - 2);
+        ctx.setLineDash([]);
+        ctx.textAlign = "center";
+        ctx.fillStyle = "#8b949e";
+        ctx.fillText("简化 · 无档位明细", x0 + FP_CELL_W / 2, yTop + hPx / 2);
+      }
 
       // 单元格：背景浓度 + 「卖 × 买」双色文本 + 失衡黄描边
       slots[ci].forEach((r, ri) => {
@@ -1164,6 +1017,25 @@ function FootprintPane({
     }
     const r = layout.slots[ci]?.get(ri);
     if (!r) {
+      // 简化柱（rows=[] 仅量价汇总）：在其 high~low 色带范围内悬停给出
+      // 降级原因与买卖汇总，消除「图坏了」的误解
+      const b = bars[ci];
+      if (b && b.rows.length === 0 && (b.total > 0 || b.buy > 0 || b.sell > 0) && b.high > 0) {
+        const hiIdx = Math.max(0, Math.min(layout.nRows - 1, Math.round((layout.maxPrice - b.high) / layout.step)));
+        const loIdx = Math.max(0, Math.min(layout.nRows - 1, Math.round((layout.maxPrice - b.low) / layout.step)));
+        if (ri >= Math.min(hiIdx, loIdx) && ri <= Math.max(hiIdx, loIdx)) {
+          setTip({
+            x,
+            y,
+            lines: [
+              "简化柱：该时段仅有量价汇总",
+              `买 ${fmtUsd(b.buy)} · 卖 ${fmtUsd(b.sell)} · Δ ${b.delta >= 0 ? "+" : ""}${fmtCompact(b.delta)}`,
+              "价格档明细自 8/2 晚间开始记录，此前时段按 K 线回补",
+            ],
+          });
+          return;
+        }
+      }
       setTip(null);
       return;
     }
@@ -1203,7 +1075,8 @@ function FootprintPane({
     <div>
       <div className="flex items-center justify-between gap-2 px-1 pb-1 flex-wrap">
         <span className="text-[10px] text-jarvis-text-secondary font-mono truncate">
-          每格「卖 × 买」 · 浓度 = 该档额 / 柱内最大档 · 黄框 = 失衡档 · 白框 = 收盘档
+          每格「卖 × 买」 · 浓度 = 该档额 / 柱内最大档 · 黄框 = 失衡档 · 白框 = 收盘档 ·
+          虚线柱 = 仅量价汇总（该时段无档位明细，悬停看说明）
         </span>
         {resp?.source && (
           <span
@@ -1355,6 +1228,165 @@ function ActorBiasCard({
   );
 }
 
+/* ────────────────────────── ② MACD 副图（主图下方可折叠） ────────────────────────── */
+
+/** MACD 线值显示：随价格量级自适应小数位 */
+function fmtMacdVal(v: number): string {
+  const a = Math.abs(v);
+  return v.toFixed(a >= 100 ? 1 : a >= 1 ? 2 : 4);
+}
+
+/**
+ * MACD(12,26,9) 副图（lightweight-charts 独立小图，不动 KlineChart.tsx）：
+ *   柱 = DIF-DEA（多头绿 / 空头红，与主图量柱同色系）；蓝线 = DIF，橙线 = DEA。
+ *   数据复用主图同一份 K 线收盘价本地计算，随主周期切换自动重算，
+ *   不发起任何新接口请求。
+ */
+function MacdPane({
+  candles,
+  height = 150,
+}: {
+  candles: CandlestickData<Time>[];
+  height?: number;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const chartRef = useRef<IChartApi | null>(null);
+  const difRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const deaRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const histRef = useRef<ISeriesApi<"Histogram"> | null>(null);
+
+  const macd = useMemo(
+    () => calcMACD(candles.map((c) => c.close)),
+    [candles],
+  );
+
+  // 初始化图实例（一次；height 变更时重建），暗色样式与页内其它小图一致
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const chart = createChart(el, {
+      width: el.clientWidth,
+      height,
+      layout: {
+        background: { type: ColorType.Solid, color: "transparent" },
+        textColor: "#8b949e",
+        fontSize: 10,
+      },
+      grid: {
+        vertLines: { color: "rgba(48, 54, 61, 0.4)" },
+        horzLines: { color: "rgba(48, 54, 61, 0.4)" },
+      },
+      crosshair: { mode: CrosshairMode.Magnet },
+      rightPriceScale: { borderColor: "#30363d" },
+      timeScale: {
+        borderColor: "#30363d",
+        timeVisible: true,
+        secondsVisible: false,
+      },
+    });
+    // 柱在底层，双线叠在柱上方
+    const hist = chart.addHistogramSeries({
+      priceFormat: { type: "price", precision: 4, minMove: 0.0001 },
+      lastValueVisible: false,
+      priceLineVisible: false,
+    });
+    const dif = chart.addLineSeries({
+      color: "#58a6ff",
+      lineWidth: 1,
+      lastValueVisible: false,
+      priceLineVisible: false,
+    });
+    const dea = chart.addLineSeries({
+      color: "#d29922",
+      lineWidth: 1,
+      lastValueVisible: false,
+      priceLineVisible: false,
+    });
+    chartRef.current = chart;
+    histRef.current = hist;
+    difRef.current = dif;
+    deaRef.current = dea;
+
+    const ro = new ResizeObserver(() =>
+      chart.applyOptions({ width: el.clientWidth }),
+    );
+    ro.observe(el);
+    return () => {
+      ro.disconnect();
+      chart.remove();
+      chartRef.current = null;
+      histRef.current = null;
+      difRef.current = null;
+      deaRef.current = null;
+    };
+  }, [height]);
+
+  // 数据更新：预热期 null 直接跳过（线从首个有效值开始画）
+  useEffect(() => {
+    const chart = chartRef.current;
+    const dif = difRef.current;
+    const dea = deaRef.current;
+    const hist = histRef.current;
+    if (!chart || !dif || !dea || !hist) return;
+
+    const difData: { time: Time; value: number }[] = [];
+    const deaData: { time: Time; value: number }[] = [];
+    const histData: { time: Time; value: number; color: string }[] = [];
+    for (let i = 0; i < candles.length; i++) {
+      const t = candles[i].time;
+      const d = macd.dif[i];
+      const s = macd.dea[i];
+      const h = macd.hist[i];
+      if (d !== null) difData.push({ time: t, value: d });
+      if (s !== null) deaData.push({ time: t, value: s });
+      if (h !== null)
+        histData.push({
+          time: t,
+          value: h,
+          color: h >= 0 ? "rgba(63, 185, 80, 0.65)" : "rgba(248, 81, 73, 0.65)",
+        });
+    }
+    hist.setData(histData);
+    dif.setData(difData);
+    dea.setData(deaData);
+    chart.timeScale().fitContent();
+  }, [candles, macd]);
+
+  // 图例：最新一根的 DIF / DEA / MACD 柱值
+  const lastIdx = (() => {
+    for (let i = macd.hist.length - 1; i >= 0; i--) {
+      if (macd.hist[i] !== null) return i;
+    }
+    return -1;
+  })();
+
+  return (
+    <div className="px-1 pt-1.5">
+      <div className="flex items-center gap-3 px-2 pb-1 text-[10px] font-mono flex-wrap">
+        <span className="text-jarvis-text-secondary">MACD(12,26,9)</span>
+        {lastIdx >= 0 && (
+          <>
+            <span style={{ color: "#58a6ff" }}>
+              DIF {fmtMacdVal(macd.dif[lastIdx]!)}
+            </span>
+            <span style={{ color: "#d29922" }}>
+              DEA {fmtMacdVal(macd.dea[lastIdx]!)}
+            </span>
+            <span
+              className={
+                macd.hist[lastIdx]! >= 0 ? "text-jarvis-green" : "text-jarvis-red"
+              }
+            >
+              MACD {fmtMacdVal(macd.hist[lastIdx]!)}
+            </span>
+          </>
+        )}
+      </div>
+      <div ref={containerRef} />
+    </div>
+  );
+}
+
 /* ────────────────────────── 页面主组件 ────────────────────────── */
 
 export default function DepthView() {
@@ -1396,15 +1428,22 @@ export default function DepthView() {
     return { candles: c, volumes: v };
   }, [rawKline]);
 
-  // ③ 盘口深度快照（3s 轮询，500 档聚合为每侧最多 24 桶）
+  // ③ 盘口深度（order-flow phase-1：WS 增量本地订单簿，1s 轮询与后端 1s 缓存
+  //    同频；本地簿未就绪时后端自动回退 REST 快照，载荷形状不变）
   const depthPoll = usePolling(
-    () => api.depthOrderbook(symbol, 500, 24),
-    3_000,
+    () => api.orderbookLive(symbol, 24),
+    1_000,
     [symbol],
   );
 
-  // ④ 成交流画像（3s 轮询，15min 窗口）
-  const tapePoll = usePolling(() => api.tapeFlow(symbol, 15), 3_000, [symbol]);
+  // ④ 成交流画像（3s 轮询）：窗口跟随主周期（TF_WINDOW_MIN 映射，强制一致），
+  // 参数进 deps，切周期即刻重取并丢弃旧窗口的慢响应
+  const windowMin = TF_WINDOW_MIN[tf];
+  const tapePoll = usePolling(
+    () => api.tapeFlow(symbol, windowMin),
+    3_000,
+    [symbol, windowMin],
+  );
   const tape = tapePoll.data;
 
   // 实时成交列表：统一按时间倒序（最新在上）
@@ -1417,15 +1456,21 @@ export default function DepthView() {
   const wsActive =
     tape?.ok === true && tape.ws_ready !== false && tape.active !== false;
 
-  // ④ 成交流区视图（足迹图|柱状图|列表）与柱状图口径，localStorage 持久
+  // ④ 成交流区视图（足迹图|列表），localStorage 持久
   const [tapeView, setTapeView] = useState<TapeView>(() =>
-    readStored(TAPE_VIEW_KEY, ["footprint", "bars", "list"] as const, "bars"),
+    readStored(TAPE_VIEW_KEY, ["footprint", "list"] as const, "footprint"),
   );
-  const [tapeScope, setTapeScope] = useState<TapeScope>(() =>
-    readStored(TAPE_SCOPE_KEY, ["all", "nr"] as const, "all"),
+
+  // ② MACD 副图开关（12/26/9，主图下方可折叠），localStorage 持久
+  const [showMacd, setShowMacd] = useState(
+    () => readStored(MACD_KEY, ["on", "off"] as const, "off") === "on",
   );
-  // 柱状图独立周期（与上方 K 线 tf 互不影响）
-  const [barTf, setBarTf] = useState<TapeInterval>("1m");
+
+  // ② 诱多诱空信号开关：与 K 线页共用 TRAP_TOGGLE_KEY（"1"/"0"），任一页
+  // 开关即两页状态一致
+  const [trapOn, setTrapOn] = useState(
+    () => readStored(TRAP_TOGGLE_KEY, ["1", "0"] as const, "0") === "1",
+  );
 
   useEffect(() => {
     try {
@@ -1436,32 +1481,96 @@ export default function DepthView() {
   }, [tapeView]);
   useEffect(() => {
     try {
-      localStorage.setItem(TAPE_SCOPE_KEY, tapeScope);
+      localStorage.setItem(MACD_KEY, showMacd ? "on" : "off");
     } catch {
       // 忽略写入失败
     }
-  }, [tapeScope]);
+  }, [showMacd]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(TRAP_TOGGLE_KEY, trapOn ? "1" : "0");
+    } catch {
+      // 忽略写入失败
+    }
+  }, [trapOn]);
 
-  // 成交流柱取数：仅柱状图视图激活时请求；1m/5m 档 3s 轮询，其它 10s
-  const barsPoll = usePolling(
-    () =>
-      tapeView === "bars"
-        ? api.tapeBars(symbol, barTf, 200)
-        : Promise.resolve(null),
-    barTf === "1m" || barTf === "5m" ? 3_000 : 10_000,
-    [tapeView, symbol, barTf],
-  );
-  // 回声校验：快速切币/切周期时，慢返回的旧响应不得写入当前图
-  const tapeBars = useMemo(() => {
-    const d = barsPoll.data;
-    if (!d) return null;
-    if (isStaleEcho(symbol, d.symbol)) return null;
-    if (d.interval && d.interval !== barTf) return null;
-    return d;
-  }, [barsPoll.data, symbol, barTf]);
+  // ── 诱多/诱空陷阱信号（复用 K 线页 B2 全链路：识别引擎 API 优先，未就绪
+  // 回退本地假突破规则识别；interval 跟随主周期 tf，切周期联动重取）──
+  const [trapApiResp, setTrapApiResp] = useState<TrapSignalsResponse | null>(null);
+  const [trapApiState, setTrapApiState] = useState<
+    "idle" | "loading" | "ok" | "unavailable"
+  >("idle");
 
-  // 足迹图独立周期 + 取数：仅足迹图视图激活时请求；1m 档 3s 轮询，其它 10s
-  const [fpTf, setFpTf] = useState<FootprintInterval>("1m");
+  useEffect(() => {
+    if (!trapOn) {
+      setTrapApiResp(null);
+      setTrapApiState("idle");
+      return;
+    }
+    let cancelled = false;
+    setTrapApiState("loading");
+    (async () => {
+      try {
+        const res = await api.trapSignals(symbol, tf);
+        if (cancelled) return;
+        // 回声校验：慢返回的旧币种/旧周期响应不得写入当前图
+        if (isStaleEcho(symbol, res?.symbol)) return;
+        if (res?.interval && res.interval !== tf) return;
+        if (res && res.ok !== false && Array.isArray(res.signals)) {
+          setTrapApiResp(res);
+          setTrapApiState("ok");
+          return;
+        }
+        setTrapApiResp(null);
+        setTrapApiState("unavailable");
+      } catch {
+        if (!cancelled) {
+          setTrapApiResp(null);
+          setTrapApiState("unavailable");
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [trapOn, symbol, tf]);
+
+  // 数据合成：引擎响应优先；未就绪时本地规则识别（随 K 线轮询自动重算）
+  const trapData = useMemo<TrapSignalsResponse | null>(() => {
+    if (!trapOn || candles.length === 0) return null;
+    if (trapApiState === "ok" && trapApiResp) return trapApiResp;
+    const bars: TrapBar[] = candles.map((c, i) => ({
+      timeSec: Number(c.time),
+      open: c.open,
+      high: c.high,
+      low: c.low,
+      close: c.close,
+      volume: volumes[i]?.value,
+    }));
+    return mockTrapSignals(symbol, tf, bars);
+  }, [trapOn, trapApiState, trapApiResp, candles, volumes, symbol, tf]);
+
+  // 信号 → 主图三角警示标记（窗口裁剪 + 锚定信号 bar 高低点）
+  const trapMarks = useMemo<TrapMark[] | null>(() => {
+    if (!trapData || candles.length === 0) return null;
+    const anchors = candles.map((c) => ({
+      timeSec: Number(c.time),
+      high: c.high,
+      low: c.low,
+    }));
+    const marks = buildTrapMarks(trapData, anchors);
+    return marks.length > 0 ? marks : null;
+  }, [trapData, candles]);
+
+  // 点击警示牌 → 原因卡片（浮在主图容器右上角）；切币种/周期/关开关时收起
+  const [selectedTrap, setSelectedTrap] = useState<TrapMark | null>(null);
+  useEffect(() => {
+    setSelectedTrap(null);
+  }, [symbol, tf, trapOn]);
+
+  // 足迹图周期强制跟随主周期（1h 回退 30m，无独立入口）+ 取数：
+  // 仅足迹图视图激活时请求；1m 档 3s 轮询，其它 10s
+  const fpTf: FootprintInterval = fpFollow(tf);
   const fpPoll = usePolling(
     () =>
       tapeView === "footprint"
@@ -1470,7 +1579,7 @@ export default function DepthView() {
     fpTf === "1m" ? 3_000 : 10_000,
     [tapeView, symbol, fpTf],
   );
-  // 回声校验同柱状图：旧币种/旧周期的慢响应直接丢弃
+  // 回声校验：快速切币/切周期时，旧币种/旧周期的慢响应直接丢弃
   const footprint = useMemo(() => {
     const d = fpPoll.data;
     if (!d) return null;
@@ -1490,29 +1599,98 @@ export default function DepthView() {
             {symbol.replace("USDT", "/USDT")}
           </span>
         </h1>
-        <div className="flex gap-1 bg-jarvis-card border border-jarvis-border rounded-lg p-1">
-          {TIMEFRAMES.map((t) => (
+        <div className="flex items-center gap-2 flex-wrap">
+          <div
+            className="flex gap-1 bg-jarvis-card border border-jarvis-border rounded-lg p-1"
+            title="主周期：K 线 / MACD / 足迹图 / 成交流画像窗口全部跟随此处，全页周期强制一致（足迹图最高 30m，1h/4h/1d 时回退 30m）"
+          >
+            {TIMEFRAMES.map((t) => (
+              <button
+                key={t}
+                onClick={() => setTf(t)}
+                className={clsx(
+                  "px-3 py-1 text-sm rounded-md transition-colors",
+                  t === tf
+                    ? "bg-jarvis-blue text-jarvis-accent-fg"
+                    : "text-jarvis-text-secondary hover:text-jarvis-text",
+                )}
+              >
+                {t}
+              </button>
+            ))}
+          </div>
+          <div className="flex gap-1 bg-jarvis-card border border-jarvis-border rounded-lg p-1">
             <button
-              key={t}
-              onClick={() => setTf(t)}
+              onClick={() => setShowMacd((v) => !v)}
+              title="MACD(12,26,9) 副图：DIF/DEA 双线 + 红绿柱，复用主图 K 线数据并随主周期联动，不新增接口请求"
               className={clsx(
                 "px-3 py-1 text-sm rounded-md transition-colors",
-                t === tf
+                showMacd
                   ? "bg-jarvis-blue text-jarvis-accent-fg"
                   : "text-jarvis-text-secondary hover:text-jarvis-text",
               )}
             >
-              {t}
+              MACD·{showMacd ? "开" : "关"}
             </button>
-          ))}
+            <button
+              onClick={() => setTrapOn((v) => !v)}
+              title="诱多诱空识别：自动标出「假突破」陷阱——冲破前高又被打回=诱多（红色倒三角，别追多），跌破前低又收回=诱空（绿色正三角，别追空）。点击图上警示牌看逐条理由与操作建议；随主周期联动，与 K 线页开关状态同步。识别引擎未接入时显示本地规则识别的演示数据"
+              className={clsx(
+                "px-3 py-1 text-sm rounded-md transition-colors",
+                trapOn
+                  ? "bg-jarvis-blue text-jarvis-accent-fg"
+                  : "text-jarvis-text-secondary hover:text-jarvis-text",
+              )}
+            >
+              诱多诱空·{trapOn ? "开" : "关"}
+            </button>
+            {trapOn && (
+              <span
+                className={clsx(
+                  "flex items-center gap-1 px-2 py-1 text-xs",
+                  trapData?.mock ? "text-jarvis-yellow" : "text-jarvis-text-secondary",
+                )}
+                title={
+                  trapData
+                    ? `当前窗口识别到 ${trapMarks?.length ?? 0} 个诱多/诱空信号${trapData.mock ? "（演示数据：识别引擎未接入，本地假突破规则识别）" : ""}`
+                    : trapApiState === "loading"
+                      ? "信号加载中…"
+                      : "K 线数不足（需 ≥25 根），暂无法识别"
+                }
+              >
+                <AlertTriangle size={12} />
+                {trapData ? (trapMarks?.length ?? 0) : "…"}
+              </span>
+            )}
+          </div>
         </div>
       </div>
 
       {/* ②③ 主区：左 K 线 + 右深度阶梯（xl 以下阶梯折到主区下方） */}
       <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_360px] gap-4">
-        <div className="card p-0 overflow-hidden">
+        <div className="card p-0 overflow-hidden relative">
           {candles.length > 0 ? (
-            <KlineChart data={candles} volumeData={volumes} height={520} />
+            <>
+              <KlineChart
+                data={candles}
+                volumeData={volumes}
+                height={showMacd ? 396 : 520}
+                trapMarks={trapMarks}
+                onTrapClick={(mark) => setSelectedTrap(mark)}
+              />
+              {showMacd && (
+                <div className="border-t border-jarvis-border">
+                  <MacdPane candles={candles} height={124} />
+                </div>
+              )}
+              {/* 陷阱原因卡片：固定右上角浮层，不遮点击处的 K 线形态 */}
+              {selectedTrap && (
+                <TrapReasonCard
+                  mark={selectedTrap}
+                  onClose={() => setSelectedTrap(null)}
+                />
+              )}
+            </>
           ) : (
             <div
               className="flex flex-col items-center justify-center text-jarvis-text-secondary"
@@ -1547,9 +1725,7 @@ export default function DepthView() {
           <Activity size={14} />
           {tapeView === "footprint"
             ? "成交流足迹图"
-            : tapeView === "bars"
-              ? "成交流柱状图"
-              : `成交流画像（${tape?.window_min ?? 15}min 窗口）`}
+            : `成交流画像（${tape?.window_min ?? windowMin}min 窗口）`}
         </p>
         <span
           className={clsx(
@@ -1574,80 +1750,19 @@ export default function DepthView() {
         )}
 
         <div className="ml-auto flex items-center gap-2 flex-wrap">
-          {/* 足迹图专属：独立周期胶囊（短周期档） */}
-          {tapeView === "footprint" && (
-            <div className="flex gap-0.5 bg-jarvis-card border border-jarvis-border rounded-lg p-0.5">
-              {FP_INTERVALS.map((t) => (
-                <button
-                  key={t}
-                  onClick={() => setFpTf(t)}
-                  className={clsx(
-                    "px-2 py-0.5 text-xs rounded-md transition-colors",
-                    t === fpTf
-                      ? "bg-jarvis-blue text-jarvis-accent-fg"
-                      : "text-jarvis-text-secondary hover:text-jarvis-text",
-                  )}
-                >
-                  {t}
-                </button>
-              ))}
-            </div>
-          )}
+          {/* 周期强制跟随主周期，不设独立周期入口；此处仅保留视图切换 */}
+          <span
+            className="text-[10px] text-jarvis-text-secondary/70 font-mono"
+            title={`足迹图周期与画像窗口跟随顶部主周期（当前 ${tf}${tapeView === "footprint" && fpFollow(tf) !== tf ? `，足迹图回退 ${fpFollow(tf)}` : ""}）`}
+          >
+            周期跟随主图·{tapeView === "footprint" ? fpTf : `${windowMin}min 窗口`}
+          </span>
 
-          {/* 柱状图专属：口径切换（全部|仅非散户）+ 独立周期胶囊 */}
-          {tapeView === "bars" && (
-            <>
-              <div className="flex gap-0.5 bg-jarvis-card border border-jarvis-border rounded-lg p-0.5">
-                {(
-                  [
-                    ["all", "全部"],
-                    ["nr", "仅非散户"],
-                  ] as const
-                ).map(([v, label]) => (
-                  <button
-                    key={v}
-                    onClick={() => setTapeScope(v)}
-                    title={
-                      v === "nr"
-                        ? "仅统计单笔金额达到非散户阈值的成交（nr_* 口径）"
-                        : "统计全部主动成交"
-                    }
-                    className={clsx(
-                      "px-2 py-0.5 text-xs rounded-md transition-colors",
-                      tapeScope === v
-                        ? "bg-jarvis-blue text-jarvis-accent-fg"
-                        : "text-jarvis-text-secondary hover:text-jarvis-text",
-                    )}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-              <div className="flex gap-0.5 bg-jarvis-card border border-jarvis-border rounded-lg p-0.5">
-                {TAPE_INTERVALS.map((t) => (
-                  <button
-                    key={t}
-                    onClick={() => setBarTf(t)}
-                    className={clsx(
-                      "px-2 py-0.5 text-xs rounded-md transition-colors",
-                      t === barTf
-                        ? "bg-jarvis-blue text-jarvis-accent-fg"
-                        : "text-jarvis-text-secondary hover:text-jarvis-text",
-                    )}
-                  >
-                    {t}
-                  </button>
-                ))}
-              </div>
-            </>
-          )}
-
-          {/* 视图切换：足迹图 | 柱状图 | 列表（localStorage 持久） */}
+          {/* 视图切换：足迹图 | 列表（localStorage 持久） */}
           <div className="flex gap-0.5 bg-jarvis-card border border-jarvis-border rounded-lg p-0.5">
             {(
               [
                 ["footprint", "足迹图", LayoutGrid],
-                ["bars", "柱状图", BarChart3],
                 ["list", "列表", List],
               ] as const
             ).map(([v, label, Icon]) => (
@@ -1686,19 +1801,6 @@ export default function DepthView() {
             />
           </div>
         </>
-      )}
-
-      {/* ④-柱状图视图：买卖额镜像柱 + 净额线（独立小图） */}
-      {tapeView === "bars" && (
-        <div className="card p-3">
-          <TapeBarsPane
-            resp={tapeBars}
-            loading={barsPoll.loading}
-            error={barsPoll.error}
-            scope={tapeScope}
-            height={260}
-          />
-        </div>
       )}
 
       {/* ④-列表视图主体：占位态 / 错误态 / 三块布局 */}

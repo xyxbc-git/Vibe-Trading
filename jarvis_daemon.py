@@ -341,6 +341,29 @@ def morning_step(symbols: list[str], *, notify: bool = True, dry_run: bool = Fal
     return res
 
 
+def twelve_sim_step() -> dict:
+    """跑一轮 12系统×6时间轴 槽位级模拟交易（jarvis_twelve_trader）。
+
+    惰性导入 + 异常隔离：失败只记日志，绝不影响 record/evaluate 主心跳。
+    币种清单由 twelve_sim_config 配置表驱动（run_cycle(None)），与 daemon
+    的信号巡检 symbols 解耦。
+    """
+    try:
+        import jarvis_twelve_trader as jtt
+        res = jtt.run_cycle()
+        n_open = n_close = 0
+        for r in (res.get("symbols") or {}).values():
+            n_open += len(r.get("opened") or [])
+            n_close += len(r.get("closed") or [])
+        _log(f"🎰 槽位模拟轮：币种 {len(res.get('symbols') or {})} / "
+             f"平仓 {n_close} / 开仓 {n_open}"
+             + (f" / {res['note']}" if res.get("note") else ""))
+        return res
+    except Exception as e:  # noqa: BLE001 — 槽位模拟失败绝不拖垮主心跳
+        _log("🎰 槽位模拟轮 ❌ 异常（已兜底）: " + repr(e)[:300])
+        return {"error": repr(e)[:300]}
+
+
 def intraday_step(symbols: list[str]) -> dict:
     """跑一轮 4h 盘中引擎（预测→模拟下单）。永不抛出，失败只记日志。"""
     try:
@@ -366,10 +389,11 @@ def _seconds_to_next_4h_close(now: float | None = None, buffer_s: int = 120) -> 
 def loop(symbols: list[str], interval_hours: float, paper_trade: bool = False,
          *, auto_grow: bool = False, grow_every: int = 30, auto_retrain_apply: bool = False,
          auto_morning: bool = False, morning_dry_run: bool = False,
-         intraday: bool = False) -> int:
+         intraday: bool = False, twelve_sim: bool = False) -> int:
     interval = max(60.0, interval_hours * 3600.0)
     _log(f"🤖 贾维斯定时引擎启动：symbols={symbols} 周期={interval_hours}h "
          f"自动跟盘={'开' if paper_trade else '关'} "
+         f"槽位模拟={'开' if twelve_sim else '关'} "
          f"4h盘中={'开（对齐 4h 收盘）' if intraday else '关'} "
          f"自进化={'开（每'+str(grow_every)+'轮，重训'+('采纳' if auto_retrain_apply else '仅建议')+'）' if auto_grow else '关'}")
     cycle_count = 0
@@ -389,6 +413,8 @@ def loop(symbols: list[str], interval_hours: float, paper_trade: bool = False,
                 _log("本轮异常（已兜底，继续运行）:\n" + traceback.format_exc())
         if intraday and db_ok:
             intraday_step(symbols)
+        if twelve_sim and db_ok:
+            twelve_sim_step()
         cycle_count += 1
         # [T-14] 每日晨报：日历日切换即触发一次（避免高频；首轮也会发一封）。
         if auto_morning:
@@ -470,6 +496,9 @@ def main() -> int:
                     help="每轮额外跑一次模拟跟盘（撮合+盯平仓+按决策开仓）；默认关闭")
     ap.add_argument("--intraday", action="store_true",
                     help="开启 4h 盘中引擎：对齐 4h K 线收盘跑 预测→模拟下单；默认关闭")
+    ap.add_argument("--twelve-sim", action="store_true",
+                    help="每轮额外跑一次 12系统×6时间轴 槽位级模拟交易"
+                         "（jarvis_twelve_trader，币种由 twelve_sim_config 驱动）；默认关闭")
     ap.add_argument("--auto-grow", action="store_true",
                     help="开启自进化：每 N 轮自动总结不足（+可选重训）；默认关闭")
     ap.add_argument("--grow-every", type=int, default=30,
@@ -516,6 +545,8 @@ def main() -> int:
         cycle = run_cycle(symbols, paper_trade=args.paper_trade)
         if args.intraday:
             intraday_step(symbols)
+        if args.twelve_sim:
+            twelve_sim_step()
         ok = all(v.get("record", {}) and v["record"].get("ok") for v in cycle["symbols"].values())
         _log("单轮完成" + ("（全部成功）" if ok else "（含失败，见日志）"))
         return 0
@@ -524,7 +555,7 @@ def main() -> int:
                 auto_grow=args.auto_grow, grow_every=args.grow_every,
                 auto_retrain_apply=args.auto_retrain_apply,
                 auto_morning=args.auto_morning, morning_dry_run=args.morning_dry_run,
-                intraday=args.intraday)
+                intraday=args.intraday, twelve_sim=args.twelve_sim)
 
 
 if __name__ == "__main__":

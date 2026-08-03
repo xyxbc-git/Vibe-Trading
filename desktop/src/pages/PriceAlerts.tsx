@@ -1,7 +1,10 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
+import { Link } from "react-router-dom";
 import {
+  AlertTriangle,
   Bell,
   BellRing,
+  CandlestickChart,
   Mail,
   Plus,
   Trash2,
@@ -22,8 +25,15 @@ import {
   type SignalAlertState,
   type SignalAlertUpdate,
 } from "@/api/client";
-import { useApi } from "@/hooks/useApi";
+import { useApi, usePolling } from "@/hooks/useApi";
 import { useSymbol } from "@/hooks/useSymbol";
+import {
+  mockTrapSignals,
+  TRAP_LABELS,
+  fmtTrapTime,
+  type TrapBar,
+  type TrapSignalsResponse,
+} from "@/lib/trapSignals";
 
 function fmtTs(ts: number | null): string {
   if (!ts) return "—";
@@ -907,6 +917,175 @@ function PlanRow({
   );
 }
 
+/* ─────────────────── 诱多诱空信号提醒 ─────────────────── */
+
+/** 提醒卡固定用 15m 周期（陷阱识别的常用观察级别，与 K 线页默认一致） */
+const TRAP_ALERT_TF = "15m";
+
+/** kline 响应行 → 陷阱识别输入（与 K 线页同一换算口径：ts 毫秒 → 秒） */
+function klineRowsToTrapBars(raw: unknown): TrapBar[] {
+  const rows = (raw as Record<string, unknown> | null)?.rows;
+  if (!Array.isArray(rows)) return [];
+  const bars: TrapBar[] = [];
+  for (const k of rows as Record<string, number>[]) {
+    bars.push({
+      timeSec: k.ts / 1000,
+      open: k.o,
+      high: k.h,
+      low: k.l,
+      close: k.c,
+      volume: k.v,
+    });
+  }
+  return bars;
+}
+
+function TrapSignalCard() {
+  const { symbol } = useSymbol();
+
+  // 60s 轮询：识别引擎 GET /api/trap-signals 优先，未就绪回退
+  // 「kline + 本地假突破规则识别」（与 K 线页同源降级逻辑，演示数据带角标）
+  const { data: resp, loading } = usePolling<TrapSignalsResponse | null>(
+    async () => {
+      try {
+        const res = await api.trapSignals(symbol, TRAP_ALERT_TF);
+        if (res && res.ok !== false && Array.isArray(res.signals)) return res;
+      } catch {
+        // 引擎未就绪 → 走本地识别回退
+      }
+      const kl = await api.kline(symbol, TRAP_ALERT_TF, 200).catch(() => null);
+      const bars = klineRowsToTrapBars(kl);
+      return bars.length > 0 ? mockTrapSignals(symbol, TRAP_ALERT_TF, bars) : null;
+    },
+    60_000,
+    [symbol],
+  );
+
+  // 未读水位：localStorage 按币种记「最近已读的信号 ts」，其后的信号标「新」
+  const seenKey = `jarvis.trap.seen.${symbol}`;
+  const [seenTs, setSeenTs] = useState(0);
+  useEffect(() => {
+    try {
+      setSeenTs(Number(localStorage.getItem(`jarvis.trap.seen.${symbol}`)) || 0);
+    } catch {
+      setSeenTs(0);
+    }
+  }, [symbol]);
+
+  // 最新在前，最多展示 8 条
+  const signals = useMemo(
+    () =>
+      (resp?.signals ?? [])
+        .slice()
+        .sort((a, b) => b.ts - a.ts)
+        .slice(0, 8),
+    [resp],
+  );
+  const unread = signals.filter((s) => s.ts > seenTs).length;
+
+  const markAllRead = () => {
+    const latest = signals.length > 0 ? signals[0].ts : Math.floor(Date.now() / 1000);
+    try {
+      localStorage.setItem(seenKey, String(latest));
+    } catch {
+      // storage unavailable — 本次会话内仍生效
+    }
+    setSeenTs(latest);
+  };
+
+  return (
+    <div className="card">
+      <h3 className="text-sm font-semibold text-jarvis-text mb-1 flex items-center gap-2">
+        <AlertTriangle size={14} className="text-jarvis-yellow" />
+        诱多诱空信号（{symbol} · {TRAP_ALERT_TF}）
+        {unread > 0 && (
+          <span
+            className="px-1.5 py-px rounded-full text-[10px] font-medium bg-jarvis-red text-white"
+            title={`${unread} 条新信号（上次查看之后出现）`}
+          >
+            新 {unread}
+          </span>
+        )}
+        {resp?.mock && (
+          <span
+            className="ml-auto px-1.5 py-px rounded text-[10px] font-normal bg-jarvis-yellow/15 text-jarvis-yellow"
+            title="识别引擎未接入，当前为本地假突破规则识别的演示数据"
+          >
+            演示数据
+          </span>
+        )}
+      </h3>
+      <p className="text-xs text-jarvis-text-secondary mb-2">
+        自动识别当前币种的假突破陷阱：冲破前高被打回=诱多（别追多），跌破前低被收回=诱空
+        （别追空）。邮件推送待识别引擎（后端）接入后开启，当前先在此列表与 K 线图上提醒。
+      </p>
+
+      {signals.length === 0 ? (
+        <p className="text-sm text-jarvis-text-secondary py-4 text-center">
+          {loading ? "识别中…" : "近期未识别到诱多/诱空陷阱。"}
+        </p>
+      ) : (
+        <div className="max-h-64 overflow-y-auto">
+          {signals.map((s) => (
+            <div
+              key={s.id}
+              className="flex items-start gap-2 py-2 border-b border-jarvis-border/50 last:border-0"
+            >
+              <span
+                className={`px-1.5 py-px rounded text-[10px] font-medium shrink-0 mt-0.5 ${
+                  s.type === "bull_trap"
+                    ? "bg-jarvis-red/15 text-jarvis-red"
+                    : "bg-jarvis-green/15 text-jarvis-green"
+                }`}
+              >
+                {TRAP_LABELS[s.type]}
+              </span>
+              {s.ts > seenTs && (
+                <span className="px-1 py-px rounded text-[10px] font-medium bg-jarvis-red text-white shrink-0 mt-0.5">
+                  新
+                </span>
+              )}
+              <div className="min-w-0 flex-1">
+                <p className="text-xs font-mono text-jarvis-text">
+                  {fmtTrapTime(s.ts)} @ {s.price.toLocaleString("en-US", { maximumFractionDigits: 2 })}
+                  <span className="text-jarvis-text-secondary ml-1.5">
+                    置信 {(Math.max(0, Math.min(1, s.confidence)) * 100).toFixed(0)}%
+                  </span>
+                </p>
+                <p
+                  className="text-xs text-jarvis-text-secondary truncate"
+                  title={[...s.reasons, `建议：${s.suggestion}`].join("\n")}
+                >
+                  {s.reasons[0] ?? s.suggestion}
+                </p>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="flex items-center gap-3 mt-3 pt-3 border-t border-jarvis-border/50">
+        <Link
+          to="/chart?trap=1"
+          className="btn-primary flex items-center gap-1.5 !no-underline"
+          title="打开 K 线页并自动开启「诱多诱空」标注，点图上警示牌看逐条原因"
+        >
+          <CandlestickChart size={14} />
+          去图表查看
+        </Link>
+        {signals.length > 0 && unread > 0 && (
+          <button
+            onClick={markAllRead}
+            className="text-xs text-jarvis-text-secondary hover:text-jarvis-text transition-colors"
+          >
+            全部标记已读
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /* ─────────────────── 12 系统信号邮件提醒总览 ─────────────────── */
 function SignalAlertCard() {
   const { data: state, refetch } = useApi<SignalAlertState>(() => api.signalAlerts());
@@ -1143,8 +1322,9 @@ export default function PriceAlertsPage() {
         <ContactsCard config={config} onSaved={refetchConfig} />
       </div>
 
-      <div className="mb-4">
+      <div className="grid grid-cols-2 gap-4 mb-4 items-start">
         <SignalAlertCard />
+        <TrapSignalCard />
       </div>
 
       <div className="grid grid-cols-2 gap-4 items-start">

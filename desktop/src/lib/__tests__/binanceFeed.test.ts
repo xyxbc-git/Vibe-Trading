@@ -3,10 +3,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Timeframe } from '../../types/footprint';
 import {
+  BinanceBanError,
   BinanceLiveFeed,
+  binanceBanRemainingMs,
+  fetchLatestKlines,
   fetchRecentAggTrades,
   klineDelta,
   klineToBar,
+  postBanCooldownUntilForTest,
+  resetRestGuardForTest,
   toTick,
   type AggTradeTick,
   type KlineData,
@@ -64,6 +69,7 @@ function stubFetch(router: (url: string) => unknown) {
 
 beforeEach(() => {
   FakeWS.instances = [];
+  resetRestGuardForTest();
   vi.stubGlobal('WebSocket', FakeWS as unknown as typeof WebSocket);
 });
 
@@ -148,6 +154,77 @@ describe('fetchRecentAggTrades 逆序分页', () => {
     expect(res.ticks[0].time).toBeGreaterThanOrEqual(now - 300_000);
     expect(res.ticks.length).toBeLessThan(2000);
     expect(res.ticks.length).toBeGreaterThan(1000);
+  });
+});
+
+describe('REST 限流/封禁防护', () => {
+  it('418：不重试、立即抛 BinanceBanError，后续调用零请求短路', async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: false,
+      status: 418,
+      headers: { get: (k: string) => (k === 'retry-after' ? '300' : null) },
+      json: async () => ({}),
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    // 首次触发 418：只发 1 个请求（不重试），封禁点按 Retry-After=300s
+    await expect(fetchLatestKlines('ETHUSDT', '4h' as Timeframe, 2)).rejects.toBeInstanceOf(
+      BinanceBanError,
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const remain = binanceBanRemainingMs();
+    expect(remain).toBeGreaterThan(290_000);
+    expect(remain).toBeLessThanOrEqual(300_000);
+
+    // 封禁期内的任何 REST 调用：直接短路，不再发出网络请求
+    await expect(fetchRecentAggTrades('ETHUSDT', 60_000, 3)).rejects.toBeInstanceOf(
+      BinanceBanError,
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('418：设置「解封后冷却窗」= banUntil + 60s（防解封即回补风暴的死循环）', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: false,
+        status: 418,
+        headers: { get: (k: string) => (k === 'retry-after' ? '2' : null) },
+        json: async () => ({}),
+      })),
+    );
+    const before = Date.now();
+    await expect(fetchLatestKlines('ETHUSDT', '4h' as Timeframe, 2)).rejects.toBeInstanceOf(
+      BinanceBanError,
+    );
+    const cooldown = postBanCooldownUntilForTest();
+    // banUntil ≈ before+2000；冷却窗 = banUntil + 60_000
+    expect(cooldown).toBeGreaterThan(before + 2_000 + 60_000 - 1_000);
+    expect(cooldown).toBeLessThan(Date.now() + 2_000 + 60_000 + 1_000);
+  });
+
+  it('429：读 Retry-After 冷却后重试成功，不升级为狂打', async () => {
+    let calls = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        calls += 1;
+        if (calls === 1) {
+          return {
+            ok: false,
+            status: 429,
+            headers: { get: (k: string) => (k === 'retry-after' ? '0' : null) },
+            json: async () => ({}),
+          };
+        }
+        return { ok: true, status: 200, headers: { get: () => null }, json: async () => [] };
+      }),
+    );
+
+    const rows = await fetchLatestKlines('ETHUSDT', '4h' as Timeframe, 2);
+    expect(rows).toEqual([]);
+    expect(calls).toBe(2);
+    expect(binanceBanRemainingMs()).toBe(0); // 429 只冷却不封禁
   });
 });
 

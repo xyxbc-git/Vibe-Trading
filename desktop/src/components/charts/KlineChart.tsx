@@ -20,11 +20,13 @@ import type { StructureDrawings, StructureMarker } from "@/api/client";
 import type { TradeMark } from "@/lib/signalTrades";
 import type { PredictionOverlay } from "@/lib/predict";
 import type { CloudPoint } from "@/lib/ichimoku";
+import type { TrapMark } from "@/lib/trapSignals";
 import { positionZoneWindow, type PositionZoneView } from "@/lib/positionZone";
 import { TradeMarkersPrimitive } from "./TradeMarkersPrimitive";
 import { PredictionPrimitive } from "./PredictionPrimitive";
 import { PositionZonePrimitive } from "./PositionZonePrimitive";
 import { IchimokuCloudPrimitive } from "./IchimokuCloudPrimitive";
+import { TrapSignalsPrimitive } from "./TrapSignalsPrimitive";
 
 /** 云图叠加载荷：三条线走 LineSeries，云带（含未来段）走 primitive */
 export interface IchimokuOverlay {
@@ -88,7 +90,32 @@ interface KlineChartProps {
    * null/undefined 不渲染。
    */
   ichimoku?: IchimokuOverlay | null;
+  /**
+   * 诱多/诱空陷阱信号标记（buildTrapMarks 生成）：诱多红色倒三角警示（挂
+   * 信号 bar 高点上方）、诱空绿色正三角警示（挂低点下方），canvas 自绘
+   * primitive 与结构买卖点的原生 setMarkers 互不干扰。null/undefined 不渲染。
+   */
+  trapMarks?: TrapMark[] | null;
+  /** 点击命中陷阱标记时回调（弹原因卡片）；pos 为图表面板内像素坐标。 */
+  onTrapClick?: (mark: TrapMark, pos: { x: number; y: number }) => void;
+  /**
+   * 数据集标识（如 "BTCUSDT|15m"）。提供时启用「视口保持」模式：仅该 key
+   * 变化（切币种/切周期/图表重建）才 fitContent 重置视口；同 key 的数据
+   * 更新（轮询刷新、历史前插）恢复原可见时间区间，用户缩放/平移与向左
+   * 拖看历史不被打断。不提供时保持旧行为（每次数据变化都 fitContent）。
+   */
+  datasetKey?: string;
+  /**
+   * 视口左缘接近数据起点（逻辑索引 < 阈值）时回调——向前懒加载更早历史。
+   * 调用方需自带防重入/到头守卫（如 useKlineHistory.loadOlder）。
+   */
+  onNearLeftEdge?: () => void;
+  /** 正在加载更早历史：图表左上角显示提示条。 */
+  loadingOlder?: boolean;
 }
+
+/** 触发历史懒加载的左缘阈值（可见范围起点距数据首根的逻辑 bar 数） */
+const NEAR_LEFT_EDGE_BARS = 15;
 
 function fmtPrice(v: number): string {
   return v.toLocaleString("en-US", { maximumFractionDigits: 2 });
@@ -129,6 +156,11 @@ export default function KlineChart({
   structMarkers,
   livePrice,
   ichimoku,
+  trapMarks,
+  onTrapClick,
+  datasetKey,
+  onNearLeftEdge,
+  loadingOlder,
 }: KlineChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -141,6 +173,15 @@ export default function KlineChart({
   const predictionPrimitiveRef = useRef<PredictionPrimitive | null>(null);
   const positionZonePrimitiveRef = useRef<PositionZonePrimitive | null>(null);
   const ichimokuPrimitiveRef = useRef<IchimokuCloudPrimitive | null>(null);
+  const trapPrimitiveRef = useRef<TrapSignalsPrimitive | null>(null);
+  // 点击回调 latest-ref：init effect 里的 subscribeClick 闭包始终调到最新回调
+  const onTrapClickRef = useRef(onTrapClick);
+  onTrapClickRef.current = onTrapClick;
+  // 左缘懒加载回调 latest-ref（同上模式）
+  const onNearLeftEdgeRef = useRef(onNearLeftEdge);
+  onNearLeftEdgeRef.current = onNearLeftEdge;
+  // 视口保持：记住上一次应用数据时的 datasetKey；图表重建后置空强制 fitContent
+  const prevDatasetKeyRef = useRef<string | undefined>(undefined);
   // 预测视口右扩去重：同一份预测（genKey）只扩一次，用户随后缩放/平移不被打断
   const predictionRef = useRef<PredictionOverlay | null>(null);
   const appliedGenKeyRef = useRef<string | null>(null);
@@ -212,8 +253,12 @@ export default function KlineChart({
     // 一目均衡表云带（双色 Kumo + 未来延伸段）：normal 层垫在蜡烛下
     const ichimokuPrimitive = new IchimokuCloudPrimitive();
     candleSeries.attachPrimitive(ichimokuPrimitive);
+    // 诱多/诱空陷阱三角警示牌：zOrder "top"，悬停出摘要、点击弹原因卡片
+    const trapPrimitive = new TrapSignalsPrimitive();
+    candleSeries.attachPrimitive(trapPrimitive);
 
-    // 悬停浮层（两类命中共用一个浮层，徽章 > 预测层）：
+    // 悬停浮层（多类命中共用一个浮层，陷阱警示 > 徽章 > 预测层）：
+    //   0. 诱多/诱空三角警示牌：命中 → 陷阱类型/置信度/价位摘要
     //   1. 信号盈损 L/S 徽章 / 出场圆点：像素坐标命中测试 → 每笔详情
     //   2. 走势预测层：概率标签盒 / 概率锥命中 → 概率与目标区摘要
     const handleCrosshair = (param: MouseEventParams<Time>) => {
@@ -221,6 +266,11 @@ export default function KlineChart({
       const pt = param.point;
       if (!pt) {
         setZoneTip(null);
+        return;
+      }
+      const trapHit = trapPrimitive.markAt(pt.x, pt.y);
+      if (trapHit) {
+        setZoneTip({ x: pt.x, y: pt.y, text: trapHit.tooltip });
         return;
       }
       const markTip = marksPrimitive.markAt(pt.x, pt.y);
@@ -242,6 +292,24 @@ export default function KlineChart({
     };
     chart.subscribeCrosshairMove(handleCrosshair);
 
+    // 点击陷阱警示牌 → 弹原因卡片（latest-ref 防 stale 回调）
+    const handleClick = (param: MouseEventParams<Time>) => {
+      if (disposedRef.current || !param.point) return;
+      const hit = trapPrimitive.markAt(param.point.x, param.point.y);
+      if (hit) {
+        onTrapClickRef.current?.(hit, { x: param.point.x, y: param.point.y });
+      }
+    };
+    chart.subscribeClick(handleClick);
+
+    // 视口左缘接近数据起点 → 懒加载更早历史（回调方自带防重入/到头守卫，
+    // 加载完成前插并恢复视口后 from 移出阈值，自然停止连发）
+    const handleRangeChange = (range: { from: number; to: number } | null) => {
+      if (disposedRef.current || !range) return;
+      if (range.from < NEAR_LEFT_EDGE_BARS) onNearLeftEdgeRef.current?.();
+    };
+    chart.timeScale().subscribeVisibleLogicalRangeChange(handleRangeChange);
+
     chartRef.current = chart;
     candleSeriesRef.current = candleSeries;
     volumeSeriesRef.current = volumeSeries;
@@ -249,11 +317,14 @@ export default function KlineChart({
     predictionPrimitiveRef.current = predictionPrimitive;
     positionZonePrimitiveRef.current = positionZonePrimitive;
     ichimokuPrimitiveRef.current = ichimokuPrimitive;
+    trapPrimitiveRef.current = trapPrimitive;
     priceLinesRef.current = [];
     overlaySeriesRef.current = [];
     ichimokuSeriesRef.current = [];
     // 重建后的图表实例 rightOffset 归零，同一份预测需重新扩一次视野
     appliedGenKeyRef.current = null;
+    // 全新图表实例视口为空：置空 key 让 data effect 走 fitContent 分支
+    prevDatasetKeyRef.current = undefined;
     setInitVersion(v => v + 1);
 
     const handleResize = () => {
@@ -267,12 +338,15 @@ export default function KlineChart({
       disposedRef.current = true;
       window.removeEventListener("resize", handleResize);
       chart.unsubscribeCrosshairMove(handleCrosshair);
+      chart.unsubscribeClick(handleClick);
+      chart.timeScale().unsubscribeVisibleLogicalRangeChange(handleRangeChange);
       candleSeriesRef.current = null;
       volumeSeriesRef.current = null;
       marksPrimitiveRef.current = null;
       predictionPrimitiveRef.current = null;
       positionZonePrimitiveRef.current = null;
       ichimokuPrimitiveRef.current = null;
+      trapPrimitiveRef.current = null;
       priceLinesRef.current = [];
       overlaySeriesRef.current = [];
       ichimokuSeriesRef.current = [];
@@ -285,32 +359,48 @@ export default function KlineChart({
   useEffect(() => {
     if (disposedRef.current) return;
     try {
+      const chart = chartRef.current;
+      // 视口保持模式：datasetKey 提供且与上次应用一致（轮询刷新/历史前插）
+      // → 记录当前可见时间区间，setData 后原样恢复。时间是稳定锚点，前插
+      // 更早历史造成的逻辑索引偏移不会让画面跳动。
+      const keepViewport =
+        datasetKey !== undefined && prevDatasetKeyRef.current === datasetKey;
+      const savedRange = keepViewport
+        ? chart?.timeScale().getVisibleRange() ?? null
+        : null;
+
       if (candleSeriesRef.current && data.length > 0) {
         candleSeriesRef.current.setData(data);
       }
       if (volumeSeriesRef.current && volumeData && volumeData.length > 0) {
         volumeSeriesRef.current.setData(volumeData);
       }
-      if (chartRef.current && data.length > 0) {
-        chartRef.current.timeScale().fitContent();
-        // 预测层/云图未来段开启时：fitContent 会把视口收到最后一根 K 线，
-        // 右侧未来区域（概率锥/未来云所在）被挤出画面——刷新后滚出对应
-        // 根数的右侧留白（两层同开取较大者）。数据轮询本来就周期性
-        // fitContent 重置视口，这里跟随同一节奏，不额外打断用户手动缩放/平移。
-        const pred = predictionRef.current;
-        const ichi = ichimokuRef.current;
-        const offset = Math.max(
-          pred ? pred.horizon + 2 : 0,
-          ichi && ichi.futureStart !== null ? ichi.displacement + 2 : 0,
-        );
-        if (offset > 0) {
-          chartRef.current.timeScale().scrollToPosition(offset, false);
+      if (chart && data.length > 0) {
+        if (keepViewport && savedRange) {
+          // 同数据集的增量更新：恢复原视口，不打断用户缩放/平移/向左回看
+          chart.timeScale().setVisibleRange(savedRange);
+        } else {
+          // 首屏 / 切币种 / 切周期 / 图表重建（或未启用视口保持的旧行为）
+          chart.timeScale().fitContent();
+          // 预测层/云图未来段开启时：fitContent 会把视口收到最后一根 K 线，
+          // 右侧未来区域（概率锥/未来云所在）被挤出画面——滚出对应根数的
+          // 右侧留白（两层同开取较大者）。
+          const pred = predictionRef.current;
+          const ichi = ichimokuRef.current;
+          const offset = Math.max(
+            pred ? pred.horizon + 2 : 0,
+            ichi && ichi.futureStart !== null ? ichi.displacement + 2 : 0,
+          );
+          if (offset > 0) {
+            chart.timeScale().scrollToPosition(offset, false);
+          }
         }
+        prevDatasetKeyRef.current = datasetKey;
       }
     } catch {
       // chart may have been disposed between render and effect
     }
-  }, [data, volumeData, initVersion]);
+  }, [data, volumeData, initVersion, datasetKey]);
 
   // 实时价补丁：用与顶栏同源的 ticker 报价流式更新最后一根未收线蜡烛
   // （series.update 只动最后一根，不触发 setData/fitContent，不打断用户
@@ -437,6 +527,17 @@ export default function KlineChart({
       // chart may have been disposed between render and effect
     }
   }, [tradeMarks, initVersion]);
+
+  // 诱多/诱空陷阱警示标记：prop 变化整组重设，传空/未传即清空；
+  // 悬停/点击命中直接查 primitive 的投影结果。
+  useEffect(() => {
+    if (disposedRef.current) return;
+    try {
+      trapPrimitiveRef.current?.setMarks(trapMarks ?? []);
+    } catch {
+      // chart may have been disposed between render and effect
+    }
+  }, [trapMarks, initVersion]);
 
   // 信号结构买卖点标注 → 原生 setMarkers。替换式 API：prop 变化整组重设，
   // 清空/未传时重设为空数组；库要求按 time 升序，窗口外的标注直接丢弃。
@@ -765,6 +866,12 @@ export default function KlineChart({
   return (
     <div className="relative">
       <div ref={containerRef} className="w-full rounded-lg overflow-hidden" />
+      {loadingOlder && (
+        <div className="pointer-events-none absolute top-2 left-2 z-10 flex items-center gap-1.5 px-2 py-1 rounded border border-jarvis-border bg-jarvis-card/90 text-xs text-jarvis-text-secondary">
+          <span className="inline-block w-3 h-3 border-2 border-jarvis-blue border-t-transparent rounded-full animate-spin" />
+          加载更早 K 线…
+        </div>
+      )}
       {zoneTip && (
         <div
           className="pointer-events-none absolute z-10 px-2 py-1 rounded border border-jarvis-border bg-jarvis-card/95 text-xs text-jarvis-text whitespace-nowrap shadow-lg"

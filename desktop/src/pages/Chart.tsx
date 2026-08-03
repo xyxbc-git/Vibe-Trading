@@ -1,6 +1,7 @@
 import { useState, useMemo, useEffect } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useApi, usePolling } from "@/hooks/useApi";
+import { useKlineHistory } from "@/hooks/useKlineHistory";
 import { useSymbol } from "@/hooks/useSymbol";
 import { useLivePrice } from "@/hooks/usePrice";
 import { api, formatPrice, type TwelveSignal, type ConsensusTradePlan, type KeyLevel, type LiqMapResponse, type SignalDirection } from "@/api/client";
@@ -63,10 +64,28 @@ import {
   ichimokuTipAt,
   type IchimokuBar,
 } from "@/lib/ichimoku";
+import {
+  mockTrapSignals,
+  buildTrapMarks,
+  TRAP_LABELS,
+  TRAP_TOGGLE_KEY,
+  fmtTrapTime,
+  type TrapSignalsResponse,
+  type TrapBar,
+  type TrapMark,
+} from "@/lib/trapSignals";
+import { detectPatterns, type DetectedPattern } from "@/lib/patterns";
+import {
+  patternToChartOverlay,
+  mergePatternDrawings,
+  mergePatternMarkers,
+} from "@/lib/patternOverlay";
 import type { IchimokuOverlay } from "@/components/charts/KlineChart";
 import DeltaPane from "@/components/charts/DeltaPane";
 import DeltaAiExplainCard from "@/components/cards/DeltaAiExplainCard";
-import { CandlestickChart, Cloudy, HelpCircle, Target, Waypoints, X } from "lucide-react";
+import TrapReasonCard from "@/components/cards/TrapReasonCard";
+import PatternExplainCard from "@/components/charts/PatternExplainCard";
+import { AlertTriangle, CandlestickChart, Cloudy, HelpCircle, Target, Waypoints, X } from "lucide-react";
 import { planSide } from "@/components/cards/SignalBoard";
 import PositionAdvisor from "@/components/cards/PositionAdvisor";
 import PredictionCard from "@/components/cards/PredictionCard";
@@ -188,8 +207,27 @@ const SYS_OVERLAY_COLORS: Record<SignalDirection, string> = {
 /** 预测覆盖的未来 bar 数（与预测引擎契约默认值一致） */
 const PREDICT_HORIZON = 16;
 
+/**
+ * 把画线引擎输出的 bar 索引整体平移 offset：画线基于「最近固定窗口」
+ * （recentCandles）计算，图表渲染的是含懒加载历史的全量数据——窗口在全量
+ * 中的起始偏移即 offset，平移后线段/矩形落回正确的 K 线上。
+ */
+function shiftDrawingIndexes(
+  d: DrawingResult | null,
+  offset: number,
+): DrawingResult | null {
+  if (!d || offset <= 0) return d;
+  return {
+    ...d,
+    segments: d.segments.map((s) => ({ ...s, i1: s.i1 + offset, i2: s.i2 + offset })),
+    bands: d.bands.map((b) => ({ ...b, i1: b.i1 + offset, i2: b.i2 + offset })),
+  };
+}
+
 /** 云图开关持久化键（跨会话记住用户偏好） */
 const ICHIMOKU_KEY = "jarvis.chart.ichimoku";
+
+// 诱多诱空开关持久化键：TRAP_TOGGLE_KEY（lib/trapSignals），与盘口透视页共用
 
 /** 云图状态提示条的色调样式（多绿/空红/震荡灰，与信号方向色一致） */
 const ICHIMOKU_TONE_CLS = {
@@ -240,6 +278,26 @@ export default function Chart() {
       /* storage unavailable — 开关仍生效，只是不持久化 */
     }
   };
+  // 诱多诱空陷阱信号开关：localStorage 记住偏好，默认关
+  const [trapOn, setTrapOnState] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(TRAP_TOGGLE_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const setTrapOn = (v: boolean) => {
+    setTrapOnState(v);
+    try {
+      localStorage.setItem(TRAP_TOGGLE_KEY, v ? "1" : "0");
+    } catch {
+      /* storage unavailable — 开关仍生效，只是不持久化 */
+    }
+  };
+  // 形态分析开关（专业模式）：识别经典形态 → 图上标注 + 解释卡片；默认关
+  const [patternOn, setPatternOn] = useState(false);
+  // 当前图上标注/卡片展开的形态下标（多形态时卡片 tab 切换联动图上标注）
+  const [patternIdx, setPatternIdx] = useState(0);
   const { symbol } = useSymbol();
 
   // ── 信号历史盈损标记（信号矩阵「盈损点」跳转携带 query 进入） ──
@@ -258,6 +316,18 @@ export default function Chart() {
     // 只清 sig* 键，保留可能并存的多空区间图参数
     setSearchParams(stripSigMarksQuery(searchParams), { replace: true });
   };
+
+  // ── 诱多诱空开关的跳转入口（提醒页「去图表查看」带 ?trap=1 进入）──
+  // 一次性消费：开启开关后即从 query 里删掉，不影响其它并存参数
+  useEffect(() => {
+    if (searchParams.get("trap") === "1") {
+      setTrapOn(true);
+      const next = new URLSearchParams(searchParams);
+      next.delete("trap");
+      setSearchParams(next, { replace: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
 
   // 进入/切换标记目标时自动对齐周期：胜率样本按 sigTf 回测，标记只有画在
   // 同周期 K 线上才与样本口径一致（任务要求：周期不一致自动切换）
@@ -393,20 +463,23 @@ export default function Chart() {
   const smartActive = !isPro || smart;
   const twelveActive = viewMode === "advanced" || (isPro && twelve);
 
-  const { data: rawKline, loading, error } = usePolling(
-    () => api.kline(symbol, tf, LIMITS[tf]),
-    tf === "1m" ? 10_000 : 60_000,
-    [tf, symbol],
-  );
+  // 实时窗口轮询（节奏与旧版一致）+ 向左拖懒加载更早历史（end_time 分页，
+  // 多页前插合并，切币种/周期自动清空）——见 useKlineHistory
+  const {
+    rows: klineRows,
+    loading,
+    error,
+    loadingOlder,
+    loadOlder,
+  } = useKlineHistory(symbol, tf, LIMITS[tf], tf === "1m" ? 10_000 : 60_000);
 
   const { candles, volumes } = useMemo(() => {
-    const rows = (rawKline as Record<string, unknown>)?.rows;
-    if (!rawKline || !Array.isArray(rows)) {
+    if (klineRows.length === 0) {
       return { candles: [] as CandlestickData<Time>[], volumes: [] as HistogramData<Time>[] };
     }
     const c: CandlestickData<Time>[] = [];
     const v: HistogramData<Time>[] = [];
-    for (const k of rows as Record<string, number>[]) {
+    for (const k of klineRows) {
       const time = (k.ts / 1000) as Time;
       c.push({
         time,
@@ -425,7 +498,7 @@ export default function Chart() {
       });
     }
     return { candles: c, volumes: v };
-  }, [rawKline]);
+  }, [klineRows]);
 
   const lastCandle = candles.length > 0 ? candles[candles.length - 1] : null;
 
@@ -488,6 +561,85 @@ export default function Chart() {
     return { overlay, readout: ichimokuReadout(bars, r) };
   }, [ichimokuOn, candles]);
 
+  // ── 诱多/诱空陷阱信号：识别引擎 GET /api/trap-signals；未就绪/失败回退
+  // 本地假突破规则识别（毫秒级纯计算，随 K 线轮询自动重算——新信号可被感知）──
+  const [trapApiResp, setTrapApiResp] = useState<TrapSignalsResponse | null>(null);
+  const [trapApiState, setTrapApiState] = useState<
+    "idle" | "loading" | "ok" | "unavailable"
+  >("idle");
+
+  useEffect(() => {
+    if (!trapOn) {
+      setTrapApiResp(null);
+      setTrapApiState("idle");
+      return;
+    }
+    let cancelled = false;
+    setTrapApiState("loading");
+    (async () => {
+      try {
+        const res = await api.trapSignals(symbol, tf);
+        if (cancelled) return;
+        // 回声校验：慢返回的旧币种/旧周期响应不得写入当前图（防交易误导）
+        if (isStaleEcho(symbol, res?.symbol)) return;
+        if (res?.interval && res.interval !== tf) return;
+        if (res && res.ok !== false && Array.isArray(res.signals)) {
+          setTrapApiResp(res);
+          setTrapApiState("ok");
+          return;
+        }
+        setTrapApiResp(null);
+        setTrapApiState("unavailable");
+      } catch {
+        if (!cancelled) {
+          setTrapApiResp(null);
+          setTrapApiState("unavailable");
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [trapOn, symbol, tf]);
+
+  // 数据合成：引擎响应优先；未就绪时本地规则识别（与预测/Delta 同款降级模式）
+  const trapData = useMemo<TrapSignalsResponse | null>(() => {
+    if (!trapOn || candles.length === 0) return null;
+    if (trapApiState === "ok" && trapApiResp) return trapApiResp;
+    const bars: TrapBar[] = candles.map((c, i) => ({
+      timeSec: Number(c.time),
+      open: c.open,
+      high: c.high,
+      low: c.low,
+      close: c.close,
+      volume: volumes[i]?.value,
+    }));
+    return mockTrapSignals(symbol, tf, bars);
+  }, [trapOn, trapApiState, trapApiResp, candles, volumes, symbol, tf]);
+
+  // 信号 → K 线三角警示标记（窗口裁剪 + 锚定信号 bar 高低点）
+  const trapMarks = useMemo<TrapMark[] | null>(() => {
+    if (!trapData || candles.length === 0) return null;
+    const anchors = candles.map((c) => ({
+      timeSec: Number(c.time),
+      high: c.high,
+      low: c.low,
+    }));
+    const marks = buildTrapMarks(trapData, anchors);
+    return marks.length > 0 ? marks : null;
+  }, [trapData, candles]);
+
+  // 点击警示牌 → 原因卡片（浮在图表容器右上角）；切币种/周期/关开关时收起
+  const [selectedTrap, setSelectedTrap] = useState<TrapMark | null>(null);
+  useEffect(() => {
+    setSelectedTrap(null);
+  }, [symbol, tf, trapOn]);
+
+  const latestTrap =
+    trapData && trapData.signals.length > 0
+      ? trapData.signals[trapData.signals.length - 1]
+      : null;
+
   // ── 信号盈损标记：拉该系统的逐笔回测明细（与信号矩阵聚合胜率同源） ──
   const { data: sigTradesResp, loading: sigTradesLoading } = useApi(
     () =>
@@ -518,14 +670,25 @@ export default function Chart() {
     );
   }, [sigSystem, sigTf, tf, sigTradesResp, candles]);
 
+  // 画线引擎输入沿用「最近固定窗口」口径（与 LIMITS 上限一致）：懒加载前插
+  // 的更早历史不进画线/自调计算——避免每页前插触发自调参数重搜（TUNE_KEY
+  // 缓存按 bars 数精确匹配，bars 每页都变则页页重搜）与评分计算量随历史
+  // 膨胀；引擎设计本来就只看最近窗口。输出的 bar 索引在传入图表前经
+  // shiftDrawingIndexes 平移 drawingsIndexOffset 对齐全量数据。
+  const recentCandles = useMemo(
+    () => (candles.length > LIMITS[tf] ? candles.slice(-LIMITS[tf]) : candles),
+    [candles, tf],
+  );
+  const drawingsIndexOffset = candles.length - recentCandles.length;
+
   // Drawing-engine input arrays, derived once per kline refresh. `dates` is
   // index-aligned (the engine keys outputs by bar index, not by label).
   const baseData = useMemo<BaseData>(() => ({
-    dates: candles.map((c) => String(c.time)),
-    closes: candles.map((c) => c.close),
-    highs: candles.map((c) => c.high),
-    lows: candles.map((c) => c.low),
-  }), [candles]);
+    dates: recentCandles.map((c) => String(c.time)),
+    closes: recentCandles.map((c) => c.close),
+    highs: recentCandles.map((c) => c.high),
+    lows: recentCandles.map((c) => c.low),
+  }), [recentCandles]);
 
   const toggleDraw = (id: DrawMode) => {
     setDraws((prev) => {
@@ -679,6 +842,24 @@ export default function Chart() {
     if (!isPro || draws.size === 0 || candles.length < 20) return null;
     return computeDrawings(draws, baseData, DRAW_COLORS, tuneInfo.params, learnedReliability);
   }, [isPro, draws, baseData, candles.length, tuneInfo.params, learnedReliability]);
+
+  // ── 形态分析（楔形/矩形/旗形·三角旗/三角形/头肩/双顶底）：专业模式开关触发，
+  // 引擎输出按置信度降序；选中形态经 patternToChartOverlay 并入 drawings /
+  // structMarkers 通道（复用现有画线原语），关闭时载荷为空 = 彻底清除 ──
+  const patternList = useMemo<DetectedPattern[] | null>(() => {
+    if (!isPro || !patternOn || candles.length < 20) return null;
+    return detectPatterns(baseData);
+  }, [isPro, patternOn, baseData, candles.length]);
+
+  const safePatternIdx =
+    patternList && patternList.length > 0 ? Math.min(patternIdx, patternList.length - 1) : 0;
+  const activePattern =
+    patternList && patternList.length > 0 ? patternList[safePatternIdx] : null;
+
+  const patternOverlay = useMemo(
+    () => patternToChartOverlay(activePattern, baseData.dates),
+    [activePattern, baseData.dates],
+  );
 
   // 进阶模式：每类线型单独计算，供组合器按可靠度裁剪（每类只保留最可靠的 1~2 条）
   const perTypeDrawings = useMemo(() => {
@@ -918,15 +1099,19 @@ export default function Chart() {
     setDeltaLoading(true);
     setDeltaError(null);
 
-    const klines = (): DeltaKline[] =>
-      candles.map((c, i) => ({
+    // 演示推演与引擎 limit=200 口径对齐：只吃最近窗口，懒加载的深历史不进
+    // Delta 演示计算（DeltaPane 渲染几千根柱会卡）
+    const klines = (): DeltaKline[] => {
+      const offset = candles.length - recentCandles.length;
+      return recentCandles.map((c, i) => ({
         timeSec: Number(c.time),
         open: c.open,
         close: c.close,
         high: c.high,
         low: c.low,
-        volume: volumes[i]?.value,
+        volume: volumes[offset + i]?.value,
       }));
+    };
 
     const fallbackToMock = (reason?: string) => {
       const mock = mockDelta(symbol, tf, klines());
@@ -1171,6 +1356,15 @@ export default function Chart() {
           </span>
         )}
 
+        {/* 诱多诱空陷阱信号：假突破识别，红▽诱多别追多 / 绿△诱空别追空 */}
+        <button
+          onClick={() => setTrapOn(!trapOn)}
+          title="诱多诱空识别：自动标出「假突破」陷阱——冲破前高又被打回=诱多（红色倒三角，别追多），跌破前低又收回=诱空（绿色正三角，别追空）。点击图上警示牌看逐条理由与操作建议。识别引擎未接入时显示本地规则识别的演示数据"
+          className={pillCls(trapOn)}
+        >
+          诱多诱空{trapOn ? "·开" : "·关"}
+        </button>
+
         {/* Delta/CVD 副图（「安全带」层）：只有 Delta 与价格背离（吸收证据）才是真反转 */}
         <button
           onClick={() => setDeltaOn((v) => !v)}
@@ -1342,6 +1536,41 @@ export default function Chart() {
             >
               清除
             </button>
+          </>
+        )}
+
+        {/* 形态分析：楔形/矩形/旗形·三角旗/三角形/头肩/双顶底 识别 + 图上标注 + 解释卡片 */}
+        {isPro && (
+          <>
+            <div className="w-px h-4 bg-jarvis-border" />
+            <button
+              onClick={() => {
+                setPatternOn((v) => !v);
+                setPatternIdx(0);
+              }}
+              title="形态分析：自动识别楔形、矩形、旗形/三角旗、三角形、头肩、双顶底等经典形态，画出上下轨/颈线并标注触点、突破位、量度目标与建议止损，附中文多空解读"
+              className={pillCls(patternOn)}
+            >
+              形态分析{patternOn ? "·开" : "·关"}
+            </button>
+            {patternOn && activePattern && (
+              <span
+                className={clsx(
+                  "px-2 py-1 rounded-md text-xs font-medium border",
+                  activePattern.direction === "bullish"
+                    ? "border-jarvis-green/60 text-jarvis-green"
+                    : activePattern.direction === "bearish"
+                      ? "border-jarvis-red/60 text-jarvis-red"
+                      : "border-jarvis-border text-jarvis-text-secondary",
+                )}
+              >
+                {activePattern.direction === "bullish" ? "▲ " : activePattern.direction === "bearish" ? "▼ " : "＝ "}
+                {activePattern.nameCn}
+              </span>
+            )}
+            {patternOn && patternList && patternList.length === 0 && (
+              <span className="text-xs text-jarvis-text-secondary">未发现明显形态</span>
+            )}
           </>
         )}
 
@@ -1634,27 +1863,81 @@ export default function Chart() {
         </div>
       )}
 
-      <div className="card p-0 overflow-hidden">
+      {/* 诱多诱空状态条：窗口内信号计数 + 最新信号摘要 + 数据来源提示 */}
+      {trapOn && (
+        <div className="flex items-center gap-2 flex-wrap text-xs bg-jarvis-card border border-jarvis-yellow/40 rounded-lg px-3 py-2">
+          <AlertTriangle size={13} className="text-jarvis-yellow shrink-0" />
+          <span className="text-jarvis-text font-medium">诱多诱空识别</span>
+          {trapData ? (
+            <>
+              <span className="text-jarvis-text-secondary">
+                窗口内 {trapMarks?.length ?? 0} 个信号（
+                <span className="text-jarvis-red">红▽=诱多别追多</span> /
+                <span className="text-jarvis-green"> 绿△=诱空别追空</span>
+                ）· 点图上警示牌看原因与建议
+              </span>
+              {latestTrap && (
+                <span className="text-jarvis-text-secondary font-mono">
+                  最新：{TRAP_LABELS[latestTrap.type]} {fmtTrapTime(latestTrap.ts)} @{" "}
+                  {formatPrice(latestTrap.price)}
+                </span>
+              )}
+              {trapData.mock && (
+                <span
+                  className="text-jarvis-yellow"
+                  title="GET /api/trap-signals 未就绪，当前为本地假突破规则识别的演示数据；识别引擎接入后自动切换真实信号"
+                >
+                  演示数据
+                </span>
+              )}
+            </>
+          ) : trapApiState === "loading" ? (
+            <span className="text-jarvis-text-secondary">加载中…</span>
+          ) : (
+            <span className="text-jarvis-text-secondary">
+              K 线数不足（需 ≥25 根），暂无法识别
+            </span>
+          )}
+        </div>
+      )}
+
+      <div className="card p-0 overflow-hidden relative">
         {candles.length > 0 ? (
-          <KlineChart
-            data={candles}
-            volumeData={volumes}
-            height={Math.max(400, window.innerHeight - 320)}
-            smartLevels={composition.smartLevels}
-            drawings={composition.drawings}
-            keyLevels={(() => {
-              const merged = [...composition.keyLevels, ...liqLevels, ...sysLevels];
-              return merged.length > 0 ? merged : undefined;
-            })()}
-            planLines={composition.planLines.length > 0 ? composition.planLines : undefined}
-            tradeMarks={sigMarks?.marks}
-            prediction={predictOverlay}
-            positionZone={positionZone ?? sysZone}
-            structure={sysStructure}
-            structMarkers={sysStructure?.markers}
-            livePrice={liveForChart}
-            ichimoku={ichimokuData?.overlay ?? null}
-          />
+          <>
+            <KlineChart
+              data={candles}
+              volumeData={volumes}
+              height={Math.max(400, window.innerHeight - 320)}
+              smartLevels={composition.smartLevels}
+              drawings={shiftDrawingIndexes(
+                // 画线引擎与形态引擎同吃 recentCandles 窗口（索引同口径），
+                // 合并后统一平移对齐含懒加载历史的全量数据
+                mergePatternDrawings(composition.drawings, patternOverlay.drawings),
+                drawingsIndexOffset,
+              )}
+              keyLevels={(() => {
+                const merged = [...composition.keyLevels, ...liqLevels, ...sysLevels];
+                return merged.length > 0 ? merged : undefined;
+              })()}
+              planLines={composition.planLines.length > 0 ? composition.planLines : undefined}
+              tradeMarks={sigMarks?.marks}
+              prediction={predictOverlay}
+              positionZone={positionZone ?? sysZone}
+              structure={sysStructure}
+              structMarkers={mergePatternMarkers(sysStructure?.markers, patternOverlay.markers)}
+              livePrice={liveForChart}
+              ichimoku={ichimokuData?.overlay ?? null}
+              trapMarks={trapMarks}
+              onTrapClick={(mark) => setSelectedTrap(mark)}
+              datasetKey={`${symbol}|${tf}`}
+              onNearLeftEdge={loadOlder}
+              loadingOlder={loadingOlder}
+            />
+            {/* 陷阱原因卡片：固定右上角浮层，不遮点击处的 K 线形态 */}
+            {selectedTrap && (
+              <TrapReasonCard mark={selectedTrap} onClose={() => setSelectedTrap(null)} />
+            )}
+          </>
         ) : (
           <div
             className="flex flex-col items-center justify-center text-jarvis-text-secondary"
@@ -1678,6 +1961,16 @@ export default function Chart() {
           </div>
         )}
       </div>
+
+      {/* 形态分析解释卡片：形态名/方向徽标/置信度/关键点位/中文多空逻辑；
+          多形态 tab 切换同时联动图上标注（选中形态才画） */}
+      {isPro && patternOn && (
+        <PatternExplainCard
+          patterns={patternList ?? []}
+          activeIndex={safePatternIdx}
+          onSelect={setPatternIdx}
+        />
+      )}
 
       {/* ── Delta/CVD 订单流副图（安全带层，可折叠）：吸收背离 = 真反转证据 ── */}
       {deltaOn && (

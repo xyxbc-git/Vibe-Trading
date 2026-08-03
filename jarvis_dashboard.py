@@ -712,16 +712,31 @@ def series(symbol: str = "BTCUSDT", days: int = 365):
 
 
 @app.get("/api/kline")
-def kline(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 200):
-    """Binance 公开 K线（免 Key），供 echarts 自绘蜡烛图 + 叠加决策信号。"""
+def kline(
+    symbol: str = "BTCUSDT",
+    interval: str = "1h",
+    limit: int = 200,
+    end_time: int | None = None,
+):
+    """Binance 公开 K线（免 Key），供 echarts 自绘蜡烛图 + 叠加决策信号。
+
+    end_time（毫秒，可选）：向前分页游标，透传交易所 klines 的 endTime，
+    返回该时刻及之前的 limit 根——桌面端 K 线图向左拖动懒加载更早历史用。
+    不传时行为与旧版完全一致（最新窗口 + 60s 缓存）；历史页内容已收线
+    不再变化，缓存放宽到 600s 减少交易所请求。
+    """
     sym = symbol.upper().replace("-", "").replace("/", "")
     spot = sym if sym.endswith("USDT") else sym + "USDT"
     allowed = {"1m", "5m", "15m", "30m", "1h", "4h", "1d"}
     iv = interval if interval in allowed else "1h"
     lim = max(20, min(int(limit), 500))
+    end_ms = int(end_time) if end_time and end_time > 0 else None
 
     def _calc():
-        raw = jcd._get(jcd.SPOT_API + "/api/v3/klines", {"symbol": spot, "interval": iv, "limit": lim})
+        params = {"symbol": spot, "interval": iv, "limit": lim}
+        if end_ms is not None:
+            params["endTime"] = end_ms
+        raw = jcd._get(jcd.SPOT_API + "/api/v3/klines", params)
         if isinstance(raw, dict):
             return {"error": raw.get("_error", "kline fetch failed"), "rows": []}
         fmt = "%m-%d" if iv in ("1d",) else "%m-%d %H:%M"
@@ -734,9 +749,12 @@ def kline(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 200):
                 "o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
                 "c": float(k[4]), "v": round(float(k[5]), 2),
             })
-        return {"symbol": spot, "interval": iv, "rows": rows}
+        return {"symbol": spot, "interval": iv, "rows": rows, "end_time": end_ms}
 
-    return JSONResponse(_cached(f"kline:{spot}:{iv}:{lim}", 60, _calc))
+    if end_ms is None:
+        # 旧行为：最新窗口 60s 缓存，key 与旧版保持一致
+        return JSONResponse(_cached(f"kline:{spot}:{iv}:{lim}", 60, _calc))
+    return JSONResponse(_cached(f"kline:{spot}:{iv}:{lim}:{end_ms}", 600, _calc))
 
 
 @app.get("/api/factor")
@@ -2897,16 +2915,33 @@ def _start_ws_stream():
             if jtc_mod.register():
                 _log_emit("tape classify 成交流主体分类已挂载 aggTrade 流",
                           "info", "tape-classify")
-                # 分钟聚合持久化（成交流 K 线复盘）：后台线程 30s flush，14 天保留
+                # 分钟聚合 + 足迹档位持久化（成交流复盘 / 历史足迹回看）：
+                # 后台线程 30s flush，保留天数走 tape_retention_days（默认 30 天）
                 try:
                     if jtc_mod.start_persist():
-                        _log_emit("tape 分钟聚合持久化线程已启动（30s flush / 14 天保留）",
+                        _log_emit("tape 分钟聚合+足迹持久化线程已启动"
+                                  "（30s flush / 保留 tape_retention_days 默认 30 天）",
                                   "info", "tape-classify")
                 except Exception as e:  # noqa: BLE001
                     _log_emit(f"tape 分钟聚合持久化启动失败（不影响实时流）: {e}",
                               "warn", "tape-classify")
         except Exception as e:  # noqa: BLE001
             _log_emit(f"tape classify 挂载失败（不影响 WS）: {e}", "warn", "tape-classify")
+        # 本地订单簿引擎挂 depth 回调（order-flow phase-1；失败不影响 WS 主链路）
+        try:
+            if jc_mod.get("book_enabled"):
+                import jarvis_orderbook as job_mod
+                if job_mod.register():
+                    _log_emit("orderbook 本地订单簿引擎已挂载 depth 流"
+                              "（快照仅初始化/重同步拉取，REST 限流生效）",
+                              "info", "orderbook")
+                    if job_mod.start_persist():
+                        _log_emit("orderbook 深度切片持久化线程已启动"
+                                  "（5s 内存切片 / 分钟降采样落库 / "
+                                  "保留 book_retention_days 默认 14 天）",
+                                  "info", "orderbook")
+        except Exception as e:  # noqa: BLE001
+            _log_emit(f"orderbook 挂载失败（不影响 WS）: {e}", "warn", "orderbook")
     except Exception as e:  # noqa: BLE001
         _log_emit(f"WS 实时流启动失败（REST 轮询不受影响）: {e}", "error", "ws-stream")
 
@@ -3924,6 +3959,70 @@ def api_depth_orderbook(symbol: str = "BTCUSDT", limit: int = 500,
         key, 3, lambda: jdv.orderbook(sym, limit, bucket, max_buckets)))
 
 
+@app.get("/api/orderbook/live")
+def api_orderbook_live(symbol: str = "BTCUSDT", bucket: float | None = None,
+                       max_buckets: int = 30):
+    """实时 DOM（order-flow phase-1）：WS 增量维护的本地订单簿，1s 缓存。
+
+    载荷形状与 /api/depth/orderbook 一致（前端零改造）；本地簿未就绪时自动
+    回退 REST 快照路径（source=rest_fallback），DepthView 永不留白。
+    """
+    sym = symbol.upper().replace("-", "").replace("/", "")
+    if not sym.endswith(("USDT", "USDC")):
+        sym += "USDT"
+
+    def _calc():
+        try:
+            import jarvis_orderbook as job
+            out = job.book(sym, max_buckets=int(max_buckets), bucket=bucket)
+            if out.get("ok"):
+                return out
+        except Exception:  # noqa: BLE001 — 引擎不可用走 REST 回退
+            pass
+        import jarvis_depth_view as jdv
+        fb = jdv.orderbook(sym, 500, bucket, int(max_buckets))
+        fb.update({"source": "rest_fallback", "synced": False})
+        return fb
+
+    key = f"book:live:{sym}:{bucket or 0}:{int(max_buckets)}"
+    return JSONResponse(_cached(key, 1, _calc))
+
+
+@app.get("/api/orderbook/heatmap")
+def api_orderbook_heatmap(symbol: str = "BTCUSDT", start: int = 0, end: int = 0,
+                          interval: str = "1m"):
+    """深度历史切片区间回放（orderbook_depth_slices 落库 + 内存近端合并）。
+
+    start/end 为 epoch 秒；phase-3 Bookmap 热力图的数据源。
+    """
+    try:
+        import jarvis_orderbook as job
+        sym = symbol.upper().replace("-", "").replace("/", "")
+        if not sym.endswith(("USDT", "USDC")):
+            sym += "USDT"
+        if not end:
+            end = int(time.time())
+        if not start:
+            start = end - 3600
+        key = f"book:hm:{sym}:{int(start)}:{int(end)}:{interval}"
+        return JSONResponse(_cached(
+            key, 10, lambda: job.heatmap(sym, int(start), int(end), interval)))
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]},
+                            status_code=500)
+
+
+@app.get("/api/orderbook/health")
+def api_orderbook_health():
+    """订单簿引擎健康度：各币同步态 / 快照限流与封禁状态。"""
+    try:
+        import jarvis_orderbook as job
+        return JSONResponse({"ok": True, **job.health()})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]},
+                            status_code=500)
+
+
 @app.get("/api/tape/flow")
 def api_tape_flow(symbol: str = "BTCUSDT", window_min: int = 15):
     """成交流主体画像：散户/机构/做市商份额 + 指纹聚合表 + 主力行为判定。
@@ -3949,11 +4048,16 @@ def api_tape_flow(symbol: str = "BTCUSDT", window_min: int = 15):
 
 
 @app.get("/api/tape/bars")
-def api_tape_bars(symbol: str = "BTCUSDT", interval: str = "1m", limit: int = 200):
+def api_tape_bars(symbol: str = "BTCUSDT", interval: str = "1m", limit: int = 200,
+                  start: int | None = None, end: int | None = None):
     """成交流多周期 K 线柱（盘口透视页复盘视图）。
 
-    数据源 = tape_minute_bars 落库历史（14 天）+ 内存未落盘分钟（含当前未完结
-    分钟），按 interval（1m/5m/15m/30m/1h/4h/1d）服务端聚合；5s 缓存。
+    数据源 = tape_minute_bars 落库历史（保留天数走 tape_retention_days 配置，
+    默认 30 天）+ 内存未落盘分钟（含当前未完结分钟），按 interval
+    （1m/5m/15m/30m/1h/4h/1d）服务端聚合；5s 缓存。
+    start/end（epoch 秒，可选，须成对）：历史区间查询，返回 [start, end]
+    内全部桶（上限 1500 根，超出截尾保留靠近 end 的部分）；已完结历史不再
+    变化，缓存放宽到 30s。不传时行为与旧版完全一致。
     """
     try:
         import jarvis_tape_classify as jtc
@@ -3961,6 +4065,13 @@ def api_tape_bars(symbol: str = "BTCUSDT", interval: str = "1m", limit: int = 20
         if not sym.endswith(("USDT", "USDC")):
             sym += "USDT"
         lim = max(1, min(int(limit), 500))
+        ranged = bool(start and end and int(end) > 0)
+        if ranged:
+            key = f"tape:bars:{sym}:{interval}:{int(start)}:{int(end)}"
+            return JSONResponse(_cached(
+                key, 30,
+                lambda: jtc.bars(sym, interval, lim,
+                                 start_s=int(start), end_s=int(end))))
         key = f"tape:bars:{sym}:{interval}:{lim}"
         return JSONResponse(_cached(key, 5, lambda: jtc.bars(sym, interval, lim)))
     except Exception as exc:  # noqa: BLE001
@@ -3969,11 +4080,15 @@ def api_tape_bars(symbol: str = "BTCUSDT", interval: str = "1m", limit: int = 20
 
 @app.get("/api/tape/footprint")
 def api_tape_footprint(symbol: str = "BTCUSDT", interval: str = "1m",
-                       limit: int = 30, buckets: int = 40):
+                       limit: int = 30, buckets: int = 40,
+                       start: int | None = None, end: int | None = None):
     """足迹图（Footprint）：每 bar 按价格档拆开的「卖×买」聚合 + 主体多空统计。
 
-    数据源为 WS aggTrade 内存足迹桶（约近 4 小时）；interval 支持 1m/5m/15m/30m，
+    默认 = WS aggTrade 内存足迹桶（约近 4 小时）；interval 支持 1m/5m/15m/30m，
     limit 上限 60、buckets 上限 60（超出向边缘归并）；3s 缓存。
+    start/end（epoch 秒，可选，须成对）：历史区间回看——tape_footprint_minutes
+    落库足迹 + tape_minute_bars 分钟聚合合并（无足迹档位的时段降级纯 OHLC 柱，
+    rows=[]），单次上限 1500 根；已完结历史缓存放宽到 30s。
     """
     try:
         import jarvis_tape_classify as jtc
@@ -3982,6 +4097,13 @@ def api_tape_footprint(symbol: str = "BTCUSDT", interval: str = "1m",
             sym += "USDT"
         lim = max(1, min(int(limit), 60))
         bkt = max(5, min(int(buckets), 60))
+        ranged = bool(start and end and int(end) > 0)
+        if ranged:
+            key = f"tape:fp:{sym}:{interval}:{bkt}:{int(start)}:{int(end)}"
+            return JSONResponse(_cached(
+                key, 30,
+                lambda: jtc.footprint(sym, interval, lim, bkt,
+                                      start_s=int(start), end_s=int(end))))
         key = f"tape:fp:{sym}:{interval}:{lim}:{bkt}"
         return JSONResponse(_cached(
             key, 3, lambda: jtc.footprint(sym, interval, lim, bkt)))
@@ -4256,6 +4378,36 @@ def api_stop_hunt(symbol: str = "BTCUSDT", timeframe: str = "15m",
                     "symbol": symbol.upper(), "timeframe": timeframe}
 
     return JSONResponse(_cached(f"stophunt:{symbol.upper()}:{timeframe}:{int(limit)}", 60, _calc))
+
+
+@app.get("/api/trap-signals")
+def api_trap_signals(symbol: str = "BTCUSDT", interval: str = "15m",
+                     limit: int = 150, mock: int = 0):
+    """诱多/诱空陷阱识别（desktop 图表「诱多诱空」层消费，契约字段名已定死）：
+
+    四类规则——假突破回落 / 长影线插针+量能异常 / 放量滞涨·缩量拉升 /
+    Delta 背离（jarvis_trap_detect）。响应带 ok 封套 + symbol/interval 回声；
+    检测失败 ok:false（前端自动回退本地演示识别）。新鲜信号顺带落提醒中心
+    （trap_signal 事件，30 分钟节流，失败静默）。?mock=1 确定性假数据；缓存 60s。
+    """
+    import jarvis_trap_detect as jtd
+    sym = symbol.upper()
+    if int(mock):
+        return JSONResponse(jtd.mock_signals(sym, interval))
+
+    def _calc():
+        try:
+            out = jtd.detect(sym, interval, limit)
+            try:
+                jtd.maybe_alert_traps(sym, interval, out.get("signals") or [])
+            except Exception:  # noqa: BLE001 — 提醒失败不影响检测响应
+                pass
+            return out
+        except Exception as exc:  # noqa: BLE001 — 检测失败不 500，前端按未就绪降级
+            return {"ok": False, "error": repr(exc)[:200],
+                    "symbol": sym, "interval": interval, "signals": []}
+
+    return JSONResponse(_cached(f"trapsig:{sym}:{interval}:{int(limit)}", 60, _calc))
 
 
 @app.get("/api/reversal-score")

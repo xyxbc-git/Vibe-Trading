@@ -24,6 +24,7 @@ summary() 时走一遍近期成交做窗口统计。纯函数核心离线可测�
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import threading
@@ -50,7 +51,7 @@ BURST_RATIO = 3.0            # 最近 60 秒大单额 ≥ 窗口其余时段分�
 FADE_WINDOW_MIN = 6          # 观察最近 N 个整分钟
 FADE_RATIO = 0.45            # 最近 2 分钟均值 ≤ 峰值 × 0.45
 # 足迹图（Footprint）分钟×价格档聚合
-FOOT_MINUTES_MAX = 240       # 足迹分钟桶上限（与 minutes deque 同命，仅内存）
+FOOT_MINUTES_MAX = 240       # 足迹分钟桶上限（内存窗口；完结分钟经 flush_bars 落库长期保留）
 FOOT_CELLS_MAX = 120         # 每分钟价格档上限（超出归并到边缘档，防内存爆）
 FOOT_STEP_PCT = 0.0005       # 档宽自适应：nice_step(price × 0.05%)
 FOOT_DRIFT_PCT = 0.25        # 价格相对锚点漂移 >25% 才重算 step（新分钟生效）
@@ -533,9 +534,26 @@ DB_DIR = os.path.expanduser("~/.vibe-trading")
 DB_PATH = os.path.join(DB_DIR, "jarvis_journal.db")
 
 PERSIST_INTERVAL_S = 30.0    # 后台 flush 周期
-RETENTION_DAYS = 14          # 分钟行保留期
+RETENTION_DAYS = 30          # 分钟行保留期默认值（配置键 tape_retention_days 可覆盖）
 _PRUNE_INTERVAL_S = 3600.0   # 保留期清理节流：每小时最多一次
 _LAST_PRUNE = 0.0
+# 区间查询（start/end）单次最多返回的 bar 数（1m 一整天 = 1440，留余量）
+RANGE_BARS_MAX = 1500
+
+
+def _retention_days(cfg: dict | None = None) -> int:
+    """分钟行/足迹行保留天数：jarvis_config `tape_retention_days`，默认 30、下限 1。"""
+    try:
+        if cfg is None:
+            import jarvis_config as jc
+            cfg = jc.load()
+    except Exception:  # noqa: BLE001
+        cfg = {}
+    try:
+        v = int(float((cfg or {}).get("tape_retention_days", RETENTION_DAYS)))
+        return v if v >= 1 else RETENTION_DAYS
+    except (TypeError, ValueError):
+        return RETENTION_DAYS
 
 # API 周期 → 秒（bars() 分桶聚合用；epoch 对齐即 UTC 对齐）
 INTERVALS_S = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800,
@@ -567,6 +585,20 @@ def init_db() -> None:
                 high_price  REAL,
                 low_price   REAL,
                 trades_n    INTEGER,
+                PRIMARY KEY (symbol, minute)
+            )
+            """
+        )
+        # 足迹（分钟×价格档）持久化：cells 为 JSON 数组
+        # [[price, buy_usd, sell_usd, buy_n, sell_n], ...]，step 为该分钟档宽。
+        # 历史足迹回看依赖本表；此前足迹仅内存（240 分钟）重启即丢。
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tape_footprint_minutes (
+                symbol  TEXT NOT NULL,
+                minute  INTEGER NOT NULL,
+                step    REAL,
+                cells   TEXT,
                 PRIMARY KEY (symbol, minute)
             )
             """
@@ -612,12 +644,33 @@ def _merge_minute(dst: dict, src: dict) -> None:
     # open 保留先出现的桶
 
 
+def _cells_to_json(cells: dict) -> str:
+    """足迹档位 dict → 紧凑 JSON [[price, buy, sell, buy_n, sell_n], ...]（价升序）。"""
+    return json.dumps(
+        [[p, round(v[0], 4), round(v[1], 4), int(v[2]), int(v[3])]
+         for p, v in sorted(cells.items())],
+        separators=(",", ":"))
+
+
+def _cells_from_json(raw: str | None) -> dict[float, list]:
+    """JSON 行 → {price: [buy, sell, buy_n, sell_n]}；坏数据返回空 dict。"""
+    try:
+        out: dict[float, list] = {}
+        for row in json.loads(raw or "[]"):
+            out[float(row[0])] = [float(row[1]), float(row[2]),
+                                  int(row[3]), int(row[4])]
+        return out
+    except Exception:  # noqa: BLE001 — 单行损坏不拖垮整个查询
+        return {}
+
+
 def flush_bars(now_ms: int | None = None) -> int:
-    """把各币种「已完结的分钟」（minute < 当前分钟）upsert 到 tape_minute_bars。
+    """把各币种「已完结的分钟」（minute < 当前分钟）upsert 到 tape_minute_bars，
+    并把对应分钟的足迹档位 upsert 到 tape_footprint_minutes（历史足迹回看）。
 
     持锁只做内存快照，DB 写在锁外（绝不阻塞 WS ingest）；写成功后才推进
     per-symbol 落盘水位（失败下轮重试，upsert 幂等）。顺带按节流做保留期清理。
-    Returns: 本轮写入（含更新）的行数；失败只记日志返回已写数。
+    Returns: 本轮写入（含更新）的分钟行数（不含足迹行）；失败只记日志返回已写数。
     """
     global _LAST_PRUNE
     written = 0
@@ -628,6 +681,7 @@ def flush_bars(now_ms: int | None = None) -> int:
 
         # ── 持锁快照：收集每币种待落盘分钟（水位 < minute < 当前分钟）──
         pending: dict[str, dict[int, dict]] = {}
+        fp_pending: dict[str, dict[int, dict]] = {}
         with _LOCK:
             for sym, st in _STATE.items():
                 mark = int(st.get("flushed_min") or 0)
@@ -643,9 +697,22 @@ def flush_bars(now_ms: int | None = None) -> int:
                         rows[mn] = bar
                 if rows:
                     pending[sym] = rows
+                # 足迹分钟（独立水位；同分钟重复出现时后者覆盖，upsert 幂等）
+                fmark = int(st.get("foot_flushed_min") or 0)
+                frows: dict[int, dict] = {}
+                for f in (st.get("footprint") or []):
+                    mn = int(f["minute"])
+                    if mn >= cur_min or mn <= fmark:
+                        continue
+                    frows[mn] = {"step": float(f["step"] or 0.0),
+                                 "cells": _cells_to_json(f["cells"])}
+                if frows:
+                    fp_pending[sym] = frows
 
         # ── 锁外写库 ──
-        for sym, rows in pending.items():
+        for sym in sorted(set(pending) | set(fp_pending)):
+            rows = pending.get(sym) or {}
+            frows = fp_pending.get(sym) or {}
             try:
                 with _conn() as conn:
                     for mn in sorted(rows):
@@ -672,13 +739,29 @@ def flush_bars(now_ms: int | None = None) -> int:
                              round(b["nr_buy"], 4), round(b["nr_sell"], 4),
                              b["open"], b["close"], b["high"], b["low"],
                              b["trades"]))
+                    for mn in sorted(frows):
+                        f = frows[mn]
+                        conn.execute(
+                            """
+                            INSERT INTO tape_footprint_minutes
+                              (symbol, minute, step, cells)
+                            VALUES (?,?,?,?)
+                            ON CONFLICT(symbol, minute) DO UPDATE SET
+                              step=excluded.step,
+                              cells=excluded.cells
+                            """,
+                            (sym, mn, f["step"], f["cells"]))
                 written += len(rows)
-                # 写成功才推进水位（rows 非空才会进到这里）
+                # 写成功才推进水位（rows/frows 非空才推进各自水位）
                 with _LOCK:
                     st = _STATE.get(sym)
                     if st is not None:
-                        st["flushed_min"] = max(int(st.get("flushed_min") or 0),
-                                                max(rows))
+                        if rows:
+                            st["flushed_min"] = max(
+                                int(st.get("flushed_min") or 0), max(rows))
+                        if frows:
+                            st["foot_flushed_min"] = max(
+                                int(st.get("foot_flushed_min") or 0), max(frows))
             except Exception as exc:  # noqa: BLE001 — 单币失败不影响其它币种
                 print(f"[tape-persist] {sym} flush 失败: {exc!r}", flush=True)
 
@@ -692,16 +775,24 @@ def flush_bars(now_ms: int | None = None) -> int:
         return written
 
 
-def prune_old(now_ms: int | None = None) -> int:
-    """删除保留期（14 天）之外的分钟行；返回删除行数，失败返回 0。"""
+def prune_old(now_ms: int | None = None, cfg: dict | None = None) -> int:
+    """删除保留期之外的分钟行与足迹行（保留天数走 `tape_retention_days`，默认
+    30 天）；返回删除的分钟行数（足迹行清理只记日志），失败返回 0。"""
     try:
         _ensure_init()
         now = int(now_ms if now_ms is not None else time.time() * 1000)
-        cutoff_min = now // 60000 - RETENTION_DAYS * 24 * 60
+        cutoff_min = now // 60000 - _retention_days(cfg) * 24 * 60
         with _conn() as conn:
             cur = conn.execute(
                 "DELETE FROM tape_minute_bars WHERE minute < ?", (cutoff_min,))
-            return cur.rowcount if cur.rowcount is not None else 0
+            removed = cur.rowcount if cur.rowcount is not None else 0
+            fcur = conn.execute(
+                "DELETE FROM tape_footprint_minutes WHERE minute < ?",
+                (cutoff_min,))
+            fremoved = fcur.rowcount if fcur.rowcount is not None else 0
+        if fremoved > 0:
+            print(f"[tape-persist] 足迹保留期清理 {fremoved} 行", flush=True)
+        return removed
     except Exception as exc:  # noqa: BLE001
         print(f"[tape-persist] 保留期清理失败: {exc!r}", flush=True)
         return 0
@@ -730,13 +821,33 @@ def start_persist(interval_s: float = PERSIST_INTERVAL_S) -> bool:
         return False
 
 
+def _range_window(itv: int, start_s: int, end_s: int) -> tuple[int, int, bool]:
+    """区间查询窗口：对齐桶边界 + RANGE_BARS_MAX 截断（保尾部）。
+
+    Returns: (start_bucket, end_bucket, truncated)。
+    """
+    end_bucket = max(0, int(end_s)) // itv * itv
+    start_bucket = max(0, int(start_s)) // itv * itv
+    if start_bucket > end_bucket:
+        start_bucket = end_bucket
+    truncated = False
+    if (end_bucket - start_bucket) // itv + 1 > RANGE_BARS_MAX:
+        start_bucket = end_bucket - (RANGE_BARS_MAX - 1) * itv
+        truncated = True
+    return start_bucket, end_bucket, truncated
+
+
 def bars(symbol: str, interval: str = "1m", limit: int = 200,
-         now_ms: int | None = None) -> dict:
+         now_ms: int | None = None, start_s: int | None = None,
+         end_s: int | None = None) -> dict:
     """多周期成交流 K 线（REST 消费入口）：库内历史 + 内存未落盘分钟合并聚合。
 
+    默认窗口 = 从当前时间往回 limit 根；同时传 start_s/end_s（epoch 秒）时切
+    区间模式：返回 [start, end] 内全部桶（上限 RANGE_BARS_MAX，超出截尾保留
+    靠近 end 的部分并置 truncated），历史回看用。
     Returns: {ok, symbol, interval, bars:[{ts, buy, sell, net, nr_buy, nr_sell,
-    nr_net, open, high, low, close, trades}], source}；ts 为桶起点 epoch 秒
-    （整除对齐 = UTC 对齐），时间升序，最多 limit 根（含当前未完结桶）。
+    nr_net, open, high, low, close, trades}], source, range?}；ts 为桶起点
+    epoch 秒（整除对齐 = UTC 对齐），时间升序。
     """
     sym = (symbol or "").upper()
     try:
@@ -747,9 +858,16 @@ def bars(symbol: str, interval: str = "1m", limit: int = 200,
                     "error": f"interval 无效：{interval}（可选 {'/'.join(INTERVALS_S)}）"}
         lim = max(1, min(int(limit), 500))
         now = int(now_ms if now_ms is not None else time.time() * 1000)
-        end_bucket = now // 1000 // itv * itv
-        start_bucket = end_bucket - (lim - 1) * itv
+        ranged = start_s is not None and end_s is not None and int(end_s) > 0
+        truncated = False
+        if ranged:
+            start_bucket, end_bucket, truncated = _range_window(
+                itv, int(start_s), int(end_s))
+        else:
+            end_bucket = now // 1000 // itv * itv
+            start_bucket = end_bucket - (lim - 1) * itv
         min_minute = start_bucket // 60
+        max_minute = (end_bucket + itv) // 60  # 排他上界（桶末分钟 +1）
 
         # 1) 库内历史（窗口内）
         merged: dict[int, dict] = {}
@@ -758,9 +876,9 @@ def bars(symbol: str, interval: str = "1m", limit: int = 200,
             cur = conn.execute(
                 "SELECT minute, buy_usd, sell_usd, nr_buy_usd, nr_sell_usd, "
                 "open_price, close_price, high_price, low_price, trades_n "
-                "FROM tape_minute_bars WHERE symbol=? AND minute>=? "
+                "FROM tape_minute_bars WHERE symbol=? AND minute>=? AND minute<? "
                 "ORDER BY minute ASC",
-                (sym, min_minute))
+                (sym, min_minute, max_minute))
             for r in cur.fetchall():
                 merged[int(r["minute"])] = {
                     "minute": int(r["minute"]),
@@ -781,7 +899,7 @@ def bars(symbol: str, interval: str = "1m", limit: int = 200,
         from_mem = 0
         for m in mem:
             mn = int(m["minute"])
-            if mn < min_minute:
+            if mn < min_minute or mn >= max_minute:
                 continue
             merged[mn] = _mem_bar(m)  # 同分钟已落库也覆盖：同源同值且内存更新鲜
             from_mem += 1
@@ -826,11 +944,16 @@ def bars(symbol: str, interval: str = "1m", limit: int = 200,
                         "open": k["open"], "high": k["high"],
                         "low": k["low"], "close": k["close"],
                         "trades": k["trades"]})
-        out = out[-lim:]
+        if not ranged:
+            out = out[-lim:]
         source = ("db+mem" if from_db and from_mem else
                   "db" if from_db else "mem" if from_mem else "empty")
-        return {"ok": True, "symbol": sym, "interval": interval,
-                "bars": out, "source": source}
+        res = {"ok": True, "symbol": sym, "interval": interval,
+               "bars": out, "source": source}
+        if ranged:
+            res["range"] = {"start": start_bucket, "end": end_bucket,
+                            "truncated": truncated}
+        return res
     except Exception as exc:  # noqa: BLE001 — 查询失败返回错误封套，不抛 500
         return {"ok": False, "symbol": sym, "interval": interval,
                 "bars": [], "source": "none", "error": repr(exc)[:200]}
@@ -863,16 +986,59 @@ def _foot_overall_verdict(buy: float, sell: float, actors: dict) -> str:
     return base
 
 
+def _side_stat(buy: float, sell: float, actor_cn: str) -> dict:
+    """买卖额 → actors 单项统计（long_pct/判词口径与 build_breakdown 一致）。"""
+    tot = buy + sell
+    if tot > 0:
+        lp = round(buy / tot * 100.0, 1)
+        if lp >= 55:
+            verdict = f"主动买 {lp:.0f}%，做多倾向"
+        elif lp <= 45:
+            verdict = f"主动卖 {100 - lp:.0f}%，做空倾向"
+        else:
+            verdict = "买卖大致均衡"
+    else:
+        lp, verdict = None, "窗口内无成交"
+    return {"actor_cn": actor_cn, "buy": round(buy, 2), "sell": round(sell, 2),
+            "net": round(buy - sell, 2), "long_pct": lp, "verdict_cn": verdict}
+
+
+def _range_actors(min_bars: list[dict]) -> dict[str, dict]:
+    """区间模式主体统计：分钟行只保留「散户 / 非散户(≥$10k)」二分口径。
+
+    历史分钟行没有逐笔与指纹组，无法细分 mid/maker——非散户额并入 inst 展示，
+    mid/maker 置零并注明，响应形状与实时模式保持一致。
+    """
+    tb = sum(b["buy"] for b in min_bars)
+    ts_ = sum(b["sell"] for b in min_bars)
+    nb = sum(b["nr_buy"] for b in min_bars)
+    ns = sum(b["nr_sell"] for b in min_bars)
+    zero = {"buy": 0.0, "sell": 0.0, "net": 0.0, "long_pct": None,
+            "verdict_cn": "历史区间按金额二分，已并入机构/大户口径"}
+    return {
+        "retail": _side_stat(max(0.0, tb - nb), max(0.0, ts_ - ns), "散户"),
+        "mid": {**zero, "actor_cn": ACTOR_CN["mid"]},
+        "inst": _side_stat(nb, ns, "机构/大户"),
+        "maker": {**zero, "actor_cn": ACTOR_CN["maker"]},
+    }
+
+
 def footprint(symbol: str, interval: str = "1m", limit: int = 30,
               buckets: int = 40, cfg: dict | None = None,
-              now_ms: int | None = None) -> dict:
+              now_ms: int | None = None, start_s: int | None = None,
+              end_s: int | None = None) -> dict:
     """足迹图数据（REST 消费入口）：每 bar 按价格档拆开的买卖聚合 + 主体多空统计。
 
+    默认窗口 = 从当前时间往回 limit 根：内存足迹 + tape_footprint_minutes
+    落库历史合并（同分钟内存优先）——重启后大周期聚合仍有完整窗口深度，
+    DB 不可用时自动回退纯内存。同时传 start_s/end_s（epoch 秒）时切
+    **区间模式**：支持任意保留期内日期回看（此时库为唯一事实源，失败报错）；
+    库里只有分钟聚合、没有足迹档位的时段降级为 rows=[] 的纯 OHLC 柱。
     Returns: {ok, symbol, interval, bucket(档宽), bars:[{ts, open, high, low,
     close, total, buy, sell, delta, cvd, rows:[{price 降序, buy, sell,
     flag:"buy_imb"|"sell_imb"|None}]}], actors:{retail/mid/inst/maker:{...,
     long_pct, verdict_cn}, overall:{buy, sell, delta, verdict_cn}}, active,
-    source, disclaimer}。仅内存（约近 4 小时），CVD 自窗口起点累计。
+    source, range?, disclaimer}。CVD 自窗口起点累计。
     """
     sym = (symbol or "").upper()
     try:
@@ -887,51 +1053,117 @@ def footprint(symbol: str, interval: str = "1m", limit: int = 30,
         bkt = max(5, min(int(buckets), 60))
         tier1, _tier2 = _cfg_tiers(cfg)
         now = int(now_ms if now_ms is not None else time.time() * 1000)
-        end_bucket = now // 1000 // itv * itv
-        start_bucket = end_bucket - (lim - 1) * itv
+        ranged = start_s is not None and end_s is not None and int(end_s) > 0
+        truncated = False
+        if ranged:
+            start_bucket, end_bucket, truncated = _range_window(
+                itv, int(start_s), int(end_s))
+        else:
+            end_bucket = now // 1000 // itv * itv
+            start_bucket = end_bucket - (lim - 1) * itv
         min_minute = start_bucket // 60
+        max_minute = (end_bucket + itv) // 60  # 排他上界
 
         # ── 持锁快照（cells 深拷到值层，锁外聚合不受 WS 并发影响）──
         with _LOCK:
             st = _STATE.get(sym)
             if st is None:
-                fp_rows: list[dict] = []
-                min_rows: list[dict] = []
+                fp_mem: list[dict] = []
+                min_mem: list[dict] = []
                 trades: list[dict] = []
                 groups: dict[str, dict] = {}
             else:
-                fp_rows = [{"minute": int(f["minute"]), "step": f["step"],
-                            "cells": {p: list(v) for p, v in f["cells"].items()}}
-                           for f in (st.get("footprint") or [])
-                           if f["minute"] >= min_minute]
-                min_rows = [dict(m) for m in st["minutes"]
-                            if m["minute"] >= min_minute]
-                trades = [t for t in st["trades"]
-                          if t["ts_ms"] >= start_bucket * 1000]
-                groups = {fp: dict(g) for fp, g in st["groups"].items()}
+                fp_mem = [{"minute": int(f["minute"]), "step": f["step"],
+                           "cells": {p: list(v) for p, v in f["cells"].items()}}
+                          for f in (st.get("footprint") or [])
+                          if min_minute <= f["minute"] < max_minute]
+                min_mem = [dict(m) for m in st["minutes"]
+                           if min_minute <= m["minute"] < max_minute]
+                trades = ([] if ranged else
+                          [t for t in st["trades"]
+                           if t["ts_ms"] >= start_bucket * 1000])
+                groups = ({} if ranged else
+                          {fp: dict(g) for fp, g in st["groups"].items()})
 
-        # ── 主体多空统计（窗口与足迹图一致；复用 breakdown 的 long_pct/判词）──
-        breakdown = build_breakdown(trades, tier1, groups)
-        actors_out: dict[str, dict] = {}
-        for k, a in breakdown["actors"].items():
-            actors_out[k] = {"actor_cn": a["actor_cn"], "buy": a["buy_usd"],
-                             "sell": a["sell_usd"], "net": a["net_usd"],
-                             "long_pct": a["long_pct"],
-                             "verdict_cn": a["verdict_cn"]}
+        # ── 库内足迹行 + 分钟行并入（同分钟以内存为准）──
+        # 区间模式：库是唯一事实源，DB 失败走错误封套。
+        # 实时模式：同样并入库内历史——重启后内存只有几分钟时，5m/15m/30m 聚合
+        # 仍能给足窗口深度（盘口页嵌入足迹「只剩 1 根柱」问题的存储侧修复）；
+        # DB 不可用时回退纯内存，绝不拖垮实时路径。
+        from_db = 0
+        fp_by_min = {int(f["minute"]): f for f in fp_mem}
+        min_by_min = {int(m["minute"]): _mem_bar(m) for m in min_mem}
+        try:
+            _ensure_init()
+            with _conn() as conn:
+                cur = conn.execute(
+                    "SELECT minute, step, cells FROM tape_footprint_minutes "
+                    "WHERE symbol=? AND minute>=? AND minute<? "
+                    "ORDER BY minute ASC",
+                    (sym, min_minute, max_minute))
+                for r in cur.fetchall():
+                    mn = int(r["minute"])
+                    if mn not in fp_by_min:
+                        fp_by_min[mn] = {"minute": mn,
+                                         "step": float(r["step"] or 0.0),
+                                         "cells": _cells_from_json(r["cells"])}
+                        from_db += 1
+                cur = conn.execute(
+                    "SELECT minute, buy_usd, sell_usd, nr_buy_usd, nr_sell_usd, "
+                    "open_price, close_price, high_price, low_price, trades_n "
+                    "FROM tape_minute_bars WHERE symbol=? AND minute>=? "
+                    "AND minute<? ORDER BY minute ASC",
+                    (sym, min_minute, max_minute))
+                for r in cur.fetchall():
+                    mn = int(r["minute"])
+                    if mn not in min_by_min:
+                        min_by_min[mn] = {
+                            "minute": mn,
+                            "buy": float(r["buy_usd"] or 0.0),
+                            "sell": float(r["sell_usd"] or 0.0),
+                            "nr_buy": float(r["nr_buy_usd"] or 0.0),
+                            "nr_sell": float(r["nr_sell_usd"] or 0.0),
+                            "open": r["open_price"], "close": r["close_price"],
+                            "high": r["high_price"], "low": r["low_price"],
+                            "trades": int(r["trades_n"] or 0)}
+                        from_db += 1
+        except Exception as exc:  # noqa: BLE001
+            if ranged:
+                raise
+            print(f"[tape-fp] 实时模式 DB 合并失败（回退纯内存）: {exc!r}",
+                  flush=True)
+        fp_rows = [fp_by_min[mn] for mn in sorted(fp_by_min)]
+        min_bars = [min_by_min[mn] for mn in sorted(min_by_min)]
+
+        # ── 主体多空统计：实时=逐笔指纹口径；区间=分钟行散户/非散户二分 ──
+        if ranged:
+            actors_out = _range_actors(min_bars)
+        else:
+            breakdown = build_breakdown(trades, tier1, groups)
+            actors_out = {}
+            for k, a in breakdown["actors"].items():
+                actors_out[k] = {"actor_cn": a["actor_cn"], "buy": a["buy_usd"],
+                                 "sell": a["sell_usd"], "net": a["net_usd"],
+                                 "long_pct": a["long_pct"],
+                                 "verdict_cn": a["verdict_cn"]}
         o_buy = round(sum(a["buy"] for a in actors_out.values()), 2)
         o_sell = round(sum(a["sell"] for a in actors_out.values()), 2)
         actors_out["overall"] = {
             "buy": o_buy, "sell": o_sell, "delta": round(o_buy - o_sell, 2),
             "verdict_cn": _foot_overall_verdict(o_buy, o_sell, actors_out)}
 
-        if not fp_rows:
-            return {"ok": True, "symbol": sym, "interval": interval,
-                    "bucket": None, "bars": [], "actors": actors_out,
-                    "active": False, "source": "empty",
-                    "disclaimer": DISCLAIMER}
+        if not fp_rows and not min_bars:
+            res = {"ok": True, "symbol": sym, "interval": interval,
+                   "bucket": None, "bars": [], "actors": actors_out,
+                   "active": False, "source": "empty",
+                   "disclaimer": DISCLAIMER}
+            if ranged:
+                res["range"] = {"start": start_bucket, "end": end_bucket,
+                                "truncated": truncated}
+            return res
 
         # ── 统一重桶：bar 内 step 混用时以最新 step 归一 ──
-        step = float(fp_rows[-1]["step"] or 1.0)
+        step = float(fp_rows[-1]["step"] or 1.0) if fp_rows else None
         bars_cells: dict[int, dict[float, list]] = {}
         for f in fp_rows:
             ts = f["minute"] * 60 // itv * itv
@@ -948,13 +1180,17 @@ def footprint(symbol: str, interval: str = "1m", limit: int = 30,
                 c[2] += v[2]
                 c[3] += v[3]
 
-        # ── OHLC：从分钟桶聚合（与 bars() 同口径）──
+        # ── OHLC + 桶级买卖总额：从分钟桶聚合（与 bars() 同口径）──
         ohlc: dict[int, dict] = {}
-        for m in min_rows:
-            ts = m["minute"] * 60 // itv * itv
+        totals: dict[int, dict] = {}
+        for mb in min_bars:
+            ts = mb["minute"] * 60 // itv * itv
             if ts < start_bucket or ts > end_bucket:
                 continue
-            mb = _mem_bar(m)
+            t = totals.setdefault(ts, {"buy": 0.0, "sell": 0.0, "trades": 0})
+            t["buy"] += mb["buy"]
+            t["sell"] += mb["sell"]
+            t["trades"] += mb["trades"]
             o = ohlc.get(ts)
             if o is None:
                 ohlc[ts] = {"open": mb["open"], "close": mb["close"],
@@ -970,10 +1206,13 @@ def footprint(symbol: str, interval: str = "1m", limit: int = 30,
                 o["low"] = mb["low"]
 
         # ── 逐 bar 输出：buckets 上限边缘归并 + 失衡 flag + CVD 累计 ──
+        # 区间模式遍历 cells ∪ 分钟行 两侧时间桶：只有分钟聚合、没有足迹档位的
+        # 历史桶降级为 rows=[] 的纯 OHLC 柱（额/笔数取分钟行，delta/CVD 连续）。
         out_bars: list[dict] = []
         cvd = 0.0
-        for ts in sorted(bars_cells):
-            rows_sorted = sorted(bars_cells[ts].items(),
+        all_ts = sorted(set(bars_cells) | set(totals))
+        for ts in all_ts:
+            rows_sorted = sorted(bars_cells.get(ts, {}).items(),
                                  key=lambda kv: kv[0], reverse=True)  # 价降序
             # 超出 buckets 上限：把额较小的边缘档向内归并（保住量能密集区）
             while len(rows_sorted) > bkt:
@@ -1007,6 +1246,11 @@ def footprint(symbol: str, interval: str = "1m", limit: int = 30,
                         flag = "sell_imb"
                 rows_out.append({"price": p, "buy": round(buy, 2),
                                  "sell": round(sell, 2), "flag": flag})
+            # 无足迹档位的历史桶：额/笔数回退到分钟行聚合
+            if not rows_sorted and ts in totals:
+                t = totals[ts]
+                bar_buy, bar_sell = t["buy"], t["sell"]
+                trades_n = t["trades"]
             o = ohlc.get(ts) or {"open": None, "close": None,
                                  "high": None, "low": None}
             delta = round(bar_buy - bar_sell, 2)
@@ -1019,10 +1263,16 @@ def footprint(symbol: str, interval: str = "1m", limit: int = 30,
                              "delta": delta, "cvd": cvd, "trades": trades_n,
                              "rows": rows_out})
 
-        return {"ok": True, "symbol": sym, "interval": interval,
-                "bucket": step, "bars": out_bars, "actors": actors_out,
-                "active": bool(out_bars), "source": "mem",
-                "disclaimer": DISCLAIMER}
+        source = ("db+mem" if from_db and (fp_mem or min_mem) else
+                  "db" if from_db else "mem")
+        res = {"ok": True, "symbol": sym, "interval": interval,
+               "bucket": step, "bars": out_bars, "actors": actors_out,
+               "active": bool(out_bars), "source": source,
+               "disclaimer": DISCLAIMER}
+        if ranged:
+            res["range"] = {"start": start_bucket, "end": end_bucket,
+                            "truncated": truncated}
+        return res
     except Exception as exc:  # noqa: BLE001 — 查询失败返回错误封套，不抛 500
         return {"ok": False, "symbol": sym, "interval": interval,
                 "bucket": None, "bars": [], "actors": None, "active": False,

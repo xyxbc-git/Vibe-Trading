@@ -8,6 +8,8 @@ import { abbreviateNum } from "@/lib/formatters";
 import { echarts, CHART_GROUP, connectCharts } from "@/lib/echarts";
 import { useDarkMode } from "@/hooks/useDarkMode";
 import { computeDrawings, computeSmartLevels, computeBias, gridSearchParams, evaluateParams, scoreDrawings, DEFAULT_PARAMS, type DrawMode, type DrawParams } from "@/lib/drawings";
+import { detectPatterns, patternsToOverlay, type DetectedPattern } from "@/lib/patterns";
+import { PatternExplainCard } from "./PatternExplainCard";
 import { appendLog, loadLog, clearLog, summarize, blendReliability, type DrawingSample } from "@/lib/drawingLog";
 import { extractFeatures, trainModel, predictProba, buildTrainingSet } from "@/lib/drawingModel";
 
@@ -114,6 +116,11 @@ export function CandlestickChart({ data, markers, indicators, height = 500, symb
   // the current price, in plain Chinese. On by default so the chart is readable
   // out of the box; the 5 pro line types stay available as advanced toggles.
   const [smart, setSmart] = useState(true);
+  // Classic pattern recognition (楔形/矩形/旗形/三角形/头肩/双顶底) — opt-in via
+  // toolbar button; off by default so it costs nothing until the user asks.
+  const [showPatterns, setShowPatterns] = useState(false);
+  // Which detected pattern is annotated on the chart & expanded in the card.
+  const [patternIdx, setPatternIdx] = useState(0);
   const { dark } = useDarkMode();
 
   const toggleOverlay = useCallback((id: Overlay) => {
@@ -399,6 +406,27 @@ export function CandlestickChart({ data, markers, indicators, height = 500, symb
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [smartLevels, dark]);
 
+  // Classic pattern recognition — recomputes only while the toggle is on, so
+  // the default-off path adds zero work to the render.
+  const patternList = useMemo<DetectedPattern[] | null>(() => {
+    if (!showPatterns || baseData.closes.length < 20) return null;
+    return detectPatterns({ dates: baseData.dates, closes: baseData.closes, highs: baseData.highs, lows: baseData.lows });
+  }, [showPatterns, baseData]);
+
+  // Clamp the user's selection against the freshly recomputed list, and keep
+  // the active pattern handy for the toolbar badge / card / overlay.
+  const safePatternIdx = patternList && patternList.length > 0 ? Math.min(patternIdx, patternList.length - 1) : 0;
+  const activePattern = patternList && patternList.length > 0 ? patternList[safePatternIdx] : null;
+
+  const patternOverlay = useMemo(() => {
+    if (!activePattern) return { lines: [], areas: [], points: [] };
+    const t = getChartTheme();
+    // patternsToOverlay annotates the first entry — feed it the selected one,
+    // so switching tabs in the explain card re-annotates the chart.
+    return patternsToOverlay([activePattern], baseData.dates, { bull: t.upColor, bear: t.downColor, neutral: t.warningColor });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activePattern, baseData.dates, dark]);
+
   // Init chart instance — only on mount/unmount and dark mode change
   useEffect(() => {
     if (!containerRef.current || data.length === 0) return;
@@ -509,10 +537,11 @@ export function CandlestickChart({ data, markers, indicators, height = 500, symb
     const maxBars = RANGE_BARS[range];
     const defaultStart = maxBars >= data.length ? 0 : Math.max(0, 100 - (maxBars / data.length) * 100);
 
-    // Merge the advanced (5-type) drawings with the beginner-friendly smart
-    // zones into one markLine/markArea payload.
-    const allLines = [...drawingOverlay.lines, ...smartOverlay.lines];
-    const allAreas = [...drawingOverlay.areas, ...smartOverlay.areas];
+    // Merge the advanced (5-type) drawings, the beginner-friendly smart zones
+    // and the classic pattern annotations into one markLine/markArea payload.
+    const allLines = [...drawingOverlay.lines, ...smartOverlay.lines, ...patternOverlay.lines];
+    const allAreas = [...drawingOverlay.areas, ...smartOverlay.areas, ...patternOverlay.areas];
+    const allMarks = [...marks, ...patternOverlay.points];
 
     chart.setOption({
       backgroundColor: "transparent",
@@ -566,7 +595,7 @@ export function CandlestickChart({ data, markers, indicators, height = 500, symb
         {
           name: "K", type: "candlestick", data: candle, xAxisIndex: 0, yAxisIndex: 0,
           itemStyle: { color: t.upColor, color0: t.downColor, borderColor: t.upColor, borderColor0: t.downColor },
-          markPoint: marks.length > 0 ? { data: marks, symbolSize: 28, tooltip: { formatter: (p: { name?: string; value?: string }) => p.name || p.value || "" } } : undefined,
+          markPoint: allMarks.length > 0 ? { data: allMarks, symbolSize: 28, tooltip: { formatter: (p: { name?: string; value?: string }) => p.name || p.value || "" } } : undefined,
           markLine: allLines.length > 0 ? { silent: true, symbol: ["none", "none"], animation: false, data: allLines } : undefined,
           markArea: allAreas.length > 0 ? { silent: true, data: allAreas } : undefined,
         },
@@ -575,7 +604,7 @@ export function CandlestickChart({ data, markers, indicators, height = 500, symb
         ...subSeries,
       ],
     }, true);
-  }, [data, markers, baseData, indicatorCache, extraIndicators, drawingOverlay, smartOverlay, sub, range, overlays, dark]);
+  }, [data, markers, baseData, indicatorCache, extraIndicators, drawingOverlay, smartOverlay, patternOverlay, sub, range, overlays, dark]);
 
   if (data.length === 0) {
     return <div className="text-muted-foreground text-sm p-4">No price data</div>;
@@ -663,6 +692,32 @@ export function CandlestickChart({ data, markers, indicators, height = 500, symb
 
         <div className="w-px h-3 bg-border/40" />
 
+        {/* Classic pattern analysis — 楔形/矩形/旗形/三角形/头肩/双顶底 */}
+        <button
+          onClick={() => setShowPatterns(v => !v)}
+          title="形态分析：自动识别楔形、矩形、旗形/三角旗、三角形、头肩、双顶底等经典形态，标注边界线/颈线/突破位/目标位/止损位并给出看涨看跌解读"
+          className={cn("px-1.5 py-0.5 rounded text-[10px] transition-colors", showPatterns ? "bg-primary/15 text-primary font-medium" : "text-muted-foreground/50 hover:text-muted-foreground")}
+        >
+          形态分析{showPatterns ? "·开" : "·关"}
+        </button>
+        {showPatterns && activePattern && (
+          <span
+            className={cn(
+              "px-1.5 py-0.5 rounded text-[10px] font-medium",
+              activePattern.direction === "bullish"
+                ? "bg-success/15 text-success"
+                : activePattern.direction === "bearish"
+                ? "bg-danger/15 text-danger"
+                : "bg-muted/40 text-muted-foreground",
+            )}
+          >
+            {activePattern.direction === "bullish" ? "▲ " : activePattern.direction === "bearish" ? "▼ " : "= "}
+            {activePattern.nameCn}
+          </span>
+        )}
+
+        <div className="w-px h-3 bg-border/40" />
+
         {/* Draw-line modes — click to auto-draw, recomputes as data grows */}
         <div className="flex gap-0.5 items-center">
           {DRAW_OPTIONS.map((o) => (
@@ -715,6 +770,17 @@ export function CandlestickChart({ data, markers, indicators, height = 500, symb
         </div>
       </div>
       <div ref={containerRef} style={{ height }} />
+
+      {/* Pattern explanation card — plain-language read of the detected
+          patterns; switching tabs also switches the on-chart annotation. */}
+      {showPatterns && (
+        <PatternExplainCard
+          className="mt-1"
+          patterns={patternList ?? []}
+          activeIndex={safePatternIdx}
+          onSelect={setPatternIdx}
+        />
+      )}
     </div>
   );
 }

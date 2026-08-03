@@ -1,8 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, BarChart3, BookOpen, Maximize2, RefreshCw, X } from "lucide-react";
+import { AlertTriangle, BarChart3, BookOpen, History, Maximize2, RefreshCw, X } from "lucide-react";
 import type { FootprintBar, PriceLevel, Timeframe } from "@/types/footprint";
 import { footprintDataService } from "@/lib/footprint/dataService";
-import { getFootprintSource, setFootprintSource } from "@/lib/footprint/binanceFeed";
+import { BinanceBanError, getFootprintSource, setFootprintSource } from "@/lib/footprint/binanceFeed";
+import {
+  fetchFootprintRange,
+  fetchOhlcRange,
+  mergeOlderBars,
+  SEED_FOOT_TFS,
+} from "@/lib/footprint/backendSeed";
+import {
+  dayRangeMs,
+  fetchHistoryBars,
+  fmtLocalDate,
+  isHistoryTimeframe,
+} from "@/lib/footprint/historyService";
 import { useSymbol } from "@/hooks/useSymbol";
 import type { BadgeBox, HoverInfo, Layout } from "./renderer";
 import {
@@ -12,6 +24,7 @@ import {
   STATS_H,
   STATS_ROWS,
   TIME_H,
+  barWOf,
   computeLayout,
   drawFrame,
   estimateTick,
@@ -43,6 +56,14 @@ const TF_MS: Record<Timeframe, number> = {
   "1d": 86_400_000,
 };
 const LOOKBACK_BARS = 240;
+
+// ── 实时态左滚历史回补（只走本地后端，零币安 REST）──
+/** 每次向前翻页的根数（后端区间上限 1500 / bars limit 500，均富余） */
+const BACKFILL_PAGE_BARS = 180;
+/** 左滚触发阈值：最左可见柱索引小于该值时预取上一页 */
+const BACKFILL_TRIGGER_BARS = 24;
+/** 拉取失败后的冷却期（后端离线时避免每帧重试打爆） */
+const BACKFILL_FAIL_COOLDOWN_MS = 5_000;
 
 const VP_ON_KEY = "jarvis.fp.profile.on";
 const VP_MODE_KEY = "jarvis.fp.profile.mode";
@@ -111,6 +132,28 @@ export default function FootprintChart() {
   // 加载兜底：超时/失败时给出具体原因 + 重试/降级操作，绝不无限「加载中」
   const [loadError, setLoadError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
+  // 历史回看：null=实时（币安直连滚动窗），'YYYY-MM-DD'=回看该日（走后端
+  // tape_footprint_minutes 落库，保留期内任意日期；无实时推送）
+  const [histDate, setHistDate] = useState<string | null>(null);
+
+  // 实时态左滚回补：in-flight 防重入 + exhausted 边界停止 + gen 代际失效
+  // （切币/切周期/重试后在途响应作废）+ cooldownUntil 失败冷却
+  const backfillRef = useRef({ gen: 0, inFlight: false, exhausted: false, cooldownUntil: 0 });
+  // 「已到本地数据起点」轻提示（几秒后自动消失）
+  const [backfillHint, setBackfillHint] = useState<string | null>(null);
+  const hintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (hintTimerRef.current) clearTimeout(hintTimerRef.current);
+    },
+    [],
+  );
+
+  // 后端足迹区间查询只支持 1m/5m/15m/30m：进历史模式时把大周期收敛到 15m
+  const enterHistory = useCallback((dateStr: string | null) => {
+    setHistDate(dateStr);
+    if (dateStr) setTf((cur) => (isHistoryTimeframe(cur) ? cur : "15m"));
+  }, []);
 
   // Volume Profile：开关 + 聚合模式（localStorage 记住），计算结果走 ref 不进渲染
   const [vpOn, setVpOn] = useState(readVpOn);
@@ -236,6 +279,54 @@ export default function FootprintChart() {
     [],
   );
 
+  // 实时态左滚接近已载数据左边界：从本地后端按时间区间向前分页拉取并拼接
+  // （与冷启动 seed 同一套 USD→币量换算；严禁触发币安 REST）。
+  // 由 rAF 主循环在布局后调用，防重入/冷却/边界判定全在此内部收口。
+  const requestOlderBars = useCallback(() => {
+    const st = backfillRef.current;
+    if (histDate || st.inFlight || st.exhausted) return;
+    // 后端落库只对应真实源；mock 源的历史与后端数据无法拼接
+    if (getFootprintSource() !== "real") return;
+    if (Date.now() < st.cooldownUntil) return;
+    const first = barsRef.current[0];
+    if (!first) return;
+    const gen = st.gen;
+    st.inFlight = true;
+    void (async () => {
+      try {
+        // 区间右端取首柱起点前 1ms：闭区间端点不会重复拉到首柱所在桶
+        const toMs = first.time - 1;
+        const fromMs = first.time - BACKFILL_PAGE_BARS * TF_MS[tf];
+        const older = (SEED_FOOT_TFS as readonly string[]).includes(tf)
+          ? await fetchFootprintRange(symbol, tf, fromMs, toMs)
+          : await fetchOhlcRange(symbol, tf, fromMs, toMs);
+        if (backfillRef.current.gen !== gen) return; // 切币/切周期后过期响应作废
+        const { bars: merged, prepended } = mergeOlderBars(barsRef.current, older);
+        if (prepended === 0) {
+          // 区间内无更早数据：到达本地落库起点，优雅停止并轻提示
+          st.exhausted = true;
+          setBackfillHint("已到本地数据起点");
+          if (hintTimerRef.current) clearTimeout(hintTimerRef.current);
+          hintTimerRef.current = setTimeout(() => setBackfillHint(null), 4_000);
+          return;
+        }
+        barsRef.current = merged;
+        // 前插使柱索引整体右移 prepended：补偿 scrollX 保持画面静止不跳
+        // （follow 态 scrollX 由 maxScroll 派生，无需补偿）
+        const vp = vpRef.current;
+        if (!vp.follow) vp.scrollX += prepended * barWOf(vp.zoomX);
+        tickRef.current = estimateTick(merged);
+        refreshAnalysis(true);
+        markDirty();
+      } catch (e) {
+        console.warn("[Footprint] 左滚历史回补失败，冷却后重试", e);
+        backfillRef.current.cooldownUntil = Date.now() + BACKFILL_FAIL_COOLDOWN_MS;
+      } finally {
+        if (backfillRef.current.gen === gen) backfillRef.current.inFlight = false;
+      }
+    })();
+  }, [symbol, tf, histDate, vpRef, markDirty, refreshAnalysis]);
+
   // Volume Profile 重算（200ms debounce）：visible 模式跟视口、session 模式跟今日全量。
   // 聚合是 O(可见柱×价位) 的纯计算且节流执行，拖拽/缩放期间不影响 60fps 主循环
   const scheduleProfileRecompute = useCallback(() => {
@@ -254,7 +345,8 @@ export default function FootprintChart() {
       if (vpModeRef.current === "session") {
         const t0 = sessionStartMs();
         s = bars.findIndex((b) => b.time >= t0);
-        if (s < 0) s = Math.max(0, bars.length - 1);
+        // 全部柱都早于今日 0 点（历史回看）：退化为全区间分布而非只取末柱
+        if (s < 0) s = 0;
         e = bars.length;
       } else {
         s = l.visStart;
@@ -331,7 +423,55 @@ export default function FootprintChart() {
     setHover(null);
     hoverRef.current = null;
     setActiveSignal(null);
+    // 左滚回补状态复位：gen+1 使在途响应作废，边界/冷却重新判定
+    backfillRef.current = {
+      gen: backfillRef.current.gen + 1,
+      inFlight: false,
+      exhausted: false,
+      cooldownUntil: 0,
+    };
+    if (hintTimerRef.current) {
+      clearTimeout(hintTimerRef.current);
+      hintTimerRef.current = null;
+    }
+    setBackfillHint(null);
     markDirty();
+
+    // ── 历史回看模式：后端落库区间查询，一次性加载、无实时订阅 ──
+    if (histDate) {
+      const tfEff = isHistoryTimeframe(tf) ? tf : "15m";
+      (async () => {
+        try {
+          const { fromMs, toMs } = dayRangeMs(histDate);
+          const bars = await fetchHistoryBars(symbol, tfEff, fromMs, toMs);
+          if (disposed) return;
+          barsRef.current = bars;
+          tickRef.current = estimateTick(bars);
+          if (bars.length === 0) {
+            setLoadError(
+              `${histDate} 后端库内暂无 ${symbol} 足迹数据——` +
+                "历史数据仅在 jarvis 后端（WS 流）运行期间积累，足迹档位从本次升级后开始落库；" +
+                "可换一个日期，或回到实时模式。",
+            );
+          }
+          resetFollow();
+        } catch (e) {
+          if (!disposed) {
+            const msg = e instanceof Error ? e.message : String(e);
+            setLoadError(`历史足迹加载失败（${msg}）——请确认 jarvis 后端服务在运行。`);
+          }
+        } finally {
+          if (!disposed) {
+            setLoading(false);
+            refreshAnalysis(true);
+            markDirty();
+          }
+        }
+      })();
+      return () => {
+        disposed = true;
+      };
+    }
 
     // 兜底计时：10s 仍无一根柱 → 弹出可操作的错误提示（后台加载继续，
     // 数据一旦到达提示自动消除；真实源冷启动正常也可能 >10s，故措辞为「缓慢/失败」）
@@ -355,7 +495,10 @@ export default function FootprintChart() {
       } else if (!last || bar.time > last.time) {
         bars.push(bar);
         isNewBar = true;
-        if (bars.length > 1500) bars.splice(0, bars.length - 1000);
+        // 只在跟随最新时裁剪左端：浏览历史（含左滚回补的前插数据）期间裁剪
+        // 会让柱索引左移导致画面跳动、回补数据被丢；follow 态 scrollX 由
+        // maxScroll 派生，裁剪无感知
+        if (vpRef.current.follow && bars.length > 1500) bars.splice(0, bars.length - 1000);
       } else {
         // 乱序旧柱：定位替换（如聚合器补发上一根收尾快照）
         const i = bars.findIndex((b) => b.time === bar.time);
@@ -394,9 +537,11 @@ export default function FootprintChart() {
         if (!disposed && barsRef.current.length === 0) {
           const msg = e instanceof Error ? e.message : String(e);
           setLoadError(
-            getFootprintSource() === "real"
-              ? `币安行情拉取失败（${msg}）——请检查网络/代理，或切换到模拟行情。`
-              : `行情数据拉取失败（${msg}）。`,
+            e instanceof BinanceBanError
+              ? `${msg}。解除前请勿反复重试（会延长封禁），可先切换到模拟行情。`
+              : getFootprintSource() === "real"
+                ? `币安行情拉取失败（${msg}）——请检查网络/代理，或切换到模拟行情。`
+                : `行情数据拉取失败（${msg}）。`,
           );
         }
       }
@@ -413,7 +558,7 @@ export default function FootprintChart() {
       clearTimeout(failTimer);
       unsub();
     };
-  }, [symbol, tf, reloadKey, markDirty, refreshAnalysis]);
+  }, [symbol, tf, histDate, reloadKey, markDirty, refreshAnalysis, resetFollow, vpRef]);
 
   // rAF 主循环：物理推进（惯性/缩放插值）+ 脏帧重绘，全程零 React 渲染
   useEffect(() => {
@@ -443,6 +588,11 @@ export default function FootprintChart() {
       );
       layoutRef.current = l;
 
+      // 左滚接近已载数据左边界 → 按需向前分页回补（防重入/边界/冷却在内部收口）
+      if (l.visStart <= BACKFILL_TRIGGER_BARS && barsRef.current.length > 0) {
+        requestOlderBars();
+      }
+
       // 可见范围或末柱变化 → 调度 VP 重算（debounce 内合并，绘制用旧缓存不卡帧）
       if (vpOnRef.current) {
         const r = vpRangeRef.current;
@@ -466,7 +616,7 @@ export default function FootprintChart() {
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
-  }, [vpRef, getGeom, syncFollow, scheduleProfileRecompute]);
+  }, [vpRef, getGeom, syncFollow, scheduleProfileRecompute, requestOlderBars]);
 
   const onMouseMove = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -674,21 +824,80 @@ export default function FootprintChart() {
           className="flex overflow-hidden rounded-md border"
           style={{ borderColor: COLORS.border }}
         >
-          {TF_LIST.map((t) => (
+          {TF_LIST.map((t) => {
+            const histBlocked = histDate !== null && !isHistoryTimeframe(t);
+            return (
+              <button
+                key={t}
+                onClick={() => {
+                  if (!histBlocked) setTf(t);
+                }}
+                className="px-2.5 py-1 font-mono text-[11px] transition-colors"
+                title={histBlocked ? "历史回看仅支持 1m/5m/15m/30m（后端落库粒度）" : undefined}
+                style={
+                  t === tf
+                    ? { background: "rgba(37,99,235,0.25)", color: "#bfdbfe" }
+                    : histBlocked
+                      ? { color: COLORS.dim, opacity: 0.35, cursor: "not-allowed" }
+                      : { color: COLORS.dim }
+                }
+              >
+                {t}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* 日期回看：实时（币安直连）/ 今日 / 昨日 / 自定义日期（后端落库历史） */}
+        <div
+          className="flex items-center overflow-hidden rounded-md border"
+          style={{ borderColor: histDate ? "rgba(96,165,250,0.5)" : COLORS.border }}
+        >
+          {(
+            [
+              { label: "实时", date: null },
+              { label: "今日", date: fmtLocalDate(new Date()) },
+              { label: "昨日", date: fmtLocalDate(new Date(Date.now() - 86_400_000)) },
+            ] as const
+          ).map((opt) => (
             <button
-              key={t}
-              onClick={() => setTf(t)}
-              className="px-2.5 py-1 font-mono text-[11px] transition-colors"
+              key={opt.label}
+              onClick={() => enterHistory(opt.date)}
+              className="px-2 py-1 text-[11px] transition-colors"
+              title={
+                opt.date === null
+                  ? "币安实时行情（滚动窗口）"
+                  : "从 jarvis 后端落库加载该日足迹（保留期内可回看）"
+              }
               style={
-                t === tf
+                histDate === opt.date
                   ? { background: "rgba(37,99,235,0.25)", color: "#bfdbfe" }
                   : { color: COLORS.dim }
               }
             >
-              {t}
+              {opt.label}
             </button>
           ))}
+          <input
+            type="date"
+            value={histDate ?? ""}
+            max={fmtLocalDate(new Date())}
+            onChange={(e) => enterHistory(e.target.value || null)}
+            className="border-l bg-transparent px-1.5 py-1 text-[11px] outline-none [color-scheme:dark]"
+            style={{ borderColor: COLORS.border, color: histDate ? "#bfdbfe" : COLORS.dim }}
+            title="回看任意历史日期（后端保留期内）"
+          />
         </div>
+        {histDate && (
+          <span
+            className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-semibold"
+            style={{ background: "rgba(234,179,8,0.14)", color: "#fde047" }}
+            title="历史回看走 jarvis 后端落库（金额单位 USD 名义额）；无实时推送，切「实时」恢复"
+          >
+            <History size={11} />
+            历史回看 {histDate}
+          </span>
+        )}
 
         <div className="hidden items-center gap-3 text-[10px] lg:flex" style={{ color: COLORS.dim }}>
           <span title="格子右列，蓝底越深买方越强">
@@ -799,12 +1008,24 @@ export default function FootprintChart() {
           />
           {tooltip}
           {signalPopover}
+          {backfillHint && (
+            <div
+              className="pointer-events-none absolute bottom-14 left-2 z-10 rounded border px-2 py-1 text-[11px] shadow-lg"
+              style={{
+                background: "rgba(7,22,34,0.92)",
+                borderColor: COLORS.border,
+                color: COLORS.dim,
+              }}
+            >
+              {backfillHint}
+            </div>
+          )}
           {loading && !loadError && (
             <div
               className="absolute inset-0 flex items-center justify-center text-xs"
               style={{ color: COLORS.dim, background: "rgba(11,30,45,0.6)" }}
             >
-              加载足迹数据…
+              {histDate ? `加载 ${histDate} 历史足迹…` : "加载足迹数据…"}
             </div>
           )}
           {loadError && (
@@ -837,7 +1058,16 @@ export default function FootprintChart() {
                     <RefreshCw size={12} />
                     重试
                   </button>
-                  {getFootprintSource() === "real" && (
+                  {histDate && (
+                    <button
+                      onClick={() => enterHistory(null)}
+                      className="flex items-center gap-1 rounded border px-2.5 py-1.5 text-xs transition-colors hover:bg-white/5"
+                      style={{ borderColor: COLORS.border, color: COLORS.text }}
+                    >
+                      回到实时
+                    </button>
+                  )}
+                  {!histDate && getFootprintSource() === "real" && (
                     <button
                       onClick={() => {
                         setFootprintSource("mock");

@@ -116,6 +116,134 @@ const REST_GAP_MS = 120;
 const RETRY_MAX = 4;
 const RETRY_BASE_MS = 1_000;
 
+// ---- 限流/封禁防护（模块级全局，覆盖所有 REST 调用方）----
+// 币安规则：持续超频先回 429（带 Retry-After）；不收手则按 IP 封禁并回 418，
+// 封禁时长递增（2min→3天），封禁期内继续请求会延长封禁。因此：
+//   418 → 全局短路闸门（零请求），封禁截止点持久化跨页面刷新生效；
+//   429 → 读 Retry-After 全局冷却，冷却期新请求等待而非发出；
+//   权重预算 → 本地先行限流，从源头避免触发 429/418。
+
+/** 币安合约 IP 权重预算 2400/min；留 1/4 余量给同 IP 其它进程 */
+const WEIGHT_BUDGET_PER_MIN = 1_800;
+/**
+ * 解封后冷却窗（防「解封→回补风暴→秒被再封」死循环）：封禁解除后的这段时间
+ * 内把权重预算压到极低，任何兜底 REST 都被强制错峰、单窗限额，杜绝瞬时打满。
+ */
+const POST_BAN_GRACE_MS = 60_000;
+const POST_BAN_WEIGHT_BUDGET = 200;
+/** 429 无 Retry-After 头时的保守全局冷却 */
+const DEFAULT_429_COOLDOWN_MS = 10_000;
+/** 418 无 Retry-After 头时的保守封禁时长（币安最短封 2min） */
+const DEFAULT_418_BAN_MS = 120_000;
+const BAN_STORE_KEY = 'jarvis-binance-ban-until';
+
+function fmtClock(ts: number): string {
+  const d = new Date(ts);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+/** IP 已被币安封禁（418）：封禁解除前所有 REST 调用直接短路抛本错误（零网络请求） */
+export class BinanceBanError extends Error {
+  constructor(readonly banUntil: number) {
+    super(
+      `币安已临时封禁本机 IP（418 超频），预计 ${fmtClock(banUntil)} 自动解除，` +
+        `封禁期内已停止全部行情请求`,
+    );
+  }
+}
+
+function readStoredBanUntil(): number {
+  try {
+    // 保留已过期的封禁截止点：解封后的「首次兜底加随机延迟」判定需要它
+    // （封禁门本身用 banUntil > now 判断，过期值不会误拦请求）
+    const v = Number(localStorage.getItem(BAN_STORE_KEY));
+    return Number.isFinite(v) && v > 0 ? v : 0;
+  } catch {
+    return 0; // node（vitest）无 localStorage
+  }
+}
+
+let banUntil = readStoredBanUntil();
+let cooldownUntil = 0;
+let weightWindowStart = 0;
+let weightWindowUsed = 0;
+// 解封后冷却截止点：封禁解除后 POST_BAN_GRACE_MS 内压低预算（跨刷新持久）
+let postBanCooldownUntil = banUntil > 0 ? banUntil + POST_BAN_GRACE_MS : 0;
+
+function setBan(durationMs: number): void {
+  banUntil = Date.now() + durationMs;
+  postBanCooldownUntil = banUntil + POST_BAN_GRACE_MS;
+  try {
+    localStorage.setItem(BAN_STORE_KEY, String(banUntil));
+  } catch {
+    // node（vitest）无 localStorage
+  }
+}
+
+/** 距离 418 封禁解除的剩余毫秒（0 = 未被封禁）；UI/降级逻辑用 */
+export function binanceBanRemainingMs(): number {
+  return Math.max(0, banUntil - Date.now());
+}
+
+/**
+ * 距离上次 418 封禁解除已过去的毫秒；从未封禁（或仍在封禁中）返回 Infinity。
+ * 调用方据此对「解封后的首次 REST 兜底」加随机延迟错峰，
+ * 避免「解封瞬间恢复风暴 → 秒被再封」的死循环。
+ */
+export function binanceBanLiftedAgoMs(): number {
+  if (banUntil <= 0 || banUntil > Date.now()) return Number.POSITIVE_INFINITY;
+  return Date.now() - banUntil;
+}
+
+/** 测试专用：解封后冷却窗截止点（0 = 无） */
+export function postBanCooldownUntilForTest(): number {
+  return postBanCooldownUntil;
+}
+
+/** 测试专用：重置模块级限流/封禁状态 */
+export function resetRestGuardForTest(): void {
+  banUntil = 0;
+  cooldownUntil = 0;
+  weightWindowStart = 0;
+  weightWindowUsed = 0;
+  postBanCooldownUntil = 0;
+  try {
+    localStorage.removeItem(BAN_STORE_KEY);
+  } catch {
+    // node（vitest）无 localStorage
+  }
+}
+
+/** 当前分钟窗口的权重预算：解封冷却窗内压到极低，其余用常规预算 */
+function currentWeightBudget(now: number): number {
+  return now < postBanCooldownUntil ? POST_BAN_WEIGHT_BUDGET : WEIGHT_BUDGET_PER_MIN;
+}
+
+/** 本地权重预算：分钟窗口内超预算则等到下一窗口，从源头不触发 429 */
+async function acquireWeight(weight: number): Promise<void> {
+  for (;;) {
+    const now = Date.now();
+    if (now - weightWindowStart >= 60_000) {
+      weightWindowStart = now;
+      weightWindowUsed = 0;
+    }
+    if (weightWindowUsed + weight <= currentWeightBudget(now)) {
+      weightWindowUsed += weight;
+      return;
+    }
+    await sleep(weightWindowStart + 60_000 - now + 50);
+  }
+}
+
+/** 解析 Retry-After 响应头（秒）；测试替身可能无 headers，全程防御访问 */
+function retryAfterMs(res: { headers?: { get?: (k: string) => string | null } }): number | null {
+  const raw = res.headers?.get?.('retry-after');
+  if (raw == null) return null;
+  const sec = Number(raw);
+  return Number.isFinite(sec) && sec >= 0 ? sec * 1000 : null;
+}
+
 /** 4xx 参数类错误：不重试直接抛 */
 class FatalRestError extends Error {}
 
@@ -123,24 +251,46 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function restJson(path: string, params: Record<string, string | number>): Promise<unknown> {
+async function restJson(
+  path: string,
+  params: Record<string, string | number>,
+  weight: number,
+): Promise<unknown> {
   const qs = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) qs.set(k, String(v));
   const url = `${REST_BASE}${path}?${qs.toString()}`;
 
   for (let attempt = 0; ; attempt++) {
+    // 418 封禁期：直接短路，绝不发请求（继续请求会延长封禁）
+    if (banUntil > Date.now()) throw new BinanceBanError(banUntil);
+    // 429 冷却期：等待而非发出（全局生效，含并行分页的其它调用）
+    const cooldownWait = cooldownUntil - Date.now();
+    if (cooldownWait > 0) await sleep(cooldownWait);
+    await acquireWeight(weight);
+
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), REST_TIMEOUT_MS);
     try {
       const res = await fetch(url, { signal: ctrl.signal });
       if (res.ok) return await res.json();
-      // 429/418（限流/封禁预警）与 5xx 走退避重试；其余 4xx 视为参数错误
-      if (res.status !== 429 && res.status !== 418 && res.status < 500) {
-        throw new FatalRestError(`binance ${res.status}: ${path}`);
+      if (res.status === 418) {
+        // IP 已被封禁：重试只会延长封禁——设全局闸门后立即失败
+        setBan(retryAfterMs(res) ?? DEFAULT_418_BAN_MS);
+        throw new BinanceBanError(banUntil);
       }
+      if (res.status === 429) {
+        // 超频警告：按 Retry-After 全局冷却；继续加压会升级为 418 封禁
+        const wait = retryAfterMs(res) ?? DEFAULT_429_COOLDOWN_MS;
+        cooldownUntil = Math.max(cooldownUntil, Date.now() + wait);
+        if (attempt >= RETRY_MAX) throw new Error(`binance 429: ${path}`);
+        continue;
+      }
+      if (res.status < 500) throw new FatalRestError(`binance ${res.status}: ${path}`);
       throw new Error(`binance ${res.status}: ${path}`);
     } catch (err) {
-      if (err instanceof FatalRestError || attempt >= RETRY_MAX) throw err;
+      if (err instanceof FatalRestError || err instanceof BinanceBanError || attempt >= RETRY_MAX) {
+        throw err;
+      }
       await sleep(RETRY_BASE_MS * 2 ** attempt);
     } finally {
       clearTimeout(timer);
@@ -171,13 +321,11 @@ export async function fetchKlines(
   const out: KlineData[] = [];
   let cursor = startTime;
   for (;;) {
-    const rows = (await restJson('/fapi/v1/klines', {
-      symbol,
-      interval: timeframe,
-      startTime: cursor,
-      endTime,
-      limit: 1500,
-    })) as (string | number)[][];
+    const rows = (await restJson(
+      '/fapi/v1/klines',
+      { symbol, interval: timeframe, startTime: cursor, endTime, limit: 1500 },
+      10, // klines limit 1500 → weight 10
+    )) as (string | number)[][];
     if (!Array.isArray(rows) || rows.length === 0) break;
     for (const r of rows) out.push(parseKlineRow(r));
     if (rows.length < 1500) break;
@@ -193,11 +341,11 @@ export async function fetchLatestKlines(
   timeframe: Timeframe,
   limit: number,
 ): Promise<KlineData[]> {
-  const rows = (await restJson('/fapi/v1/klines', {
-    symbol,
-    interval: timeframe,
-    limit,
-  })) as (string | number)[][];
+  const rows = (await restJson(
+    '/fapi/v1/klines',
+    { symbol, interval: timeframe, limit },
+    5, // klines limit ≤499 → weight 5（重连重放仅拉 2 根）
+  )) as (string | number)[][];
   return Array.isArray(rows) ? rows.map(parseKlineRow) : [];
 }
 
@@ -227,7 +375,7 @@ export async function fetchRecentAggTrades(
   for (let i = 0; i < maxRequests; i++) {
     const params: Record<string, string | number> = { symbol, limit: 1000 };
     if (fromId !== null) params.fromId = fromId;
-    const raw = (await restJson('/fapi/v1/aggTrades', params)) as RawAggTrade[];
+    const raw = (await restJson('/fapi/v1/aggTrades', params, 20)) as RawAggTrade[];
     if (!Array.isArray(raw) || raw.length === 0) {
       truncated = false;
       break;
@@ -271,11 +419,11 @@ export async function fetchAggTradesFrom(
   const out: AggTradeTick[] = [];
   let cursor = fromId;
   for (let i = 0; i < maxRequests; i++) {
-    const raw = (await restJson('/fapi/v1/aggTrades', {
-      symbol,
-      fromId: cursor,
-      limit: 1000,
-    })) as RawAggTrade[];
+    const raw = (await restJson(
+      '/fapi/v1/aggTrades',
+      { symbol, fromId: cursor, limit: 1000 },
+      20,
+    )) as RawAggTrade[];
     if (!Array.isArray(raw) || raw.length === 0) return { ticks: out, complete: true };
     for (const r of raw) out.push(toTick(r));
     if (raw.length < 1000) return { ticks: out, complete: true };
@@ -287,8 +435,12 @@ export async function fetchAggTradesFrom(
 
 // ------------------------------------------------------------------ 实时流
 
-/** WS 重连补档的分页预算：1000 笔/页 ×40 ≈ 数分钟断档可精确补齐 */
-const GAP_FILL_MAX_REQUESTS = 40;
+/**
+ * WS 重连补档的分页预算：1000 笔/页 ×8 ≈ 覆盖秒级~分钟级正常重连缺口。
+ * 更长断档由 onGap 触发上层「后端重建」（零币安权重），不再靠币安逆序翻页，
+ * 从源头杜绝重连时的币安 REST 请求风暴。
+ */
+const GAP_FILL_MAX_REQUESTS = 8;
 const RECONNECT_MIN_MS = 1_000;
 const RECONNECT_MAX_MS = 30_000;
 
@@ -299,6 +451,16 @@ export interface LiveFeedHandlers {
   onKline(timeframe: Timeframe, k: KlineData): void;
   /** 断档无法精确补齐（REST 失败/预算耗尽），上层应触发重建 */
   onGap(reason: string): void;
+}
+
+/** BinanceLiveFeed 可选行为 */
+export interface LiveFeedOptions {
+  /**
+   * 连接（含重连）后是否用 REST 重放大周期最近 2 根 K 线覆盖末柱。
+   * 默认 true（保持历史行为）；当上层已从后端 seed 大周期当前柱时应传 false，
+   * 避免每次连接都发币安 REST（WS kline 流会在数秒内自愈末柱）。
+   */
+  replayKlinesOnConnect?: boolean;
 }
 
 /**
@@ -320,6 +482,7 @@ export class BinanceLiveFeed {
     private readonly klineTfs: readonly Timeframe[],
     private readonly handlers: LiveFeedHandlers,
     sinceAggId = -1,
+    private readonly opts: LiveFeedOptions = {},
   ) {
     this.lastAggId = sinceAggId;
   }
@@ -337,7 +500,7 @@ export class BinanceLiveFeed {
     ws.onopen = () => {
       this.reconnectDelay = RECONNECT_MIN_MS;
       if (this.buffering) void this.fillGap();
-      void this.replayKlines();
+      if (this.opts.replayKlinesOnConnect !== false) void this.replayKlines();
     };
     ws.onmessage = (ev) => this.onMessage(ev);
     ws.onclose = () => this.scheduleReconnect();

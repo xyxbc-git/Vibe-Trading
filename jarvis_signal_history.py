@@ -312,6 +312,11 @@ def record_batch(symbol: str, tf: str, signals: list[dict],
                         "new_direction": sig.get("direction"),
                         "prev_strength": prev.get("strength") if prev else None,
                         "new_strength": sig.get("strength"), "price": price,
+                        # 复用上面已构建的快照/变更类型（零额外计算、不改落库），
+                        # 供邮件模板渲染「交易计划变更前→后」对比与关键点位
+                        "change_kinds": list(kinds),
+                        "prev_snapshot": prev_snapshot,
+                        "new_snapshot": new_snapshot,
                     })
 
                 out[system] = {"updated_at": ts, "changed_at": changed_ts}

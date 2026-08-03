@@ -165,6 +165,11 @@ DEFAULTS: dict = {
     "ws_reconnect_base_s": 1.0,       # 重连指数退避起始秒
     "ws_reconnect_max_s": 60.0,       # 重连退避封顶秒
     "ws_force_order_persist": True,   # forceOrder 是否落 SQLite 保留历史
+    # ── order-flow phase-1 本地订单簿引擎（jarvis_orderbook）───────────────────
+    "book_enabled": True,             # 总开关：dashboard 启动时挂载订单簿引擎
+    "book_snapshot_interval_s": 5.0,  # 内存深度切片周期（秒）
+    "book_retention_days": 14,        # 深度切片落库保留天数
+    "book_levels": 60,                # 每片每侧落库价格档数
     # ── [风控篇 P0-2] 模拟盘成交摩擦（jarvis_paper_trader，双边生效，0=关闭）────
     "paper_fee_pct": 0.05,            # 单边手续费%（taker 近似；开/平各收一次）
     "paper_slippage_pct": 0.02,       # 单边滑点%（市价单成交价按方向变差；限价单不加）
@@ -173,6 +178,10 @@ DEFAULTS: dict = {
     # ── [风控篇 P0-4] 12 系统自动跟盘红线 ──────────────────────────────────
     "twelve_max_open_positions": 4,   # 总持仓数上限（含全部未平仓，非仅 twelve 来源）
     "twelve_reopen_cooldown_min": 60, # 同币平仓后再开仓冷却（分钟；0=关闭）
+    # ── 模拟交易器（jarvis_twelve_trader：12系统×6时间轴槽位独立钱包台账）──────
+    # 独立引擎，不影响 12 信号主链路；参数主要走 twelve_sim_config 表分层覆盖，
+    # 此处仅登记全局费率（数据经 jarvis_sync 旁路同步到 RuoYi 分析）。
+    "twelve_sim_fee_pct": 0.05,       # 单边手续费%（按名义，开/平双边各收一次）
 }
 
 # ── YAML 分组 schema：key → 组名（trading/risk/signal/data/notify/system）────────
@@ -202,6 +211,7 @@ GROUPS: dict[str, str] = {
     "paper_slippage_pct": "trading",
     "twelve_max_open_positions": "trading",
     "twelve_reopen_cooldown_min": "trading",
+    "twelve_sim_fee_pct": "trading",
     # risk——风控红线
     "max_portfolio_risk_pct": "risk",
     "max_effective_pct": "risk",
@@ -254,6 +264,9 @@ GROUPS: dict[str, str] = {
     "ws_reconnect_base_s": "data",
     "ws_reconnect_max_s": "data",
     "ws_force_order_persist": "data",
+    "book_snapshot_interval_s": "data",
+    "book_retention_days": "data",
+    "book_levels": "data",
     # notify——通知
     "notify_timeout_s": "notify",
     "notify_all_closes": "notify",
@@ -262,6 +275,7 @@ GROUPS: dict[str, str] = {
     "dashboard_host": "system",
     "dashboard_port": "system",
     "ws_enabled": "system",
+    "book_enabled": "system",
 }
 
 # 组内注释（init 模板用；也是 Settings 页分组展示的口径说明）。
@@ -327,11 +341,15 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "ws_buffer_size": (100, 100_000),
     "ws_reconnect_base_s": (0.5, 30.0),
     "ws_reconnect_max_s": (5.0, 600.0),
+    "book_snapshot_interval_s": (1.0, 60.0),
+    "book_retention_days": (1, 365),
+    "book_levels": (10, 200),
     "liq_magnet_warn_pct": (0.1, 10.0),
     "paper_fee_pct": (0.0, 1.0),             # 单边费率%（0=关闭；>1% 不现实）
     "paper_slippage_pct": (0.0, 2.0),        # 单边滑点%（0=关闭）
     "twelve_max_open_positions": (1, 20),
     "twelve_reopen_cooldown_min": (0, 1440),  # 0=关闭 ~ 24 小时
+    "twelve_sim_fee_pct": (0.0, 1.0),         # 模拟交易器单边费率%
 }
 
 # 允许的枚举键。

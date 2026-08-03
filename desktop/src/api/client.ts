@@ -89,9 +89,12 @@ export const api = {
   snapshot: (symbol = "BTCUSDT") =>
     api.get<Record<string, unknown>>(`/snapshot?symbol=${symbol}`),
 
-  kline: (symbol = "BTCUSDT", interval = "15m", limit = 200) =>
+  // endTimeMs（毫秒，可选）：向前分页游标，返回该时刻及之前的 limit 根
+  // （K 线图向左拖懒加载更早历史用）；缺省时 URL 与旧版一致，行为不变。
+  kline: (symbol = "BTCUSDT", interval = "15m", limit = 200, endTimeMs?: number) =>
     api.get<Record<string, unknown>>(
-      `/kline?symbol=${symbol}&interval=${interval}&limit=${limit}`,
+      `/kline?symbol=${symbol}&interval=${interval}&limit=${limit}` +
+        (endTimeMs && endTimeMs > 0 ? `&end_time=${Math.floor(endTimeMs)}` : ""),
     ),
 
   wallet: () => api.get<Record<string, unknown>>("/wallet"),
@@ -638,6 +641,15 @@ export const api = {
       30_000,
     ),
 
+  // ─── 诱多/诱空陷阱信号（B1 识别引擎；未就绪时调用方回退本地规则识别）───
+  // 响应契约见 src/lib/trapSignals.ts 的 TrapSignalsResponse（假突破陷阱 + 中文证据）
+  trapSignals: (symbol: string, interval: string) =>
+    request<import("../lib/trapSignals").TrapSignalsResponse>(
+      `/trap-signals?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}`,
+      undefined,
+      30_000,
+    ),
+
   // ─── 高胜率反转四条件叠加评分（Delta 背离 + 多分布 + 三连确认 + 止损扫单）───
   reversalScore: (symbol: string, timeframe: string) =>
     request<ReversalScoreResponse>(
@@ -688,6 +700,13 @@ export const api = {
   depthOrderbook: (symbol: string, limit = 500, maxBuckets = 30) =>
     api.get<DepthOrderbookResponse>(
       `/depth/orderbook?symbol=${encodeURIComponent(symbol)}&limit=${limit}&max_buckets=${maxBuckets}`,
+    ),
+
+  // ─── 实时 DOM（order-flow phase-1：WS 增量维护的本地订单簿，1s 级；
+  //     本地簿未就绪时后端自动回退 REST 快照，载荷形状与 depthOrderbook 一致）───
+  orderbookLive: (symbol: string, maxBuckets = 30) =>
+    api.get<DepthOrderbookResponse>(
+      `/orderbook/live?symbol=${encodeURIComponent(symbol)}&max_buckets=${maxBuckets}`,
     ),
 
   // ─── 成交流主体画像（散户/机构/做市商 + 指纹聚合 + 主力行为判定）───
@@ -2045,6 +2064,12 @@ export interface DepthOrderbookResponse {
   imbalance?: { bid_usd_10: number; ask_usd_10: number; ratio: number | null };
   /** true = 本次快照拉取失败，返回的是上一次成功结果 */
   stale?: boolean;
+  /** order-flow phase-1：ws_book=WS 增量本地簿 / rest_fallback=REST 快照回退 */
+  source?: "ws_book" | "rest_fallback";
+  /** 本地订单簿是否与增量流对齐（rest_fallback 时为 false） */
+  synced?: boolean;
+  /** 本地簿最后一次增量距响应生成的毫秒数（ws_book 时提供） */
+  age_ms?: number;
   error?: string;
 }
 

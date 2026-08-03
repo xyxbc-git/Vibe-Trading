@@ -667,7 +667,7 @@ def load_task_modules() -> None:
     import importlib
 
     sys.modules.setdefault("jarvis_sync", sys.modules[__name__])
-    for mod in ("jarvis_sync_tasks_a", "jarvis_sync_tasks_b"):
+    for mod in ("jarvis_sync_tasks_a", "jarvis_sync_tasks_b", "jarvis_sync_tasks_sim"):
         try:
             importlib.import_module(mod)
             log.info("任务模块 %s 已加载", mod)

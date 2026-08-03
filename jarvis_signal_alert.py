@@ -271,14 +271,116 @@ def _fmt_price(v) -> str:
     return f"{f:.6g}"
 
 
+_SIDE_CN = {"long": "做多", "short": "做空"}
+
+# 交易计划展示字段：(展示名, plan 键按序取第一个非空——兼容单系统计划
+# take_profit 与共识计划 take_profit_1 两种键名, 是否数值型可标注变化幅度)
+_PLAN_FIELDS = (
+    ("方向", ("side",), False),
+    ("入场", ("entry",), True),
+    ("止损", ("stop_loss",), True),
+    ("止盈1", ("take_profit", "take_profit_1"), True),
+    ("止盈2", ("take_profit_2",), True),
+    ("建议仓位", ("position_pct",), True),
+)
+
+_MAX_LEVELS_IN_MAIL = 6   # 关键点位最多列几条（防冗长）
+
+
+def _plan_get(plan, keys: tuple):
+    if not isinstance(plan, dict):
+        return None
+    for k in keys:
+        if plan.get(k) is not None:
+            return plan.get(k)
+    return None
+
+
+def _delta_pct(pv, nv) -> str:
+    """数值变化幅度标注 ' (+0.63%)'；基数为 0、相等或非数值返回空串。"""
+    try:
+        fp, fn = float(pv), float(nv)
+    except (TypeError, ValueError):
+        return ""
+    if abs(fp) < 1e-12 or fp == fn:
+        return ""
+    return f" ({(fn - fp) / abs(fp) * 100.0:+.2f}%)"
+
+
+def _plan_value_fmt(label: str, v) -> str:
+    if v is None:
+        return "—"
+    if label == "方向":
+        return _SIDE_CN.get(str(v), str(v))
+    if label == "建议仓位":
+        try:
+            return f"{float(v):g}%"
+        except (TypeError, ValueError):
+            return str(v)
+    return _fmt_price(v)
+
+
+def _value_changed(pv, nv) -> bool:
+    if pv is None and nv is None:
+        return False
+    if (pv is None) != (nv is None):
+        return True
+    try:
+        return float(pv) != float(nv)
+    except (TypeError, ValueError):
+        return str(pv) != str(nv)
+
+
+def _plan_block(prev_plan, new_plan) -> list[str]:
+    """交易计划块：逐项「变更前 → 变更后」；未变化项只展示当前值。"""
+    if prev_plan is None and new_plan is None:
+        return ["", "交易计划：该信号当前无自洽交易计划"]
+    if prev_plan is None:
+        head = "交易计划（本次新增）："
+    elif new_plan is None:
+        head = "交易计划（本次撤销，变更前 → 撤销后）："
+    else:
+        head = "交易计划："
+    out = ["", head]
+    for label, keys, numeric in _PLAN_FIELDS:
+        pv, nv = _plan_get(prev_plan, keys), _plan_get(new_plan, keys)
+        if pv is None and nv is None:
+            continue   # 前后都没有的字段不占行（如单系统计划无止盈2/仓位）
+        if _value_changed(pv, nv):
+            arrow = _delta_pct(pv, nv) if numeric else ""
+            out.append(f"  {label}：{_plan_value_fmt(label, pv)} → "
+                       f"{_plan_value_fmt(label, nv)}{arrow}")
+        else:
+            out.append(f"  {label}：{_plan_value_fmt(label, nv)}")
+    return out
+
+
+def _levels_block(levels) -> list[str]:
+    """关键点位块：支撑/阻力最多列 _MAX_LEVELS_IN_MAIL 条；无点位不占行。"""
+    rows = [x for x in (levels or []) if isinstance(x, dict)][:_MAX_LEVELS_IN_MAIL]
+    if not rows:
+        return []
+    out = ["", "关键点位："]
+    for lv in rows:
+        out.append(f"  · {lv.get('label') or '—'}：{_fmt_price(lv.get('price'))}")
+    return out
+
+
 def _format_mail(ev: dict) -> tuple[str, str]:
-    """变更事件 → (subject, body)。中文模板，覆盖任务要求的全部字段。"""
+    """变更事件 → (subject, body)。中文模板，覆盖任务要求的全部字段。
+
+    ev 可选携带 prev_snapshot/new_snapshot（trade_plan + key_levels 快照，
+    jarvis_signal_history.record_batch 附带）与 change_kinds；缺失时按旧版
+    模板降级渲染，绝不报错。
+    """
     name = ev.get("name_cn") or ev.get("system") or "未知系统"
     sym = ev.get("symbol") or "—"
     tf = ev.get("tf") or "—"
     prev_dir = _DIR_CN.get(str(ev.get("prev_direction")), str(ev.get("prev_direction") or "—"))
     new_dir = _DIR_CN.get(str(ev.get("new_direction")), str(ev.get("new_direction") or "—"))
-    subject = f"【贾维斯信号提醒】{sym} {tf} {name} 信号变化"
+    kinds = [str(k) for k in (ev.get("change_kinds") or [])]
+    suffix = "（含点位变更）" if ("plan" in kinds or "levels" in kinds) else ""
+    subject = f"【贾维斯信号提醒】{sym} {tf} {name} 信号变化{suffix}"
     lines = [
         f"{sym} {tf} 周期「{name}」发生实质变化：",
         "",
@@ -291,8 +393,16 @@ def _format_mail(ev: dict) -> tuple[str, str]:
             lines.append(f"强度：{float(ps or 0):.0%} → {float(ns or 0):.0%}")
         except (TypeError, ValueError):
             pass
+    lines.append(f"当前价：{_fmt_price(ev.get('price'))}")
+
+    # 交易计划对比 + 关键点位：仅当事件携带快照时渲染（旧事件保持旧版式）
+    if ("prev_snapshot" in ev) or ("new_snapshot" in ev):
+        prev_snap = ev.get("prev_snapshot") if isinstance(ev.get("prev_snapshot"), dict) else {}
+        new_snap = ev.get("new_snapshot") if isinstance(ev.get("new_snapshot"), dict) else {}
+        lines += _plan_block(prev_snap.get("trade_plan"), new_snap.get("trade_plan"))
+        lines += _levels_block(new_snap.get("key_levels"))
+
     lines += [
-        f"当前价：{_fmt_price(ev.get('price'))}",
         f"时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
         "",
         "提示：单一系统信号变化不构成买卖建议，请结合共识面板与自身风控决策。",
@@ -310,7 +420,9 @@ def maybe_notify(events: list[dict]) -> dict:
     """信号变更落库后的提醒钩子（jarvis_signal_history.record_batch 调用）。
 
     events 每项：{symbol, tf, system, name_cn, summary, prev_direction,
-                  new_direction, prev_strength, new_strength, price}
+                  new_direction, prev_strength, new_strength, price,
+                  change_kinds?, prev_snapshot?, new_snapshot?}
+    （后三项 record_batch 附带，供邮件渲染计划对比与关键位；缺失时降级。）
     命中订阅 → 冷却/日上限过滤 → 发邮件。任何异常不外抛（返回摘要 dict）。
     """
     global _daily_limit_warned_day
