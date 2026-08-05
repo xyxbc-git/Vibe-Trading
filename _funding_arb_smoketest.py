@@ -15,6 +15,9 @@ jj.DB_PATH = os.path.join(_TMP, "test.db")
 
 import jarvis_funding_arb as jfa
 
+# 监控池打桩：隔离用户本地 jarvis_config，冒烟池恒定为内置默认
+jfa._watchlist = lambda: jfa.DEFAULT_WATCHLIST
+
 PASS = 0
 FAIL = 0
 
@@ -44,7 +47,7 @@ jfa._premium_index_one = lambda sym: {
 jfa._premium_index_all = lambda: [
     {"symbol": s, "markPrice": str(FAKE_MARK), "lastFundingRate": str(FAKE_RATE),
      "nextFundingTime": str(int((NOW + 3600) * 1000))}
-    for s in jfa.WATCHLIST
+    for s in jfa.DEFAULT_WATCHLIST
 ]
 
 
@@ -74,7 +77,7 @@ check("空区间无结算点", jfa._settle_points_between(100, 200) == [])
 # ── 2. 机会列表（打桩行情）─────────────────────────────────────────────
 opps = jfa.fetch_opportunities(force=True)
 check("机会列表 ok", opps.get("ok") is True, str(opps)[:120])
-check("watchlist 全覆盖", len(opps["opportunities"]) == len(jfa.WATCHLIST))
+check("watchlist 全覆盖", len(opps["opportunities"]) == len(jfa.DEFAULT_WATCHLIST))
 o0 = opps["opportunities"][0]
 check("机会字段齐全", all(k in o0 for k in
       ("symbol", "mark_price", "funding_rate", "apr_now", "apr_7d",
@@ -138,7 +141,7 @@ check("费率转负触发预警", lst_neg["positions"][0]["warning"] is not None
       str(lst_neg["positions"][0].get("warning")))
 neg_opp = dict(_neg)
 jfa._premium_index_all = lambda: [
-    {**neg_opp, "symbol": s} for s in jfa.WATCHLIST]
+    {**neg_opp, "symbol": s} for s in jfa.DEFAULT_WATCHLIST]
 opps_neg = jfa.fetch_opportunities(force=True)
 check("负费率机会带预警+无回本天数",
       opps_neg["opportunities"][0]["warning"] is not None

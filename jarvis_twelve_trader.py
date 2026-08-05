@@ -280,6 +280,20 @@ def latest_price(cfg: dict, symbol: str) -> float | None:
         return None
 
 
+def mark_price_of(cfg: dict, symbol: str) -> float | None:
+    """标记价（爆仓判定口径，币安合约强平按 markPrice 触发）：惰性导入 jcd。
+
+    冒烟测试直接对本函数打桩（jtt.mark_price_of = lambda ...）；返回 None 时
+    爆仓判定回退最新成交价（与旧行为一致）。
+    """
+    try:
+        import jarvis_crypto_data as jcd
+        return jcd.fetch_mark_price(symbol)
+    except Exception as exc:  # noqa: BLE001 — 标记价缺失不阻塞盯盘，回退成交价
+        _log(f"⚠️ {symbol} 取标记价失败: {exc!r}"[:160])
+        return None
+
+
 def _load_cfg() -> dict:
     """执行手配置（gateway_base/agent_token 等，供取价用）；失败回空 dict。"""
     try:
@@ -745,12 +759,15 @@ def _liq_price(entry: float, direction: str, leverage: float) -> float | None:
 
 
 def _exit_check(pos: dict, price: float,
-                bars: list[dict] | None) -> tuple[str, float] | None:
+                bars: list[dict] | None,
+                mark_price: float | None = None) -> tuple[str, float] | None:
     """爆仓/止损/止盈 盘中触发判定 → (reason, 结算价) 或 None。
 
     bars=自开仓以来已收盘 bar（含影线 high/low）；None/为空 → 回退快照现价。
     优先级 liq > sl > tp（同 bar 双触按保守取 SL）；结算价=触发位本身，
     缺口行情（快照已越过触发位）按更差价结算。
+    mark_price=合约标记价（2026-08-05 口径切换：爆仓按 markPrice 判定，与币安
+    强平规则一致）；None 时回退 price（成交价），sl/tp 始终按成交价口径。
     """
     entry = float(pos["entry_price"])
     long_side = pos["direction"] == "long"
@@ -767,9 +784,12 @@ def _exit_check(pos: dict, price: float,
 
     liq = _liq_price(entry, pos["direction"], pos.get("leverage") or 1.0)
     if liq is not None:
-        if long_side and eff_lo <= liq:
+        mark = float(mark_price) if mark_price else price
+        m_hi = max(hi, mark) if hi is not None else mark
+        m_lo = min(lo, mark) if lo is not None else mark
+        if long_side and m_lo <= liq:
             return ("liq", liq)
-        if not long_side and eff_hi >= liq:
+        if not long_side and m_hi >= liq:
             return ("liq", liq)
 
     sl, tp = pos.get("stop_loss"), pos.get("take_profit")
@@ -1104,6 +1124,7 @@ def _cycle_symbol(sym: str, cfg: dict, now: float | None = None) -> dict:
     price = latest_price(cfg, sym)
     if price is None or price <= 0:
         return {"skipped": "无现价"}
+    mark = mark_price_of(cfg, sym)   # 爆仓判定用标记价；None 时 _exit_check 回退成交价
     cfg_rows = list_configs(sym)
     ensure_wallets(sym, cfg_rows)
     signals = read_signals(sym)
@@ -1194,7 +1215,7 @@ def _cycle_symbol(sym: str, cfg: dict, now: float | None = None) -> dict:
             tf_ = str(pos["tf"])
             if tf_ not in bars_cache:
                 bars_cache[tf_] = _fetch_bars(sym, tf_)
-            hit = _exit_check(pos, price, bars_cache[tf_])
+            hit = _exit_check(pos, price, bars_cache[tf_], mark_price=mark)
             if hit:
                 reason, exit_px = hit
                 res["closed"].append(_do_close(conn, pos, exit_px, reason, ts))

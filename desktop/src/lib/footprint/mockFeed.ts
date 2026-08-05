@@ -25,8 +25,16 @@ import { inferTickSize } from './aggregator';
 
 /** 各币种 mock 基准价（量级贴近 2026 常态行情，精确值不重要） */
 export const BASE_PRICES: Record<string, number> = {
+  // 当前 watchlist 8 品种（2026-08-05 收敛）
   BTCUSDT: 64000,
   ETHUSDT: 3400,
+  SNDKUSDT: 52,
+  SKHYUSDT: 190,
+  SPCXUSDT: 110,
+  XAUUSDT: 3300,
+  CLUSDT: 72,
+  BZUSDT: 76,
+  // 已退出 watchlist 的旧币种锚点保留：既有测试断言引用，删除无收益
   SOLUSDT: 145,
   BNBUSDT: 590,
   XRPUSDT: 0.52,

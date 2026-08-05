@@ -79,20 +79,31 @@ def _norm_limit(limit, max_n: int = LIMIT_MAX) -> int:
 
 def fetch_bars(symbol: str, timeframe: str, limit: int = LIMIT_DEFAULT,
                max_n: int = LIMIT_MAX) -> list[dict] | None:
-    """拉现货 K 线并保留 taker_buy 字段；只回已收盘 bar；失败返回 None。
+    """拉 K 线并保留 taker_buy 字段；只回已收盘 bar；失败返回 None。
 
     自建拉取的原因：项目公共 fetch（jarvis_twelve_systems.fetch_klines_df /
     dashboard /api/kline）都丢掉了 k[9] taker_buy_base_asset_volume，
     改它们会影响既有消费方——本模块独立取数，互不干扰。
+
+    数据源（2026-08-05 与 jcd.PRICE_SOURCE_SWITCHED_AT 口径对齐）：USDⓈ-M
+    合约优先——watchlist 8 品种中 SNDK/SKHY/SPCX/XAU/CL/BZ 为合约独有，
+    现货接口无此符号；合约失败再回退现货（BTC/ETH 兜底路径保留）。
+    合约 K 线同样携带 k[9] taker_buy，输出结构不变。
     """
     sym, tf = _norm_symbol(symbol), _norm_tf(timeframe)
     lim = _norm_limit(limit, max_n=max_n)
-    try:
-        raw = jcd._get(jcd.SPOT_API + "/api/v3/klines",
-                       {"symbol": sym, "interval": tf, "limit": min(lim + 1, 1000)})
-    except Exception:  # noqa: BLE001 — 取数失败交调用方降级
-        return None
-    if not isinstance(raw, list) or not raw:
+    raw = None
+    for base, path in ((jcd.FAPI, "/fapi/v1/klines"),
+                       (jcd.SPOT_API, "/api/v3/klines")):
+        try:
+            got = jcd._get(base + path,
+                           {"symbol": sym, "interval": tf, "limit": min(lim + 1, 1000)})
+        except Exception:  # noqa: BLE001 — 单源失败轮换下一源
+            continue
+        if isinstance(got, list) and got:
+            raw = got
+            break
+    if not raw:
         return None
     # 丢进行中的最后一根（close_time k[6] 未到 = 未收盘），防前瞻
     try:

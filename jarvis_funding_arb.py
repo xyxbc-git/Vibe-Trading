@@ -44,9 +44,23 @@ import jarvis_journal as jj
 DISCLAIMER = ("模拟盘：费率按交易所真实历史结算，但未建模滑点/借币成本/保证金波动；"
               "收益为统计参考，非投资建议。")
 
-# 机会监控币种池（Binance USDT 永续 + 现货均有的主流币）
-WATCHLIST = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
-             "DOGEUSDT", "ADAUSDT", "LINKUSDT", "AVAXUSDT", "LTCUSDT")
+# 机会监控币种池：跟随配置中心 watchlist（用户关注品种），读取失败回退内置默认。
+# 注意：费率监控只需永续合约（8 品种均为币安 USDⓈ-M 永续）；
+# 真正建仓的现货腿是否存在由 open 时取价环节自然校验。
+DEFAULT_WATCHLIST = ("BTCUSDT", "ETHUSDT", "SNDKUSDT", "SKHYUSDT", "SPCXUSDT",
+                     "XAUUSDT", "CLUSDT", "BZUSDT")
+
+
+def _watchlist() -> tuple[str, ...]:
+    """当前监控币种池：配置中心 watchlist 优先，异常回退内置默认。永不抛出。"""
+    try:
+        import jarvis_config as jcfg
+        wl = jcfg.get("watchlist")
+        if isinstance(wl, list) and wl:
+            return tuple(str(s).upper() for s in wl)
+    except Exception:  # noqa: BLE001 — 配置异常不拖垮费率监控
+        pass
+    return DEFAULT_WATCHLIST
 
 SPOT_TAKER_FEE = 0.001    # 现货 taker 0.1%
 PERP_TAKER_FEE = 0.0005   # U 本位合约 taker 0.05%
@@ -176,15 +190,16 @@ def fetch_opportunities(force: bool = False) -> dict:
         if not force and hit is not None and now - _OPP_CACHE["ts"] < OPP_TTL:
             return hit
 
+    watchlist = _watchlist()
     rows = _premium_index_all()
-    want = {s: None for s in WATCHLIST}
+    want = {s: None for s in watchlist}
     for row in rows:
         sym = row.get("symbol")
         if sym in want and want[sym] is None:
             want[sym] = row
 
     # 7 日均费率：并行补充（每币一次历史请求，失败置 None 不拖垮列表）
-    hist_avg: dict[str, float | None] = {s: None for s in WATCHLIST}
+    hist_avg: dict[str, float | None] = {s: None for s in watchlist}
 
     def _one(sym: str) -> None:
         try:
@@ -203,7 +218,7 @@ def fetch_opportunities(force: bool = False) -> dict:
         t.join(timeout=10)
 
     opps = []
-    for sym in WATCHLIST:
+    for sym in watchlist:
         row = want[sym]
         if row is None:
             continue

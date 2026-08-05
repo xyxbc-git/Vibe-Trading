@@ -31,7 +31,9 @@ import jarvis_correlation as jcorr
 
 # 默认篮子（与仪表盘币种下拉一致，可扩展）。
 # [T-15] 优先取配置中心 watchlist；配置缺失时回退此内置原值（零回归）。
-DEFAULT_WATCHLIST = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT"]
+# 2026-08-05 任务K：回退默认与配置中心同步收敛为用户 8 品种。
+DEFAULT_WATCHLIST = ["BTCUSDT", "ETHUSDT", "SNDKUSDT", "SKHYUSDT", "SPCXUSDT",
+                     "XAUUSDT", "CLUSDT", "BZUSDT"]
 
 
 def _watchlist() -> list[str]:

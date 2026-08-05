@@ -22,6 +22,11 @@
   - 判重幂等：reco_plan 靠 uk(symbol,plan_hash) INSERT IGNORE；market_snapshot
     靠 uk(symbol,snap_time) INSERT IGNORE——重放/补写天然无重复。
   - 源侧零写入：本模块只发 GET 请求，不连贾维斯 PG/SQLite。
+  - 币种池收敛（2026-08-05）：market_snapshot 写库成功后追加 symbol 维度
+    delete-absent 清扫（10 分钟节流）——镜像中不属于 watchlist（ctx.symbols）的
+    历史快照行删除，监控总览 marketCards/trendSeries 的币种跟随收敛
+    （与 tasks_a tape_bar/signal_change 同纪律；需 jarvis_sync 账号有 DELETE
+    权限，见 sql/jarvis_mysql_watchlist_cleanup.sql）。
 
 游标口径：reco_plan 无游标语义，本地 cursors.json 存「symbol→plan_hash」
 JSON 映射（跨重启跳过未变化计划的 no-op INSERT）；心跳表 cursor_value 只放
@@ -139,6 +144,46 @@ def _take_pending(table: str) -> list[tuple]:
     return _pending.pop(table, [])
 
 
+# symbol 维度 delete-absent 清扫节流（与 tasks_a 同款纪律；模块自含独立计时）
+_SWEEP_INTERVAL_S = 600.0
+_last_sweep: dict[str, float] = {}
+
+
+def _sweep_absent_symbols(mysql_conn, table: str, symbols: list[str]) -> int:
+    """symbol 维度 delete-absent：清理镜像中不属于当前币种池的行。
+
+    与 tasks_a._sweep_absent_symbols 同语义（jarvis-monitor-redesign §2.2-4 sim
+    纪律推广）：watchlist 收敛后镜像 distinct symbol 跟随收敛。本表行本就按
+    ctx.symbols 生产，残留只来自历史币种池变更。
+    护栏：symbols 为空不动镜像；失败 rollback 后上抛（框架记 error 下轮重试）。
+    Returns: 本轮删除行数（被节流跳过返回 0）。
+    """
+    if not symbols:
+        return 0
+    now = time.monotonic()
+    last = _last_sweep.get(table)
+    if last is not None and now - last < _SWEEP_INTERVAL_S:
+        return 0
+    ph = ",".join(["%s"] * len(symbols))
+    try:
+        with mysql_conn.cursor() as cur:
+            cur.execute(
+                f"DELETE FROM {table} WHERE symbol NOT IN ({ph})", list(symbols))
+            deleted = int(cur.rowcount or 0)
+        mysql_conn.commit()
+    except Exception:
+        try:
+            mysql_conn.rollback()
+        except Exception:  # noqa: BLE001 — 连接已断时 rollback 本身可失败，不掩盖原异常
+            pass
+        raise
+    _last_sweep[table] = now
+    if deleted:
+        log.warning("[%s] delete-absent 清理 %d 行非币种池残留（收敛到 %s）",
+                    table, deleted, ",".join(symbols))
+    return deleted
+
+
 # ══════════════════════════════════════════════════════ reco_plan（api 组 180s）
 
 _RECO_INSERT = (
@@ -228,7 +273,8 @@ def _seed_last_hash(ctx: SyncContext) -> None:
         log.warning("[%s] cursors.json 中判重映射损坏，忽略（uk 幂等兜底）", RECO_TABLE)
 
 
-@register_task(group="api", table=RECO_TABLE)
+# [2026-08-05 下线] 若依「推荐点位」页与 App 端已删除，表无消费者，停止注册（恢复：取消下行注释）
+# @register_task(group="api", table=RECO_TABLE)
 def sync_reco_plan(ctx: SyncContext) -> TaskResult:
     """逐币拉 consensus → hash 判重 → INSERT IGNORE jarvis_reco_plan。
 
@@ -305,8 +351,10 @@ def _build_snap_row(symbol: str, snap_time: str, intel: dict,
                     senti: Optional[dict]) -> tuple:
     """market-intel + sentiment → jarvis_market_snapshot 一行。
 
-    源数据覆盖范围（实测 §1.1④）：funding 仅 4 币、oi/long_short/price_24h
-    仅 BTCUSDT、fng 全市场共享——不匹配的列写 NULL 属正常。
+    源数据覆盖范围：funding 仅 4 币、oi/long_short 仅 BTCUSDT、fng 全市场
+    共享——不匹配的列写 NULL 属正常。price_24h 自 2026-08-05 起带
+    "all" 全量 USDT 映射（逐币价格不再 NULL）；旧 intel（dashboard 未重启）
+    无 "all" 时回退单币匹配口径。
     """
     funding = (intel.get("funding_rate") or {}).get(symbol)
     oi = intel.get("oi") or {}
@@ -315,15 +363,18 @@ def _build_snap_row(symbol: str, snap_time: str, intel: dict,
     fng = intel.get("fng") or {}
     oi_match = oi.get("symbol") == symbol
     ls_match = ls.get("symbol") == symbol
-    p24_match = p24.get("symbol") == symbol
+    p24_row = (p24.get("all") or {}).get(symbol)
+    if p24_row is None and p24.get("symbol") == symbol:
+        p24_row = p24  # 兼容旧单币口径（升级窗口期 dashboard/sync 版本不一致）
+    p24_row = p24_row or {}
 
     senti = senti if isinstance(senti, dict) and senti.get("ok") else {}
     factors = senti.get("factors")
     return (
         symbol,
         snap_time,
-        _num(p24.get("last_price")) if p24_match else None,
-        _num(p24.get("change_pct")) if p24_match else None,
+        _num(p24_row.get("last_price")),
+        _num(p24_row.get("change_pct")),
         _num(funding),
         _num(oi.get("value")) if oi_match else None,
         _num(oi.get("change_pct")) if oi_match else None,
@@ -341,7 +392,11 @@ def _build_snap_row(symbol: str, snap_time: str, intel: dict,
 
 @register_task(group="market_snapshot", table=SNAP_TABLE)
 def sync_market_snapshot(ctx: SyncContext) -> TaskResult:
-    """market-intel 全局一次 + 逐币 sentiment → INSERT IGNORE 时序快照。"""
+    """market-intel 全局一次 + 逐币 sentiment → INSERT IGNORE 时序快照。
+
+    写库成功后追加 symbol 维度 delete-absent（节流）：非 watchlist 币种的历史
+    快照行从镜像清理，总览币种卡片跟随币种池收敛。
+    """
     cfg = ctx.config
     base = cfg["dashboard_base_url"]
     timeout = float(cfg["http_timeout_s"])
@@ -379,6 +434,9 @@ def sync_market_snapshot(ctx: SyncContext) -> TaskResult:
             pass
         _pending[SNAP_TABLE] = pending + rows
         raise
+
+    # 写库成功后清扫非币种池残留（节流；失败上抛重试，本轮行已落库不受影响）
+    _sweep_absent_symbols(conn, SNAP_TABLE, ctx.symbols)
 
     lag = (datetime.now(TZ_GMT8) - now).total_seconds()
     return TaskResult(

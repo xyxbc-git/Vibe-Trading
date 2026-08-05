@@ -487,6 +487,16 @@ export const api = {
       `/alerts/price?symbol=${encodeURIComponent(symbol)}`,
     ),
 
+  // ─── 币种接入（watchlist 管理，后端 agent-9/11 契约 2026-08-05）───
+  /** 接入检测：币种能否被行情源接入（不落库，仅探测） */
+  checkSymbol: (symbol: string) =>
+    api.get<SymbolCheckResult>(
+      `/symbol/check?symbol=${encodeURIComponent(symbol)}`,
+    ),
+  /** 确认加入后端 watchlist（daemon 重启后开始产数） */
+  addWatchlist: (symbol: string) =>
+    api.post<WatchlistAddResult>("/watchlist/add", { symbol }),
+
   // ─── 12 系统信号变更邮件提醒（逐信号开关）───
   signalAlerts: () => api.get<SignalAlertState>("/signal-alerts"),
   updateSignalAlerts: (data: SignalAlertUpdate) =>
@@ -646,6 +656,14 @@ export const api = {
   trapSignals: (symbol: string, interval: string) =>
     request<import("../lib/trapSignals").TrapSignalsResponse>(
       `/trap-signals?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}`,
+      undefined,
+      30_000,
+    ),
+
+  // ─── 量价核对「主力底牌」裁决（威科夫×订单流 P1：五路证据 → 吸筹/派发 + 突破真伪）───
+  sdVerdict: (symbol: string, interval: string) =>
+    request<SdVerdictResponse>(
+      `/sd-verdict?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}`,
       undefined,
       30_000,
     ),
@@ -1322,6 +1340,30 @@ export interface OrderNotifyInput {
   email: string;
   notify_take_profit: boolean;
   notify_stop_loss: boolean;
+}
+
+/** GET /symbol/check 返回：币种接入检测结果 */
+export interface SymbolCheckResult {
+  /** true=可接入 */
+  ok: boolean;
+  /** 可接入时的行情源市场（如 binance-futures / okx-spot） */
+  market?: string;
+  /** 不可接入原因（ok=false 时展示） */
+  reason?: string;
+  /** 辅助提示（如拼写建议），可选 */
+  hint?: string;
+  /** 可接入时的当前价 */
+  price?: number | null;
+}
+
+/** POST /watchlist/add 返回：加入 watchlist 结果 */
+export interface WatchlistAddResult {
+  ok: boolean;
+  /** true=本次新加入；false 可能是已存在 */
+  added?: boolean;
+  /** true=需要 daemon 重启后才开始产数 */
+  need_daemon_restart?: boolean;
+  reason?: string;
 }
 
 export interface AlertCheckResult {
@@ -2368,6 +2410,44 @@ export interface ReversalCondition {
   note: string;
   /** 上游数据源未就绪（不计入 met，UI 显示 ⚪ 态） */
   unavailable?: boolean;
+}
+
+// ─── 量价核对「主力底牌」裁决（/api/sd-verdict，威科夫×订单流 P1）───
+
+export type SdBias = "accumulation" | "distribution" | "neutral";
+
+/** 单路证据：direction +1 需求方/-1 供给方/0 中性；weight=0 表示该路缺失 */
+export interface SdEvidence {
+  source: "trap" | "cvd" | "whale" | "book" | "vp";
+  signal: string | null;
+  direction: -1 | 0 | 1;
+  weight: number;
+  detail: string;
+}
+
+export interface SdBreakoutCheck {
+  active: boolean;
+  direction: "up" | "down" | null;
+  verdict: "confirmed" | "suspect" | "unknown";
+  reasons: string[];
+}
+
+export interface SdVerdictResponse {
+  ok: boolean;
+  error?: string;
+  symbol: string;
+  interval: string;
+  ts?: number;
+  bias?: SdBias;
+  /** -1（强派发）～ +1（强吸筹） */
+  score?: number;
+  confidence?: number;
+  /** 0~1：六路证据可用比例（bars/trap/cvd/whale/book/vp） */
+  coverage?: number;
+  breakout_check?: SdBreakoutCheck;
+  evidence_chain?: SdEvidence[];
+  stale?: boolean;
+  disclaimer?: string;
 }
 
 export interface ReversalScoreResponse {

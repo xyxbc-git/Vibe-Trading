@@ -86,7 +86,7 @@ if [ -n "$DAEMON_CMD" ]; then
   echo "   daemon 已拉起 → 日志 $VT_DIR/jarvis_daemon_run.log"
 else
   echo "   （原先没在跑 daemon，跳过。手动启动示例："
-  echo "     $PY jarvis_daemon.py --symbols BTCUSDT,ETHUSDT,SOLUSDT --interval-hours 24.0 --intraday ）"
+  echo "     $PY jarvis_daemon.py --symbols BTCUSDT,ETHUSDT --interval-hours 24.0 --intraday ）"
 fi
 if [ -n "$DASH_CMD" ]; then
   nohup bash -c "$DASH_CMD" >> "$VT_DIR/jarvis_dashboard_run.log" 2>&1 &

@@ -461,7 +461,6 @@ def install_launchd(symbols: list[str], interval_hours: float, paper_trade: bool
   <array>
     <string>{py}</string>
     <string>{script}</string>
-    <string>--symbols</string><string>{','.join(symbols)}</string>
     <string>--interval-hours</string><string>{interval_hours}</string>{pt_arg}
   </array>
   <key>WorkingDirectory</key><string>{os.path.dirname(script)}</string>
@@ -482,7 +481,7 @@ def install_launchd(symbols: list[str], interval_hours: float, paper_trade: bool
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="贾维斯 7×24 定时引擎")
-    ap.add_argument("--symbols", default="BTCUSDT", help="逗号分隔，如 BTCUSDT,ETHUSDT")
+    ap.add_argument("--symbols", default="", help="逗号分隔，如 BTCUSDT,ETHUSDT；缺省则读配置中心 watchlist")
     # [Sprint0] 默认周期从配置中心读（daemon_interval_hours，默认 24 零回归）；CLI 显式传参仍最高优先。
     try:
         import jarvis_config as _jcfg
@@ -516,7 +515,17 @@ def main() -> int:
     ap.add_argument("--install-launchd", action="store_true", help="生成 macOS launchd plist")
     args = ap.parse_args()
 
-    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    if args.symbols.strip():
+        symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    else:
+        # 缺省跟随配置中心 watchlist：加减币种只改 watchlist，daemon 重启即自动跟随，
+        # 无需每次手改 --symbols + 重装 launchd（消除繁琐运维）。
+        try:
+            import jarvis_config as _jc
+            symbols = [str(s).strip().upper()
+                       for s in (_jc.get("watchlist") or []) if str(s).strip()]
+        except Exception:  # noqa: BLE001 — 配置不可用兜底默认
+            symbols = []
     if not symbols:
         symbols = ["BTCUSDT"]
 

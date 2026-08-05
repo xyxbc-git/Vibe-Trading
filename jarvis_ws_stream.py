@@ -68,7 +68,12 @@ LOG_PATH = os.path.join(CONFIG_DIR, "jarvis_ws_stream.log")
 MAX_CONN_AGE_S = 23 * 3600.0
 
 # 首帧确认窗口：连接后该秒数内收不到任何数据帧 = 当前端点策略无效
-FIRST_FRAME_TIMEOUT_S = 15.0
+# [任务H 方案4] 15→8s：坏端点更快出局（合约域经代理"握手成功但丢数据帧"场景，
+# 8s 无帧已足够判死，整轮探测时间近乎减半）
+FIRST_FRAME_TIMEOUT_S = 8.0
+
+# 连接建立超时：[任务H 方案4] 12→6s——直连被墙/代理僵死场景更快轮换下一策略
+SOCK_CONNECT_TIMEOUT_S = 6.0
 
 # 端点策略表：(名称, base_url, 是否用代理, 是否合约域)
 _ENDPOINT_PLANS: tuple[tuple[str, str, bool, bool], ...] = (
@@ -337,7 +342,44 @@ def next_backoff(attempt: int, base_s: float, max_s: float) -> float:
 # ────────────────────────── WS 主循环 ──────────────────────────
 
 # 记住上次成功的端点策略索引（重连时优先复用，减少探测时间）
+# [任务H 方案4] 持久化到磁盘：进程重启后直接从历史可用策略起步，省掉整轮探测
 _LAST_GOOD_PLAN: dict = {"idx": None}
+LAST_GOOD_PLAN_PATH = os.path.join(CONFIG_DIR, "ws_last_good_plan.json")
+
+
+def _save_last_good_plan(idx: int) -> None:
+    """成功策略落盘（按名称存，策略表增删重排也不错位）。失败静默不影响主链路。"""
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(LAST_GOOD_PLAN_PATH, "w", encoding="utf-8") as f:
+            json.dump({"name": _ENDPOINT_PLANS[idx][0], "ts": time.time()}, f)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _load_last_good_plan() -> Optional[int]:
+    """读回持久化的成功策略索引；文件缺失/损坏/名称已不存在返回 None。"""
+    try:
+        with open(LAST_GOOD_PLAN_PATH, encoding="utf-8") as f:
+            name = str(json.load(f).get("name") or "")
+        for i, plan in enumerate(_ENDPOINT_PLANS):
+            if plan[0] == name:
+                return i
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _apply_fail_jump(fail_streak: int, plan_idx: int) -> int:
+    """[任务H 方案4] 连续失败 2 次时直接跳回历史可用策略，不再按表慢慢轮。
+
+    无历史记录 / 已在该策略上时原样返回；仅在 streak==2 触发一次，
+    历史策略也失败则继续正常轮换（避免死磕）。
+    """
+    good = _LAST_GOOD_PLAN["idx"]
+    if fail_streak == 2 and good is not None and good != plan_idx:
+        return good
+    return plan_idx
 
 
 async def _connect_once(symbols: list[str], cfg: dict, plan_idx: int) -> str:
@@ -360,7 +402,7 @@ async def _connect_once(symbols: list[str], cfg: dict, plan_idx: int) -> str:
              if use_proxy else None)
     _META["url_streams"] = len(streams)
 
-    timeout = aiohttp.ClientTimeout(total=None, sock_connect=12)
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=SOCK_CONNECT_TIMEOUT_S)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.ws_connect(url, proxy=proxy, heartbeat=None,
                                       autoping=True, max_msg_size=4 * 2 ** 20) as ws:
@@ -392,6 +434,7 @@ async def _connect_once(symbols: list[str], cfg: dict, plan_idx: int) -> str:
                         got_first = True
                         _META["last_error"] = None
                         _LAST_GOOD_PLAN["idx"] = plan_idx
+                        _save_last_good_plan(plan_idx)
                         _log(f"[{name}] 首帧确认，数据流正常")
                     dispatch(msg.data)
                 elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING,
@@ -403,23 +446,33 @@ async def _connect_once(symbols: list[str], cfg: dict, plan_idx: int) -> str:
 
 async def _run_ws(symbols: list[str]) -> None:
     attempt = 0
+    fail_streak = 0  # 连续未确认首帧的连接次数（正常收过数即归零）
     plan_idx = _LAST_GOOD_PLAN["idx"] if _LAST_GOOD_PLAN["idx"] is not None else 0
     while not _STOP.is_set():
         cfg = _cfg()
         try:
             outcome = await _connect_once(symbols, cfg, plan_idx)
             if outcome == "no-first-frame":
+                fail_streak += 1
                 plan_idx = (plan_idx + 1) % len(_ENDPOINT_PLANS)
                 _log(f"切换端点策略 → {_ENDPOINT_PLANS[plan_idx][0]}")
             elif outcome == "closed":
                 attempt = 0  # 曾正常收数：退避归零，同策略快速重连
+                fail_streak = 0
         except Exception as exc:  # noqa: BLE001
             _META["last_error"] = repr(exc)[:200]
             _log(f"[{_ENDPOINT_PLANS[plan_idx][0]}] 连接异常: {exc!r}")
             # 连接层异常（超时/拒绝/代理挂了）也轮换策略，避免死磕坏端点
+            fail_streak += 1
             plan_idx = (plan_idx + 1) % len(_ENDPOINT_PLANS)
         finally:
             _META["connected"] = False
+        # [任务H 方案4] 连续 2 次失败：直接跳回历史可用策略
+        jump = _apply_fail_jump(fail_streak, plan_idx)
+        if jump != plan_idx:
+            plan_idx = jump
+            _log(f"连续 {fail_streak} 次失败，跳转历史可用策略 → "
+                 f"{_ENDPOINT_PLANS[plan_idx][0]}")
         if _STOP.is_set():
             break
         wait = next_backoff(attempt, float(cfg.get("ws_reconnect_base_s") or 1.0),
@@ -459,6 +512,12 @@ def start(symbols: list[str] | None = None) -> bool:
     cfg = _cfg()
     if symbols is None:
         symbols = [str(s).upper() for s in (cfg.get("watchlist") or ["BTCUSDT"])]
+    # [任务H 方案4] 冷启动读回历史可用策略（进程内已有记忆时不覆盖）
+    if _LAST_GOOD_PLAN["idx"] is None:
+        disk_idx = _load_last_good_plan()
+        if disk_idx is not None:
+            _LAST_GOOD_PLAN["idx"] = disk_idx
+            _log(f"读回历史可用端点策略：{_ENDPOINT_PLANS[disk_idx][0]}")
     _STOP.clear()
     _META.update({"running": True, "started_at": time.time(), "symbols": symbols})
     _THREAD = threading.Thread(target=_thread_main, args=(symbols,),

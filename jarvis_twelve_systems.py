@@ -1374,7 +1374,7 @@ def consensus_multi_tf(tf_consensus: dict[str, dict]) -> dict:
 
 def fetch_klines_df(symbol: str, interval: str = "4h", limit: int = 300,
                     *, drop_unclosed: bool = False) -> pd.DataFrame | None:
-    """从 Binance 现货拉 K 线转 DataFrame（与 dashboard /api/kline 同源同参）。
+    """从 Binance USDⓈ-M 永续合约拉 K 线转 DataFrame（与 dashboard /api/kline 同源同参）。
 
     本模块唯一联网函数；失败返回 None，绝不抛出。
 
@@ -1391,7 +1391,7 @@ def fetch_klines_df(symbol: str, interval: str = "4h", limit: int = 300,
         if not sym.endswith(("USDT", "USDC")):
             sym += "USDT"
         lim = max(50, min(int(limit), 500))
-        raw = jcd._get(jcd.SPOT_API + "/api/v3/klines",
+        raw = jcd._get(jcd.FAPI + "/fapi/v1/klines",
                        {"symbol": sym, "interval": interval, "limit": lim})
         if not isinstance(raw, list) or not raw:
             return None

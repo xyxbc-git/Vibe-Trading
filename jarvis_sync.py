@@ -195,7 +195,9 @@ def resolve_symbols(cfg: dict) -> list[str]:
             return [str(s).upper() for s in wl]
     except Exception as e:  # noqa: BLE001 — 跟随失败走内置默认，不阻断同步
         log.warning("读取 jarvis_config watchlist 失败（%s），使用内置默认", e)
-    return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT"]
+    # 兜底默认与 jarvis_config.DEFAULTS.watchlist 同步收敛（2026-08-05 用户关注 8 品种）
+    return ["BTCUSDT", "ETHUSDT", "SNDKUSDT", "SKHYUSDT", "SPCXUSDT",
+            "XAUUSDT", "CLUSDT", "BZUSDT"]
 
 
 # ══════════════════════════════════════════════════════ 日志
@@ -565,6 +567,10 @@ class Scheduler:
 
     def run_group(self, group: str) -> None:
         tasks = TASK_REGISTRY.get(group, [])
+        # [2026-08-05 币种统一] 每轮重解析 symbols：symbols=null（跟随模式）时
+        # watchlist 增删币种无需重启守护进程即生效（jarvis_config.load 有 mtime
+        # 缓存，未改文件时零磁盘 IO）；显式配置 symbols 的部署行为不变。
+        self.ctx.symbols = resolve_symbols(self.cfg)
         conn = self.ctx.mysql.get()
         if not tasks:
             # T2 阶段无任务：写框架心跳证明调度器存活

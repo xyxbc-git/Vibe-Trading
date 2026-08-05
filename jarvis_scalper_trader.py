@@ -158,21 +158,21 @@ _OKX_BAR_MAP = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1H", "4h": "4H", "1
 
 
 def _fetch_latest_klines(symbol: str, timeframe: str = "15m", limit: int = 200) -> list[dict] | None:
-    """获取最新 K 线（T-06 双源降级：Binance 现货 → OKX 永续）。
+    """获取最新 K 线（T-06 双源降级：Binance 永续 → OKX 永续，两腿同为合约口径）。
 
-    原直连 fapi.binance.com 期货接口在部分网络下被 418 拒绝；改走项目统一的
-    现货源封装（自带缓存回退），失败再切 OKX candles，口径与其余引擎一致。
+    走项目统一封装 jts.fetch_klines_df（2026-08-05 起 USDⓈ-M 合约源，jcd._get
+    自带限流退避 + 缓存回退），失败再切 OKX 永续 candles，口径与其余引擎一致。
     """
     interval = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}.get(timeframe, "15m")
 
-    # 主源：Binance 现货（jarvis_twelve_systems 封装，jcd._get 自带缓存降级）
+    # 主源：Binance USDⓈ-M 永续（jarvis_twelve_systems 封装，jcd._get 自带缓存降级）
     try:
         import jarvis_twelve_systems as jts
         df = jts.fetch_klines_df(symbol, interval, limit)
         if df is not None and len(df) > 0:
             return df.to_dict("records")
     except Exception as e:  # noqa: BLE001
-        _log(f"K 线主源(Binance 现货)异常: {e}")
+        _log(f"K 线主源(Binance 永续)异常: {e}")
 
     # 备用源：OKX 永续 candles（最新在前，需反转；字段 [ts,o,h,l,c,vol,...]）
     try:

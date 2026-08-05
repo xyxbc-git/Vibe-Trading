@@ -4,11 +4,13 @@ import { api, formatPrice } from "@/api/client";
 import { useSymbol } from "@/hooks/useSymbol";
 import { useLivePrice } from "@/hooks/usePrice";
 import SymbolPicker from "./SymbolPicker";
+import AddSymbolDialog from "./AddSymbolDialog";
 import RegimeBadge from "./RegimeBadge";
 import RefreshCountdown from "./RefreshCountdown";
 import {
   Activity,
   Clock,
+  Plus,
   TrendingDown,
   TrendingUp,
   Wifi,
@@ -31,6 +33,7 @@ export default function Header() {
   const connected = !error;
 
   const [quote, setQuote] = useState<HeaderQuote | null>(null);
+  const [addOpen, setAddOpen] = useState(false);
 
   useEffect(() => {
     if (livePrice == null) return;
@@ -102,6 +105,15 @@ export default function Header() {
 
         <SymbolPicker />
 
+        <button
+          onClick={() => setAddOpen(true)}
+          className="flex items-center gap-1 px-2 py-1 text-xs rounded-md border border-jarvis-border text-jarvis-text-secondary hover:text-jarvis-blue hover:border-jarvis-blue transition-colors"
+          title="添加币种到后端 watchlist（接入检测后确认加入）"
+        >
+          <Plus size={12} />
+          添加币种
+        </button>
+
         {wallet && (
           <span className="text-sm font-mono text-jarvis-text-secondary">
             余额:{" "}
@@ -129,6 +141,8 @@ export default function Header() {
           )}
         </div>
       </div>
+
+      <AddSymbolDialog open={addOpen} onClose={() => setAddOpen(false)} />
     </header>
   );
 }

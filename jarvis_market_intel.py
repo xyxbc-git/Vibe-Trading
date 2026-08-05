@@ -31,8 +31,10 @@ FNG_API = "https://api.alternative.me/fng/"
 TIMEOUT = 5
 _HEADERS = {"User-Agent": "jarvis-market-intel/1.0"}
 
-# 资金费率展示币种；OI / 多空比与页面主语境一致用 BTC
-SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT")
+# 资金费率展示币种（2026-08-05 任务K：对齐用户 watchlist 8 品种，premiumIndex
+# 全量拉取天然覆盖）；OI / 多空比与页面主语境一致用 BTC
+SYMBOLS = ("BTCUSDT", "ETHUSDT", "SNDKUSDT", "SKHYUSDT", "SPCXUSDT",
+           "XAUUSDT", "CLUSDT", "BZUSDT")
 OI_SYMBOL = "BTCUSDT"
 LS_SYMBOL = "BTCUSDT"
 
@@ -52,21 +54,34 @@ def _get_json(url: str, params: dict | None = None):
     return r.json()
 
 
+def _display_symbols() -> tuple:
+    """资金费率展示币种：跟随配置中心 watchlist（新增品种免改代码），失败回退 SYMBOLS。"""
+    try:
+        import jarvis_config as jc
+        wl = [str(s).upper() for s in (jc.get("watchlist") or []) if str(s).strip()]
+        if wl:
+            return tuple(wl)
+    except Exception:  # noqa: BLE001 — 配置层异常回退内置默认，不拖垮行情面板
+        pass
+    return SYMBOLS
+
+
 def _fetch_funding() -> dict:
+    symbols = _display_symbols()
     rows = _get_json(f"{FAPI}/fapi/v1/premiumIndex")
     out: dict[str, float] = {}
     if isinstance(rows, list):
-        want = set(SYMBOLS)
+        want = set(symbols)
         for row in rows:
             sym = row.get("symbol")
             if sym in want:
                 out[sym] = round(float(row.get("lastFundingRate") or 0), 8)
-    if len(out) < len(SYMBOLS):
-        missing = set(SYMBOLS) - set(out)
+    if len(out) < len(symbols):
+        missing = set(symbols) - set(out)
         if not out:
             raise ValueError(f"premiumIndex 未返回目标币种 {missing}")
-    # 按 SYMBOLS 顺序输出，前端展示稳定
-    return {"rates": {s: out[s] for s in SYMBOLS if s in out}}
+    # 按 watchlist 顺序输出，前端展示稳定
+    return {"rates": {s: out[s] for s in symbols if s in out}}
 
 
 def _fetch_oi() -> dict:
@@ -123,13 +138,33 @@ def _fetch_fng() -> dict:
 
 
 def _fetch_price_24h() -> dict:
-    """24h 价格涨跌幅（合约 ticker）。情绪因子里与 OI 变化交叉判断趋势健康度。"""
-    row = _get_json(f"{FAPI}/fapi/v1/ticker/24hr", {"symbol": OI_SYMBOL})
-    if not isinstance(row, dict) or "priceChangePercent" not in row:
+    """24h 价格涨跌幅（合约 ticker，无 symbol 参数全量拉取，同 _fetch_funding 模式）。
+
+    2026-08-05 修复：原先只拉 OI_SYMBOL 单币，下游 RuoYi jarvis_market_snapshot
+    其它币种 price 恒 NULL。顶层字段保留 OI_SYMBOL 口径（jarvis_sentiment /
+    既有消费方兼容），新增 "all" = {symbol: {last_price, change_pct}} 全量
+    USDT 永续映射供逐币消费（TTL 120s 不变，全量接口权重由缓存摊薄）。
+    """
+    rows = _get_json(f"{FAPI}/fapi/v1/ticker/24hr")
+    if not isinstance(rows, list) or not rows:
         raise ValueError("ticker/24hr 异常返回")
-    return {"symbol": OI_SYMBOL,
-            "last_price": round(float(row.get("lastPrice") or 0), 6),
-            "change_pct": round(float(row["priceChangePercent"]), 2)}
+    all_map: dict[str, dict] = {}
+    for row in rows:
+        sym = str(row.get("symbol") or "")
+        if not sym.endswith("USDT"):
+            continue
+        try:
+            all_map[sym] = {
+                "last_price": round(float(row.get("lastPrice") or 0), 6),
+                "change_pct": round(float(row.get("priceChangePercent") or 0), 2),
+            }
+        except (TypeError, ValueError):
+            continue  # 单币字段异常跳过，不拖垮全量
+    top = all_map.get(OI_SYMBOL)
+    if not top:
+        raise ValueError(f"ticker/24hr 未含 {OI_SYMBOL}")
+    return {"symbol": OI_SYMBOL, "last_price": top["last_price"],
+            "change_pct": top["change_pct"], "all": all_map}
 
 
 _FETCHERS = {"funding": _fetch_funding, "oi": _fetch_oi,

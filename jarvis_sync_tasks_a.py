@@ -20,6 +20,12 @@
   - 游标从不后退：每批 executemany + commit 成功后才推进并落盘。
   - 源表暂缺（twelve_* 懒建）容忍：记 warn 返回 0 行，不算失败。
   - 时区口径：MySQL 侧所有 DATETIME 列统一存东八区（GMT+8）挂钟时间。
+  - 币种池收敛（2026-08-05）：tape_bar / signal_change 每轮 upsert 后追加 symbol
+    维度 delete-absent 清扫（10 分钟节流）——镜像中不属于 watchlist（ctx.symbols）
+    的行删除，使若依下拉/筛选直读的 distinct symbol 跟随币种池收敛
+    （jarvis-monitor-redesign §2.2-4 sim 纪律推广；本地源保留的退役币历史不受影响，
+    只清 MySQL 镜像。需 jarvis_sync 账号有 DELETE 权限，
+    见 sql/jarvis_mysql_watchlist_cleanup.sql）。
 
 时间单位备忘（源码核对，文件:行号见开发计划 §1.1）：
   twelve_signal_state.updated_ts / changes.ts / snapshots.created_ts /
@@ -143,6 +149,50 @@ def _catchup(pull_once) -> tuple[int, Optional[float]]:
         time.sleep(0.05)
 
 
+# symbol 维度 delete-absent 清扫节流：每表 ≥ 该间隔才真正执行（进程启动后首轮立即）。
+# 正常态删 0 行，只是一次 symbol 前缀索引探测；节流避免 fast 组 5s 周期反复扫描。
+_SWEEP_INTERVAL_S = 600.0
+_last_sweep: dict[str, float] = {}
+
+
+def _sweep_absent_symbols(mysql_conn, table: str, symbols: list[str]) -> int:
+    """symbol 维度 delete-absent：清理镜像中不属于当前币种池的行。
+
+    目标（jarvis-monitor-redesign §2.1 R2 / §2.2-4 sim delete-absent 纪律推广到
+    symbol 维度）：watchlist 收敛后，镜像 distinct symbol 跟随收敛——若依「盘口
+    分钟聚合」下拉、变更流水筛选均直读镜像 distinct symbol。本地源侧刻意保留的
+    退役币历史数据不受影响（本清扫只动 MySQL 镜像行）。
+
+    护栏：symbols 为空不动镜像（resolve_symbols 恒非空，纯防御，防误清全表）；
+    失败 rollback 后上抛（框架记 error 下轮重试，upsert 主链路游标已各自落盘）。
+    Returns: 本轮删除行数（被节流跳过返回 0）。
+    """
+    if not symbols:
+        return 0
+    now = time.monotonic()
+    last = _last_sweep.get(table)
+    if last is not None and now - last < _SWEEP_INTERVAL_S:
+        return 0
+    ph = ",".join(["%s"] * len(symbols))
+    try:
+        with mysql_conn.cursor() as cur:
+            cur.execute(
+                f"DELETE FROM {table} WHERE symbol NOT IN ({ph})", list(symbols))
+            deleted = int(cur.rowcount or 0)
+        mysql_conn.commit()
+    except Exception:
+        try:
+            mysql_conn.rollback()
+        except Exception:  # noqa: BLE001 — 连接已断时 rollback 本身可失败，不掩盖原异常
+            pass
+        raise
+    _last_sweep[table] = now
+    if deleted:
+        log.warning("[%s] delete-absent 清理 %d 行非币种池残留（收敛到 %s）",
+                    table, deleted, ",".join(symbols))
+    return deleted
+
+
 # ══════════════════════════════════════════════════════ fast 组
 
 
@@ -165,7 +215,8 @@ _SQL_STATE_DST = (
 )
 
 
-@register_task(group="fast", table="jarvis_signal_state")
+# [2026-08-05 下线] 若依「信号当前态」页与 App 端已删除，表无消费者，停止注册（恢复：取消下行注释）
+# @register_task(group="fast", table="jarvis_signal_state")
 def sync_signal_state(ctx: SyncContext) -> TaskResult:
     """信号当前态：updated_ts 游标 + 5s 重叠窗，全值列覆盖 upsert。"""
     table = "jarvis_signal_state"
@@ -223,7 +274,11 @@ _SQL_CHANGE_DST = (
 
 @register_task(group="fast", table="jarvis_signal_change")
 def sync_signal_change(ctx: SyncContext) -> TaskResult:
-    """信号变更流水：id 单调游标，追加型 no-op upsert（天然幂等）。"""
+    """信号变更流水：id 单调游标，追加型 no-op upsert（天然幂等）。
+
+    轮末追加 symbol 维度 delete-absent（节流）：非 watchlist 币种的历史流水行
+    从镜像清理，筛选下拉 distinct symbol 跟随币种池收敛。
+    """
     table = "jarvis_signal_change"
     mysql_conn = _mysql_or_skip(ctx, table)
     if mysql_conn is None:
@@ -258,6 +313,8 @@ def sync_signal_change(ctx: SyncContext) -> TaskResult:
         return len(rows), float(rows[-1]["ts"] or 0.0), len(rows) >= batch
 
     total, max_ts = _catchup(pull_once)
+    # signal_change 是历史变更流水，语义为「出现过的币种」，保留退役币历史行不做 symbol 清扫
+    # （与流水页筛选语义一致，对系统更友好）；tape_bar 等实时镜像仍在各自 sync 内清扫收敛。
     return TaskResult(rows=total, cursor_value=str(state["cursor"]),
                       lag_seconds=max(0.0, time.time() - max_ts) if max_ts else None)
 
@@ -265,10 +322,15 @@ def sync_signal_change(ctx: SyncContext) -> TaskResult:
 # ══════════════════════════════════════════════════════ mid 组
 
 
-_SQL_TAPE_SRC = (
+# [2026-08-05 币种统一] 源表保留已移除币种的历史行（jarvis_config 注释：仅退出
+# 活跃订阅），不过滤会把旧主流币整批镜像给若依。symbol IN 按 ctx.symbols
+# （= jarvis_config.watchlist，见 jarvis_sync.resolve_symbols）每轮动态生成，
+# watchlist 增删币种同步链路自动跟随。
+_SQL_TAPE_SRC_TMPL = (
     "SELECT symbol, minute, buy_usd, sell_usd, nr_buy_usd, nr_sell_usd, "
     "open_price, close_price, high_price, low_price, trades_n "
-    "FROM tape_minute_bars WHERE minute > ? ORDER BY minute LIMIT ?"
+    "FROM tape_minute_bars WHERE minute > ? AND symbol IN ({ph}) "
+    "ORDER BY minute LIMIT ?"
 )
 
 _SQL_TAPE_DST = (
@@ -286,7 +348,11 @@ _SQL_TAPE_DST = (
 
 @register_task(group="mid", table="jarvis_tape_bar")
 def sync_tape_bar(ctx: SyncContext) -> TaskResult:
-    """盘口分钟聚合：minute 游标 + 2 分钟重叠（源 30s flush 可能补写迟到分钟）。"""
+    """盘口分钟聚合：minute 游标 + 2 分钟重叠（源 30s flush 可能补写迟到分钟）。
+
+    轮末追加 symbol 维度 delete-absent（节流）：非 watchlist 币种的镜像行清理，
+    若依「盘口分钟聚合」下拉（distinct symbol）跟随币种池收敛。
+    """
     table = "jarvis_tape_bar"
     mysql_conn = _mysql_or_skip(ctx, table)
     if mysql_conn is None:
@@ -301,12 +367,14 @@ def sync_tape_bar(ctx: SyncContext) -> TaskResult:
                     table, batch, overlap_rows)
         batch = overlap_rows + 1
     state = {"cursor": int(ctx.cursors.get(table) or 0)}
+    symbols = [str(s).upper() for s in ctx.symbols] or ["BTCUSDT"]
+    sql_src = _SQL_TAPE_SRC_TMPL.format(ph=",".join(["?"] * len(symbols)))
 
     def pull_once() -> tuple[int, Optional[float], bool]:
         try:
             with _src_conn() as src:
                 rows = src.execute(
-                    _SQL_TAPE_SRC, (max(0, state["cursor"] - 2), batch)
+                    sql_src, (max(0, state["cursor"] - 2), *symbols, batch)
                 ).fetchall()
         except Exception as e:  # noqa: BLE001
             if _is_missing_table(e):
@@ -332,6 +400,8 @@ def sync_tape_bar(ctx: SyncContext) -> TaskResult:
         return len(rows), float(new_cur * 60), len(rows) >= batch
 
     total, max_ts = _catchup(pull_once)
+    if table not in _missing_warned:  # 源表可达才清扫（懒建期不动镜像）
+        _sweep_absent_symbols(mysql_conn, table, ctx.symbols)
     return TaskResult(rows=total, cursor_value=str(state["cursor"]),
                       lag_seconds=max(0.0, time.time() - max_ts) if max_ts else None)
 
@@ -356,7 +426,8 @@ _SQL_PRED_DST = (
 )
 
 
-@register_task(group="mid", table="jarvis_intraday_prediction")
+# [2026-08-05 下线] 若依「4小时预测」页与 App 端已删除，表无消费者，停止注册（本地生产 daemon --intraday 不受影响）
+# @register_task(group="mid", table="jarvis_intraday_prediction")
 def sync_intraday_prediction(ctx: SyncContext) -> TaskResult:
     """4h 预测：bar_ts（epoch 毫秒）游标 + 重推未回填行（outcome_ret IS NULL）。
 
@@ -428,7 +499,8 @@ _SQL_SNAP_DST = (
 _SNAP_REFRESH_WINDOW_S = 7 * 86400  # 同日 DO UPDATE 无独立更新时间列，短窗重刷兜底
 
 
-@register_task(group="mid", table="jarvis_snapshot")
+# [2026-08-05 下线] 若依端零消费者（无 mapper 引用），停止注册
+# @register_task(group="mid", table="jarvis_snapshot")
 def sync_snapshot(ctx: SyncContext) -> TaskResult:
     """每日决策快照：created_ts 游标 + 近 7 天窗口重刷。"""
     table = "jarvis_snapshot"
@@ -487,7 +559,8 @@ _SQL_OUT_DST = (
 )
 
 
-@register_task(group="mid", table="jarvis_outcome")
+# [2026-08-05 下线] 若依端零消费者（无 mapper 引用），停止注册
+# @register_task(group="mid", table="jarvis_outcome")
 def sync_outcome(ctx: SyncContext) -> TaskResult:
     """前向收益：evaluated_ts 游标 + 60s 重叠（重评刷新 evaluated_ts 天然覆盖更新）。"""
     table = "jarvis_outcome"
@@ -553,7 +626,8 @@ _SQL_POS_DST = (
 )
 
 
-@register_task(group="mid", table="jarvis_position")
+# [2026-08-05 下线] 若依端零消费者（无 mapper 引用），停止注册
+# @register_task(group="mid", table="jarvis_position")
 def sync_position(ctx: SyncContext) -> TaskResult:
     """模拟仓：双游标（opened_ts/closed_ts，各 60s 重叠）+ 全量重推 open 态。"""
     table = "jarvis_position"
@@ -628,7 +702,8 @@ _SQL_LMT_DST = (
 )
 
 
-@register_task(group="mid", table="jarvis_limit_order")
+# [2026-08-05 下线] 若依端零消费者（无 mapper 引用），停止注册
+# @register_task(group="mid", table="jarvis_limit_order")
 def sync_limit_order(ctx: SyncContext) -> TaskResult:
     """限价挂单：created_ts 游标（60s 重叠）+ 全量重推 pending 态。
 
@@ -697,7 +772,8 @@ _SQL_FORCE_DST = (
 )
 
 
-@register_task(group="mid", table="jarvis_force_order_min")
+# [2026-08-05 下线] 若依端零消费者（无 mapper 引用），停止注册
+# @register_task(group="mid", table="jarvis_force_order_min")
 def sync_force_order_min(ctx: SyncContext) -> TaskResult:
     """强平分钟聚合：id 游标找出受影响分钟桶 → 逐桶**全量重算**覆盖（方案 §2.2 G7）。
 

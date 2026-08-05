@@ -201,8 +201,46 @@ async def _access_timing(request: "Request", call_next):
     return resp
 
 
-# 简单内存缓存：{key: (ts, value)}，TTL 控制刷新频率
+# 简单内存缓存：{key: (ts, value)}，TTL 控制刷新频率。
+# [任务H 方案2] 单飞 + 旧值兜底（stale-while-revalidate）：
+#   - 过期但有旧值 → 旧值立即返回，后台线程单飞刷新（同 key 只起一个）；
+#     上游劣化时用户端恒为缓存速度，不再出现 TTL 过期瞬间的惊群同步回源。
+#   - 全新 key（无旧值）→ per-key 锁单飞：一个请求算，其余并发等锁后直接复用，
+#     避免 N 个线程同时打上游。
+# 值结构保持 (ts, value) 不变——外部直接 _CACHE.pop / _CACHE[key]=... 的旁路照旧兼容。
 _CACHE: dict[str, tuple[float, object]] = {}
+_CACHE_META_LOCK = _threading.Lock()          # 保护 key 锁表与刷新标记
+_CACHE_KEY_LOCKS: dict[str, _threading.Lock] = {}
+_CACHE_REFRESHING: set[str] = set()
+
+
+def _cache_key_lock(key: str) -> "_threading.Lock":
+    with _CACHE_META_LOCK:
+        lk = _CACHE_KEY_LOCKS.get(key)
+        if lk is None:
+            lk = _threading.Lock()
+            _CACHE_KEY_LOCKS[key] = lk
+        return lk
+
+
+def _cache_spawn_refresh(key: str, fn) -> None:
+    """后台刷新（同 key 单飞）：成功覆盖缓存，失败保留旧值下轮再试。"""
+    with _CACHE_META_LOCK:
+        if key in _CACHE_REFRESHING:
+            return
+        _CACHE_REFRESHING.add(key)
+
+    def _run():
+        try:
+            val = fn()
+            _CACHE[key] = (time.time(), val)
+        except Exception as exc:  # noqa: BLE001 — 刷新失败留旧值，绝不抛出
+            _log_emit(f"缓存后台刷新失败 key={key}: {exc!r}", "warn", "cache")
+        finally:
+            with _CACHE_META_LOCK:
+                _CACHE_REFRESHING.discard(key)
+
+    _threading.Thread(target=_run, daemon=True, name=f"cache-swr:{key[:32]}").start()
 
 
 def _cached(key: str, ttl: int, fn):
@@ -210,9 +248,19 @@ def _cached(key: str, ttl: int, fn):
     hit = _CACHE.get(key)
     if hit and now - hit[0] < ttl:
         return hit[1]
-    val = fn()
-    _CACHE[key] = (now, val)
-    return val
+    if hit:
+        # 过期但有旧值：旧值立即返回（值内 as_of/ts 字段即真实数据龄），后台刷新
+        _cache_spawn_refresh(key, fn)
+        return hit[1]
+    # 全新 key：单飞同步计算；并发方等锁后复用刚算好的结果
+    lk = _cache_key_lock(key)
+    with lk:
+        hit = _CACHE.get(key)
+        if hit:
+            return hit[1]
+        val = fn()
+        _CACHE[key] = (time.time(), val)
+        return val
 
 
 # ============ 后端日志接口（前端「终端」页面消费）============
@@ -682,6 +730,171 @@ def api_config_center_put(data: dict):
                          "version": cfg.get("meta", {}).get("version")})
 
 
+# ============ watchlist 币种池增删（写 jarvis_config，mtime 热加载生效）============
+# 生效边界（实读源码口径）：
+#   - 热跟随：dashboard / jarvis_twelve_trader 等每轮 jarvis_config.load()，改完即生效；
+#   - 须重启：jarvis_daemon 以启动期 --symbols 运行（launchd plist 内嵌参数，
+#     jarvis_daemon.py L464/L485），jarvis_sync 启动时 resolve_symbols 解析一次
+#     —— 因此 add/remove 成功后返回 need_daemon_restart=true + restart_hint。
+
+_WATCHLIST_RESTART_HINT = (
+    "daemon（launchd）：cd Vibe-Trading && .venv/bin/python jarvis_daemon.py "
+    "--symbols <新列表逗号分隔> --install-launchd && launchctl unload "
+    "~/Library/LaunchAgents/com.jarvis.daemon.plist && launchctl load 同路径；"
+    "手动进程直接带新 --symbols 重跑。桌面后端/同步器：cd Vibe-Trading && ./restart.sh"
+    "（dashboard 本身热跟随，仅需重启常驻 jarvis_sync 时使用其 launchd kickstart）"
+)
+
+_SYMBOL_CHECK_TIMEOUT_S = 10.0
+
+
+def _norm_symbol(raw) -> str:
+    """交易对输入归一：去空白/连字符/斜杠 → 大写；非法返回空串。
+
+    口径与 /api/snapshot 等既有路由一致（upper + 去分隔符），格式限
+    字母数字 5~32 位（BTCUSDT / 1000PEPEUSDT 等币安 USDⓈ-M 符号均含 USDT 后缀）。
+    """
+    s = str(raw or "").strip().upper().replace("-", "").replace("/", "")
+    return s if 5 <= len(s) <= 32 and s.isascii() and s.isalnum() else ""
+
+
+def _self_api_base() -> str:
+    """本进程 API 根地址：优先 main() 记录的实际监听参数，回退配置中心。"""
+    import jarvis_config as jc_mod
+    host = str(getattr(app.state, "self_host", "") or jc_mod.get("dashboard_host")
+               or "127.0.0.1")
+    port = int(getattr(app.state, "self_port", 0) or jc_mod.get("dashboard_port") or 7899)
+    if host in ("0.0.0.0", "::"):  # 通配监听地址不可作为连接目标
+        host = "127.0.0.1"
+    return f"http://{host}:{port}"
+
+
+def _symbol_check_via_api(symbol: str) -> tuple[bool, str]:
+    """调接入检测 /api/symbol/check（同进程自 HTTP，与实现方模块解耦）。
+
+    契约：响应 JSON 的 ok 字段为检测结论，reason 为说明。GET ?symbol= 优先，
+    405 回退 POST {symbol}（并行开发期方法契约兜底）。检测接口未上线（404）/
+    不可达/响应缺 ok 字段一律失败闭合——宁拒不误加。
+    自调用安全性：本 app 的路由均为 sync def，跑在 uvicorn 线程池，自 HTTP
+    由另一线程服务，不会自锁。
+    """
+
+    def _call(req) -> tuple[bool, str]:
+        with urllib.request.urlopen(req, timeout=_SYMBOL_CHECK_TIMEOUT_S) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if not isinstance(data, dict) or "ok" not in data:
+            return False, f"检测接口响应缺 ok 字段：{str(data)[:120]}"
+        reason = str(data.get("reason") or data.get("msg") or "")
+        return bool(data.get("ok")), reason or ("检测通过" if data.get("ok") else "检测未通过")
+
+    url = f"{_self_api_base()}/api/symbol/check"
+    try:
+        return _call(urllib.request.Request(
+            f"{url}?symbol={symbol}", headers={"Accept": "application/json"}))
+    except urllib.error.HTTPError as e:
+        if e.code == 405:  # 实现方为 POST：方法回退
+            try:
+                return _call(urllib.request.Request(
+                    url, data=json.dumps({"symbol": symbol}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}))
+            except Exception as e2:  # noqa: BLE001 — 失败闭合，原因透传给调用方
+                return False, f"检测接口调用失败（POST 回退）：{e2!r}"[:200]
+        if e.code == 404:
+            return False, "接入检测接口 /api/symbol/check 未上线，暂不能加币"
+        return False, f"检测接口 HTTP {e.code}"
+    except Exception as e:  # noqa: BLE001 — 网络类异常失败闭合
+        return False, f"检测接口不可达：{e!r}"[:200]
+
+
+@app.get("/api/watchlist")
+def api_watchlist_get():
+    """当前币种池（生效值：DEFAULTS→旧JSON→config.yaml→env 叠加后口径）。"""
+    import jarvis_config as jc_mod
+    return JSONResponse(
+        {"symbols": [str(s).upper() for s in (jc_mod.get("watchlist") or [])]})
+
+
+@app.post("/api/watchlist/add")
+def api_watchlist_add(data: dict):
+    """加币入 watchlist：先过 /api/symbol/check 接入检测，ok 才写配置。
+
+    返回 {ok, added, need_daemon_restart, reason}；写入走 jarvis_config.save
+    （原子落盘 + version 累加），已在池中/检测失败均不写。
+    """
+    import jarvis_config as jc_mod
+    sym = _norm_symbol((data or {}).get("symbol"))
+    if not sym:
+        return JSONResponse(
+            {"ok": False, "added": False, "need_daemon_restart": False,
+             "reason": "symbol 缺失或格式非法（字母数字 5~32 位，如 BTCUSDT）"},
+            status_code=400)
+    watchlist = [str(s).upper() for s in (jc_mod.get("watchlist") or [])]
+    if sym in watchlist:
+        return JSONResponse(
+            {"ok": True, "added": False, "need_daemon_restart": False,
+             "watchlist": watchlist, "reason": f"{sym} 已在 watchlist，未重复写入"})
+    check_ok, check_reason = _symbol_check_via_api(sym)
+    if not check_ok:
+        return JSONResponse(
+            {"ok": False, "added": False, "need_daemon_restart": False,
+             "reason": f"接入检测未通过：{check_reason}"})
+    merged = list(dict.fromkeys(watchlist + [sym]))  # 合并去重，保留既有顺序
+    try:
+        cfg = jc_mod.save({"watchlist": merged}, source="watchlist-api",
+                          note=f"add {sym}")
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(
+            {"ok": False, "added": False, "need_daemon_restart": False,
+             "reason": f"写配置失败：{e!r}"[:300]}, status_code=500)
+    return JSONResponse({
+        "ok": True, "added": True, "need_daemon_restart": True,
+        "watchlist": cfg.get("watchlist"),
+        "reason": (f"{sym} 已加入 watchlist 并热生效（dashboard/模拟交易器自动跟随）；"
+                   "daemon 需重启带新 --symbols 生效"),
+        "restart_hint": _WATCHLIST_RESTART_HINT,
+    })
+
+
+@app.post("/api/watchlist/remove")
+def api_watchlist_remove(data: dict):
+    """移币出 watchlist：历史数据保留在库，仅退出活跃订阅（任务K 同口径）。
+
+    返回 {ok, removed, ...}；不在池中为幂等成功（removed=false），
+    拒绝清空最后一个币种（决策链依赖非空币种池）。
+    """
+    import jarvis_config as jc_mod
+    sym = _norm_symbol((data or {}).get("symbol"))
+    if not sym:
+        return JSONResponse(
+            {"ok": False, "removed": False, "need_daemon_restart": False,
+             "reason": "symbol 缺失或格式非法（字母数字 5~32 位，如 BTCUSDT）"},
+            status_code=400)
+    watchlist = [str(s).upper() for s in (jc_mod.get("watchlist") or [])]
+    if sym not in watchlist:
+        return JSONResponse(
+            {"ok": True, "removed": False, "need_daemon_restart": False,
+             "watchlist": watchlist, "reason": f"{sym} 不在 watchlist，无需移除"})
+    remain = [s for s in watchlist if s != sym]
+    if not remain:
+        return JSONResponse(
+            {"ok": False, "removed": False, "need_daemon_restart": False,
+             "reason": "拒绝移除最后一个币种：watchlist 不可为空"}, status_code=400)
+    try:
+        cfg = jc_mod.save({"watchlist": remain}, source="watchlist-api",
+                          note=f"remove {sym}")
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(
+            {"ok": False, "removed": False, "need_daemon_restart": False,
+             "reason": f"写配置失败：{e!r}"[:300]}, status_code=500)
+    return JSONResponse({
+        "ok": True, "removed": True, "need_daemon_restart": True,
+        "watchlist": cfg.get("watchlist"),
+        "reason": (f"{sym} 已移出 watchlist 并热生效（历史数据保留在库）；"
+                   "daemon 需重启带新 --symbols 生效"),
+        "restart_hint": _WATCHLIST_RESTART_HINT,
+    })
+
+
 @app.get("/api/snapshot")
 def snapshot(symbol: str = "BTCUSDT"):
     sym = symbol.upper().replace("-", "").replace("/", "")
@@ -718,7 +931,10 @@ def kline(
     limit: int = 200,
     end_time: int | None = None,
 ):
-    """Binance 公开 K线（免 Key），供 echarts 自绘蜡烛图 + 叠加决策信号。
+    """Binance USDⓈ-M 永续合约公开 K线（免 Key），供 echarts 自绘蜡烛图 + 叠加决策信号。
+
+    2026-08-05T09:55+08:00 数据源切换：现货 /api/v3/klines → 合约 /fapi/v1/klines，
+    与 TradingView ETHUSDT.P 口径对齐（此前历史缓存/截图为现货口径）。
 
     end_time（毫秒，可选）：向前分页游标，透传交易所 klines 的 endTime，
     返回该时刻及之前的 limit 根——桌面端 K 线图向左拖动懒加载更早历史用。
@@ -736,7 +952,7 @@ def kline(
         params = {"symbol": spot, "interval": iv, "limit": lim}
         if end_ms is not None:
             params["endTime"] = end_ms
-        raw = jcd._get(jcd.SPOT_API + "/api/v3/klines", params)
+        raw = jcd._get(jcd.FAPI + "/fapi/v1/klines", params, fast=True)
         if isinstance(raw, dict):
             return {"error": raw.get("_error", "kline fetch failed"), "rows": []}
         fmt = "%m-%d" if iv in ("1d",) else "%m-%d %H:%M"
@@ -755,6 +971,25 @@ def kline(
         # 旧行为：最新窗口 60s 缓存，key 与旧版保持一致
         return JSONResponse(_cached(f"kline:{spot}:{iv}:{lim}", 60, _calc))
     return JSONResponse(_cached(f"kline:{spot}:{iv}:{lim}:{end_ms}", 600, _calc))
+
+
+@app.get("/api/symbol/check")
+def api_symbol_check(symbol: str = ""):
+    """币种接入预检：新增币种前先探「能否接入」，不能则给人话原因。
+
+    契约（前后端对齐）：{symbol, ok, market: spot|futures|both|none, reason,
+    hint, price}。判定矩阵与取数见 jcd.check_symbol——探测复用 _get 三道闸
+    （TTL/封禁短路/分钟预算）不加重 418；封禁期给「封禁至 HH:MM」；合约独有
+    符号在合约域(fstream/fapi)不通时判不可接入（新 6 币踩过的坑）。
+    30s 服务端缓存吸收前端重复点击。
+    """
+    sym = (symbol or "").strip().upper().replace("-", "").replace("/", "")
+    if not sym:
+        return JSONResponse({"symbol": "", "ok": False, "market": "none",
+                             "reason": "缺少 symbol 参数",
+                             "hint": "用法：/api/symbol/check?symbol=BTCUSDT",
+                             "price": None})
+    return JSONResponse(_cached(f"symcheck:{sym}", 30, lambda: jcd.check_symbol(sym)))
 
 
 @app.get("/api/factor")
@@ -1100,10 +1335,12 @@ def api_behavior_stats():
 
 
 @app.post("/api/trader/cycle")
-def api_trader_cycle(symbols: str = "BTC,ETH,SOL", dry_run: bool = False):
-    """跑一轮自动跟盘：撮合限价单 → 盯平仓 → 按决策找开仓。"""
+def api_trader_cycle(symbols: str = "", dry_run: bool = False):
+    """跑一轮自动跟盘：撮合限价单 → 盯平仓 → 按决策找开仓。symbols 缺省取 watchlist。"""
+    import jarvis_config as jc_mod
     cfg = _trader_cfg()
-    syms = [s.strip() for s in symbols.split(",") if s.strip()] or ["BTC"]
+    syms = [s.strip() for s in symbols.split(",") if s.strip()] or \
+        list(jc_mod.get("watchlist") or ["BTCUSDT"])
     return JSONResponse(jpt.run_cycle(syms, cfg, dry_run=dry_run))
 
 
@@ -1233,7 +1470,7 @@ def _market_events(spot: str) -> list[dict]:
     # 2) 价格异动事件（来自真实 1h K 线，单根 |涨跌| ≥ 2% 记一条，用真实 bar 时间戳）
     try:
         kraw = jcd._get(jcd.SPOT_API + "/api/v3/klines",
-                        {"symbol": spot, "interval": "1h", "limit": 120})
+                        {"symbol": spot, "interval": "1h", "limit": 120}, fast=True)
         if not isinstance(kraw, dict):
             cnt = 0
             for k in reversed(kraw[-48:]):
@@ -2609,9 +2846,17 @@ def api_alerts_check(data: dict | None = None):
 
 @app.get("/api/alerts/price")
 def api_alerts_price(symbol: str = "BTCUSDT"):
-    """取某币种现价，供前端设定目标价位时参考。"""
-    price = jpa.current_price(symbol)
-    return JSONResponse({"symbol": jpa._normalize_symbol(symbol), "price": price})
+    """取某币种现价，供前端设定目标价位时参考。
+
+    [任务H 方案3] 8s 进程内缓存（原先每次轮询都同步回源，上游劣化时单次 16s+）；
+    配合 _cached 的旧值兜底，过期后也是旧价先返、后台刷新。
+    """
+    sym = jpa._normalize_symbol(symbol)
+
+    def _calc():
+        return {"symbol": sym, "price": jpa.current_price(sym)}
+
+    return JSONResponse(_cached(f"alerts:price:{sym}", 8, _calc))
 
 
 # ─────────────────── 12 系统信号变更邮件提醒（逐信号开关） ───────────────────
@@ -3693,12 +3938,14 @@ def api_watchlist_post(data: dict):
         if len(wl) >= 15:
             return JSONResponse({"ok": False, "error": "自选上限 15 个，请先删除再添加"},
                                 status_code=400)
-        info = jcd._get(jcd.SPOT_API + "/api/v3/exchangeInfo", {"symbol": sym})
+        # 2026-08-05 任务K：校验口径随数据源切换改为 USDⓈ-M 合约 exchangeInfo
+        # （fapi 不支持 symbol 过滤参数，全量拉取 weight=1，经 _get 缓存）
+        info = jcd._get(jcd.FAPI + "/fapi/v1/exchangeInfo", fast=True)
         ok = isinstance(info, dict) and any(
             s.get("symbol") == sym and s.get("status") == "TRADING"
             for s in (info.get("symbols") or []))
         if not ok:
-            return JSONResponse({"ok": False, "error": f"币安不存在可交易的 {sym}，请检查代码"},
+            return JSONResponse({"ok": False, "error": f"币安 USDⓈ-M 合约不存在可交易的 {sym}，请检查代码"},
                                 status_code=400)
         wl.append(sym)
     else:
@@ -4410,6 +4657,137 @@ def api_trap_signals(symbol: str = "BTCUSDT", interval: str = "15m",
     return JSONResponse(_cached(f"trapsig:{sym}:{interval}:{int(limit)}", 60, _calc))
 
 
+@app.get("/api/sd-verdict")
+def api_sd_verdict(symbol: str = "BTCUSDT", interval: str = "15m"):
+    """量价核对「主力底牌」裁决（威科夫×订单流 P1，desktop 底牌卡消费）。
+
+    五路证据（trap 陷阱 / cvd 吸收背离 / whale 大单净流 / book 盘口失衡 /
+    vp 价值区位置）归一加权 → 吸筹/派发/中性 + 突破真伪核验 + 证据链。
+    证据缺失自动降 coverage 与置信；失败 ok:false 不 500；缓存 60s。
+    """
+    import jarvis_supply_demand as jsd
+    sym = symbol.upper()
+    return JSONResponse(_cached(f"sdverdict:{sym}:{interval}", 60,
+                                lambda: jsd.analyze(sym, interval)))
+
+
+# ─────────────── 威科夫阶段引擎 API（P2 T2.5 后端；引擎=包甲 jarvis_wyckoff）───────────────
+# 契约见 贾维斯-威科夫量价核对-开发计划.md §T2.5/§T2.6。路由与安全带因子共用
+# _wyckoff_payload_cached 取数（60s 进程内缓存），引擎未交付期间 ok:false 降级
+# 不 500——接口骨架先行，甲交付后零改动直通（整装入口）或按文档签名组合。
+
+_WK_SIDE_CN = {"acc": "吸筹", "dist": "派发", "trend": "趋势段", "unknown": "未知"}
+
+
+def _wyckoff_compute(sym: str, interval: str) -> dict:
+    """组装 §T2.5 契约响应：range / state / events / verdict_hint。
+
+    优先走甲的整装入口 analyze(symbol, interval)（若提供，内部自带「最后收盘
+    bar 指纹」增量缓存）；否则按文档 §T2.1-T2.3 签名组合 detect_range /
+    detect_events / resolve_phase（bars 经 delta_flow.fetch_bars，只含已收盘）。
+    任何缺失/异常 → ok:false + error，永不抛出。
+    """
+    base = {"ok": False, "symbol": sym, "interval": interval,
+            "range": None, "state": None, "events": [], "verdict_hint": None}
+    try:
+        import jarvis_wyckoff as jwk
+    except Exception:  # noqa: BLE001 — 模块未交付期间接口骨架先行
+        return {**base, "error": "jarvis_wyckoff 未交付（T2.1-T2.4 进行中），接口骨架已就绪"}
+
+    if callable(getattr(jwk, "analyze", None)):
+        try:
+            out = jwk.analyze(sym, interval)
+            if not isinstance(out, dict):
+                return {**base, "error": f"analyze 返回非 dict：{type(out).__name__}"}
+            merged = {**base, **out}
+            merged["ok"] = bool(out.get("ok", True))
+            return merged
+        except Exception as exc:  # noqa: BLE001
+            return {**base, "error": repr(exc)[:200]}
+
+    # 组合路径（甲未给整装入口时按文档签名拼装；enrich 证据绑定待其入口）
+    missing = [f for f in ("detect_range", "detect_events", "resolve_phase")
+               if not callable(getattr(jwk, f, None))]
+    if missing:
+        return {**base, "error": f"jarvis_wyckoff 缺函数：{', '.join(missing)}"}
+    try:
+        import jarvis_delta_flow as jdf
+        bars = jdf.fetch_bars(sym, interval, 300)
+        if not bars:
+            return {**base, "error": "K线取数失败（fetch_bars 返回空）"}
+        rng = jwk.detect_range(bars)
+        events = jwk.detect_events(bars, rng) if rng else []
+        state = jwk.resolve_phase(events, rng)
+        ev_out = [{
+            "type": e.get("type"), "ts": e.get("ts"), "price": e.get("price"),
+            "confidence": e.get("confidence", e.get("raw_score")),
+            "sd_bias": e.get("sd_bias"), "reasons": e.get("reasons") or [],
+        } for e in (events or []) if isinstance(e, dict)]
+        side = (state or {}).get("side") or "unknown"
+        phase = (state or {}).get("phase")
+        if side in ("acc", "dist") and phase:
+            hint = (f"威科夫{_WK_SIDE_CN[side]}区间 Phase {phase}"
+                    "（组合骨架口径，事件×订单流证据绑定待整装入口）")
+        elif not rng:
+            hint = "无近端交易区间（趋势段/样本不足），威科夫叙事不适用"
+        else:
+            hint = "区间已识别但阶段未定（事件不足）"
+        return {**base, "ok": True, "range": rng, "state": state,
+                "events": ev_out, "verdict_hint": hint}
+    except Exception as exc:  # noqa: BLE001
+        return {**base, "error": repr(exc)[:200]}
+
+
+def _wyckoff_payload_cached(sym: str, interval: str) -> dict:
+    """(symbol, interval) 60s 进程内缓存（_cached：带锁单飞+SWR，同 sd-verdict
+    口径，满足计划「性能纪律 2」）；/api/wyckoff 路由与安全带因子共用本入口。"""
+    return _cached(f"wyckoff:{sym}:{interval}", 60,
+                   lambda: _wyckoff_compute(sym, interval))
+
+
+@app.get("/api/wyckoff")
+def api_wyckoff(symbol: str = "BTCUSDT", interval: str = "1h"):
+    """威科夫区间/事件/阶段叙事（P2 T2.5，K线页阶段带+事件标记消费）。
+
+    响应：{ok, symbol, interval, range|null, state, events[], verdict_hint}
+    （契约见开发计划 §T2.5）；引擎未交付/失败 ok:false 不 500；缓存 60s。
+    """
+    return JSONResponse(_wyckoff_payload_cached(symbol.upper(), interval))
+
+
+@app.get("/api/wyckoff/backtest")
+def api_wyckoff_backtest(symbol: str = "BTCUSDT", interval: str = "1h", days: int = 90):
+    """威科夫事件历史回放回测（T2.6 甲实现，诚实口径：样本<30 出 insufficient_samples）。
+
+    结果按 (symbol, interval, days) 缓存 1h（供权重校准，计划 §T2.6）；
+    回测函数未交付/失败 ok:false 不 500。days 夹到 [7, 365]。
+    """
+    sym = symbol.upper()
+    days_i = max(7, min(365, int(days)))
+
+    def _calc():
+        base = {"ok": False, "symbol": sym, "interval": interval, "days": days_i}
+        try:
+            import jarvis_wyckoff as jwk
+        except Exception:  # noqa: BLE001 — 未交付期间骨架先行
+            return {**base, "error": "jarvis_wyckoff 未交付（回测函数随包甲交付）"}
+        fn = next((getattr(jwk, n) for n in ("backtest", "run_backtest", "replay_backtest")
+                   if callable(getattr(jwk, n, None))), None)
+        if fn is None:
+            return {**base, "error": "回测函数未就绪（jarvis_wyckoff 缺 backtest 入口）"}
+        try:
+            out = fn(sym, interval, days_i)
+            if not isinstance(out, dict):
+                return {**base, "error": f"回测返回非 dict：{type(out).__name__}"}
+            merged = {**base, **out}
+            merged["ok"] = bool(out.get("ok", True))
+            return merged
+        except Exception as exc:  # noqa: BLE001
+            return {**base, "error": repr(exc)[:200]}
+
+    return JSONResponse(_cached(f"wyckoffbt:{sym}:{interval}:{days_i}", 3600, _calc))
+
+
 @app.get("/api/reversal-score")
 def api_reversal_score(symbol: str = "BTCUSDT", timeframe: str = "15m", mock: int = 0):
     """高胜率反转四条件叠加评分（MCP-6 反转面板消费）：
@@ -5008,7 +5386,8 @@ HTML = r"""<!doctype html>
 
   <div class="bar">
     <select id="symbol">
-      <option>BTCUSDT</option><option>ETHUSDT</option><option>SOLUSDT</option><option>BNBUSDT</option>
+      <option>BTCUSDT</option><option>ETHUSDT</option><option>SNDKUSDT</option><option>SKHYUSDT</option>
+      <option>SPCXUSDT</option><option>XAUUSDT</option><option>CLUSDT</option><option>BZUSDT</option>
     </select>
     <button class="primary" onclick="loadAll()">刷新</button>
     <span id="status" class="loading"></span>
@@ -5081,7 +5460,7 @@ HTML = r"""<!doctype html>
   <div class="card" style="margin-top:12px">
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
       <strong style="font-size:13px">挂限价单（自己指定点位）：</strong>
-      <select id="loSym"><option>BTCUSDT</option><option>ETHUSDT</option><option>SOLUSDT</option><option>BNBUSDT</option></select>
+      <select id="loSym"><option>BTCUSDT</option><option>ETHUSDT</option><option>SNDKUSDT</option><option>SKHYUSDT</option><option>SPCXUSDT</option><option>XAUUSDT</option><option>CLUSDT</option><option>BZUSDT</option></select>
       <select id="loSide"><option value="buy">买入</option><option value="sell">卖出</option></select>
       <input id="loPrice" placeholder="限价" class="inp"/>
       <input id="loQty" placeholder="数量" class="inp"/>
@@ -5093,7 +5472,7 @@ HTML = r"""<!doctype html>
       <input id="depAmt" placeholder="入金额" class="inp"/>
       <button onclick="deposit()">入金</button>
       <span style="border-left:1px solid var(--bd);height:24px"></span>
-      <input id="cycSyms" placeholder="跟盘币种 BTC,ETH" class="inp" style="width:150px" value="BTC,ETH,SOL"/>
+      <input id="cycSyms" placeholder="跟盘币种 BTC,ETH" class="inp" style="width:150px" value="BTC,ETH"/>
       <button class="primary" onclick="runCycle()">跑一轮自动跟盘</button>
       <button onclick="loadTrader()">刷新台账</button>
       <span id="loStatus" class="loading" style="font-size:12px"></span>
@@ -5134,7 +5513,7 @@ function renderTV(sym){
   $('tvchart').innerHTML = '';
   tvWidget = new TradingView.widget({
     container_id: 'tvchart',
-    symbol: 'BINANCE:'+sym,
+    symbol: 'BINANCE:'+sym+'.P',
     interval: '60',
     timezone: 'Asia/Shanghai',
     theme: 'dark',
@@ -5307,7 +5686,7 @@ async function matchOrders(){
 }
 
 async function runCycle(){
-  const syms=($('cycSyms').value||'BTC,ETH,SOL').trim();
+  const syms=($('cycSyms').value||'BTC,ETH').trim();
   $('loStatus').textContent='自动跟盘中（拉决策+取价，约 10-30 秒）…';
   try{
     const r=await (await fetch('/api/trader/cycle?symbols='+encodeURIComponent(syms),{method:'POST'})).json();
@@ -5617,7 +5996,8 @@ LITE_HTML = r"""<!doctype html>
   <div class="top">
     <h1>🤖 贾维斯 · 小白模式</h1>
     <select id="symbol" onchange="loadAll()">
-      <option>BTCUSDT</option><option>ETHUSDT</option><option>SOLUSDT</option><option>BNBUSDT</option>
+      <option>BTCUSDT</option><option>ETHUSDT</option><option>SNDKUSDT</option><option>SKHYUSDT</option>
+      <option>SPCXUSDT</option><option>XAUUSDT</option><option>CLUSDT</option><option>BZUSDT</option>
     </select>
     <button class="primary" onclick="loadAll()">立即刷新</button>
     <span class="refresh"><span class="pulse"></span><span id="upAt">加载中…</span><br><span id="nextIn"></span></span>
@@ -6034,6 +6414,7 @@ COCKPIT_HTML = r"""<!doctype html>
         <button data-vis="sr" onclick="toggleVis('sr')">支撑阻力</button>
         <button data-vis="trend" onclick="toggleVis('trend')">趋势通道</button>
         <button data-vis="marks" onclick="toggleVis('marks')">买卖点</button>
+        <button data-vis="macd" onclick="toggleVis('macd')">MACD</button>
         <span class="hint" title="蓝虚线=入场 红=止损 绿=止盈 ▲▼=买卖点 · 黄=MA7 蓝=MA25 · 底部柱=成交量 · 徽标依次为 4h/15天/30天 三周期预测；「15天目标/30天目标」虚线=分位回归 p50 目标价；灰虚线/👁=观察模式参考点位（未过精准度门禁，引擎不开仓）">?</span>
         <span class="hint" id="predBadge"></span>
       </div>
@@ -6077,7 +6458,7 @@ COCKPIT_HTML = r"""<!doctype html>
 <script>
 const $ = id => document.getElementById(id);
 const REFRESH = 60;
-let SYMS = ['BTCUSDT','ETHUSDT','SOLUSDT'];   // 启动后由 /api/watchlist 覆盖
+let SYMS = ['BTCUSDT','ETHUSDT'];   // 启动后由 /api/watchlist 覆盖
 let sym = 'BTCUSDT', iv = '4h';
 let chart, candleSeries=null, volSeries=null, maSeries={}, markersPrim=null, priceLines=[], chartKey='';
 let lastDec=null, lastFac=null, lastKline=null, lastPositions=[], lastIntraday=null, lastHorizons=null;
@@ -6085,8 +6466,8 @@ let countdown = REFRESH, tick=null;
 const TZ = new Date().getTimezoneOffset()*60;   // 秒：让 X 轴显示本地时间
 const barTime = r => Math.floor(r.ts/1000) - TZ;
 
-// 画线分组开关（localStorage 持久化）：core=入场/止损/止盈+4h预测 sr=支撑阻力 trend=趋势/斐波/通道/形态 marks=买卖点
-let VIS = {core:true, sr:true, trend:false, marks:true};
+// 画线分组开关（localStorage 持久化）：core=入场/止损/止盈+4h预测 sr=支撑阻力 trend=趋势/斐波/通道/形态 marks=买卖点 macd=MACD副图
+let VIS = {core:true, sr:true, trend:false, marks:true, macd:true};
 try{ const v=JSON.parse(localStorage.getItem('cockpitVis')||'null'); if(v&&typeof v==='object') VIS={...VIS,...v}; }catch(e){}
 // 多周期卡开关（点卡片开/关该周期在 K 线上的预测线；localStorage 持久化）
 let HZVIS = {'4h':true,'15':true,'30':true};
@@ -6243,6 +6624,7 @@ function drawChart(){
   // key 未变时不在这里更新蜡烛——由 WebSocket 实时 update()，避免 REST 旧值覆盖更新
   if(VIS.trend){ drawTrendlines(); drawFib(); drawChannel(); drawPattern(); }
   else { clearTrend(); clearFib(); clearChan(); if(vtopPrim) vtopPrim.setPts(null); }
+  if(VIS.macd){ drawMacd(); } else { removeMacd(); }   // 开关/周期/币种变化时全量重算
   drawOverlay();
 }
 
@@ -6264,6 +6646,69 @@ function drawVolMA(rows){
   })));
   if(maSeries.ma7)  maSeries.ma7.setData(ma(rows,7));
   if(maSeries.ma25) maSeries.ma25.setData(ma(rows,25));
+}
+
+// ───────── MACD(12,26,9) 副图（[任务L] 独立 pane 挂主图下方，时间轴原生联动）─────────
+// 标准口径：DIF=EMA12−EMA26；DEA=EMA9(DIF)；柱=DIF−DEA（TradingView 同口径，
+// 中式软件柱=2×(DIF−DEA) 仅为显示放大，如需在 hist 值处 ×2 即可）。
+// EMA 递推 α=2/(n+1)、首值取首样本；从 EMA26 满窗（第 26 根）起出值避免暖机段误导，
+// 180 根历史下尾部与 SMA 种子口径的差异已收敛到可忽略。柱正绿负红与页面涨跌色一致。
+let macdSeries=null;
+const MACD_UP='rgba(14,203,129,0.55)', MACD_DN='rgba(246,70,93,0.55)';
+function macdCalc(rows){
+  const out={dif:[],dea:[],hist:[]};
+  if(!rows||rows.length<27) return out;
+  const a12=2/13, a26=2/27, a9=2/10;
+  let e12=+rows[0].c, e26=+rows[0].c, dea=null;
+  for(let i=1;i<rows.length;i++){
+    const c=+rows[i].c;
+    e12=c*a12+e12*(1-a12);
+    e26=c*a26+e26*(1-a26);
+    if(i<25) continue;                    // i=25 即第 26 根：EMA26 满窗后才出值
+    const dif=e12-e26;
+    dea = dea===null ? dif : dif*a9+dea*(1-a9);
+    const t=barTime(rows[i]), h=dif-dea;
+    out.dif.push({time:t,value:dif});
+    out.dea.push({time:t,value:dea});
+    out.hist.push({time:t,value:h,color:h>=0?MACD_UP:MACD_DN});
+  }
+  return out;
+}
+function ensureMacd(){
+  if(macdSeries||!chart) return;
+  const pf={type:'custom',formatter:fmt,minMove:0.00000001};   // 自适应小数位（跟随页面 fmt）
+  macdSeries={
+    hist: chart.addSeries(LightweightCharts.HistogramSeries,{priceFormat:pf,base:0,
+      lastValueVisible:false,priceLineVisible:false},1),
+    dif:  chart.addSeries(LightweightCharts.LineSeries,{color:'rgba(240,185,11,0.9)',lineWidth:1,priceFormat:pf,
+      lastValueVisible:false,priceLineVisible:false,pointMarkersVisible:false},1),
+    dea:  chart.addSeries(LightweightCharts.LineSeries,{color:'rgba(96,165,250,0.9)',lineWidth:1,priceFormat:pf,
+      lastValueVisible:false,priceLineVisible:false,pointMarkersVisible:false},1),
+  };
+  try{ const p=chart.panes()[1]; if(p&&p.setHeight) p.setHeight(110); }catch(e){}
+}
+function removeMacd(){
+  if(!macdSeries) return;
+  Object.values(macdSeries).forEach(s=>{ try{chart.removeSeries(s);}catch(e){} });
+  macdSeries=null;                        // pane 内序列清空后 v5 自动回收副窗格
+}
+function drawMacd(){
+  if(!chart||!lastKline) return;
+  ensureMacd(); if(!macdSeries) return;
+  const m=macdCalc(lastKline.rows||[]);
+  macdSeries.hist.setData(m.hist);
+  macdSeries.dif.setData(m.dif);
+  macdSeries.dea.setData(m.dea);
+}
+function macdTick(){
+  if(!VIS.macd||!macdSeries||!lastKline) return;
+  const m=macdCalc(lastKline.rows||[]);   // EMA 递推性质：tick 只改末点，历史点不变
+  if(!m.hist.length) return;
+  try{
+    macdSeries.hist.update(m.hist[m.hist.length-1]);
+    macdSeries.dif.update(m.dif[m.dif.length-1]);
+    macdSeries.dea.update(m.dea[m.dea.length-1]);
+  }catch(e){}
 }
 
 // ───────── 斜趋势线（连真实摆动高/低点，形成上下轨通道，对标 trendiq）─────────
@@ -6487,7 +6932,7 @@ function closeWS(){ if(ws){ try{ ws.onclose=null; ws.onerror=null; ws.close(); }
 function openWS(){
   const want=sym+'|'+iv; wsWanted=want; closeWS();
   let sock;
-  try{ sock=new WebSocket('wss://stream.binance.com:9443/ws/'+sym.toLowerCase()+'@kline_'+iv); }
+  try{ sock=new WebSocket('wss://fstream.binance.com/ws/'+sym.toLowerCase()+'@kline_'+iv); }
   catch(e){ setWsStatus('🟡 实时不可用·轮询兜底'); return; }
   ws=sock;
   sock.onopen=()=>{ wsRetry=0; setWsStatus('🟢 实时 · Binance WS'); };
@@ -6499,6 +6944,16 @@ function openWS(){
     const bar={time:t, open:+k.o, high:+k.h, low:+k.l, close:+k.c};
     try{ candleSeries.update(bar); }catch(e){}  // 逐 tick 更新当前蜡烛，丝滑不重画
     try{ if(volSeries) volSeries.update({time:t, value:+k.v||0, color:(+k.c>=+k.o)?'rgba(14,203,129,0.45)':'rgba(246,70,93,0.45)'}); }catch(e){}
+    // [任务L] 同步维护内存 K 线末根（新 bar 开启则追加），MACD 末值随 tick 重算
+    try{
+      const rows=(lastKline&&lastKline.rows)||null;
+      if(rows&&rows.length){
+        const lr=rows[rows.length-1];
+        if(+lr.ts===+k.t){ lr.o=+k.o; lr.h=+k.h; lr.l=+k.l; lr.c=+k.c; lr.v=+k.v||0; }
+        else if(+k.t>+lr.ts){ rows.push({t:'',ts:+k.t,o:+k.o,h:+k.h,l:+k.l,c:+k.c,v:+k.v||0}); if(rows.length>500) rows.shift(); }
+        macdTick();
+      }
+    }catch(e){}
     const pxEl=$('px'), prev=parseFloat((pxEl.textContent||'').replace(/,/g,''));
     pxEl.textContent=fmt(+k.c);
     if(!isNaN(prev)&&+k.c!==prev){ pxEl.classList.toggle('tick-up',+k.c>prev); pxEl.classList.toggle('tick-down',+k.c<prev); }
@@ -7135,6 +7590,10 @@ def main() -> int:
     ap.add_argument("--host", default=_dhost)
     ap.add_argument("--port", type=int, default=_dport)
     args = ap.parse_args()
+    # 记录实际监听参数：watchlist add 的 /api/symbol/check 自调用按此定位本进程
+    # （显式 --port 覆盖配置中心时，配置值会指向错误端口）。
+    app.state.self_host = args.host
+    app.state.self_port = args.port
     # access_log=False：逐请求耗时由 _access_timing 中间件统一记录，避免与
     # uvicorn 自带访问日志重复刷屏。
     uvicorn.run(app, host=args.host, port=args.port, log_level="info", access_log=False)

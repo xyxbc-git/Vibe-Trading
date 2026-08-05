@@ -16,6 +16,7 @@ REST 快照口径（比维护 depth 增量流的本地订单簿简单可靠得�
 from __future__ import annotations
 
 import math
+import re
 import time
 from typing import Any
 
@@ -125,20 +126,57 @@ def _fetch(url: str, symbol: str, limit: int) -> Any:
     return r.json()
 
 
+_BAN_UNTIL_RE = re.compile(r"banned until (\d{10,16})", re.I)
+
+
+def _ban_hhmm(ts: float) -> str:
+    return time.strftime("%H:%M", time.localtime(ts))
+
+
 def orderbook(symbol: str, limit: int = 500, bucket: float | None = None,
               max_buckets: int = 30) -> dict:
-    """盘口深度快照 + 桶聚合（REST 合约优先、现货回退、旧快照兜底）。"""
+    """盘口深度快照 + 桶聚合（REST 合约优先、现货回退、旧快照兜底）。
+
+    IP 封禁感知：合约域处于登记封禁期时跳过不撞（jarvis_net 多进程共享），
+    并把「封禁至几点 / 现货无此交易对」等人话原因带给前端。
+    """
     sym = (symbol or "BTCUSDT").upper()
     lim = max(50, min(int(limit), 1000))
     _jnet.ensure_proxy()
-    raw, market, err = None, None, None
-    for url, mk in ((FAPI_DEPTH, "futures"), (SPOT_DEPTH, "spot")):
+    raw, market = None, None
+    errs: list[str] = []
+    plans: list[tuple[str, str]] = []
+    fapi_ban = _jnet.banned_until(FAPI_DEPTH)
+    if fapi_ban:
+        errs.append(f"合约行情接口 IP 限频封禁至 {_ban_hhmm(fapi_ban)}，暂不可用")
+    else:
+        plans.append((FAPI_DEPTH, "futures"))
+    plans.append((SPOT_DEPTH, "spot"))
+    for url, mk in plans:
         try:
             raw = _fetch(url, sym, lim)
             market = mk
             break
-        except Exception as exc:  # noqa: BLE001 — 逐级回退
-            err = repr(exc)[:200]
+        except requests.HTTPError as exc:  # noqa: PERF203 — 逐级回退
+            resp = exc.response
+            code = resp.status_code if resp is not None else 0
+            try:
+                body_msg = str((resp.json() or {}).get("msg", "")) if resp is not None else ""
+            except Exception:  # noqa: BLE001
+                body_msg = ""
+            m = _BAN_UNTIL_RE.search(body_msg)
+            if mk == "futures" and m:
+                ts = float(m.group(1))
+                ts = ts / 1000.0 if ts > 1e12 else ts
+                _jnet.report_ban(url, ts)
+                errs.append(f"合约行情接口 IP 限频封禁至 {_ban_hhmm(ts)}，暂不可用")
+            elif mk == "spot" and code == 400:
+                errs.append(f"现货市场无 {sym} 交易对（该品种仅合约有）")
+            else:
+                errs.append(f"{mk} HTTP {code}" + (f"：{body_msg[:80]}" if body_msg else ""))
+        except Exception as exc:  # noqa: BLE001 — 连接/超时等逐级回退
+            errs.append(f"{mk} {repr(exc)[:120]}")
+    err = "；".join(errs) if errs else None
     if not isinstance(raw, dict) or not raw.get("bids"):
         last = _LAST_GOOD.get(sym)
         if last:

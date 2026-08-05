@@ -605,18 +605,22 @@ def _apply_plan_updates(updates: dict) -> None:
 # ─────────────────────────── 价格获取 ───────────────────────────
 
 def current_price(symbol: str) -> float | None:
-    """取现货最新成交价（Binance 主源，OKX 兜底）。失败返回 None。"""
+    """取 USDⓈ-M 永续合约最新成交价（Binance 主源，OKX 永续兜底）。失败返回 None。
+
+    [任务H 方案1] fast 短预算：本函数在 /api/alerts/price 请求线程与提醒巡检里
+    高频调用，上游劣化时快速失败切 OKX / 返回 None，不再拖 15s×4 重试。
+    """
     if jcd is None:
         return None
     sym = _normalize_symbol(symbol)
     try:
-        r = jcd._get(jcd.SPOT_API + "/api/v3/ticker/price", {"symbol": sym})
+        r = jcd._get(jcd.FAPI + "/fapi/v1/ticker/price", {"symbol": sym}, fast=True)
         if isinstance(r, dict) and r.get("price"):
             return float(r["price"])
     except Exception:  # noqa: BLE001
         pass
     try:
-        p = jcd._okx_spot_price(sym)
+        p = jcd._okx_swap_price(sym, fast=True)
         if p:
             return float(p)
     except Exception:  # noqa: BLE001

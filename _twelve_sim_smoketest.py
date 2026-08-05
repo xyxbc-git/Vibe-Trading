@@ -57,6 +57,7 @@ def set_signal(tf: str, system: str, direction: str, plan: dict | None = None,
 # 现价打桩：全程无网络
 _PRICE = {"v": 100.0}
 jtt.latest_price = lambda cfg, s: _PRICE["v"]
+jtt.mark_price_of = lambda cfg, s: None   # 离线：标记价缺失→爆仓判定回退成交价（旧口径）
 # K 线打桩：默认取不到（引擎应优雅回退快照现价比对）；影线用例单独喂 bar
 jtt._fetch_bars = lambda symbol, tf: None
 # 手续费打桩：基础用例免手续费保持整数断言；手续费用例单独开 0.05

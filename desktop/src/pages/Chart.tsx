@@ -82,6 +82,7 @@ import {
 } from "@/lib/patternOverlay";
 import type { IchimokuOverlay } from "@/components/charts/KlineChart";
 import DeltaPane from "@/components/charts/DeltaPane";
+import MacdPane from "@/components/charts/MacdPane";
 import DeltaAiExplainCard from "@/components/cards/DeltaAiExplainCard";
 import TrapReasonCard from "@/components/cards/TrapReasonCard";
 import PatternExplainCard from "@/components/charts/PatternExplainCard";
@@ -90,6 +91,7 @@ import { planSide } from "@/components/cards/SignalBoard";
 import PositionAdvisor from "@/components/cards/PositionAdvisor";
 import PredictionCard from "@/components/cards/PredictionCard";
 import ReversalScorePanel from "@/components/cards/ReversalScorePanel";
+import SupplyDemandCard from "@/components/cards/SupplyDemandCard";
 import { clsx } from "clsx";
 import type {
   CandlestickData,
@@ -1081,6 +1083,9 @@ export default function Chart() {
       }));
   }, [liqOn, liqMap]);
 
+  // ── MACD 指标副图：主图 K 线本地计算（12/26/9），无额外请求 ──
+  const [macdOn, setMacdOn] = useState(false);
+
   // ── Delta/CVD 订单流副图（「安全带」层）：引擎 GET /api/delta，未就绪时
   // 回退 K 线本地演示推演（角标标注），与预测层同一套降级模式 ──
   const [deltaOn, setDeltaOn] = useState(false);
@@ -1372,6 +1377,15 @@ export default function Chart() {
           className={pillCls(deltaOn)}
         >
           Delta{deltaOn ? "·开" : "·关"}
+        </button>
+
+        {/* MACD 指标副图：主图 K 线本地计算，经典 12/26/9 */}
+        <button
+          onClick={() => setMacdOn((v) => !v)}
+          title="MACD 指标副图（12/26/9）：柱体 = DIF−DEA（正绿负红），金线 = DIF 快线，蓝线 = DEA 慢线。DIF 上穿 DEA 为金叉看多、下穿为死叉看空；柱体缩短 = 动能衰减，常先于价格转向。由当前 K 线本地计算，无额外请求"
+          className={pillCls(macdOn)}
+        >
+          MACD{macdOn ? "·开" : "·关"}
         </button>
 
         {/* [M2 s5] 磁吸位：清算/止损密集区水平线（庄家扫单/插针目标位预判） */}
@@ -1972,6 +1986,9 @@ export default function Chart() {
         />
       )}
 
+      {/* ── MACD 指标副图（12/26/9）：与画线/Delta 同吃最近窗口，时间轴口径一致 ── */}
+      {macdOn && <MacdPane candles={recentCandles} />}
+
       {/* ── Delta/CVD 订单流副图（安全带层，可折叠）：吸收背离 = 真反转证据 ── */}
       {deltaOn && (
         <>
@@ -1985,6 +2002,9 @@ export default function Chart() {
 
       {/* ── 高胜率反转四条件叠加：Delta 背离 + 多分布 + 三连确认 + 止损扫单 ── */}
       <ReversalScorePanel symbol={symbol} timeframe={tf} />
+
+      {/* ── 主力底牌（威科夫×订单流量价核对）：吸筹/派发裁决 + 突破真伪核验 ── */}
+      <SupplyDemandCard symbol={symbol} interval={tf} />
 
       {/* ── 仓位与风控建议：共识计划 ×（本金/杠杆/风险%）→ 可执行下单参数 ── */}
       <PositionAdvisor

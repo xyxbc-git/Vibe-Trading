@@ -168,3 +168,46 @@ def maybe_alert_strong_divergence(symbol: str, delta_payload: dict | None) -> No
             )
         except Exception:  # noqa: BLE001 — 提醒失败不影响主链路
             return
+
+
+# ─────────────────── 威科夫阶段可选因子（P2 T2.7，默认关零回归） ───────────────────
+
+
+def wyckoff_check(direction: str, wyckoff_payload: dict | None) -> dict | None:
+    """威科夫阶段叙事 × 开仓方向 → 可选安全带提醒因子（纯函数，不取数不联网）。
+
+    规则（贾维斯-威科夫量价核对-开发计划.md §T2.7）：
+      - 共识 bullish × 派发区间 dist Phase C/D → 多头逆主力派发节奏，警示
+        （C/D 正是 UTAD/SOW 高发窗口）
+      - 共识 bearish × 吸筹区间 acc Phase C/D → 空头逆主力吸筹节奏，镜像警示
+      - 其余（无方向 / 叙事一致 / 非 C-D 阶段 / trend / unknown）一律返回 None
+        —— 消费方（dashboard 共识端点）对 None 不挂键，与 whale_check 同口径。
+
+    开关 signal.wyckoff_seatbelt_enabled（默认 False）由消费方检查，本函数只管
+    判定；wyckoff_payload 为 /api/wyckoff 契约体，引擎未交付（ok:false）/无
+    state 时返回 None，不影响共识主体。提醒不阻断：只输出条目，不修改置信度。
+    """
+    if not isinstance(wyckoff_payload, dict) or wyckoff_payload.get("ok") is not True:
+        return None
+    state = wyckoff_payload.get("state") or {}
+    side = state.get("side")
+    phase = str(state.get("phase") or "").upper()
+    if side not in ("acc", "dist") or phase not in ("C", "D"):
+        return None
+    if direction == "bullish" and side == "dist":
+        against_cn, side_cn, trap_cn = "多头", "派发", "UTAD/SOW 假突破陷阱"
+    elif direction == "bearish" and side == "acc":
+        against_cn, side_cn, trap_cn = "空头", "吸筹", "Spring 假跌破陷阱"
+    else:
+        return None
+    hint = str(wyckoff_payload.get("verdict_hint") or "").strip()
+    note = (f"技术面{'看涨' if direction == 'bullish' else '看跌'}，但威科夫叙事处于"
+            f"{side_cn}区间 Phase {phase}——{against_cn}开仓正逆主力{side_cn}节奏，"
+            f"谨防{trap_cn}" + (f"。{hint}" if hint else ""))
+    return {
+        "status": "warning",
+        "wyckoff_side": side,
+        "phase": phase,
+        "against": "long" if against_cn == "多头" else "short",
+        "note": note,
+    }

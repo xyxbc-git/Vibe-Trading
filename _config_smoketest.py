@@ -46,7 +46,7 @@ check("默认 take_profit_pct=8", d["take_profit_pct"] == 8.0)
 check("默认 time_stop_days=30", d["time_stop_days"] == 30)
 check("默认 entry_band 1.5/0.5", d["entry_band_below_pct"] == 1.5 and d["entry_band_above_pct"] == 0.5)
 check("默认 sizing_method=fixed", d["sizing_method"] == "fixed")
-check("默认 watchlist 7 币含 BTCUSDT", "BTCUSDT" in d["watchlist"] and len(d["watchlist"]) == 7)
+check("默认 watchlist 8 品种含 BTCUSDT", "BTCUSDT" in d["watchlist"] and len(d["watchlist"]) == 8)
 
 # ── 2. 缺失/损坏文件回退默认 ──
 with tempfile.TemporaryDirectory() as td:

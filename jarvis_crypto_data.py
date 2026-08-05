@@ -21,8 +21,11 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
+import threading
 import time
+from collections import deque
 from typing import Any, Optional
 
 import requests
@@ -39,8 +42,15 @@ OKX_API = "https://www.okx.com"  # T-06 备用源：Binance 主源失败时切 O
 # T-13 扩展数据源（需 Key；无 Key 时优雅降级为 _skipped，绝不报错）。
 COINGLASS_API = "https://open-api-v4.coinglass.com"   # 爆仓热力图 / 清算数据
 GLASSNODE_API = "https://api.glassnode.com"           # 链上：交易所净流 / 大额转账
-TIMEOUT = 15
+# [任务H 方案1] 超时拆分 (connect, read)：连接 3s + 读 5s。原单值 15s 在代理劣化时
+# 把单次请求拖满 15s、叠加重试最坏 80s+；连接要么秒成要么不通，读 5s 足够公开行情接口。
+TIMEOUT = (3, 5)
 _HEADERS = {"User-Agent": "jarvis-crypto-data/1.0"}
+
+# 数据源切换标记：K线/最新价主链路 现货(api.binance.com) → USDⓈ-M 永续(fapi.binance.com)，
+# 与 TradingView ETHUSDT.P 口径对齐。此时刻之前落库/缓存的 K线与价格均为现货口径；
+# 期现基差 fetch_basis / fetch_basis_series 按设计保留现货腿，不在切换范围内。
+PRICE_SOURCE_SWITCHED_AT = "2026-08-05T09:55+08:00"
 
 # T-13 凭据不硬编码：优先 env，其次 ~/.vibe-trading/data_keys.json。
 DATA_KEYS_PATH = os.path.expanduser("~/.vibe-trading/data_keys.json")
@@ -115,25 +125,159 @@ def _is_ok(data: Any) -> bool:
     return bool(data)
 
 
-def _get(url: str, params: Optional[dict] = None, retries: int = 4) -> Any:
-    """带指数退避的 GET，优雅处理 binance 限流(-1003/418/429)，主源失败回退缓存。"""
+# ── REST 防限频双层闸（2026-08-05 任务L：IP 反复被封的根因治理）──────────────
+# 第一层 TTL 直出：同 URL+参数在端点级 TTL 内直接回磁盘缓存，不出网——价格
+# 预警轮询 / 桌面价格条 / 十二系统多周期 K 线 / 图表刷新等高频重复请求在此吸收。
+# 第二层 分钟预算：单进程对单主机每分钟实际出网次数硬上限（含重试），超限走
+# 缓存/短错——杜绝突发把共享代理出口 IP 再次撞进币安 IP 级封禁（418/-1003）。
+_ENDPOINT_TTL: tuple[tuple[str, float], ...] = (
+    ("/fapi/v1/ticker/price", 10.0),
+    ("/api/v3/ticker/price", 10.0),
+    ("/fapi/v1/klines", 30.0),
+    ("/api/v3/klines", 30.0),
+    ("/fapi/v1/premiumIndex", 30.0),
+    ("/fapi/v1/fundingRate", 300.0),
+    ("/fapi/v1/openInterest", 60.0),
+    ("/futures/data/", 300.0),          # OI 历史 / 多空账户比 / 主动买卖比
+    ("api.alternative.me", 600.0),
+    ("api.coingecko.com", 300.0),
+)
+
+
+def _endpoint_ttl(url: str) -> float:
+    for pat, t in _ENDPOINT_TTL:
+        if pat in url:
+            return t
+    return 0.0
+
+
+_REQ_WINDOW: dict[str, deque] = {}
+_REQ_LOCK = threading.Lock()
+
+
+def _budget_per_min() -> int:
+    try:
+        import jarvis_config as _jc
+        return int(_jc.get("rest_max_per_min") or 180)
+    except Exception:  # noqa: BLE001 — 配置层异常用内置默认
+        return 180
+
+
+def _budget_take(host: str, *, block: bool) -> bool:
+    """占用一次对该主机的出网额度；block=True 时最多等 15s 让滑窗腾位。
+
+    [任务L 治本] 优先走 jarvis_net 跨进程共享预算——daemon / dashboard / sync /
+    twelvesim 多进程共用一个 IP 级真实额度（rest_max_per_min 此时语义为「全局
+    每分钟出网上限」）。共享层不可用（旧版 jarvis_net / 平台无 fcntl / 文件故障）
+    时回退进程内滑窗（原逻辑），保证向后兼容、绝不因共享层故障阻断出网。
+    """
+    budget = _budget_per_min()
+    try:
+        _shared = getattr(jarvis_net, "budget_take", None)
+        if callable(_shared):
+            return _shared(host, budget, block=block)
+    except Exception:  # noqa: BLE001 — 共享层异常回退进程内
+        pass
+    deadline = time.time() + (15.0 if block else 0.0)
+    while True:
+        now = time.time()
+        with _REQ_LOCK:
+            win = _REQ_WINDOW.setdefault(host, deque())
+            while win and now - win[0] > 60.0:
+                win.popleft()
+            if len(win) < budget:
+                win.append(now)
+                return True
+            wait = (win[0] + 60.0) - now if win else 0.5
+        if now >= deadline:
+            return False
+        time.sleep(min(max(wait, 0.1), 0.5))
+
+
+# IP 级封禁检测："banned until <10~16位时间戳>"（-1003 / HTTP 418 携带）
+_BAN_UNTIL_RE = re.compile(r"banned until (\d{10,16})", re.I)
+
+
+def _note_ban(url: str, msg: str) -> bool:
+    """从限频错误文案解析 IP 封禁截止并登记到 jarvis_net（多进程共享）。
+
+    返回是否命中封禁——命中后调用方应立即停止重试（继续撞墙会延长封禁）。
+    """
+    m = _BAN_UNTIL_RE.search(msg or "")
+    if not m:
+        return False
+    ts = float(m.group(1))
+    if ts > 1e12:  # 毫秒 → 秒
+        ts /= 1000.0
+    jarvis_net.report_ban(url, ts)
+    _degrade_log(
+        f"IP 封禁登记 host={jarvis_net._ban_key(url)} "
+        f"until={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))}")
+    return True
+
+
+def _get(url: str, params: Optional[dict] = None, retries: Optional[int] = None,
+         *, fast: bool = False, ttl: Optional[float] = None) -> Any:
+    """带指数退避的 GET，优雅处理 binance 限流(-1003/418/429)，主源失败回退缓存。
+
+    [任务H 方案1] fast=True：交互短预算（dashboard 请求线程内用）——2 次尝试、
+    退避 0.5s/1s，尽快失败转磁盘缓存/备源，不拖死前端请求。默认（后台同步/
+    训练等）保留 4 次尝试 + 1.5s 起步退避的长预算，行为与旧版一致。
+    末次尝试失败后不再空睡（原版多睡一轮退避才回缓存，纯浪费）。
+
+    [任务L] 防限频三道闸（顺序生效）：
+      1. TTL 直出：缓存龄 < ttl（缺省按 _ENDPOINT_TTL 端点表）直接回缓存不出网；
+      2. 封禁短路：主机在登记封禁期内不出网（缓存/报错），响应解析到
+         "banned until" 时登记封禁并立即停止重试；
+      3. 分钟预算：单进程对单主机出网次数/分钟 ≤ rest_max_per_min（含重试）。
+    """
     key = _cache_key(url, params)
-    delay = 1.5
+    eff_ttl = _endpoint_ttl(url) if ttl is None else float(ttl)
+    if eff_ttl > 0:
+        cached = _cache_read(key)
+        if cached is not None and time.time() - float(cached.get("ts", 0)) < eff_ttl:
+            return cached.get("data")
+    ban_ts = jarvis_net.banned_until(url)
+    if ban_ts:
+        cached = _cache_read(key)
+        if cached is not None:
+            return cached.get("data")
+        return {"_error": "IP rate-limit banned until "
+                          + time.strftime("%H:%M:%S", time.localtime(ban_ts))}
+    if retries is None:
+        retries = 2 if fast else 4
+    delay = 0.5 if fast else 1.5
     last_err = None
+    host = jarvis_net._ban_key(url)
     jarvis_net.ensure_proxy()
     for attempt in range(retries):
+        last_try = attempt >= retries - 1
+        if not _budget_take(host, block=(not fast and attempt == 0)):
+            last_err = "REST 分钟预算耗尽（防限频闸拦截）"
+            break
         try:
             r = requests.get(url, params=params, headers=_HEADERS, timeout=TIMEOUT)
             if r.status_code in (418, 429):
                 last_err = f"HTTP {r.status_code} rate-limited"
-                time.sleep(delay)
-                delay *= 2
+                try:
+                    body_msg = str((r.json() or {}).get("msg", ""))
+                except Exception:  # noqa: BLE001 — 非 JSON 限频体
+                    body_msg = ""
+                if _note_ban(url, body_msg):
+                    last_err = body_msg or last_err
+                    break
+                if not last_try:
+                    time.sleep(delay)
+                    delay *= 2
                 continue
             data = r.json()
             if isinstance(data, dict) and data.get("code") == -1003:
                 last_err = data.get("msg", "rate-limited")
-                time.sleep(delay)
-                delay *= 2
+                if _note_ban(url, last_err):
+                    break
+                if not last_try:
+                    time.sleep(delay)
+                    delay *= 2
                 continue
             if _is_ok(data):
                 _cache_write(key, data)
@@ -142,8 +286,9 @@ def _get(url: str, params: Optional[dict] = None, retries: int = 4) -> Any:
             last_err = repr(e)[:200]
             # 连接类失败可能是代理进程启停造成的，强制重探本地代理后再试
             jarvis_net.ensure_proxy(force=True)
-            time.sleep(delay)
-            delay *= 2
+            if not last_try:
+                time.sleep(delay)
+                delay *= 2
     cached = _cache_read(key)
     if cached is not None:
         age = int(time.time() - cached.get("ts", 0))
@@ -255,6 +400,18 @@ def _okx_spot_price(symbol: str) -> Optional[float]:
     return None
 
 
+def _okx_swap_price(symbol: str, *, fast: bool = False) -> Optional[float]:
+    """OKX 备用源：USDT 永续最新成交价（合约口径最新价兜底）。"""
+    inst = _okx_swap_inst(symbol)
+    r = _get(f"{OKX_API}/api/v5/market/ticker", {"instId": inst}, fast=fast)
+    rows = _okx_rows(r)
+    if rows:
+        last = float(rows[0].get("last", 0) or 0)
+        if last:
+            return last
+    return None
+
+
 def fetch_daily_closes(symbol: str, days: int = 30) -> list[float]:
     """日线收盘价序列（由旧到新），供相关性/波动等计算。
 
@@ -291,7 +448,7 @@ _KLINE_INTERVAL_MS = {
 
 
 def fetch_kline(symbol: str, interval: str = "4h", total: int = 1500) -> list[dict]:
-    """Binance Spot K 线分页拉取（单次上限 1000，用 endTime 往前翻页凑够 total 根）。
+    """Binance USDⓈ-M 永续合约 K 线分页拉取（单次上限 1000，用 endTime 往前翻页凑够 total 根）。
 
     返回升序 [{"ts": 开盘毫秒, "open", "high", "low", "close", "volume"}, ...]。
     复用 _get（自带限流退避 + 缓存降级）；彻底失败返回 []，绝不抛出。
@@ -311,7 +468,7 @@ def fetch_kline(symbol: str, interval: str = "4h", total: int = 1500) -> list[di
         params: dict = {"symbol": sym, "interval": interval, "limit": want}
         if end_time is not None:
             params["endTime"] = end_time
-        raw = _get(SPOT_API + "/api/v3/klines", params)
+        raw = _get(FAPI + "/fapi/v1/klines", params)
         if not isinstance(raw, list) or not raw:
             break
         try:
@@ -367,6 +524,179 @@ def fetch_funding(symbol: str) -> dict:
             for k, v in okx.items():
                 out.setdefault(k, v)
             _degrade_log(f"fetch_funding 切备用源 OKX symbol={symbol}")
+    return out
+
+
+def fetch_mark_price(symbol: str) -> Optional[float]:
+    """标记价 markPrice（爆仓/风控线判定口径）：Binance premiumIndex 主源，OKX 备源。
+
+    与 fetch_funding 的 mark_price 同源，但只拉单接口单字段（轻量）；
+    失败返回 None，调用方回退最新成交价，绝不抛出。
+    """
+    sym = (symbol or "").upper().replace("-", "").replace("/", "")
+    if not sym.endswith(("USDT", "USDC", "USD")):
+        sym += "USDT"
+    prem = _get(f"{FAPI}/fapi/v1/premiumIndex", {"symbol": sym}, retries=2)
+    if isinstance(prem, dict) and prem.get("markPrice"):
+        try:
+            mp = float(prem["markPrice"])
+            if mp > 0:
+                return mp
+        except (TypeError, ValueError):
+            pass
+    okx = _okx_funding(sym)
+    mp = okx.get("mark_price")
+    try:
+        return float(mp) if mp else None
+    except (TypeError, ValueError):
+        return None
+
+
+# ── 币种接入预检（dashboard /api/symbol/check 数据源，2026-08-05 新功能）─────
+# 背景：SNDK/SKHY/SPCX/XAU/CL/BZ 等合约独有符号在「合约域不通（WS 回退现货）」
+# 期间拉不到数据——新增币种前先探两域可用性，把这类坑提前暴露给用户。
+
+
+def _probe_ticker(base: str, path: str, sym: str) -> tuple[str, Optional[float]]:
+    """单域 ticker 轻探。返回 (状态, 价格)。
+
+    状态：available=有此符号 / absent=域可达但无此符号（-1121 等业务错）/
+    down=域不可达（封禁短路/分钟预算/网络失败）。走 _get 三道闸，不加重 418。
+    """
+    data = _get(f"{base}{path}", {"symbol": sym}, fast=True)
+    if isinstance(data, dict) and "_error" not in data:
+        if data.get("price") is not None:
+            try:
+                return "available", float(data["price"])
+            except (TypeError, ValueError):
+                return "available", None
+        if data.get("code") is not None:
+            return "absent", None
+    return "down", None
+
+
+def check_symbol(symbol: str) -> dict:
+    """币种接入预检：探现货/合约两域，判定能否接入并给出人话原因。
+
+    返回契约（前后端对齐，勿改字段）：
+      {symbol, ok: bool, market: "spot"|"futures"|"both"|"none",
+       reason: str, hint: str, price: float|None}
+
+    判定矩阵：
+      现货 TRADING              → ok=true  market=spot|both
+      仅合约有 且 合约域通       → ok=true  market=futures
+      仅合约有 且 合约域不通     → ok=false（合约独有符号暂不可接入）
+      两域都无                  → ok=false（交易所无此交易对）
+      判定所需域封禁/不可达      → ok=false（封禁至 HH:MM / 稍后重试）
+
+    「合约域不通」= REST fapi 封禁或探测失败，或 WS 已回退现货域（代理丢
+    fstream 数据帧，合约独有符号拉不到实时数据，见 jarvis_ws_stream 回退策略）。
+    现货用 exchangeInfo?symbol= 精确判 status=TRADING（过滤后响应很小）；
+    合约 fapi exchangeInfo 不支持 symbol 过滤（全量 ~1.5MB），用 ticker 轻探。
+    全部走 _get 三道闸（TTL/封禁短路/分钟预算），绝不绕闸直连。永不抛出。
+    """
+    sym = (symbol or "").strip().upper().replace("-", "").replace("/", "")
+    if sym and not sym.endswith(("USDT", "USDC", "USD")):
+        sym += "USDT"
+    out: dict = {"symbol": sym, "ok": False, "market": "none",
+                 "reason": "", "hint": "", "price": None}
+    if not sym:
+        out["reason"] = "缺少 symbol 参数"
+        out["hint"] = "示例：BTCUSDT（未带后缀时自动补 USDT）"
+        return out
+
+    # 现货域：exchangeInfo 判 status；非 TRADING（BREAK/HALT 等）按不可用处理
+    spot_state, spot_status_note = "down", ""
+    spot_info = _get(f"{SPOT_API}/api/v3/exchangeInfo", {"symbol": sym},
+                     fast=True, ttl=300.0)
+    if isinstance(spot_info, dict) and "_error" not in spot_info:
+        arr = spot_info.get("symbols")
+        if isinstance(arr, list):
+            trading = bool(arr) and str(arr[0].get("status", "")).upper() == "TRADING"
+            spot_state = "available" if trading else "absent"
+            if arr and not trading:
+                spot_status_note = str(arr[0].get("status", ""))
+        elif spot_info.get("code") is not None:
+            spot_state = "absent"
+
+    # 合约域：ticker 轻探（_ENDPOINT_TTL 已带 10s TTL）
+    fut_state, fut_price = _probe_ticker(FAPI, "/fapi/v1/ticker/price", sym)
+
+    # 合约域「通/不通」：REST 封禁登记 + WS 现货回退态
+    fut_ban = jarvis_net.banned_until(FAPI)
+    spot_ban = jarvis_net.banned_until(SPOT_API)
+    ws_spot_fallback = False
+    try:
+        import jarvis_ws_stream as _jws  # 懒导入：WS 未部署/未运行不拖垮预检
+        h = _jws.health()
+        ws_spot_fallback = bool(h.get("running")) and str(h.get("market") or "") == "spot"
+    except Exception:  # noqa: BLE001 — WS 态不可得时按「不通不确定」保守略过
+        pass
+    futures_domain_down = fut_state == "down" or bool(fut_ban) or ws_spot_fallback
+
+    # ── 判定矩阵 ──
+    if spot_state == "available":
+        both = fut_state == "available"
+        out["ok"] = True
+        out["market"] = "both" if both else "spot"
+        out["reason"] = "现货+合约均可用" if both else "现货可用"
+        out["price"] = fut_price  # 主链路合约优先（PRICE_SOURCE_SWITCHED_AT 口径）
+        if not both:
+            out["hint"] = ("合约域无此符号，将以现货数据接入" if fut_state == "absent"
+                           else "合约侧暂无法确认（域封禁/不通），现货侧已确认可用")
+        if out["price"] is None:
+            tick = _get(f"{SPOT_API}/api/v3/ticker/price", {"symbol": sym}, fast=True)
+            if isinstance(tick, dict) and tick.get("price") is not None:
+                try:
+                    out["price"] = float(tick["price"])
+                except (TypeError, ValueError):
+                    pass
+        return out
+
+    if fut_state == "available":  # 现货 absent/down → 合约独有（或现货暂无法确认）
+        out["market"] = "futures"
+        out["price"] = fut_price
+        if futures_domain_down:
+            if fut_ban:
+                out["reason"] = ("合约独有符号，当前限速封禁至 "
+                                 + time.strftime("%H:%M", time.localtime(fut_ban))
+                                 + "，稍后重试")
+            else:
+                out["reason"] = "合约独有符号，当前合约域(fstream/fapi)不通，暂不可接入"
+            out["hint"] = ("把 fstream.binance.com 加入代理放行名单后自动恢复，"
+                           "恢复后重新检测")
+            return out
+        out["ok"] = True
+        if spot_state == "down":
+            out["reason"] = "合约可用（现货侧暂无法确认）"
+            out["hint"] = "现货域暂不可达，仅确认了合约侧"
+        else:
+            out["reason"] = "合约独有符号，合约域当前可用"
+            out["hint"] = "现货无此符号；合约域(fstream/fapi)不通期间该币将拉不到数据"
+        return out
+
+    if spot_state == "absent" and fut_state == "absent":
+        out["reason"] = "交易所无此交易对"
+        out["hint"] = ("现货有该符号但状态为 " + spot_status_note + "（非 TRADING）"
+                       if spot_status_note
+                       else "确认符号拼写（示例 BTCUSDT）；Binance 现货与 USDⓈ-M 合约均无此符号")
+        return out
+
+    # 至少一个域 down 且无法确认符号存在 → 封禁优先给准确解封时间
+    ban = max(fut_ban, spot_ban)
+    if ban:
+        out["reason"] = ("当前限速封禁至 "
+                         + time.strftime("%H:%M", time.localtime(ban)) + "，稍后重试")
+        out["hint"] = "封禁解除后重新检测；封禁期系统自动走缓存不撞墙"
+    elif spot_state == "absent":  # 合约域 down
+        out["reason"] = "现货无此符号，合约域(fapi)当前不通无法确认，暂不可接入"
+        out["hint"] = "合约域恢复后重新检测；合约独有符号需合约域可用才能接入"
+    elif fut_state == "absent":  # 现货域 down
+        out["reason"] = "合约无此符号，现货域当前不通无法确认，稍后重试"
+        out["hint"] = "现货域恢复后重新检测"
+    else:  # 两域均 down 且未登记封禁
+        out["reason"] = "币安 REST 暂不可达（网络/代理异常），稍后重试"
+        out["hint"] = "检查本地代理状态后重试"
     return out
 
 

@@ -21,14 +21,16 @@ export interface SymbolInfo {
   custom?: boolean;
 }
 
-/** 内置币种（不可删除） */
+/** 内置币种（不可删除）——与后端配置中心 watchlist 收敛为用户关注 8 品种（2026-08-05） */
 export const DEFAULT_SYMBOLS: SymbolInfo[] = [
   { value: "BTCUSDT", label: "BTC/USDT", short: "BTC" },
   { value: "ETHUSDT", label: "ETH/USDT", short: "ETH" },
-  { value: "SOLUSDT", label: "SOL/USDT", short: "SOL" },
-  { value: "BNBUSDT", label: "BNB/USDT", short: "BNB" },
-  { value: "XRPUSDT", label: "XRP/USDT", short: "XRP" },
-  { value: "DOGEUSDT", label: "DOGE/USDT", short: "DOGE" },
+  { value: "SNDKUSDT", label: "SNDK/USDT", short: "SNDK" },
+  { value: "SKHYUSDT", label: "SKHY/USDT", short: "SKHY" },
+  { value: "SPCXUSDT", label: "SPCX/USDT", short: "SPCX" },
+  { value: "XAUUSDT", label: "XAU/USDT", short: "XAU" },
+  { value: "CLUSDT", label: "CL/USDT", short: "CL" },
+  { value: "BZUSDT", label: "BZ/USDT", short: "BZ" },
 ];
 
 /** @deprecated 兼容旧引用；新代码请使用 useSymbol().supported（含用户自定义币种） */
@@ -63,6 +65,11 @@ interface SymbolContextValue {
   supported: SymbolInfo[];
   /** 校验（格式 + 交易所存在性）并添加自定义币种，持久化到 localStorage */
   addSymbol: (raw: string) => Promise<AddSymbolResult>;
+  /**
+   * 本地登记币种（不做远端校验）：供「添加币种到后端 watchlist」流程在
+   * 后端确认可接入后同步本地选择器列表。返回规范化 symbol；格式非法返回 null。
+   */
+  registerSymbol: (raw: string) => string | null;
   /** 删除自定义币种（内置币种忽略）；若删除的是当前选中币种则回退到 BTCUSDT */
   removeSymbol: (value: string) => void;
 }
@@ -73,7 +80,12 @@ function readInitialSymbol(): string {
   try {
     const fromStorage = localStorage.getItem(STORAGE_KEY);
     if (fromStorage && /^[A-Z0-9]+USDT$/.test(fromStorage)) {
-      return fromStorage;
+      // 内置池收敛后，历史选中的已下架币种（如 SOLUSDT）回退默认，
+      // 避免选择器出现「不在列表里的当前币」
+      const known =
+        DEFAULT_SYMBOLS.some((s) => s.value === fromStorage) ||
+        readCustomSymbols().includes(fromStorage);
+      if (known) return fromStorage;
     }
   } catch {
     // localStorage 不可用时 fallback
@@ -156,14 +168,25 @@ export function SymbolProvider({ children }: { children: ReactNode }) {
     [customSymbols],
   );
 
+  const registerSymbol = useCallback((raw: string): string | null => {
+    const value = normalizeSymbolInput(raw);
+    if (!value || !SYMBOL_RE.test(value)) return null;
+    if (!DEFAULT_SYMBOLS.some((s) => s.value === value)) {
+      setCustomSymbols((prev) =>
+        prev.includes(value) ? prev : [...prev, value],
+      );
+    }
+    return value;
+  }, []);
+
   const removeSymbol = useCallback((value: string) => {
     setCustomSymbols((prev) => prev.filter((v) => v !== value));
     setSymbolState((cur) => (cur === value ? DEFAULT_SYMBOL : cur));
   }, []);
 
   const ctxValue = useMemo(
-    () => ({ symbol, setSymbol, supported, addSymbol, removeSymbol }),
-    [symbol, setSymbol, supported, addSymbol, removeSymbol],
+    () => ({ symbol, setSymbol, supported, addSymbol, registerSymbol, removeSymbol }),
+    [symbol, setSymbol, supported, addSymbol, registerSymbol, removeSymbol],
   );
 
   return (

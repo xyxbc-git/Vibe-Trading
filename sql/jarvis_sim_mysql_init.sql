@@ -140,10 +140,13 @@ CREATE TABLE IF NOT EXISTS jarvis_sim_trade (
 --    此处不授予，维持最小权限
 -- ============================================================================
 
-GRANT SELECT                 ON `jiaweisi`.`jarvis_sim_config`   TO 'jarvis_sync'@'%';
-GRANT SELECT, INSERT, UPDATE ON `jiaweisi`.`jarvis_sim_wallet`   TO 'jarvis_sync'@'%';
-GRANT SELECT, INSERT, UPDATE ON `jiaweisi`.`jarvis_sim_position` TO 'jarvis_sync'@'%';
-GRANT SELECT, INSERT, UPDATE ON `jiaweisi`.`jarvis_sim_trade`    TO 'jarvis_sync'@'%';
+-- wallet/position/trade 含 DELETE：delete-absent / 台账重置清理需要
+-- （jarvis_sync_tasks_sim.py 2026-07-31 起；存量环境增量授权见
+-- jarvis_mysql_watchlist_cleanup.sql B2 段）
+GRANT SELECT                         ON `jiaweisi`.`jarvis_sim_config`   TO 'jarvis_sync'@'%';
+GRANT SELECT, INSERT, UPDATE, DELETE ON `jiaweisi`.`jarvis_sim_wallet`   TO 'jarvis_sync'@'%';
+GRANT SELECT, INSERT, UPDATE, DELETE ON `jiaweisi`.`jarvis_sim_position` TO 'jarvis_sync'@'%';
+GRANT SELECT, INSERT, UPDATE, DELETE ON `jiaweisi`.`jarvis_sim_trade`    TO 'jarvis_sync'@'%';
 FLUSH PRIVILEGES;
 
 -- ============================================================================

@@ -36,6 +36,7 @@ import {
 } from "@/api/client";
 import KlineChart from "@/components/charts/KlineChart";
 import TrapReasonCard from "@/components/cards/TrapReasonCard";
+import SupplyDemandCard from "@/components/cards/SupplyDemandCard";
 import {
   mockTrapSignals,
   buildTrapMarks,
@@ -1711,12 +1712,17 @@ export default function DepthView() {
             </div>
           )}
         </div>
-        <DepthLadder
-          depth={depthPoll.data}
-          loading={depthPoll.loading}
-          error={depthPoll.error}
-          symbol={symbol}
-        />
+        <div className="flex flex-col gap-4 min-w-0">
+          <DepthLadder
+            depth={depthPoll.data}
+            loading={depthPoll.loading}
+            error={depthPoll.error}
+            symbol={symbol}
+          />
+          {/* 主力底牌（威科夫×订单流量价核对）：与上方阶梯同 symbol/周期联动；
+              1m 噪声过大且不在分析周期集合内，映射到 5m */}
+          <SupplyDemandCard symbol={symbol} interval={tf === "1m" ? "5m" : tf} />
+        </div>
       </div>
 
       {/* ④ 成交流区标题栏：WS 状态 + 视图切换（柱状图|列表）+ 柱状图专属控件 */}

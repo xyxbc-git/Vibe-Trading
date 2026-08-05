@@ -352,12 +352,15 @@ CREATE TABLE IF NOT EXISTS jarvis_sync_state (
 CREATE USER IF NOT EXISTS 'jarvis_sync'@'%' IDENTIFIED BY '__CHANGE_ME_32CHARS__';
 
 GRANT SELECT, INSERT, UPDATE ON `jiaweisi`.`jarvis_signal_state`        TO 'jarvis_sync'@'%';
-GRANT SELECT, INSERT, UPDATE ON `jiaweisi`.`jarvis_signal_change`       TO 'jarvis_sync'@'%';
+-- signal_change / tape_bar / market_snapshot 含 DELETE：symbol 维度 delete-absent
+-- 清扫（2026-08-05 币种池收敛，jarvis_sync_tasks_{a,b}.py；存量环境增量授权见
+-- jarvis_mysql_watchlist_cleanup.sql）
+GRANT SELECT, INSERT, UPDATE, DELETE ON `jiaweisi`.`jarvis_signal_change`   TO 'jarvis_sync'@'%';
 GRANT SELECT, INSERT, UPDATE ON `jiaweisi`.`jarvis_reco_plan`           TO 'jarvis_sync'@'%';
 GRANT SELECT, INSERT, UPDATE ON `jiaweisi`.`jarvis_intraday_prediction` TO 'jarvis_sync'@'%';
-GRANT SELECT, INSERT, UPDATE ON `jiaweisi`.`jarvis_tape_bar`            TO 'jarvis_sync'@'%';
+GRANT SELECT, INSERT, UPDATE, DELETE ON `jiaweisi`.`jarvis_tape_bar`        TO 'jarvis_sync'@'%';
 GRANT SELECT, INSERT, UPDATE ON `jiaweisi`.`jarvis_force_order_min`     TO 'jarvis_sync'@'%';
-GRANT SELECT, INSERT, UPDATE ON `jiaweisi`.`jarvis_market_snapshot`     TO 'jarvis_sync'@'%';
+GRANT SELECT, INSERT, UPDATE, DELETE ON `jiaweisi`.`jarvis_market_snapshot` TO 'jarvis_sync'@'%';
 GRANT SELECT, INSERT, UPDATE ON `jiaweisi`.`jarvis_snapshot`            TO 'jarvis_sync'@'%';
 GRANT SELECT, INSERT, UPDATE ON `jiaweisi`.`jarvis_outcome`             TO 'jarvis_sync'@'%';
 GRANT SELECT, INSERT, UPDATE ON `jiaweisi`.`jarvis_position`            TO 'jarvis_sync'@'%';
@@ -368,7 +371,9 @@ FLUSH PRIVILEGES;
 
 -- 验证（手工执行）：
 --   SHOW GRANTS FOR 'jarvis_sync'@'%';
---   用 jarvis_sync 连接后执行 DELETE 应报 1142 权限拒绝
+--   用 jarvis_sync 连接后对未授权 DELETE 的表（如 jarvis_signal_state）执行
+--   DELETE 应报 1142 权限拒绝；signal_change / tape_bar / market_snapshot 例外
+--   （delete-absent 清扫需要）
 
 -- ============================================================================
 -- C. 可选：RuoYi 字典初始化（jarvis_direction / jarvis_plan_status）

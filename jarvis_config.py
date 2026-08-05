@@ -58,8 +58,11 @@ ENV_PREFIX = "JARVIS_CFG_"
 
 # ── 内置默认 = 各脚本改造前的硬编码原值（改这里会直接改变运行口径）────────────
 DEFAULTS: dict = {
-    # 币种池（与 jarvis_radar.DEFAULT_WATCHLIST 原值一致）
-    "watchlist": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT"],
+    # 币种池（2026-08-05 任务K 收敛：用户关注 8 品种，实拔确认全部为币安 USDⓈ-M
+    # 永续 TRADING 符号；与 jarvis_radar.DEFAULT_WATCHLIST 保持一致。
+    # 旧 7 币中移除的 SOL/BNB/XRP/DOGE/ADA 历史数据保留在库，仅退出活跃订阅）
+    "watchlist": ["BTCUSDT", "ETHUSDT", "SNDKUSDT", "SKHYUSDT", "SPCXUSDT",
+                  "XAUUSDT", "CLUSDT", "BZUSDT"],
     # 执行 / 雷达共享旋钮
     "min_conviction": 0.8,            # 偏多达标信心阈值（executor 护栏 + radar）
     "max_position_pct": 40.0,         # 单笔仓位上限%（与 brief 弱因子上限一致）
@@ -121,6 +124,9 @@ DEFAULTS: dict = {
     # ── M2 s7 Delta 面板 AI 解读卡（jarvis_delta_explain）──────────────────────
     "ai_explain_enabled": True,       # 总开关（关=接口返回 disabled，前端隐藏入口）
     "ai_explain_cache_min": 5,        # 同 symbol+tf 解读结果缓存（分钟），防重复烧 token
+    # ── 威科夫×订单流 P1：量价核对裁决权重（jarvis_supply_demand）──────────────
+    # JSON 字符串，如 '{"trap":0.4,"cvd":0.3}'；空串 = 用模块内置默认权重。
+    "sd_weights": "",
     # ── T1.7 持仓陪伴条：止损接近度预警阈值（/api/positions 陪伴字段）─────────
     # 现价到止损的剩余距离占「入场→止损总距离」比例低于该百分比时预警变色。
     "sl_proximity_warn_pct": 30.0,
@@ -153,6 +159,10 @@ DEFAULTS: dict = {
     "liq_leverage_weights": "5:0.1,10:0.3,25:0.3,50:0.2,100:0.1",
     "liq_magnet_warn_pct": 1.5,       # 现价距强磁吸位小于该% → 插针风险提醒
     "liq_map_seatbelt_enabled": True,  # 磁吸位提醒因子并入 seatbelt 输出
+    # ── 威科夫 P2 T2.7 安全带可选因子（jarvis_seatbelt.wyckoff_check）────────────
+    # 开仓方向逆威科夫阶段叙事（多头逆派发 C/D、空头逆吸筹 C/D）时提醒；
+    # 默认关闭 = 零回归，引擎（jarvis_wyckoff）验收后再手动开启。
+    "wyckoff_seatbelt_enabled": False,
     # ── M2 s4 Binance WebSocket 实时数据地基（jarvis_ws_stream）──────────────
     "ws_enabled": True,               # 总开关：dashboard 启动时是否拉起 WS 客户端
     "ws_stream_kline": True,          # 订阅 K 线增量流
@@ -165,6 +175,10 @@ DEFAULTS: dict = {
     "ws_reconnect_base_s": 1.0,       # 重连指数退避起始秒
     "ws_reconnect_max_s": 60.0,       # 重连退避封顶秒
     "ws_force_order_persist": True,   # forceOrder 是否落 SQLite 保留历史
+    # ── REST 防限频（2026-08-05 任务L：共享代理 IP 反复被币安封禁的根因治理）──
+    # 单进程对单主机每分钟实际出网请求上限（含重试）；超限走缓存/短错。
+    # 4 个常驻进程 × 该值 ≈ 全系统上限，默认 180×4=720 远低于币安 2400 权重/分。
+    "rest_max_per_min": 180,
     # ── order-flow phase-1 本地订单簿引擎（jarvis_orderbook）───────────────────
     "book_enabled": True,             # 总开关：dashboard 启动时挂载订单簿引擎
     "book_snapshot_interval_s": 5.0,  # 内存深度切片周期（秒）
@@ -245,6 +259,7 @@ GROUPS: dict[str, str] = {
     "liq_cluster_min_count": "signal",
     "ai_explain_enabled": "signal",
     "ai_explain_cache_min": "signal",
+    "sd_weights": "signal",
     "liq_leverage_weights": "signal",
     "liq_magnet_warn_pct": "signal",
     "liq_map_seatbelt_enabled": "signal",
@@ -252,6 +267,7 @@ GROUPS: dict[str, str] = {
     "whale_tier2_usd": "signal",
     "whale_window_min": "signal",
     "whale_seatbelt_enabled": "signal",
+    "wyckoff_seatbelt_enabled": "signal",
     # data——数据/回测口径
     "backtest_cost_bps": "data",
     "ws_stream_kline": "data",
@@ -264,6 +280,7 @@ GROUPS: dict[str, str] = {
     "ws_reconnect_base_s": "data",
     "ws_reconnect_max_s": "data",
     "ws_force_order_persist": "data",
+    "rest_max_per_min": "data",
     "book_snapshot_interval_s": "data",
     "book_retention_days": "data",
     "book_levels": "data",
@@ -341,6 +358,7 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "ws_buffer_size": (100, 100_000),
     "ws_reconnect_base_s": (0.5, 30.0),
     "ws_reconnect_max_s": (5.0, 600.0),
+    "rest_max_per_min": (30, 2000),
     "book_snapshot_interval_s": (1.0, 60.0),
     "book_retention_days": (1, 365),
     "book_levels": (10, 200),
