@@ -21,12 +21,14 @@ import type { TradeMark } from "@/lib/signalTrades";
 import type { PredictionOverlay } from "@/lib/predict";
 import type { CloudPoint } from "@/lib/ichimoku";
 import type { TrapMark } from "@/lib/trapSignals";
+import type { WyckoffOverlay } from "@/lib/wyckoff";
 import { positionZoneWindow, type PositionZoneView } from "@/lib/positionZone";
 import { TradeMarkersPrimitive } from "./TradeMarkersPrimitive";
 import { PredictionPrimitive } from "./PredictionPrimitive";
 import { PositionZonePrimitive } from "./PositionZonePrimitive";
 import { IchimokuCloudPrimitive } from "./IchimokuCloudPrimitive";
 import { TrapSignalsPrimitive } from "./TrapSignalsPrimitive";
+import { WyckoffPrimitive } from "./WyckoffPrimitive";
 
 /** 云图叠加载荷：三条线走 LineSeries，云带（含未来段）走 primitive */
 export interface IchimokuOverlay {
@@ -99,6 +101,13 @@ interface KlineChartProps {
   /** 点击命中陷阱标记时回调（弹原因卡片）；pos 为图表面板内像素坐标。 */
   onTrapClick?: (mark: TrapMark, pos: { x: number; y: number }) => void;
   /**
+   * 威科夫阶段引擎叠加（buildWyckoffBand + buildWyckoffMarks 生成）：
+   * 阶段带 = 交易区间半透明背景（acc 绿 / dist 红，透明度按 Phase A-E 深浅，
+   * bottom 层垫在蜡烛下）；事件徽章 = 12 事件缩写牌挂锚定 bar 影线之外
+   * （top 层，与陷阱三角同型 canvas 自绘通道）。null/undefined 不渲染。
+   */
+  wyckoff?: WyckoffOverlay | null;
+  /**
    * 数据集标识（如 "BTCUSDT|15m"）。提供时启用「视口保持」模式：仅该 key
    * 变化（切币种/切周期/图表重建）才 fitContent 重置视口；同 key 的数据
    * 更新（轮询刷新、历史前插）恢复原可见时间区间，用户缩放/平移与向左
@@ -158,6 +167,7 @@ export default function KlineChart({
   ichimoku,
   trapMarks,
   onTrapClick,
+  wyckoff,
   datasetKey,
   onNearLeftEdge,
   loadingOlder,
@@ -174,6 +184,7 @@ export default function KlineChart({
   const positionZonePrimitiveRef = useRef<PositionZonePrimitive | null>(null);
   const ichimokuPrimitiveRef = useRef<IchimokuCloudPrimitive | null>(null);
   const trapPrimitiveRef = useRef<TrapSignalsPrimitive | null>(null);
+  const wyckoffPrimitiveRef = useRef<WyckoffPrimitive | null>(null);
   // 点击回调 latest-ref：init effect 里的 subscribeClick 闭包始终调到最新回调
   const onTrapClickRef = useRef(onTrapClick);
   onTrapClickRef.current = onTrapClick;
@@ -256,6 +267,9 @@ export default function KlineChart({
     // 诱多/诱空陷阱三角警示牌：zOrder "top"，悬停出摘要、点击弹原因卡片
     const trapPrimitive = new TrapSignalsPrimitive();
     candleSeries.attachPrimitive(trapPrimitive);
+    // 威科夫阶段带（bottom 垫底）+ 12 事件徽章（top，悬停出摘要）
+    const wyckoffPrimitive = new WyckoffPrimitive();
+    candleSeries.attachPrimitive(wyckoffPrimitive);
 
     // 悬停浮层（多类命中共用一个浮层，陷阱警示 > 徽章 > 预测层）：
     //   0. 诱多/诱空三角警示牌：命中 → 陷阱类型/置信度/价位摘要
@@ -271,6 +285,11 @@ export default function KlineChart({
       const trapHit = trapPrimitive.markAt(pt.x, pt.y);
       if (trapHit) {
         setZoneTip({ x: pt.x, y: pt.y, text: trapHit.tooltip });
+        return;
+      }
+      const wyckoffHit = wyckoffPrimitive.markAt(pt.x, pt.y);
+      if (wyckoffHit) {
+        setZoneTip({ x: pt.x, y: pt.y, text: wyckoffHit.tooltip });
         return;
       }
       const markTip = marksPrimitive.markAt(pt.x, pt.y);
@@ -318,6 +337,7 @@ export default function KlineChart({
     positionZonePrimitiveRef.current = positionZonePrimitive;
     ichimokuPrimitiveRef.current = ichimokuPrimitive;
     trapPrimitiveRef.current = trapPrimitive;
+    wyckoffPrimitiveRef.current = wyckoffPrimitive;
     priceLinesRef.current = [];
     overlaySeriesRef.current = [];
     ichimokuSeriesRef.current = [];
@@ -347,6 +367,7 @@ export default function KlineChart({
       positionZonePrimitiveRef.current = null;
       ichimokuPrimitiveRef.current = null;
       trapPrimitiveRef.current = null;
+      wyckoffPrimitiveRef.current = null;
       priceLinesRef.current = [];
       overlaySeriesRef.current = [];
       ichimokuSeriesRef.current = [];
@@ -538,6 +559,17 @@ export default function KlineChart({
       // chart may have been disposed between render and effect
     }
   }, [trapMarks, initVersion]);
+
+  // 威科夫阶段带 + 事件徽章：prop 变化整组重设，传空/未传即清空；
+  // 悬停命中直接查 primitive 的投影结果。
+  useEffect(() => {
+    if (disposedRef.current) return;
+    try {
+      wyckoffPrimitiveRef.current?.setOverlay(wyckoff ?? null);
+    } catch {
+      // chart may have been disposed between render and effect
+    }
+  }, [wyckoff, initVersion]);
 
   // 信号结构买卖点标注 → 原生 setMarkers。替换式 API：prop 变化整组重设，
   // 清空/未传时重设为空数组；库要求按 time 升序，窗口外的标注直接丢弃。

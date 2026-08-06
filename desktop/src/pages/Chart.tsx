@@ -74,6 +74,15 @@ import {
   type TrapBar,
   type TrapMark,
 } from "@/lib/trapSignals";
+import {
+  buildWyckoffBand,
+  buildWyckoffMarks,
+  WYCKOFF_EVENT_META,
+  WYCKOFF_SIDE_LABELS,
+  WYCKOFF_TOGGLE_KEY,
+  type WyckoffOverlay,
+  type WyckoffResponse,
+} from "@/lib/wyckoff";
 import { detectPatterns, type DetectedPattern } from "@/lib/patterns";
 import {
   patternToChartOverlay,
@@ -86,7 +95,7 @@ import MacdPane from "@/components/charts/MacdPane";
 import DeltaAiExplainCard from "@/components/cards/DeltaAiExplainCard";
 import TrapReasonCard from "@/components/cards/TrapReasonCard";
 import PatternExplainCard from "@/components/charts/PatternExplainCard";
-import { AlertTriangle, CandlestickChart, Cloudy, HelpCircle, Target, Waypoints, X } from "lucide-react";
+import { AlertTriangle, CandlestickChart, Cloudy, HelpCircle, Layers, Target, Waypoints, X } from "lucide-react";
 import { planSide } from "@/components/cards/SignalBoard";
 import PositionAdvisor from "@/components/cards/PositionAdvisor";
 import PredictionCard from "@/components/cards/PredictionCard";
@@ -292,6 +301,22 @@ export default function Chart() {
     setTrapOnState(v);
     try {
       localStorage.setItem(TRAP_TOGGLE_KEY, v ? "1" : "0");
+    } catch {
+      /* storage unavailable — 开关仍生效，只是不持久化 */
+    }
+  };
+  // 威科夫阶段带/事件标记开关：localStorage 记住偏好，默认关
+  const [wyckoffOn, setWyckoffOnState] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(WYCKOFF_TOGGLE_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const setWyckoffOn = (v: boolean) => {
+    setWyckoffOnState(v);
+    try {
+      localStorage.setItem(WYCKOFF_TOGGLE_KEY, v ? "1" : "0");
     } catch {
       /* storage unavailable — 开关仍生效，只是不持久化 */
     }
@@ -641,6 +666,79 @@ export default function Chart() {
     trapData && trapData.signals.length > 0
       ? trapData.signals[trapData.signals.length - 1]
       : null;
+
+  // ── 威科夫阶段引擎（GET /api/wyckoff）：阶段带 + 12 事件标记 ──
+  // 刷新联动：以「最新一根 K 线的开盘时间」为依赖锚点——现有 kline 轮询
+  // 收到新 bar 时自动重拉一次（后端按同指纹缓存，成本≈0），同一根 bar 内
+  // 的轮询刷新不重复请求。不新增任何 setInterval/独立轮询（性能纪律第 6 条）。
+  const [wyckoffResp, setWyckoffResp] = useState<WyckoffResponse | null>(null);
+  const [wyckoffApiState, setWyckoffApiState] = useState<
+    "idle" | "loading" | "ok" | "unavailable"
+  >("idle");
+  const lastKlineTs = klineRows.length > 0 ? klineRows[klineRows.length - 1].ts : 0;
+
+  useEffect(() => {
+    if (!wyckoffOn) {
+      setWyckoffResp(null);
+      setWyckoffApiState("idle");
+      return;
+    }
+    if (lastKlineTs <= 0) return; // K 线未就位，等下一轮联动
+    let cancelled = false;
+    setWyckoffApiState((s) => (s === "ok" ? s : "loading"));
+    (async () => {
+      try {
+        const res = await api.wyckoff(symbol, tf);
+        if (cancelled) return;
+        // 回声校验：慢返回的旧币种/旧周期响应不得写入当前图（防交易误导）
+        if (isStaleEcho(symbol, res?.symbol)) return;
+        if (res?.interval && res.interval !== tf) return;
+        if (res && res.ok !== false) {
+          setWyckoffResp(res);
+          setWyckoffApiState("ok");
+          return;
+        }
+        setWyckoffResp(null);
+        setWyckoffApiState("unavailable");
+      } catch {
+        if (!cancelled) {
+          setWyckoffResp(null);
+          setWyckoffApiState("unavailable");
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [wyckoffOn, symbol, tf, lastKlineTs]);
+
+  // 二次回声守卫：切币种/周期后、新响应到达前，旧响应不得参与本图渲染
+  const wyckoffData = useMemo<WyckoffResponse | null>(() => {
+    if (!wyckoffOn || !wyckoffResp) return null;
+    if (isStaleEcho(symbol, wyckoffResp.symbol)) return null;
+    if (wyckoffResp.interval && wyckoffResp.interval !== tf) return null;
+    return wyckoffResp;
+  }, [wyckoffOn, wyckoffResp, symbol, tf]);
+
+  // 响应 → 阶段带 + 事件徽章载荷（窗口裁剪 + 吸附锚定 bar，纯函数换算）
+  const wyckoffOverlay = useMemo<WyckoffOverlay | null>(() => {
+    if (!wyckoffData || candles.length === 0) return null;
+    const anchors = candles.map((c) => ({
+      timeSec: Number(c.time),
+      high: c.high,
+      low: c.low,
+    }));
+    const band = buildWyckoffBand(wyckoffData, anchors);
+    const marks = buildWyckoffMarks(wyckoffData, anchors);
+    return band || marks.length > 0 ? { band, marks } : null;
+  }, [wyckoffData, candles]);
+
+  const latestWyckoffEvent = useMemo(() => {
+    const evs = wyckoffData?.events;
+    if (!Array.isArray(evs) || evs.length === 0) return null;
+    const known = evs.filter((e) => WYCKOFF_EVENT_META[e?.type]);
+    return known.length > 0 ? known[known.length - 1] : null;
+  }, [wyckoffData]);
 
   // ── 信号盈损标记：拉该系统的逐笔回测明细（与信号矩阵聚合胜率同源） ──
   const { data: sigTradesResp, loading: sigTradesLoading } = useApi(
@@ -1370,6 +1468,15 @@ export default function Chart() {
           诱多诱空{trapOn ? "·开" : "·关"}
         </button>
 
+        {/* 威科夫阶段带/事件标记：吸筹绿带/派发红带 + 12 事件徽章（SC/Spring/SOS/UTAD…） */}
+        <button
+          onClick={() => setWyckoffOn(!wyckoffOn)}
+          title="威科夫阶段引擎：交易区间画成半透明背景带（吸筹=绿 / 派发=红，Phase A→E 颜色渐深），12 个威科夫事件（SC 恐慌抛售、Spring 弹簧、SOS 强势信号、UTAD 派发上冲…）以缩写徽章挂在事件 K 线上，悬停看置信度与订单流佐证。引擎未就绪时显示接口提示"
+          className={pillCls(wyckoffOn)}
+        >
+          威科夫{wyckoffOn ? "·开" : "·关"}
+        </button>
+
         {/* Delta/CVD 副图（「安全带」层）：只有 Delta 与价格背离（吸收证据）才是真反转 */}
         <button
           onClick={() => setDeltaOn((v) => !v)}
@@ -1915,6 +2022,72 @@ export default function Chart() {
         </div>
       )}
 
+      {/* 威科夫状态条：阶段（侧/Phase）+ 窗口内事件数 + 最新事件 + 研判提示 */}
+      {wyckoffOn && (
+        <div className="flex items-center gap-2 flex-wrap text-xs bg-jarvis-card border border-jarvis-border rounded-lg px-3 py-2">
+          <Layers size={13} className="text-jarvis-blue shrink-0" />
+          <span className="text-jarvis-text font-medium">威科夫阶段</span>
+          {wyckoffData ? (
+            <>
+              {wyckoffData.state && (
+                <span
+                  className={clsx(
+                    "px-1.5 py-px rounded text-[10px] font-medium text-white",
+                    wyckoffData.state.side === "acc"
+                      ? "bg-jarvis-green"
+                      : wyckoffData.state.side === "dist"
+                        ? "bg-jarvis-red"
+                        : "bg-jarvis-text-secondary/60",
+                  )}
+                >
+                  {WYCKOFF_SIDE_LABELS[wyckoffData.state.side] ?? wyckoffData.state.side}
+                  {wyckoffData.state.phase ? ` · Phase ${wyckoffData.state.phase}` : ""}
+                </span>
+              )}
+              {!wyckoffData.range && (
+                <span className="text-jarvis-text-secondary">
+                  当前为趋势段（无交易区间，不画阶段带）
+                </span>
+              )}
+              <span className="text-jarvis-text-secondary">
+                窗口内 {wyckoffOverlay?.marks.length ?? 0} 个事件标记 · 悬停徽章看置信度与证据
+              </span>
+              {latestWyckoffEvent && (
+                <span className="text-jarvis-text-secondary font-mono">
+                  最新：{WYCKOFF_EVENT_META[latestWyckoffEvent.type].label}（
+                  {WYCKOFF_EVENT_META[latestWyckoffEvent.type].abbr}）@{" "}
+                  {formatPrice(latestWyckoffEvent.price)}
+                </span>
+              )}
+              {wyckoffData.verdict_hint && (
+                <span
+                  className="text-jarvis-text truncate max-w-[28rem] cursor-help"
+                  title={wyckoffData.verdict_hint}
+                >
+                  {wyckoffData.verdict_hint}
+                </span>
+              )}
+              {wyckoffData.stale && (
+                <span className="text-jarvis-yellow" title="数据层暂时失败，展示的是后端上次成功的缓存结果">
+                  缓存数据
+                </span>
+              )}
+            </>
+          ) : wyckoffApiState === "loading" ? (
+            <span className="text-jarvis-text-secondary">加载中…</span>
+          ) : wyckoffApiState === "unavailable" ? (
+            <span
+              className="text-jarvis-yellow"
+              title="GET /api/wyckoff 不可用，可能后端阶段引擎尚未部署；接入后自动出现阶段带与事件标记"
+            >
+              阶段引擎接口未就绪
+            </span>
+          ) : (
+            <span className="text-jarvis-text-secondary">等待 K 线数据…</span>
+          )}
+        </div>
+      )}
+
       <div className="card p-0 overflow-hidden relative">
         {candles.length > 0 ? (
           <>
@@ -1943,6 +2116,7 @@ export default function Chart() {
               ichimoku={ichimokuData?.overlay ?? null}
               trapMarks={trapMarks}
               onTrapClick={(mark) => setSelectedTrap(mark)}
+              wyckoff={wyckoffOverlay}
               datasetKey={`${symbol}|${tf}`}
               onNearLeftEdge={loadOlder}
               loadingOlder={loadingOlder}

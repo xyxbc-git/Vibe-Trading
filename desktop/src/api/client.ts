@@ -668,6 +668,15 @@ export const api = {
       30_000,
     ),
 
+  // ─── 威科夫阶段引擎（P2：交易区间/12事件/阶段状态机；未就绪时调用方须做降级）───
+  // 响应契约见 src/lib/wyckoff.ts 的 WyckoffResponse（阶段带 + 事件标记数据源）
+  wyckoff: (symbol: string, interval: string) =>
+    request<import("../lib/wyckoff").WyckoffResponse>(
+      `/wyckoff?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}`,
+      undefined,
+      30_000,
+    ),
+
   // ─── 高胜率反转四条件叠加评分（Delta 背离 + 多分布 + 三连确认 + 止损扫单）───
   reversalScore: (symbol: string, timeframe: string) =>
     request<ReversalScoreResponse>(
