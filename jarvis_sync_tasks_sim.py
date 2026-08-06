@@ -9,8 +9,10 @@
                           upsert 后 delete-absent：源端不存在的 id 从镜像删除，
                           台账重置后不留残留）
   jarvis_sim_position   ← twelve_sim_position   （分页全量 upsert + 全状态
-                          delete-absent 镜像照源；源本身保留 closed 历史行，
-                          pending 撤销/台账重置残留统一按「源端不存在即删」清理）
+                          delete-absent 镜像照源；源本身保留 closed 历史行与
+                          canceled 失效留痕行（R3：pending 失效改为 status='canceled'
+                          + cancel_reason/canceled_ts，7 天后源端清理，镜像随
+                          delete-absent 同步消失）；台账重置残留按「源端不存在即删」清理）
   jarvis_sim_trade      ← twelve_sim_trade      （id 单调游标增量，覆盖式 upsert；
                           残留检测：源 id 回退 / 镜像行数或 max(id) 超过源
                           ⇒ 台账重置 → 旧轮次行先归档 jarvis_sim_trade_hist
@@ -28,7 +30,8 @@
                         price change_kinds applied(INTEGER) note
   twelve_sim_position : id symbol tf system direction entry_price entry_ts(epoch)
                         qty margin leverage position_pct stop_loss take_profit
-                        cur_price unrealized_pnl status —— 无 unrealized_pnl_pct 列，
+                        cur_price unrealized_pnl status cancel_reason
+                        canceled_ts(epoch) —— 无 unrealized_pnl_pct 列，
                         镜像侧按源同口径推导（close 口径 pnl/margin*100，见 trader L542）
   twelve_sim_trade    : id symbol tf system name_cn direction entry_price entry_ts
                         exit_price exit_ts qty margin leverage stop_loss take_profit
@@ -353,7 +356,7 @@ def sync_sim_wallet(ctx: SyncContext) -> TaskResult:
 _SQL_POSITION_SRC = (
     "SELECT id, symbol, tf, system, direction, entry_price, entry_ts, qty, "
     "margin, leverage, position_pct, stop_loss, take_profit, cur_price, "
-    "unrealized_pnl, status "
+    "unrealized_pnl, status, cancel_reason, canceled_ts "
     "FROM twelve_sim_position WHERE id > ? ORDER BY id LIMIT ?"
 )
 
@@ -361,8 +364,8 @@ _SQL_POSITION_DST = (
     f"INSERT INTO {POSITION_TABLE} "
     "(id, symbol, tf, system_code, direction, entry_price, entry_time, qty, "
     " margin, leverage, position_pct, stop_loss, take_profit, cur_price, "
-    " unrealized_pnl, unrealized_pnl_pct, status) "
-    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+    " unrealized_pnl, unrealized_pnl_pct, status, cancel_reason, cancel_time) "
+    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
     "ON DUPLICATE KEY UPDATE "
     "symbol=VALUES(symbol), tf=VALUES(tf), system_code=VALUES(system_code), "
     "direction=VALUES(direction), entry_price=VALUES(entry_price), "
@@ -370,7 +373,8 @@ _SQL_POSITION_DST = (
     "leverage=VALUES(leverage), position_pct=VALUES(position_pct), "
     "stop_loss=VALUES(stop_loss), take_profit=VALUES(take_profit), "
     "cur_price=VALUES(cur_price), unrealized_pnl=VALUES(unrealized_pnl), "
-    "unrealized_pnl_pct=VALUES(unrealized_pnl_pct), status=VALUES(status)"
+    "unrealized_pnl_pct=VALUES(unrealized_pnl_pct), status=VALUES(status), "
+    "cancel_reason=VALUES(cancel_reason), cancel_time=VALUES(cancel_time)"
 )
 
 
@@ -389,10 +393,11 @@ def _upnl_pct(pnl, margin) -> Optional[float]:
 def sync_sim_position(ctx: SyncContext) -> TaskResult:
     """模拟持仓/计划：分页全量 upsert + 全状态 delete-absent（镜像照源）。
 
-    源端语义（实读 trader 代码）：closed 行只 UPDATE 不删除（L685），pending
-    行撤销时物理删除（L871）——即源表本身就保留完整 open/closed 历史。因此
-    镜像直接对齐源：源端不存在的 id 一律删除，天然覆盖 a) pending 撤销、
-    b) 台账重置残留（旧 open/closed 行冒充在场持仓）两类脏数据。
+    源端语义（实读 trader 代码，R3 后）：closed 行只 UPDATE 不删除；pending
+    失效改为 status='canceled' 留痕行（带 cancel_reason/canceled_ts，源端保留
+    7 天后清理）——源表保留 open/closed/canceled 完整现场。镜像直接对齐源：
+    源端不存在的 id 一律删除，天然覆盖 a) canceled 留痕到期清理、
+    b) 台账重置残留（旧行冒充在场持仓）两类脏数据。
     """
     mysql_conn = ctx.mysql.get()
     if mysql_conn is None:
@@ -410,6 +415,7 @@ def sync_sim_position(ctx: SyncContext) -> TaskResult:
                 r["leverage"], r["position_pct"], r["stop_loss"], r["take_profit"],
                 r["cur_price"], r["unrealized_pnl"],
                 _upnl_pct(r["unrealized_pnl"], r["margin"]), r["status"],
+                r["cancel_reason"], _dt8(r["canceled_ts"]),
             ) for r in rows]
             seen_ids.extend(int(r["id"]) for r in rows)
             _upsert_many(mysql_conn, _SQL_POSITION_DST, payload, exec_batch)

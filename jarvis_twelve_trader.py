@@ -11,32 +11,41 @@
     同款通道（Agent Gateway /price，失败回退 brief 因子价）；
   - 独立进程运行（CLI loop / daemon --twelve-sim），绝不挂进 dashboard 请求路径。
 
-交易规则（每轮 run_cycle，平仓判定优先级 爆仓 > 止损 > 止盈 > 翻转 > 时间止损）：
+交易规则（每轮 run_cycle，平仓判定优先级 爆仓 > 止损 > 止盈 > 时间止损；
+2026-08-06 R3 重构：点位触发才成交 + 信号变更失效留痕 + 已成交仓位独立）：
   1. 盯盘：持仓槽位先用「自开仓以来已收盘 bar 的 high/low」判断 爆仓(liq)/
      止损(sl)/止盈(tp) 盘中触碰（影线也算；同 bar 双触按保守取 SL；结算价=触发位；
      K 线取不到时优雅回退快照现价比对，缺口按更差价结算）；
-  2. 翻转：槽位信号方向与持仓相反 → 先平(exit_reason=flip)再反手开仓；
+  2. 已成交仓位独立（R3 规则3）：持仓后同槽位信号再变化（反向/转中性/点位更新）
+     **绝不影响已成交仓位**——不 flip 平仓、不跟随更新 SL/TP，仅记 applied=0
+     留痕日志；持仓只按自身 liq/sl/tp/timeout 生命周期退出。反向信号作为
+     **新的独立计划**评估（同槽位可并存 1 多 + 1 空 + 1 pending）；
+     同方向信号视为同一观点延续，不重复建仓；
   3. 时间止损：持仓超过 TF 分档上限（5m/15m:1天 30m:2天 1h:3天 4h:7天 1d:14天）
      → 以现价平仓(exit_reason=timeout)；
-  3.5 点位跟随：持有期间信号 plan 的 SL/TP 实质变化（相对变化 ≥0.2%，对齐
-     jarvis_signal_history 计划价阈值）→ 自动更新持仓止盈止损并落
-     twelve_sim_signal_log 变更日志；配置层已固定 stop_loss_pct/take_profit_pct
-     的维度不跟随（配置优先级高于信号）；新点位与现价不自洽（多单需
-     SL<现价<TP，空单反之）时不硬改，仅记 applied=0 日志；
-  4. 开仓（计划→成交语义）：槽位无仓时 bullish 开多 / bearish 开空；neutral 不动；
-     - plan 的 entry_type=market（或计划缺失/entry 非法）→ 维持现状按现价立即开仓；
-     - entry_type=breakout/pullback 且现价已触达 plan['entry'] → 按现价立即开仓；
-     - entry_type=breakout/pullback 且现价未触达 → 只建**计划(pending)**：
-       不建持仓、不动钱包、不进胜率、不写 twelve_sim_trade；
+  4. 开仓（R3 规则1：点位触发才算成交）：信号 bullish 开多 / bearish 开空；
+     neutral 不动；只要 plan 给出有效 entry 点位就必须比对实时价格：
+     - entry_type=breakout/pullback：沿用方向性触达口径（见 4.5）；
+     - entry_type=market（或缺 entry_type）且带有效 entry：按「点位或更优」限价
+       口径（做多 现价≤点位 / 做空 现价≥点位）；已处于可成交侧 → 按现价立即
+       成交（现有业务口径）；未触达 → 挂计划(pending) 等触达；
+     - 计划缺失 / entry 非法 → 无点位可比，维持现状按现价立即开仓；
+     - pending 不建持仓、不动钱包、不进胜率、不写 twelve_sim_trade；
   4.5 计划盯盘（每轮，先于持仓开仓处理）：
      - 触达判定用「自计划创建以来已收盘 bar 的 high/low ∪ 快照现价」（同 _exit_check
        口径）：breakout 多 high≥entry / 空 low≤entry；pullback 多 low≤entry / 空 high≥entry；
+       market 按限价口径（多 low≤entry / 空 high≥entry，成交价取点位与现价更优侧）；
      - 触达即「成交」：以 **plan['entry'] 价**转持仓（entry_price=entry、entry_ts=成交
        时刻），SL/TP/杠杆/qty 经 _resolve_entry_params 基于 entry 价合成；
+       成交落 twelve_sim_signal_log 留痕（change_kinds=fill）；
      - 未成交期间信号 entry/SL/TP 实质变化（≥0.2%）→ 更新计划点位并记
        twelve_sim_signal_log（position_id 关联 pending 行）；
-     - 信号反向/转 neutral/计划消失/槽位停用/挂单超过 TF 超时档（同时间止损分档）
-       → **撤销计划**（删 pending 行），全程不产生 twelve_sim_trade；
+     - R3 规则2：pending 期间同级别信号变更（反向/转 neutral/计划消失/槽位停用/
+       挂单超 TF 超时档）→ **旧计划失效**：行保留 status='canceled' + cancel_reason
+       + canceled_ts 留痕（看板可见「已失效」），并落 twelve_sim_signal_log
+       （change_kinds=cancel）；失效后价格再触达旧点位也不成交，一切以最新信号
+       为准（撤销判定先于触达成交判定）；canceled 行保留 7 天后清理
+       （日志表留痕永久）；全程不产生 twelve_sim_trade；
   5. 参数：止损/止盈/杠杆/仓位% 优先用 twelve_sim_config 覆盖
      （优先级 信号级 > tf组级 > 币种级），否则用 plan_json 系统推荐；杠杆双兜底：
      配置/plan 均未给时按止损距离自动推荐（打到止损亏≈保证金50%，夹 [1,20]）；
@@ -47,13 +56,14 @@
 
 五张本地表（经 jarvis_db 兼容层懒建，pg 可切）：
   twelve_sim_wallet     槽位虚拟钱包 + 累计战绩（UNIQUE symbol,tf,system）
-  twelve_sim_position   计划/在途持仓（status pending计划未成交 / open持仓 / closed已平；
-                        pending 行 entry_price=计划入场价、entry_ts=计划创建时刻、
-                        qty/margin=0 延迟到成交时按 entry 价计算回填）
-  twelve_sim_trade      平仓台账流水（exit_reason tp/sl/flip/timeout/liq；
+  twelve_sim_position   计划/在途持仓（status pending计划未成交 / open持仓 /
+                        closed已平 / canceled已失效；pending 行 entry_price=计划
+                        入场价、entry_ts=计划创建时刻、qty/margin=0 延迟到成交时
+                        按 entry 价计算回填；canceled 行带 cancel_reason/canceled_ts）
+  twelve_sim_trade      平仓台账流水（exit_reason tp/sl/flip(历史)/timeout/liq；
                         只有「成交→平仓」才写，计划的建/撤/改不落此表）
-  twelve_sim_signal_log 点位跟随变更日志（持仓 SL/TP 或计划 entry/SL/TP 更新
-                        前后值 + 关联 position_id + applied 是否已应用）
+  twelve_sim_signal_log 信号变更留痕日志（计划建/撤/成交、pending 点位跟随、
+                        持仓期间信号漂移 applied=0 留痕；关联 position_id）
   twelve_sim_config     参数配置（scope_tf/scope_system 可 NULL 分层覆盖；
                         内容由 RuoYi 同步链路回读落地，本模块只负责
                         建表 + 读取 + 提供 upsert_config 函数）
@@ -106,6 +116,17 @@ MAX_AUTO_LEVERAGE = 20.0
 # 点位跟随：SL/TP 相对变化 ≥ 此阈值(%)才算实质变更（对齐 jarvis_signal_history
 # 计划价 0.2% 变更判定，滤掉浮点噪音与微调抖动）
 SLTP_MIN_CHANGE_PCT = 0.2
+
+# 已失效(canceled)计划行保留天数：看板留痕窗口；到期物理清理防表膨胀
+# （twelve_sim_signal_log 的 cancel 留痕永久保留，完整审计链在日志表）
+CANCELED_RETENTION_DAYS = 7
+
+# 计划失效原因 → 中文留痕说明（写进 twelve_sim_signal_log.note，看板直读）
+CANCEL_REASON_CN = {
+    "neutral": "信号转中性", "flip": "信号反向", "plan_gone": "信号计划消失",
+    "disabled": "槽位停用", "timeout": "挂单超时", "broke": "槽位余额不足",
+    "incoherent": "点位与配置不自洽",
+}
 
 _INITED = False
 
@@ -177,6 +198,14 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_tsp_sym_status "
             "ON twelve_sim_position(symbol, status)"
         )
+        # 旧库升级：R3 失效留痕列（SQLite 无 IF NOT EXISTS，重复加列抛错=已升级过；
+        # jarvis_db 兼容层对 pg 自动翻译为 ADD COLUMN IF NOT EXISTS 幂等）
+        for _ddl in ("ALTER TABLE twelve_sim_position ADD COLUMN cancel_reason TEXT",
+                     "ALTER TABLE twelve_sim_position ADD COLUMN canceled_ts REAL"):
+            try:
+                conn.execute(_ddl)
+            except Exception:  # noqa: BLE001 — duplicate column = 已升级过
+                pass
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS twelve_sim_trade (
@@ -524,6 +553,21 @@ def pending_positions(symbol: str | None = None) -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
+def canceled_positions(symbol: str | None = None) -> list[dict]:
+    """已失效(canceled)计划行查询：R3 规则2 留痕（保留 7 天，看板/冒烟/调试用）。"""
+    _ensure_init()
+    with _conn() as conn:
+        if symbol:
+            cur = conn.execute(
+                "SELECT * FROM twelve_sim_position WHERE status='canceled' AND symbol=? "
+                "ORDER BY canceled_ts DESC, id DESC", (_norm_symbol(symbol),))
+        else:
+            cur = conn.execute(
+                "SELECT * FROM twelve_sim_position WHERE status='canceled' "
+                "ORDER BY canceled_ts DESC, id DESC")
+        return [dict(r) for r in cur.fetchall()]
+
+
 def trades(symbol: str | None = None, tf: str | None = None,
            system: str | None = None, limit: int = 200) -> list[dict]:
     _ensure_init()
@@ -847,7 +891,9 @@ def _entry_touched(direction: str, entry_type: str, entry: float, price: float,
     """计划入场价是否已触达：自 since_ts 以来已收盘 bar 影线 ∪ 快照现价（同
     _exit_check 有效触及口径；bars 取不到时优雅回退快照现价比对）。
 
-    breakout：多 high≥entry / 空 low≤entry；pullback：多 low≤entry / 空 high≥entry。
+    breakout：多 high≥entry / 空 low≤entry；pullback：多 low≤entry / 空 high≥entry；
+    market（带有效点位，R3 规则1）：按「点位或更优」限价口径 = 多 low≤entry /
+    空 high≥entry（与任务边界约定一致：做多触发 现价≤点位 / 做空触发 现价≥点位）。
     """
     hi = lo = None
     if bars:
@@ -859,9 +905,8 @@ def _entry_touched(direction: str, entry_type: str, entry: float, price: float,
     eff_hi = max(hi, price) if hi is not None else price
     eff_lo = min(lo, price) if lo is not None else price
     long_side = direction == "long"
-    if entry_type == "pullback":
+    if entry_type in ("pullback", "market"):
         return (eff_lo <= entry) if long_side else (eff_hi >= entry)
-    # breakout（market 不走 pending，此处兜底按 breakout 口径）
     return (eff_hi >= entry) if long_side else (eff_lo <= entry)
 
 
@@ -871,8 +916,9 @@ def _do_plan(conn, sym: str, tf: str, system: str, direction: str,
 
     entry_price=计划入场价、entry_ts=计划创建时刻；qty/margin=0 延迟到成交时
     按 entry 价计算回填（leverage 占位 1，成交时重算）。
+    计划创建落 twelve_sim_signal_log 留痕（change_kinds=plan，新计划替换可追溯）。
     """
-    conn.execute(
+    cur = conn.execute(
         """
         INSERT INTO twelve_sim_position
           (symbol, tf, system, direction, entry_price, entry_ts, qty, margin,
@@ -882,14 +928,49 @@ def _do_plan(conn, sym: str, tf: str, system: str, direction: str,
         """,
         (sym, tf, system, direction, pts["entry"], now,
          eff.get("position_pct"), pts["stop_loss"], pts["take_profit"], price))
+    pid = cur.lastrowid
+    conn.execute(
+        """
+        INSERT INTO twelve_sim_signal_log
+          (ts, symbol, tf, system, name_cn, position_id,
+           prev_entry, prev_sl, prev_tp, new_entry, new_sl, new_tp,
+           price, change_kinds, applied, note)
+        VALUES (?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,?,'plan',1,?)
+        """,
+        (now, sym, tf, system, NAME_CN.get(system, system), pid,
+         pts["entry"], pts["stop_loss"], pts["take_profit"], price,
+         f"新计划创建（挂单等触达，{'做多' if direction == 'long' else '做空'}"
+         f"@{pts['entry']}）"))
     return {"symbol": sym, "tf": tf, "system": system, "direction": direction,
-            "entry": pts["entry"], "entry_type": pts["entry_type"]}
+            "entry": pts["entry"], "entry_type": pts["entry_type"],
+            "position_id": pid}
 
 
-def _cancel_plan(conn, pen: dict, reason: str) -> dict:
-    """撤销计划：直接删 pending 行（不产生 twelve_sim_trade，不影响钱包/胜率）。"""
-    conn.execute("DELETE FROM twelve_sim_position WHERE id=? AND status='pending'",
-                 (pen["id"],))
+def _cancel_plan(conn, pen: dict, reason: str, price: float, now: float) -> dict:
+    """计划失效（R3 规则2）：pending 行保留为 status='canceled' + 失效原因/时刻，
+    并落 twelve_sim_signal_log 留痕（不产生 twelve_sim_trade，不影响钱包/胜率）。
+
+    失效后该计划永不再参与触达成交判定（触达查询只认 status='pending'）。
+    """
+    conn.execute(
+        "UPDATE twelve_sim_position SET status='canceled', cancel_reason=?, "
+        "canceled_ts=?, cur_price=? WHERE id=? AND status='pending'",
+        (reason, now, price, pen["id"]))
+    old_sl = float(pen["stop_loss"]) if pen.get("stop_loss") is not None else None
+    old_tp = float(pen["take_profit"]) if pen.get("take_profit") is not None else None
+    conn.execute(
+        """
+        INSERT INTO twelve_sim_signal_log
+          (ts, symbol, tf, system, name_cn, position_id,
+           prev_entry, prev_sl, prev_tp, new_entry, new_sl, new_tp,
+           price, change_kinds, applied, note)
+        VALUES (?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,'cancel',1,?)
+        """,
+        (now, pen["symbol"], pen["tf"], pen["system"],
+         NAME_CN.get(str(pen["system"]), str(pen["system"])), pen["id"],
+         float(pen["entry_price"]), old_sl, old_tp, price,
+         f"计划已失效（{CANCEL_REASON_CN.get(reason, reason)}），"
+         f"之后价格触达旧点位也不成交"))
     return {"symbol": pen["symbol"], "tf": pen["tf"], "system": pen["system"],
             "direction": pen["direction"], "entry": float(pen["entry_price"]),
             "reason": reason}
@@ -941,7 +1022,8 @@ def _maybe_update_plan(conn, pen: dict, pts: dict, price: float,
 def _fill_plan(conn, pen: dict, plan: dict | None, eff: dict, balance: float,
                price: float, now: float) -> dict | None:
     """计划触达成交：以计划 entry 价转正式持仓（entry_ts=成交时刻），
-    SL/TP/杠杆/qty 经 _resolve_entry_params 基于 entry 价合成回填。
+    SL/TP/杠杆/qty 经 _resolve_entry_params 基于 entry 价合成回填；
+    成交落 twelve_sim_signal_log 留痕（change_kinds=fill）。
 
     点位相对 entry 不自洽（配置/信号漂移）→ 返回 None，由调用方撤销计划。
     """
@@ -961,6 +1043,18 @@ def _fill_plan(conn, pen: dict, plan: dict | None, eff: dict, balance: float,
         """,
         (now, qty, margin, params["leverage"], params["position_pct"],
          params["stop_loss"], params["take_profit"], price, pen["id"]))
+    conn.execute(
+        """
+        INSERT INTO twelve_sim_signal_log
+          (ts, symbol, tf, system, name_cn, position_id,
+           prev_entry, prev_sl, prev_tp, new_entry, new_sl, new_tp,
+           price, change_kinds, applied, note)
+        VALUES (?,?,?,?,?,?,?,NULL,NULL,?,?,?,?,'fill',1,?)
+        """,
+        (now, pen["symbol"], pen["tf"], pen["system"],
+         NAME_CN.get(str(pen["system"]), str(pen["system"])), pen["id"],
+         entry, entry, params["stop_loss"], params["take_profit"], price,
+         "计划触达成交（按计划价成交，成交后独立于后续信号变化）"))
     return {"symbol": pen["symbol"], "tf": pen["tf"], "system": pen["system"],
             "direction": pen["direction"], "entry_price": entry, "qty": qty,
             "margin": margin, "leverage": params["leverage"],
@@ -979,27 +1073,21 @@ def _sltp_changed(old: float | None, new: float | None) -> bool:
     return abs(new - old) / old * 100.0 >= SLTP_MIN_CHANGE_PCT
 
 
-def _maybe_update_sltp(conn, pos: dict, sig: dict | None, eff: dict,
-                       price: float, now: float) -> dict | None:
-    """持仓期间信号点位跟随更新（需求：信号更新则自动更新持仓风控点位并留痕）。
+def _log_signal_drift(conn, pos: dict, sig: dict | None,
+                      price: float, now: float) -> dict | None:
+    """持仓期间同级别信号点位漂移留痕（R3 规则3：已成交仓位不受后续信号影响）。
 
-    规则：
-      - 配置层已固定 stop_loss_pct / take_profit_pct 的维度不跟随（开仓时该维度
-        点位即来自配置，优先级高于信号 plan，跟随会破坏用户显式约束）；
-      - 信号 plan 的 SL/TP 相对持仓当前值变化 ≥ SLTP_MIN_CHANGE_PCT% 才算实质变更；
-      - 合成后的新点位须与持仓方向、现价自洽（多单 SL<现价<TP，空单反之），
-        自洽则 UPDATE 持仓并记日志 applied=1；不自洽不硬改，仅记 applied=0
-        留痕（信号建议已漂移出持仓可用区间，维持原风控点位继续盯盘）。
+    已开仓位的 SL/TP **绝不**跟随信号更新（成交即独立，只按自身
+    liq/sl/tp/timeout 生命周期退出）；此处仅在同方向信号的 plan 点位相对持仓
+    当前风控点位实质变化（≥ SLTP_MIN_CHANGE_PCT%）时记 applied=0 留痕，
+    供看板追溯「信号变了但仓位保持独立」。
 
-    返回日志摘要 dict（含 applied），无实质变更返回 None。
+    防重：与该持仓最近一条日志的 new 值一致（同阈值口径）则不重复记录。
+    返回日志摘要 dict（applied 恒为 False），无实质变化返回 None。
     """
     plan = (sig or {}).get("plan") or {}
     if not isinstance(plan, dict) or not plan:
         return None
-    cfg_sl_fixed = eff.get("stop_loss_pct") is not None
-    cfg_tp_fixed = eff.get("take_profit_pct") is not None
-    if cfg_sl_fixed and cfg_tp_fixed:
-        return None   # 两维度均被配置钉死，无可跟随项
     try:
         new_sl = float(plan["stop_loss"]) if plan.get("stop_loss") is not None else None
         tp_raw = plan.get("take_profit") or plan.get("take_profit_1")
@@ -1010,59 +1098,40 @@ def _maybe_update_sltp(conn, pos: dict, sig: dict | None, eff: dict,
     old_sl = float(pos["stop_loss"]) if pos.get("stop_loss") is not None else None
     old_tp = float(pos["take_profit"]) if pos.get("take_profit") is not None else None
 
-    upd_sl = (not cfg_sl_fixed) and _sltp_changed(old_sl, new_sl)
-    upd_tp = (not cfg_tp_fixed) and _sltp_changed(old_tp, new_tp)
-    if not (upd_sl or upd_tp):
+    drift_sl = _sltp_changed(old_sl, new_sl)
+    drift_tp = _sltp_changed(old_tp, new_tp)
+    if not (drift_sl or drift_tp):
         return None
 
-    cand_sl = new_sl if upd_sl else old_sl
-    cand_tp = new_tp if upd_tp else old_tp
-    long_side = pos["direction"] == "long"
-    coherent = (cand_sl is not None and cand_tp is not None
-                and ((long_side and cand_sl < price < cand_tp)
-                     or (not long_side and cand_tp < price < cand_sl)))
-    kinds = ",".join(k for k, u in (("sl", upd_sl), ("tp", upd_tp)) if u)
-    note = None if coherent else "新点位与现价不自洽，未应用（维持原风控点位）"
+    # 防重：信号维持同一组点位时每轮都会走到这里，与最近一条日志一致则跳过
+    last = conn.execute(
+        "SELECT new_sl, new_tp FROM twelve_sim_signal_log "
+        "WHERE position_id=? ORDER BY id DESC LIMIT 1",
+        (pos["id"],)).fetchone()
+    if last is not None:
+        last_sl = float(last["new_sl"]) if last["new_sl"] is not None else None
+        last_tp = float(last["new_tp"]) if last["new_tp"] is not None else None
+        if (not _sltp_changed(last_sl, new_sl)
+                and not _sltp_changed(last_tp, new_tp)):
+            return None
 
-    if not coherent:
-        # applied=0 防重：信号维持同一组不自洽点位时每轮都会走到这里，
-        # 与该持仓最近一条日志的 new 值一致（同阈值口径）则不重复记录
-        last = conn.execute(
-            "SELECT new_sl, new_tp FROM twelve_sim_signal_log "
-            "WHERE position_id=? ORDER BY id DESC LIMIT 1",
-            (pos["id"],)).fetchone()
-        if last is not None:
-            last_sl = float(last["new_sl"]) if last["new_sl"] is not None else None
-            last_tp = float(last["new_tp"]) if last["new_tp"] is not None else None
-            if (not _sltp_changed(last_sl, new_sl)
-                    and not _sltp_changed(last_tp, new_tp)):
-                return None
-
-    if coherent:
-        conn.execute(
-            "UPDATE twelve_sim_position SET stop_loss=?, take_profit=? WHERE id=?",
-            (cand_sl, cand_tp, pos["id"]))
-        pos["stop_loss"], pos["take_profit"] = cand_sl, cand_tp
-
+    kinds = ",".join(k for k, u in (("sl", drift_sl), ("tp", drift_tp)) if u)
     conn.execute(
         """
         INSERT INTO twelve_sim_signal_log
           (ts, symbol, tf, system, name_cn, position_id,
            prev_entry, prev_sl, prev_tp, new_entry, new_sl, new_tp,
            price, change_kinds, applied, note)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)
         """,
         (now, pos["symbol"], pos["tf"], pos["system"],
          NAME_CN.get(str(pos["system"]), str(pos["system"])), pos["id"],
          float(pos["entry_price"]), old_sl, old_tp,
-         new_entry, cand_sl if coherent else new_sl,
-         cand_tp if coherent else new_tp,
-         price, kinds, 1 if coherent else 0, note))
+         new_entry, new_sl, new_tp, price, kinds,
+         "信号点位已更新，但已成交仓位保持独立不跟随（新信号另行计算计划）"))
     return {"symbol": pos["symbol"], "tf": pos["tf"], "system": pos["system"],
             "position_id": pos["id"], "change_kinds": kinds,
-            "applied": coherent,
-            "stop_loss": cand_sl if coherent else old_sl,
-            "take_profit": cand_tp if coherent else old_tp}
+            "applied": False, "stop_loss": old_sl, "take_profit": old_tp}
 
 
 def signal_logs(symbol: str | None = None, tf: str | None = None,
@@ -1094,9 +1163,9 @@ _DIR_OF_SIGNAL = {"bullish": "long", "bearish": "short"}
 
 def run_cycle(symbols: list[str] | None = None, cfg: dict | None = None,
               now: float | None = None) -> dict:
-    """跑一轮：每个配置币种 → 计划盯盘（撤销/点位跟随/触达成交）→ 盯盘平仓
-    （liq/sl/tp，含影线）→ 翻转（flip+反手）→ 时间止损（timeout）
-    → 空槽开仓或挂计划（breakout/pullback 未触达只挂 pending）。
+    """跑一轮：每个配置币种 → 计划盯盘（失效留痕/点位跟随/触达成交）→ 持仓盯盘
+    （liq/sl/tp/timeout，含影线；已成交仓位独立，不受信号变更影响）
+    → 开仓/挂计划（有点位未触达只挂 pending；反向信号=新独立计划）。
 
     symbols=None 时用 twelve_sim_config 里已启用的币种；cfg 为取价配置
     （None 自动加载执行手配置）。单币失败只记日志跳过，永不抛出。
@@ -1133,10 +1202,9 @@ def _cycle_symbol(sym: str, cfg: dict, now: float | None = None) -> dict:
            "plan_updates": []}
 
     with _conn() as conn:
-        pos_rows = conn.execute(
+        pos_rows = [dict(p) for p in conn.execute(
             "SELECT * FROM twelve_sim_position WHERE status='open' AND symbol=?",
-            (sym,)).fetchall()
-        positions = {(str(p["tf"]), str(p["system"])): dict(p) for p in pos_rows}
+            (sym,)).fetchall()]
         pend_rows = conn.execute(
             "SELECT * FROM twelve_sim_position WHERE status='pending' AND symbol=?",
             (sym,)).fetchall()
@@ -1147,11 +1215,13 @@ def _cycle_symbol(sym: str, cfg: dict, now: float | None = None) -> dict:
         balances = {(str(w["tf"]), str(w["system"])): float(w["balance"])
                     for w in wal_rows}
         bars_cache: dict[str, list[dict] | None] = {}   # 每 TF 只拉一次 K 线
-        filled_slots: set[tuple[str, str]] = set()
+        # 本轮成交槽位 → 成交方向（成交后同槽位同方向本轮不再评估新计划）
+        filled_dirs: dict[tuple[str, str], set[str]] = {}
         # 超时撤销的槽位本轮不再重挂（否则同轮重建=无限续期）；下一轮信号仍在则重新评估
         timeout_slots: set[tuple[str, str]] = set()
 
-        # 0) 计划(pending)盯盘：撤销 → 点位跟随 → 触达成交（不产生 twelve_sim_trade）
+        # 0) 计划(pending)盯盘：失效判定 → 点位跟随 → 触达成交
+        #    （R3 规则2：失效判定先于触达成交——信号已变更时，价格触达旧点位也不成交）
         for slot, pen in list(pendings.items()):
             tf_, system_ = slot
             sig = signals.get(slot)
@@ -1161,26 +1231,24 @@ def _cycle_symbol(sym: str, cfg: dict, now: float | None = None) -> dict:
 
             reason = None
             if want is None:
-                reason = "neutral"           # 信号转中性 → 撤
+                reason = "neutral"           # 信号转中性 → 旧计划失效
             elif want != str(pen["direction"]):
-                reason = "flip"              # 信号反向 → 撤
+                reason = "flip"              # 信号反向 → 旧计划失效
             elif pts is None:
-                reason = "plan_gone"         # 计划消失/entry 失效 → 撤
+                reason = "plan_gone"         # 计划消失/entry 失效 → 失效
             elif not eff["enabled"]:
-                reason = "disabled"          # 槽位停用 → 撤
+                reason = "disabled"          # 槽位停用 → 失效
             elif _timeout_due(pen, ts):
-                reason = "timeout"           # 挂单超过 TF 超时档 → 撤
-            elif pts["entry_type"] == "market":
-                # 信号计划转 market：撤计划，交由本轮开仓阶段按现价处理
-                reason = "to_market"
+                reason = "timeout"           # 挂单超过 TF 超时档 → 失效
             if reason:
-                res["canceled"].append(_cancel_plan(conn, pen, reason))
+                res["canceled"].append(_cancel_plan(conn, pen, reason, price, ts))
                 pendings.pop(slot)
                 if reason == "timeout":
                     timeout_slots.add(slot)
                 continue
 
-            # 点位跟随（先更新再判触达，触达判定用最新 entry）
+            # 点位跟随（同方向信号点位更新 → pending 计划以最新信号为准；
+            # 先更新再判触达，触达判定用最新 entry）
             upd = _maybe_update_plan(conn, pen, pts, price, ts)
             if upd:
                 res["plan_updates"].append(upd)
@@ -1192,27 +1260,34 @@ def _cycle_symbol(sym: str, cfg: dict, now: float | None = None) -> dict:
                               bars_cache[tf_], float(pen["entry_ts"])):
                 balance = balances.get(slot, DEFAULT_PRINCIPAL)
                 if balance < MIN_BALANCE:
-                    res["canceled"].append(_cancel_plan(conn, pen, "broke"))
+                    res["canceled"].append(_cancel_plan(conn, pen, "broke", price, ts))
                     pendings.pop(slot)
                     continue
                 filled = _fill_plan(conn, pen, (sig or {}).get("plan"),
                                     eff, balance, price, ts)
                 if filled is None:
-                    # 点位相对 entry 不自洽（配置/信号漂移）→ 宁缺毋滥撤计划
-                    res["canceled"].append(_cancel_plan(conn, pen, "incoherent"))
+                    # 点位相对 entry 不自洽（配置/信号漂移）→ 宁缺毋滥失效
+                    res["canceled"].append(
+                        _cancel_plan(conn, pen, "incoherent", price, ts))
                     pendings.pop(slot)
                     continue
                 res["filled"].append(filled)
-                filled_slots.add(slot)
+                filled_dirs.setdefault(slot, set()).add(str(pen["direction"]))
                 pendings.pop(slot)
                 continue
             # 未触达继续挂：仅刷新展示用现价
             conn.execute("UPDATE twelve_sim_position SET cur_price=? WHERE id=?",
                          (price, pen["id"]))
 
-        # 1) 盯盘 + 翻转 + 时间止损：优先级 liq > sl > tp > flip > timeout
-        for slot, pos in positions.items():
-            tf_ = str(pos["tf"])
+        # 1) 持仓盯盘：优先级 liq > sl > tp > timeout。
+        #    R3 规则3：已成交仓位独立——信号反向不再 flip 平仓、SL/TP 不跟随信号，
+        #    只按自身生命周期退出；同方向信号点位漂移仅记 applied=0 留痕。
+        #    同槽位可能并存多笔仓位（1多+1空），浮盈按槽位累计后更新钱包 equity。
+        open_dirs: dict[tuple[str, str], set[str]] = {}
+        upnl_by_slot: dict[tuple[str, str], float] = {}
+        for pos in pos_rows:
+            slot = (str(pos["tf"]), str(pos["system"]))
+            tf_ = slot[0]
             if tf_ not in bars_cache:
                 bars_cache[tf_] = _fetch_bars(sym, tf_)
             hit = _exit_check(pos, price, bars_cache[tf_], mark_price=mark)
@@ -1220,22 +1295,17 @@ def _cycle_symbol(sym: str, cfg: dict, now: float | None = None) -> dict:
                 reason, exit_px = hit
                 res["closed"].append(_do_close(conn, pos, exit_px, reason, ts))
                 continue
-            sig = signals.get(slot)
-            want = _DIR_OF_SIGNAL.get((sig or {}).get("direction") or "")
-            if want and want != pos["direction"]:
-                # 方向翻转：先平(flip)，反手在下方开仓阶段统一处理
-                res["closed"].append(_do_close(conn, pos, price, "flip", ts))
-                continue
             if _timeout_due(pos, ts):
                 # TF 分档持仓超时：以现价平仓
                 res["closed"].append(_do_close(conn, pos, price, "timeout", ts))
                 continue
-            # 持有（本轮不平仓）：先做信号点位跟随（§3.5 更新 SL/TP + 变更日志，
-            # 下一轮盯盘即用新点位），再刷新现价与浮盈
-            eff = effective_config(sym, tf_, str(pos["system"]), cfg_rows)
-            upd = _maybe_update_sltp(conn, pos, sig, eff, price, ts)
-            if upd:
-                res["sltp_updates"].append(upd)
+            # 持有（本轮不平仓）：同方向信号点位漂移留痕（不应用），刷新现价与浮盈
+            sig = signals.get(slot)
+            want = _DIR_OF_SIGNAL.get((sig or {}).get("direction") or "")
+            if want == str(pos["direction"]):
+                upd = _log_signal_drift(conn, pos, sig, price, ts)
+                if upd:
+                    res["sltp_updates"].append(upd)
             sign = 1.0 if pos["direction"] == "long" else -1.0
             upnl = round(max((price - float(pos["entry_price"]))
                              * float(pos["qty"]) * sign,
@@ -1243,15 +1313,19 @@ def _cycle_symbol(sym: str, cfg: dict, now: float | None = None) -> dict:
             conn.execute(
                 "UPDATE twelve_sim_position SET cur_price=?, unrealized_pnl=? "
                 "WHERE id=?", (price, upnl, pos["id"]))
+            open_dirs.setdefault(slot, set()).add(str(pos["direction"]))
+            upnl_by_slot[slot] = upnl_by_slot.get(slot, 0.0) + upnl
+            res["holds"] += 1
+        for slot, upnl in upnl_by_slot.items():
             conn.execute(
                 "UPDATE twelve_sim_wallet SET equity=balance+?, updated_ts=? "
                 "WHERE symbol=? AND tf=? AND system=?",
-                (upnl, ts, sym, pos["tf"], pos["system"]))
-            res["holds"] += 1
+                (round(upnl, 8), ts, sym, slot[0], slot[1]))
 
-        # 2) 开仓/挂计划：本轮平掉的槽位（含 flip 反手）+ 原本无仓无计划槽位
-        closed_slots = {(c["tf"], c["system"]) for c in res["closed"]}
-        still_open = {s for s in positions if s not in closed_slots}
+        # 2) 开仓/挂计划（R3 规则1+3）：
+        #    - 同槽位已有**同方向**持仓 → 视为同一信号观点延续，不重复建仓；
+        #    - 反向信号即使有持仓也作为**新的独立计划**评估（不影响已成交仓位）；
+        #    - 有有效点位必须触达才成交，未触达一律挂 pending。
         wal_rows = conn.execute(
             "SELECT tf, system, balance FROM twelve_sim_wallet WHERE symbol=?",
             (sym,)).fetchall()
@@ -1259,13 +1333,15 @@ def _cycle_symbol(sym: str, cfg: dict, now: float | None = None) -> dict:
                     for w in wal_rows}
         for slot, sig in signals.items():
             tf, system = slot
-            if (slot in still_open or slot in pendings or slot in filled_slots
-                    or slot in timeout_slots
+            if (slot in pendings or slot in timeout_slots
                     or tf not in TFS or system not in SYSTEMS):
                 continue
             direction = _DIR_OF_SIGNAL.get(sig["direction"])
             if not direction:
                 continue   # neutral 不动
+            occupied = open_dirs.get(slot, set()) | filled_dirs.get(slot, set())
+            if direction in occupied:
+                continue   # 同方向已有持仓 → 不重复建仓
             eff = effective_config(sym, tf, system, cfg_rows)
             if not eff["enabled"]:
                 continue
@@ -1274,20 +1350,25 @@ def _cycle_symbol(sym: str, cfg: dict, now: float | None = None) -> dict:
                 continue   # 槽位已爆仓，停开
             plan = sig.get("plan")
             pts = _plan_points(plan)
-            if (pts and pts["entry_type"] in ("breakout", "pullback")
-                    and not _entry_touched(direction, pts["entry_type"],
+            if (pts and not _entry_touched(direction, pts["entry_type"],
                                            pts["entry"], price, None, ts)):
-                # 现价未触达推荐入场价 → 只挂计划(pending)，价到才成交
+                # 有点位且现价未触达 → 只挂计划(pending)，价到才成交（规则1）
                 res["planned"].append(
                     _do_plan(conn, sym, tf, system, direction, pts, eff, price, ts))
                 continue
-            # market / 计划缺失 / 现价已触达 → 维持现状：按现价立即开仓
+            # 计划缺失（无点位可比）/ 现价已处于可成交侧 → 按现价立即成交（现有口径）
             params = _resolve_entry_params(direction, price, eff, plan)
             if params is None:
                 continue   # 点位缺失或不自洽，宁缺毋滥
             opened = _do_open(conn, sym, tf, system,
                               direction, price, balance, params, ts)
             res["opened"].append(opened)
+
+        # 3) 已失效(canceled)留痕行到期清理（日志表留痕永久，行级留痕仅保窗口期）
+        conn.execute(
+            "DELETE FROM twelve_sim_position WHERE symbol=? AND status='canceled' "
+            "AND canceled_ts IS NOT NULL AND canceled_ts < ?",
+            (sym, ts - CANCELED_RETENTION_DAYS * 86400.0))
 
     if (res["closed"] or res["opened"] or res["sltp_updates"] or res["planned"]
             or res["filled"] or res["canceled"] or res["plan_updates"]):

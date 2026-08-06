@@ -170,34 +170,42 @@ check("台账流水字段完整（rr=2.0 / holding_minutes≥0）",
       and t_rows[0]["holding_minutes"] is not None
       and t_rows[0]["exit_reason"] == "tp", str(t_rows[0] if t_rows else None))
 
-# ═══════════ 5. 方向翻转：先平(flip)再反手 ═══════════
+# ═══════════ 5. 方向翻转（R3 规则3）：已成交仓位独立，反向信号=新的独立计划 ═══════════
 set_signal("1h", "turtle", "bearish",
            {"side": "short", "entry": 111.0, "stop_loss": 120.0,
             "take_profit": 90.0})
-out = jtt.run_cycle(cfg={})   # 槽位已空 → 直接开空 @111
+out = jtt.run_cycle(cfg={})   # 槽位已空 → 触达（做空 111≥111）直接开空 @111
 r_sym = out["symbols"][SYM]
-check("翻转前置：开空 1 笔", len(r_sym["opened"]) == 1
-      and r_sym["opened"][0]["direction"] == "short", str(r_sym["opened"]))
+op_t = [o for o in r_sym["opened"] if (o["tf"], o["system"]) == ("1h", "turtle")]
+check("翻转前置：开空 1 笔", len(op_t) == 1 and op_t[0]["direction"] == "short",
+      str(r_sym["opened"]))
 
 set_signal("1h", "turtle", "bullish",
            {"side": "long", "entry": 111.0, "stop_loss": 100.0,
             "take_profit": 125.0})
-out = jtt.run_cycle(cfg={})   # 价不变 111：不触 SL/TP，仅方向翻转
+out = jtt.run_cycle(cfg={})   # 价不变 111：信号反向
 r_sym = out["symbols"][SYM]
-check("翻转平仓 exit_reason=flip", len(r_sym["closed"]) == 1
-      and r_sym["closed"][0]["exit_reason"] == "flip", str(r_sym["closed"]))
-check("同轮反手开多", len(r_sym["opened"]) == 1
-      and r_sym["opened"][0]["direction"] == "long"
-      and r_sym["opened"][0]["tf"] == "1h", str(r_sym["opened"]))
-check("flip 平仓 pnl=0（同价进出）",
-      abs(r_sym["closed"][0]["pnl"]) < 1e-9, str(r_sym["closed"][0]["pnl"]))
+check("规则3：信号反向不平已成交仓位（无 flip 平仓）", not r_sym["closed"],
+      str(r_sym["closed"]))
+op_t = [o for o in r_sym["opened"] if (o["tf"], o["system"]) == ("1h", "turtle")]
+check("反向信号=新的独立计划：触达（做多 111≤111）另开多单，原空单保留",
+      len(op_t) == 1 and op_t[0]["direction"] == "long", str(r_sym["opened"]))
+poss_t = [p for p in jtt.open_positions(SYM)
+          if (p["tf"], p["system"]) == ("1h", "turtle")]
+check("同槽位多空并存（1空+1多，互不影响）",
+      sorted(p["direction"] for p in poss_t) == ["long", "short"],
+      str([(p["direction"], p["entry_price"]) for p in poss_t]))
+out = jtt.run_cycle(cfg={})   # 同方向信号持续 → 不重复建仓不重复挂计划
+r_sym = out["symbols"][SYM]
+check("同方向信号持续：不重复建仓/挂计划", not r_sym["opened"]
+      and not r_sym["planned"] and r_sym["holds"] == 2, str(r_sym))
 
 # ═══════════ 6. neutral 持仓不动（不平已有仓） ═══════════
 set_signal("1h", "turtle", "neutral", None)
 out = jtt.run_cycle(cfg={})
 r_sym = out["symbols"][SYM]
-check("信号转 neutral：持仓不平不动", not r_sym["closed"] and r_sym["holds"] == 1,
-      str(r_sym))
+check("信号转 neutral：已成交仓位不平不动（多空各1）",
+      not r_sym["closed"] and r_sym["holds"] == 2, str(r_sym))
 
 # ═══════════ 7. 槽位停用 + 爆仓停开 ═══════════
 jtt.upsert_config(SYM, "4h", "dow", enabled=False)
@@ -237,9 +245,10 @@ check("深跌越过爆仓价 → exit_reason=liq 且亏损=−margin 不倒欠",
       and abs(c_mg[0]["pnl"] + mg["margin"]) < 1e-6
       and c_mg[0]["balance_after"] >= 0, str(c_mg))
 
-# ═══════════ 9. 新能力用例准备：人工清场（平掉全部在途 + 钱包复位 + 信号归中） ═══════════
+# ═══════════ 9. 新能力用例准备：人工清场（平掉全部在途/挂单 + 钱包复位 + 信号归中） ═══════════
 with jtt._conn() as conn:
     conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+    conn.execute("DELETE FROM twelve_sim_position WHERE status='pending'")
     conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
 for _tf, _sys in [("1h", "turtle"), ("4h", "dow"), ("5m", "gap"),
                   ("15m", "elliott"), ("30m", "gann"), ("1d", "martingale")]:
@@ -331,86 +340,73 @@ check("liq 优先于 sl，以爆仓价 110 结算 pnl=-margin=-10",
       and abs(c_dw[0]["pnl"] + 10.0) < 1e-9,
       str(c_dw and (c_dw[0]["exit_reason"], c_dw[0]["exit_price"], c_dw[0]["pnl"])))
 
-# ═══════════ 13.5 持仓点位跟随（信号更新 → SL/TP 同步 + 变更日志） ═══════════
+# ═══════════ 13.5 R3 规则3：持仓期间信号点位变化只留痕（applied=0），绝不修改持仓 ═══════════
 _PRICE["v"] = 100.0
 set_signal("1h", "turtle", "bullish",
            {"side": "long", "entry": 100.0, "stop_loss": 95.0, "take_profit": 110.0})
 out = jtt.run_cycle(cfg={})
-check("跟随用例开多（SL95/TP110）", len(out["symbols"][SYM]["opened"]) == 1,
+check("留痕用例开多（SL95/TP110）", len(out["symbols"][SYM]["opened"]) == 1,
       str(out["symbols"][SYM]["opened"]))
+n_logs0 = len(jtt.signal_logs(SYM, "1h", "turtle"))
 
-# a) 信号点位实质变化（SL 95→97 / TP 110→115，均 >0.2%）→ 持仓跟随 + applied=1
+# a) 信号点位实质变化（SL 95→97 / TP 110→115，均 >0.2%）→ 不应用，仅 applied=0 留痕
 set_signal("1h", "turtle", "bullish",
            {"side": "long", "entry": 101.0, "stop_loss": 97.0, "take_profit": 115.0})
 out = jtt.run_cycle(cfg={})
 r_sym = out["symbols"][SYM]
-check("点位跟随触发（sltp_updates=1 / 不平不开）",
-      len(r_sym["sltp_updates"]) == 1 and not r_sym["closed"]
-      and not r_sym["opened"] and r_sym["sltp_updates"][0]["applied"] is True,
+check("规则3：信号点位变化仅留痕（applied=0 / 不平不开不改）",
+      len(r_sym["sltp_updates"]) == 1
+      and r_sym["sltp_updates"][0]["applied"] is False
+      and not r_sym["closed"] and not r_sym["opened"],
       str(r_sym["sltp_updates"]))
 pos_t = {(p["tf"], p["system"]): p for p in jtt.open_positions(SYM)}[("1h", "turtle")]
-check("持仓 SL/TP 已跟随为 97/115",
-      abs(pos_t["stop_loss"] - 97.0) < 1e-9 and abs(pos_t["take_profit"] - 115.0) < 1e-9,
+check("持仓 SL/TP 维持 95/110 不跟随（已成交仓位独立）",
+      abs(pos_t["stop_loss"] - 95.0) < 1e-9 and abs(pos_t["take_profit"] - 110.0) < 1e-9,
       str((pos_t["stop_loss"], pos_t["take_profit"])))
 logs = jtt.signal_logs(SYM, "1h", "turtle")
-check("变更日志 applied=1：前后值 + 关联 position_id + 新计划 entry",
-      len(logs) == 1 and logs[0]["applied"] == 1
+check("留痕日志 applied=0：前后值 + 关联 position_id + 新计划 entry + note",
+      len(logs) == n_logs0 + 1 and logs[0]["applied"] == 0
       and abs(logs[0]["prev_sl"] - 95.0) < 1e-9 and abs(logs[0]["new_sl"] - 97.0) < 1e-9
       and abs(logs[0]["prev_tp"] - 110.0) < 1e-9 and abs(logs[0]["new_tp"] - 115.0) < 1e-9
       and logs[0]["position_id"] == pos_t["id"]
       and abs(logs[0]["new_entry"] - 101.0) < 1e-9
-      and logs[0]["change_kinds"] == "sl,tp",
+      and logs[0]["change_kinds"] == "sl,tp" and logs[0]["note"] is not None,
       str(logs[0] if logs else None))
 
-# b) 微小变化（SL 97→97.15 ≈0.15% < 0.2%）→ 不跟随不记日志
+# b) 相对上次留痕微小变化（SL 97→97.15 ≈0.15% < 0.2%）→ 防重不重复记录
 set_signal("1h", "turtle", "bullish",
            {"side": "long", "entry": 101.0, "stop_loss": 97.15, "take_profit": 115.0})
 out = jtt.run_cycle(cfg={})
-check("微小变化(<0.2%)不跟随", not out["symbols"][SYM]["sltp_updates"]
-      and len(jtt.signal_logs(SYM, "1h", "turtle")) == 1,
+check("微小变化(<0.2%)防重不重复留痕", not out["symbols"][SYM]["sltp_updates"]
+      and len(jtt.signal_logs(SYM, "1h", "turtle")) == n_logs0 + 1,
       str(out["symbols"][SYM]["sltp_updates"]))
 
-# c) 不自洽新点位（多单新 SL105 > 现价100）→ 不应用，applied=0 留痕
+# c) 同一组点位下一轮防重：不再重复记录
+out = jtt.run_cycle(cfg={})
+check("同点位下一轮防重（日志数不变）",
+      not out["symbols"][SYM]["sltp_updates"]
+      and len(jtt.signal_logs(SYM, "1h", "turtle")) == n_logs0 + 1,
+      str(out["symbols"][SYM]["sltp_updates"]))
+
+# d) 再次实质变化 → 新留痕；持仓点位依旧纹丝不动
 set_signal("1h", "turtle", "bullish",
-           {"side": "long", "entry": 106.0, "stop_loss": 105.0, "take_profit": 120.0})
+           {"side": "long", "entry": 101.0, "stop_loss": 99.0, "take_profit": 118.0})
 out = jtt.run_cycle(cfg={})
 r_sym = out["symbols"][SYM]
-check("不自洽点位不应用（applied=0 留痕）",
-      len(r_sym["sltp_updates"]) == 1 and r_sym["sltp_updates"][0]["applied"] is False,
-      str(r_sym["sltp_updates"]))
 pos_t2 = {(p["tf"], p["system"]): p for p in jtt.open_positions(SYM)}[("1h", "turtle")]
-check("持仓 SL/TP 维持 97/115 未被破坏",
-      abs(pos_t2["stop_loss"] - 97.0) < 1e-9 and abs(pos_t2["take_profit"] - 115.0) < 1e-9,
-      str((pos_t2["stop_loss"], pos_t2["take_profit"])))
-logs = jtt.signal_logs(SYM, "1h", "turtle")
-check("applied=0 日志含 note 说明", len(logs) == 2 and logs[0]["applied"] == 0
-      and logs[0]["note"] is not None, str(logs[0] if logs else None))
+check("再次实质变化 → 新增留痕且持仓仍 95/110",
+      len(r_sym["sltp_updates"]) == 1
+      and r_sym["sltp_updates"][0]["applied"] is False
+      and len(jtt.signal_logs(SYM, "1h", "turtle")) == n_logs0 + 2
+      and abs(pos_t2["stop_loss"] - 95.0) < 1e-9
+      and abs(pos_t2["take_profit"] - 110.0) < 1e-9,
+      str((r_sym["sltp_updates"], pos_t2["stop_loss"], pos_t2["take_profit"])))
 
-# d) 同一组不自洽点位下一轮防重：不再重复记录
-out = jtt.run_cycle(cfg={})
-check("applied=0 防重（同点位不重复记日志）",
-      not out["symbols"][SYM]["sltp_updates"]
-      and len(jtt.signal_logs(SYM, "1h", "turtle")) == 2,
-      str(out["symbols"][SYM]["sltp_updates"]))
-
-# e) 配置层固定 sl/tp pct 的槽位（1d/martingale sl_pct=90 tp_pct=95）不跟随信号
-set_signal("1d", "martingale", "bullish",
-           {"side": "long", "entry": 100.0, "stop_loss": 95.0, "take_profit": 110.0})
-out = jtt.run_cycle(cfg={})
-check("配置固定槽位开仓（SL/TP 来自配置 pct）",
-      len(out["symbols"][SYM]["opened"]) == 1, str(out["symbols"][SYM]["opened"]))
-set_signal("1d", "martingale", "bullish",
-           {"side": "long", "entry": 100.0, "stop_loss": 98.0, "take_profit": 130.0})
-out = jtt.run_cycle(cfg={})
-mg_upds = [u for u in out["symbols"][SYM]["sltp_updates"]
-           if (u["tf"], u["system"]) == ("1d", "martingale")]
-check("配置固定 sl/tp pct 槽位不跟随信号点位", not mg_upds,
-      str(out["symbols"][SYM]["sltp_updates"]))
-
-# ═══════════ 13.7 计划→成交语义（breakout/pullback 挂计划 · 触达成交 · 跟随 · 撤销） ═══════════
-# 清场：平掉全部在途 + 钱包复位 + 信号归中（复用既有 6 槽位，保持信号行数不变）
+# ═══════════ 13.7 计划→成交语义（breakout/pullback 挂计划 · 触达成交 · 跟随 · 失效） ═══════════
+# 清场：平掉全部在途/挂单 + 钱包复位 + 信号归中（复用既有 6 槽位，保持信号行数不变）
 with jtt._conn() as conn:
     conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+    conn.execute("DELETE FROM twelve_sim_position WHERE status='pending'")
     conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
 for _tf, _sys in [("1h", "turtle"), ("4h", "dow"), ("5m", "gap"),
                   ("15m", "elliott"), ("30m", "gann"), ("1d", "martingale")]:
@@ -493,8 +489,14 @@ set_signal("15m", "elliott", "bearish",
 out = jtt.run_cycle(cfg={}, now=T2 + 300)
 r_sym = out["symbols"][SYM]
 cx = [c for c in r_sym["canceled"] if (c["tf"], c["system"]) == ("15m", "elliott")]
-check("信号反向 → 撤计划（reason=flip，删 pending 行）",
+check("信号反向 → 旧计划失效（reason=flip）",
       len(cx) == 1 and cx[0]["reason"] == "flip", str(r_sym["canceled"]))
+cxr = [c for c in jtt.canceled_positions(SYM)
+       if (c["tf"], c["system"]) == ("15m", "elliott")]
+check("失效行留痕（status=canceled + cancel_reason=flip + canceled_ts）",
+      len(cxr) == 1 and cxr[0]["cancel_reason"] == "flip"
+      and cxr[0]["canceled_ts"] is not None
+      and abs(float(cxr[0]["entry_price"]) - 92.0) < 1e-9, str(cxr))
 check("flip 撤销后同轮按新方向重挂（short breakout 90 未触达）",
       len(r_sym["planned"]) == 1 and r_sym["planned"][0]["direction"] == "short",
       str(r_sym["planned"]))
@@ -539,6 +541,59 @@ check("现价已触达（95≤96 pullback）→ 立即按现价 95 开仓",
                if (p["tf"], p["system"]) == ("30m", "gann")], str(op))
 check("计划全周期未污染台账（trade 行数不变）",
       len(jtt.trades(SYM, limit=500)) == n_trades_before)
+
+# ═══════════ 13.8 R1/R2 补充：market 限价点位语义 + 失效后触达不成交（时序例） ═══════════
+T4 = T3 + 1.01 * 86400 + 180
+
+# R1) market 带有效点位：未触达不立即开仓，挂 pending；触达按计划价成交
+_PRICE["v"] = 100.0
+set_signal("15m", "elliott", "bearish",
+           {"side": "short", "entry": 104.0, "entry_type": "market",
+            "stop_loss": 110.0, "take_profit": 92.0})
+out = jtt.run_cycle(cfg={}, now=T4)
+r_sym = out["symbols"][SYM]
+pl = [p for p in r_sym["planned"] if (p["tf"], p["system"]) == ("15m", "elliott")]
+check("R1：market 带点位未触达（做空104 现价100 未达）→ 挂计划不立即开仓",
+      len(pl) == 1 and not [o for o in r_sym["opened"]
+                            if (o["tf"], o["system"]) == ("15m", "elliott")],
+      str((r_sym["planned"], r_sym["opened"])))
+_PRICE["v"] = 104.5
+out = jtt.run_cycle(cfg={}, now=T4 + 60)
+fl = [f for f in out["symbols"][SYM]["filled"]
+      if (f["tf"], f["system"]) == ("15m", "elliott")]
+check("R1：现价 104.5 ≥ 点位 104（做空触发）→ 成交且成交价=计划价 104",
+      len(fl) == 1 and abs(fl[0]["entry_price"] - 104.0) < 1e-9, str(fl))
+
+# R2 时序) pending 期间信号变更 → 旧计划失效；之后价格触达旧点位也不成交
+#   前置：5m gap 有一条 breakout 做多 @110 的 pending（来自 13.7e 重挂）
+pends_gap = [p for p in jtt.pending_positions(SYM)
+             if (p["tf"], p["system"]) == ("5m", "gap")]
+check("R2 前置：5m gap 存在未成交挂单 @110", len(pends_gap) == 1
+      and abs(float(pends_gap[0]["entry_price"]) - 110.0) < 1e-9, str(pends_gap))
+set_signal("5m", "gap", "neutral", None)
+out = jtt.run_cycle(cfg={}, now=T4 + 120)
+cx = [c for c in out["symbols"][SYM]["canceled"]
+      if (c["tf"], c["system"]) == ("5m", "gap")]
+check("R2：信号转中性 → 旧计划失效（reason=neutral）",
+      len(cx) == 1 and cx[0]["reason"] == "neutral", str(cx))
+cxr = [c for c in jtt.canceled_positions(SYM)
+       if (c["tf"], c["system"]) == ("5m", "gap")
+       and c["cancel_reason"] == "neutral"]
+check("R2：失效行留痕（cancel_reason=neutral + canceled_ts）",
+      len(cxr) == 1 and cxr[0]["canceled_ts"] is not None, str(cxr))
+_PRICE["v"] = 111.0   # 价格随后真正触达旧点位 110
+out = jtt.run_cycle(cfg={}, now=T4 + 180)
+r_sym = out["symbols"][SYM]
+check("R2 时序：失效后价格触达旧点位 110 → 不成交不开仓（一切以最新信号为准）",
+      not [f for f in r_sym["filled"] if (f["tf"], f["system"]) == ("5m", "gap")]
+      and not [o for o in r_sym["opened"] if (o["tf"], o["system"]) == ("5m", "gap")]
+      and not [p for p in jtt.open_positions(SYM)
+               if (p["tf"], p["system"]) == ("5m", "gap")],
+      str((r_sym["filled"], r_sym["opened"])))
+logs_gap = [l for l in jtt.signal_logs(SYM, "5m", "gap")
+            if l["change_kinds"] == "cancel"]
+check("R2：失效落变更日志（change_kinds=cancel，note 说明不再成交）",
+      len(logs_gap) >= 1 and "已失效" in str(logs_gap[0]["note"]), str(logs_gap[:1]))
 
 # ═══════════ 14. 只读约束 + 状态汇总 ═══════════
 with jsh._conn() as conn:
