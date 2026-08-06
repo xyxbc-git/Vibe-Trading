@@ -70,6 +70,8 @@ jtt._trend_context = lambda sym: (None, None)
 # D0 环境快照打桩：全局空快照（真实 provider 会拉 regime/ATR/情报数据出网，
 # 冒烟必须离线且快）；D0 用例分节自行换桩验证落库链路
 jtt._market_context = lambda sym, tf, now: {}
+# D2 量能核验打桩：全局无核验结果（真实 provider 拉 K 线出网）；D2 用例分节换桩
+jtt._volume_context = lambda sym, tf: None
 
 # ── 门禁配置隔离（亏损止血 S1+ 开仓门禁链）────────────────────────────────
 # jarvis_config 路径指到临时目录：冒烟绝不读/写用户真实 ~/.vibe-trading 配置
@@ -1278,6 +1280,114 @@ with jtt._conn() as conn:
     conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
 for _tf, _sys in [("1h", "turtle"), ("4h", "dow"), ("15m", "elliott"),
                   ("30m", "gann")]:
+    set_signal(_tf, _sys, "neutral", None)
+
+# ═══════════ 22. D2 量能/CVD 突破确认上下文层（打标降权，绝不拒单） ═══════════
+check("D2 配置登记：twelve_ctx_deweight_suspect 默认 0.5 + vol_systems 默认表",
+      jc.default_config().get("twelve_ctx_deweight_suspect") == 0.5
+      and jc.default_config().get("twelve_ctx_vol_systems")
+      == ["turtle", "rule123", "gap", "dow", "chanlun"])
+
+T12 = T11 + 96 * 3600
+_PRICE["v"] = 100.0
+
+# a) suspect 同向 → 成交但仓位减半 + 标签 + 留痕（绝不拒单）
+jtt._volume_context = lambda sym, tf: {
+    "active": True, "direction": "up", "verdict": "suspect",
+    "reasons": ["突破根量能仅 0.5× 均量（无承接嫌疑）"]}
+set_signal("1h", "turtle", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 95.0, "take_profit": 110.0})
+out = jtt.run_cycle(cfg={}, now=T12)
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("1h", "turtle")]
+check("D2a：量能 suspect → 多单仍成交（不拒单）且 margin 减半（20→10）",
+      len(op) == 1 and abs(op[0]["margin"] - 10.0) < 1e-9
+      and op[0]["size_factor"] == 0.5 and op[0]["context_tags"] == "vol_suspect",
+      str(op))
+logs = [x for x in jtt.signal_logs(SYM, "1h", "turtle")
+        if x.get("change_kinds") == "context"]
+check("D2a：上下文降权留痕（change_kinds='context'，note 含标签与系数）",
+      logs and logs[0]["position_id"] == op[0]["position_id"]
+      and "vol_suspect" in (logs[0].get("note") or "")
+      and "0.5" in (logs[0].get("note") or ""),
+      str(logs[0] if logs else None))
+
+# b) 方向不同向（做空 vs 向上突破）→ 核验不适用，不打标不降权
+set_signal("1h", "turtle", "neutral", None)
+set_signal("4h", "dow", "bearish",
+           {"side": "short", "entry": 100.0, "stop_loss": 105.0, "take_profit": 90.0})
+out = jtt.run_cycle(cfg={}, now=T12 + 60)
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("4h", "dow")]
+check("D2b：空单 vs 向上突破（不同向）→ 不打标不降权（margin=10）",
+      len(op) == 1 and abs(op[0]["margin"] - 10.0) < 1e-9
+      and op[0]["context_tags"] is None and op[0]["size_factor"] == 1.0, str(op))
+
+# c) 非突破类系统（elliott 不在 vol_systems）→ 即使 suspect 也不受影响
+set_signal("4h", "dow", "neutral", None)
+set_signal("15m", "elliott", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 97.0, "take_profit": 106.0})
+out = jtt.run_cycle(cfg={}, now=T12 + 120)
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("15m", "elliott")]
+check("D2c：elliott 不在 vol_systems → 量能层不适用（margin=10 无标签）",
+      len(op) == 1 and abs(op[0]["margin"] - 10.0) < 1e-9
+      and op[0]["context_tags"] is None, str(op))
+
+# d) confirmed 同向 → 纯标记不降权；平仓后标签/系数拷入台账
+#    （用 dow 做多：dow 在 vol_systems 集合内；与 D2b 的 dow 空单反向并存）
+set_signal("15m", "elliott", "neutral", None)
+jtt._volume_context = lambda sym, tf: {
+    "active": True, "direction": "up", "verdict": "confirmed",
+    "reasons": ["突破根放量 2.0× 均量"]}
+set_signal("4h", "dow", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 97.0, "take_profit": 106.0})
+out = jtt.run_cycle(cfg={}, now=T12 + 180)
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("4h", "dow") and o["direction"] == "long"]
+check("D2d：量能 confirmed → 纯标记 vol_confirmed 不降权（margin=10）",
+      len(op) == 1 and abs(op[0]["margin"] - 10.0) < 1e-9
+      and op[0]["context_tags"] == "vol_confirmed"
+      and op[0]["size_factor"] == 1.0, str(op))
+_PRICE["v"] = 106.0
+out = jtt.run_cycle(cfg={}, now=T12 + 240)
+with jtt._conn() as conn:
+    tr = conn.execute(
+        "SELECT context_tags, size_factor FROM twelve_sim_trade WHERE symbol=? "
+        "AND tf='4h' AND system='dow' AND direction='long' "
+        "ORDER BY id DESC LIMIT 1", (SYM,)).fetchone()
+check("D2d：平仓 → context_tags/size_factor 原样拷入台账",
+      tr is not None and tr["context_tags"] == "vol_confirmed"
+      and float(tr["size_factor"]) == 1.0, str(dict(tr) if tr else None))
+
+# e) pending 触达成交路径同样打标降权（成交时刻核验；gap 在集合内且槽位空闲）
+_PRICE["v"] = 100.0
+jtt._volume_context = lambda sym, tf: {
+    "active": True, "direction": "up", "verdict": "suspect",
+    "reasons": ["价格破位但 CVD 未创同向极值（量价背离）"]}
+set_signal("4h", "dow", "neutral", None)
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 104.0, "entry_type": "breakout",
+            "stop_loss": 100.0, "take_profit": 112.0}, strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T12 + 300)
+check("D2e：breakout 未触达 → 先挂计划",
+      len(out["symbols"][SYM]["planned"]) == 1, str(out["symbols"][SYM]["planned"]))
+_PRICE["v"] = 105.0
+out = jtt.run_cycle(cfg={}, now=T12 + 360)
+fl = [f for f in out["symbols"][SYM]["filled"]
+      if (f["tf"], f["system"]) == ("5m", "gap")]
+check("D2e：计划触达成交 → 成交时刻打标降权（margin 减半 + vol_suspect）",
+      len(fl) == 1 and fl[0]["size_factor"] == 0.5
+      and fl[0]["context_tags"] == "vol_suspect"
+      and abs(fl[0]["margin"] - 5.0) < 1e-9, str(fl))
+
+# 复位：量能核验回全局空桩 + 清场
+jtt._volume_context = lambda sym, tf: None
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+    conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
+for _tf, _sys in [("1h", "turtle"), ("4h", "dow"), ("15m", "elliott"),
+                  ("30m", "gann"), ("5m", "gap")]:
     set_signal(_tf, _sys, "neutral", None)
 
 print()

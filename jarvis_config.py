@@ -240,6 +240,13 @@ DEFAULTS: dict = {
     # 取数失败落 NULL 绝不阻塞开仓；关闭开关=全落 NULL 且零出网增量。
     "twelve_ctx_snapshot_enabled": True,
     "twelve_ctx_cache_ttl_s": 300,    # 快照取数缓存 TTL（秒）：regime/ATR 拉 K 线限频
+    # ── 13诊断 D2：量能/CVD 突破确认上下文层（jarvis_twelve_trader）─────────────
+    # 装眼睛不拒单：突破/追价类信号在量能不确认（假突破嫌疑）时打 vol_suspect
+    # 标签并按系数降低仓位；量能确认打 vol_confirmed 纯标记。信号继续跑、
+    # 数据继续攒——降权而非关闭（诊断实验场纪律）。
+    "twelve_ctx_deweight_suspect": 0.5,   # vol_suspect 仓位系数（1.0=不降权）
+    "twelve_ctx_vol_systems": [           # 适用系统（突破/追价类；小写槽位名）
+        "turtle", "rule123", "gap", "dow", "chanlun"],
     # ── 13诊断 D1：归因报表稳定亏识别阈值（jarvis_dashboard /api/twelve/attribution）──
     # stable_losers 候选门槛：样本 ≥ min_samples 且 胜率 < max_winrate 且 净亏，
     # 作 D7 反向影子验证的输入；仅统计筛选，不影响交易引擎。
@@ -335,6 +342,8 @@ GROUPS: dict[str, str] = {
     "twelve_diag_max_winrate": "signal",
     "twelve_ctx_snapshot_enabled": "signal",
     "twelve_ctx_cache_ttl_s": "signal",
+    "twelve_ctx_deweight_suspect": "signal",
+    "twelve_ctx_vol_systems": "signal",
     # data——数据/回测口径
     "backtest_cost_bps": "data",
     "ws_stream_kline": "data",
@@ -447,6 +456,7 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "twelve_diag_min_samples": (5, 500),       # 稳定亏候选最小样本数
     "twelve_diag_max_winrate": (0.0, 100.0),   # 稳定亏候选胜率上限%
     "twelve_ctx_cache_ttl_s": (30, 3600),      # 环境快照缓存 TTL（秒）
+    "twelve_ctx_deweight_suspect": (0.05, 1.0),  # 降权下限 0.05：绝不降到 0 断样本
 }
 
 # 允许的枚举键。
@@ -465,8 +475,8 @@ def default_config() -> dict:
     return cfg
 
 
-# 保留原文大小写的 list 键（自由文本标签）；watchlist 等币种列表仍统一大写。
-_TEXT_LIST_KEYS = {"journal_tags"}
+# 保留原文大小写的 list 键（自由文本标签/小写系统槽位名）；watchlist 等币种列表仍统一大写。
+_TEXT_LIST_KEYS = {"journal_tags", "twelve_ctx_vol_systems"}
 
 
 def _coerce(key: str, value):

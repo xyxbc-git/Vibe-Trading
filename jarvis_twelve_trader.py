@@ -206,6 +206,17 @@ CTX_COLUMNS_DDL = (
 CTX_FIELDS = tuple(c for c, _ in CTX_COLUMNS_DDL if c not in
                    ("context_tags", "size_factor"))
 
+# 13诊断 D2+：信号侧上下文层（装眼睛+打标签+降权，绝不拒单/关闭——诊断实验场
+# 纪律：错误环境降权继续攒数据，稳定亏组合本身就是候选反向 alpha）。
+# D2 量能/CVD 突破确认：突破/追价类信号量能不确认 → vol_suspect 降权。
+CTX_DEWEIGHT_SUSPECT_DEFAULT = 0.5
+CTX_VOL_SYSTEMS_DEFAULT = ("turtle", "rule123", "gap", "dow", "chanlun")
+CTX_MIN_SIZE_FACTOR = 0.05    # 降权系数连乘下限：绝不降到 0（=变相关闭断样本）
+CONTEXT_TAG_CN = {
+    "vol_suspect": "量能/CVD 不确认突破（假突破嫌疑）",
+    "vol_confirmed": "量能/CVD 确认突破",
+}
+
 # 门禁拒单原因 → 中文留痕说明（写进 twelve_sim_signal_log.note，看板/复盘直读）
 REJECT_REASON_CN = {
     "sl_too_tight": "止损距离低于该周期下限",
@@ -1038,10 +1049,124 @@ def _ctx_snapshot(sym: str, tf: str, now: float) -> dict:
         return {}
 
 
+# ─────────── 13诊断 D2+：信号侧上下文层（打标签+降权公共设施，绝不拒单） ───────────
+
+_CTX_VOL_CACHE: dict = {}   # (sym, tf) → (ts, verdict_dict|None)
+
+
+def _apply_context(params: dict, tag: str, factor: float, note: str = "") -> dict:
+    """上下文打标 + 降权（D2-D6 公共设施）：tag 追加进 params['context_tags']、
+    factor 连乘进 params['size_factor']（下限 CTX_MIN_SIZE_FACTOR，绝不到 0）。
+
+    只降仓位不拒单——信号继续跑、样本继续攒，标签落库供 D1 按环境切片归因。
+    同 tag 幂等（重复打标不重复降权）。
+    """
+    tags = params.setdefault("context_tags", [])
+    if any(t["tag"] == tag for t in tags):
+        return params
+    tags.append({"tag": tag, "factor": float(factor),
+                 "note": note or CONTEXT_TAG_CN.get(tag, tag)})
+    params["size_factor"] = round(
+        max(CTX_MIN_SIZE_FACTOR,
+            float(params.get("size_factor", 1.0)) * float(factor)), 6)
+    return params
+
+
+def _ctx_tags_str(params: dict) -> str | None:
+    """params 的上下文标签 → 逗号串（落库口径）；无标签 → None。"""
+    tags = params.get("context_tags") or []
+    return ",".join(t["tag"] for t in tags) or None
+
+
+def _log_context(conn, sym: str, tf: str, system: str, position_id: int,
+                 price: float, now: float, params: dict) -> None:
+    """上下文打标留痕（change_kinds='context'）：不静默丢弃降权原因，
+    D1 报表/看板可复盘「为什么这单只有半仓」。日志失败不拖垮开仓。"""
+    tags = params.get("context_tags") or []
+    if not tags:
+        return
+    try:
+        note = "；".join(f"{t['tag']}×{t['factor']:g}：{t['note']}" for t in tags)
+        conn.execute(
+            """
+            INSERT INTO twelve_sim_signal_log
+              (ts, symbol, tf, system, name_cn, position_id,
+               price, change_kinds, applied, note)
+            VALUES (?,?,?,?,?,?,?,'context',1,?)
+            """,
+            (now, sym, tf, system, NAME_CN.get(system, system), position_id,
+             price, f"[上下文降权 size_factor={params.get('size_factor', 1.0):g}] {note}"[:500]))
+    except Exception:  # noqa: BLE001 — 留痕失败不阻塞开仓
+        pass
+
+
+def _volume_context(sym: str, tf: str) -> dict | None:
+    """量能/CVD 突破核验（TTL 缓存）→ {active, direction, verdict, reasons} 或 None。
+
+    取数三件套：jarvis_delta_flow.fetch_bars（含 taker_buy 的已收盘 bar）→
+    compute_delta_cvd → jarvis_supply_demand.breakout_check(bars, cvd, None, None)。
+    trap/whale 传 None：二者是 dashboard 进程 WS 内存态，trader 独立进程恒空，
+    breakout_check 已容错判空。取数失败返回 None（不打标放行）。
+    """
+    key = (sym, tf)
+    hit = _CTX_VOL_CACHE.get(key)
+    if hit and time.time() - hit[0] < _ctx_ttl():
+        return hit[1]
+    out = None
+    try:
+        import jarvis_delta_flow as jdf
+        import jarvis_supply_demand as jsd
+        bars = jdf.fetch_bars(sym, tf, 80)
+        if bars and len(bars) >= 25:
+            rows = jdf.compute_delta_cvd(bars)
+            chk = jsd.breakout_check(bars, {"rows": rows}, None, None)
+            if isinstance(chk, dict):
+                out = chk
+    except Exception:  # noqa: BLE001 — 眼睛坏了=不打标，绝不阻塞
+        out = None
+    _CTX_VOL_CACHE[key] = (time.time(), out)
+    return out
+
+
+def _context_layers(sym: str, tf: str, system: str, direction: str,
+                    params: dict, now: float) -> dict:
+    """信号侧上下文层总装（开仓/成交前对 params 打标降权；逐层独立容错）。
+
+    D2 量能/CVD 突破确认层；D3 趋势/regime 层、D4 拥挤度层在此追加。
+    任何一层异常 = 该层不打标放行，绝不拒单、绝不阻塞开仓主链路。
+    """
+    # D2：突破/追价类系统 × 量能核验（同向突破才有核验意义）
+    try:
+        raw = _gate_cfg("twelve_ctx_vol_systems", list(CTX_VOL_SYSTEMS_DEFAULT))
+        if isinstance(raw, str):
+            raw = [s.strip() for s in raw.split(",") if s.strip()]
+        vol_systems = {str(s).lower() for s in (raw or [])}
+        if system.lower() in vol_systems:
+            vc = _volume_context(sym, tf)
+            if vc and vc.get("active"):
+                same = ((direction == "long" and vc.get("direction") == "up")
+                        or (direction == "short" and vc.get("direction") == "down"))
+                if same and vc.get("verdict") == "suspect":
+                    why = "；".join(map(str, vc.get("reasons") or []))[:200]
+                    _apply_context(
+                        params, "vol_suspect",
+                        _gate_num("twelve_ctx_deweight_suspect",
+                                  CTX_DEWEIGHT_SUSPECT_DEFAULT),
+                        f"{CONTEXT_TAG_CN['vol_suspect']}：{why}" if why else "")
+                elif same and vc.get("verdict") == "confirmed":
+                    # 纯标记（factor=1 不降权）：归因侧对照「确认组 vs 嫌疑组」用
+                    _apply_context(params, "vol_confirmed", 1.0)
+    except Exception:  # noqa: BLE001
+        pass
+    return params
+
+
 def _do_open(conn, sym: str, tf: str, system: str,
              direction: str, price: float, balance: float,
              params: dict, now: float) -> dict:
-    margin = round(min(balance, balance * params["position_pct"] / 100.0), 8)
+    _context_layers(sym, tf, system, direction, params, now)   # D2+：打标降权
+    sf = float(params.get("size_factor") or 1.0)
+    margin = round(min(balance, balance * params["position_pct"] / 100.0 * sf), 8)
     qty = round(margin * params["leverage"] / price, 8)
     ctx = _ctx_snapshot(sym, tf, now)   # D0：开仓时刻环境快照（失败=全 NULL）
     cur = conn.execute(
@@ -1053,16 +1178,18 @@ def _do_open(conn, sym: str, tf: str, system: str,
            ctx_regime, ctx_regime_dir, ctx_atr_pct, ctx_vol_bucket, ctx_wyckoff,
            ctx_funding, ctx_oi_btc_chg, ctx_hour_utc, ctx_btc_trend,
            context_tags, size_factor)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,'open',?,?,?,?,?,?,?,?,?,NULL,1.0)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,'open',?,?,?,?,?,?,?,?,?,?,?)
         """,
         (sym, tf, system, direction, price, now, qty, margin,
          params["leverage"], params["position_pct"],
          params["stop_loss"], params["take_profit"], price,
-         *(ctx.get(f) for f in CTX_FIELDS)))
+         *(ctx.get(f) for f in CTX_FIELDS), _ctx_tags_str(params), sf))
+    _log_context(conn, sym, tf, system, int(cur.lastrowid or 0), price, now, params)
     return {"symbol": sym, "tf": tf, "system": system, "direction": direction,
             "entry_price": price, "qty": qty, "margin": margin,
             "leverage": params["leverage"], "stop_loss": params["stop_loss"],
-            "take_profit": params["take_profit"], "position_id": cur.lastrowid}
+            "take_profit": params["take_profit"], "position_id": cur.lastrowid,
+            "context_tags": _ctx_tags_str(params), "size_factor": sf}
 
 
 def _do_close(conn, pos: dict, exit_price: float, reason: str, now: float) -> dict:
@@ -1678,7 +1805,10 @@ def _fill_plan(conn, pen: dict, plan: dict | None, eff: dict, balance: float,
     risk = _risk_gate(tf, entry, params)
     if risk:
         return {"rejected": True, "reason": risk}
-    margin = round(min(balance, balance * params["position_pct"] / 100.0), 8)
+    _context_layers(str(pen["symbol"]), tf, str(pen["system"]),
+                    str(pen["direction"]), params, now)   # D2+：成交时刻打标降权
+    sf = float(params.get("size_factor") or 1.0)
+    margin = round(min(balance, balance * params["position_pct"] / 100.0 * sf), 8)
     qty = round(margin * params["leverage"] / entry, 8)
     ctx = _ctx_snapshot(str(pen["symbol"]), tf, now)   # D0：成交时刻=开仓时刻快照
     conn.execute(
@@ -1689,12 +1819,14 @@ def _fill_plan(conn, pen: dict, plan: dict | None, eff: dict, balance: float,
             status='open',
             ctx_regime=?, ctx_regime_dir=?, ctx_atr_pct=?, ctx_vol_bucket=?,
             ctx_wyckoff=?, ctx_funding=?, ctx_oi_btc_chg=?, ctx_hour_utc=?,
-            ctx_btc_trend=?, context_tags=NULL, size_factor=1.0
+            ctx_btc_trend=?, context_tags=?, size_factor=?
         WHERE id=? AND status='pending'
         """,
         (now, qty, margin, params["leverage"], params["position_pct"],
          params["stop_loss"], params["take_profit"], price,
-         *(ctx.get(f) for f in CTX_FIELDS), pen["id"]))
+         *(ctx.get(f) for f in CTX_FIELDS), _ctx_tags_str(params), sf, pen["id"]))
+    _log_context(conn, str(pen["symbol"]), tf, str(pen["system"]),
+                 int(pen["id"]), price, now, params)
     conn.execute(
         """
         INSERT INTO twelve_sim_signal_log
@@ -1711,7 +1843,8 @@ def _fill_plan(conn, pen: dict, plan: dict | None, eff: dict, balance: float,
             "direction": pen["direction"], "entry_price": entry, "qty": qty,
             "margin": margin, "leverage": params["leverage"],
             "stop_loss": params["stop_loss"], "take_profit": params["take_profit"],
-            "position_id": pen["id"]}
+            "position_id": pen["id"],
+            "context_tags": _ctx_tags_str(params), "size_factor": sf}
 
 
 # ─────────────────────────── 持仓点位跟随（信号更新 → 同步 SL/TP + 变更日志） ───────────────────────────
