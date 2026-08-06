@@ -57,10 +57,13 @@ import {
 } from "lightweight-charts";
 
 /**
- * 盘口透视页（/depth）：
- *   ② 左主区 K 线（复用 KlineChart，不加 overlay）+ 可折叠 MACD(12,26,9) 副图
- *   ③ 右侧 DOM 深度阶梯（REST 快照聚合价格桶，一行一桶：左红卖 / 右绿买）
- *   ④ 下方成交流画像（柱状图视图：买卖额镜像柱 + 净额线；列表视图：主力判定 + 指纹聚合 + 实时成交列表）
+ * 盘口透视页（/depth）——核心监控区 + 成交流区两段式布局：
+ *   ② 左列上：K 线主图（复用 KlineChart，不加 overlay）+ 可折叠 MACD(12,26,9) 副图
+ *      左列下：主力底牌卡（SupplyDemandCard 通栏，证据链有横向空间）
+ *   ③ 右列：DOM 深度阶梯拉通左列总高（REST 快照聚合价格桶，一行一桶：
+ *      左红卖 / 右绿买；xl 起 flex 填高，内部滚动）
+ *   ④ 下方成交流区：足迹图视图 =「主体多空卡｜足迹图」并排；
+ *      列表视图 = 主力判定 + 指纹聚合 + 实时成交列表三卡
  * 币种跟随全局 useSymbol（Header 已有切币器）。
  * 周期强制一致：全页只有顶部一个主周期开关（1m~1d 七档），足迹图周期与
  * 成交流画像窗口始终跟随主周期（足迹图超 30m 回退 30m），不提供独立周期
@@ -376,8 +379,13 @@ function DepthLadder({
         <span className="text-right">买盘挂单额 →</span>
       </div>
 
-      {/* 阶梯主体（滚动容器；offsetTop 相对本容器，供 mid 自动居中） */}
-      <div ref={ladderRef} className="relative overflow-y-auto max-h-[480px] pr-0.5">
+      {/* 阶梯主体（滚动容器；offsetTop 相对本容器，供 mid 自动居中）——
+          xl 起卡片被网格拉通到左列总高，此处 flex-1 吃掉剩余空间显示更多
+          档位；xl 以下（纵向堆叠）回退固定 480px 上限防止页面被撑爆 */}
+      <div
+        ref={ladderRef}
+        className="relative overflow-y-auto max-h-[480px] xl:max-h-none xl:flex-1 min-h-0 pr-0.5"
+      >
         {!depth && loading && (
           <div className="flex items-center justify-center py-16">
             <div className="w-5 h-5 border-2 border-jarvis-blue border-t-transparent rounded-full animate-spin" />
@@ -1667,62 +1675,64 @@ export default function DepthView() {
         </div>
       </div>
 
-      {/* ②③ 主区：左 K 线 + 右深度阶梯（xl 以下阶梯折到主区下方） */}
+      {/* ②③ 核心监控区：左列纵向堆「K 线主图卡 + 主力底牌通栏卡」，右列深度
+          阶梯拉通左列总高（内部滚动，一屏可见档位更多）——两列内容高度互相
+          咬合，消灭旧版主图卡下方的整片空黑。xl 以下依次纵向堆叠。 */}
       <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_360px] gap-4">
-        <div className="card p-0 overflow-hidden relative">
-          {candles.length > 0 ? (
-            <>
-              <KlineChart
-                data={candles}
-                volumeData={volumes}
-                height={showMacd ? 396 : 520}
-                trapMarks={trapMarks}
-                onTrapClick={(mark) => setSelectedTrap(mark)}
-              />
-              {showMacd && (
-                <div className="border-t border-jarvis-border">
-                  <MacdPane candles={candles} height={124} />
-                </div>
-              )}
-              {/* 陷阱原因卡片：固定右上角浮层，不遮点击处的 K 线形态 */}
-              {selectedTrap && (
-                <TrapReasonCard
-                  mark={selectedTrap}
-                  onClose={() => setSelectedTrap(null)}
-                />
-              )}
-            </>
-          ) : (
-            <div
-              className="flex flex-col items-center justify-center text-jarvis-text-secondary"
-              style={{ height: 520 }}
-            >
-              {klineLoading ? (
-                <>
-                  <div className="w-6 h-6 border-2 border-jarvis-blue border-t-transparent rounded-full animate-spin mb-3" />
-                  <p className="text-sm">正在获取 K 线数据...</p>
-                </>
-              ) : klineError ? (
-                <p className="text-sm text-jarvis-red">
-                  K 线加载失败:{klineError}
-                </p>
-              ) : (
-                <p className="text-sm">暂无 K 线数据</p>
-              )}
-            </div>
-          )}
-        </div>
         <div className="flex flex-col gap-4 min-w-0">
-          <DepthLadder
-            depth={depthPoll.data}
-            loading={depthPoll.loading}
-            error={depthPoll.error}
-            symbol={symbol}
-          />
-          {/* 主力底牌（威科夫×订单流量价核对）：与上方阶梯同 symbol/周期联动；
-              1m 噪声过大且不在分析周期集合内，映射到 5m */}
+          <div className="card p-0 overflow-hidden relative">
+            {candles.length > 0 ? (
+              <>
+                <KlineChart
+                  data={candles}
+                  volumeData={volumes}
+                  height={showMacd ? 436 : 560}
+                  trapMarks={trapMarks}
+                  onTrapClick={(mark) => setSelectedTrap(mark)}
+                />
+                {showMacd && (
+                  <div className="border-t border-jarvis-border">
+                    <MacdPane candles={candles} height={124} />
+                  </div>
+                )}
+                {/* 陷阱原因卡片：固定右上角浮层，不遮点击处的 K 线形态 */}
+                {selectedTrap && (
+                  <TrapReasonCard
+                    mark={selectedTrap}
+                    onClose={() => setSelectedTrap(null)}
+                  />
+                )}
+              </>
+            ) : (
+              <div
+                className="flex flex-col items-center justify-center text-jarvis-text-secondary"
+                style={{ height: 560 }}
+              >
+                {klineLoading ? (
+                  <>
+                    <div className="w-6 h-6 border-2 border-jarvis-blue border-t-transparent rounded-full animate-spin mb-3" />
+                    <p className="text-sm">正在获取 K 线数据...</p>
+                  </>
+                ) : klineError ? (
+                  <p className="text-sm text-jarvis-red">
+                    K 线加载失败:{klineError}
+                  </p>
+                ) : (
+                  <p className="text-sm">暂无 K 线数据</p>
+                )}
+              </div>
+            )}
+          </div>
+          {/* 主力底牌（威科夫×订单流量价核对）：主图正下方通栏展示，证据链有
+              足够横向空间不再拥挤；1m 噪声过大且不在分析周期集合内，映射到 5m */}
           <SupplyDemandCard symbol={symbol} interval={tf === "1m" ? "5m" : tf} />
         </div>
+        <DepthLadder
+          depth={depthPoll.data}
+          loading={depthPoll.loading}
+          error={depthPoll.error}
+          symbol={symbol}
+        />
       </div>
 
       {/* ④ 成交流区标题栏：WS 状态 + 视图切换（柱状图|列表）+ 柱状图专属控件 */}
@@ -1790,23 +1800,31 @@ export default function DepthView() {
         </div>
       </div>
 
-      {/* ④-足迹图视图：主体多空统计卡 + canvas 足迹图 */}
+      {/* ④-足迹图视图：主体多空统计卡（窄列结论）｜canvas 足迹图（宽列明细）
+          并排——足迹图不再被上方通栏卡压到页面最底部，两块同屏可读；
+          xl 以下纵向堆叠，无多空数据时足迹图独占整行 */}
       {tapeView === "footprint" && (
-        <>
+        <div
+          className={clsx(
+            "grid grid-cols-1 gap-4 items-start",
+            footprint?.ok && footprint.actors &&
+              "xl:grid-cols-[320px_minmax(0,1fr)]",
+          )}
+        >
           {footprint?.ok && footprint.actors && (
             <ActorBiasCard
               actors={footprint.actors}
               disclaimer={footprint.disclaimer}
             />
           )}
-          <div className="card p-3">
+          <div className="card p-3 min-w-0">
             <FootprintPane
               resp={footprint}
               loading={fpPoll.loading}
               error={fpPoll.error}
             />
           </div>
-        </>
+        </div>
       )}
 
       {/* ④-列表视图主体：占位态 / 错误态 / 三块布局 */}

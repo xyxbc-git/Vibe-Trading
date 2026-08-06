@@ -1,5 +1,8 @@
+import { useState } from "react";
 import { clsx } from "clsx";
 import {
+  ChevronDown,
+  ChevronRight,
   Eye,
   TrendingUp,
   TrendingDown,
@@ -140,6 +143,9 @@ export default function SupplyDemandCard({
     pollMs,
     [symbol, interval],
   );
+  // 证据链明细折叠开关：bias 结论/score 条是核心信息常驻，五行明细属次级
+  // 展示，可收起降噪；默认展开保持既有页面（Chart 侧栏等）观感不变
+  const [evidenceOpen, setEvidenceOpen] = useState(true);
 
   return (
     <div className="card p-3 space-y-2.5 min-w-0">
@@ -194,11 +200,31 @@ export default function SupplyDemandCard({
 
           {data.breakout_check && <BreakoutStrip data={data.breakout_check} />}
 
-          <div className="space-y-1">
-            {(data.evidence_chain ?? []).map((e) => (
-              <EvidenceRow key={e.source} e={e} />
-            ))}
-          </div>
+          {(data.evidence_chain ?? []).length > 0 && (
+            <div>
+              <button
+                type="button"
+                onClick={() => setEvidenceOpen((v) => !v)}
+                className="flex items-center gap-1 text-[10px] text-jarvis-text-secondary hover:text-jarvis-text transition-colors mb-1"
+                title={evidenceOpen ? "收起证据链明细" : "展开证据链明细"}
+              >
+                {evidenceOpen ? (
+                  <ChevronDown size={11} />
+                ) : (
+                  <ChevronRight size={11} />
+                )}
+                证据链明细（{(data.evidence_chain ?? []).length} 条）
+              </button>
+              {/* 宽容器（如盘口页通栏）双列排布，窄容器单列，缓解条目拥挤 */}
+              {evidenceOpen && (
+                <div className="grid gap-1 md:grid-cols-2">
+                  {(data.evidence_chain ?? []).map((e) => (
+                    <EvidenceRow key={e.source} e={e} />
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
 
           {(data.coverage ?? 0) < 0.5 && (
             <p className="text-[10px] text-jarvis-text-secondary leading-snug">
