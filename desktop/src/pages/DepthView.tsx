@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import { usePolling } from "@/hooks/useApi";
 import { useSymbol } from "@/hooks/useSymbol";
+import { useLivePrice } from "@/hooks/usePrice";
 import { isStaleEcho } from "@/lib/chartView";
 import { calcMACD } from "@/lib/indicators";
 import {
@@ -1413,6 +1414,20 @@ export default function DepthView() {
     [tf, symbol],
   );
 
+  // ── 实时价对齐（与 Chart.tsx 同一机制）：顶栏价来自全局 PriceProvider
+  // 共享 ticker（10s 轮询，全应用仅此一路请求），这里订阅同一 context 把
+  // 最后一根未收线蜡烛的 close 流式对齐到顶栏价（KlineChart 内部
+  // series.update，high/low 随之扩展）；kline 慢轮询到达时以服务端数据
+  // 覆盖，不产生漂移，也不新增任何网络请求。只认当前币种的报价。
+  const livePrice = useLivePrice();
+  const liveForChart = useMemo(
+    () =>
+      livePrice && livePrice.symbol === symbol
+        ? { price: livePrice.price, timeSec: Math.floor(livePrice.at / 1000) }
+        : null,
+    [livePrice, symbol],
+  );
+
   // 后端 rows → lightweight-charts 蜡烛 / 量柱
   const { candles, volumes } = useMemo(() => {
     const rows = (rawKline as Record<string, unknown>)?.rows;
@@ -1687,6 +1702,7 @@ export default function DepthView() {
                   data={candles}
                   volumeData={volumes}
                   height={showMacd ? 436 : 560}
+                  livePrice={liveForChart}
                   trapMarks={trapMarks}
                   onTrapClick={(mark) => setSelectedTrap(mark)}
                 />
