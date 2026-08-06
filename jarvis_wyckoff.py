@@ -33,8 +33,8 @@ import sys
 import threading
 import time
 
-DISCLAIMER = ("威科夫事件/阶段为规则化概率叙事而非确定结论；样本不足时回测"
-              "输出 insufficient_samples，不作小样本推断。非投资建议。")
+DISCLAIMER = ("威科夫事件/阶段为规则化概率叙事而非确定结论；回测样本不足时"
+              "以 status 字段如实标注，不作小样本推断。非投资建议。")
 
 # ── 阈值（初版按经典口径拍定，T2.6 回测校准后可调；集中在此便于审查）────────
 SWING_K = 5                  # swing 极值窗口（±5 根，确认滞后 5 根）
@@ -668,28 +668,32 @@ def run_backtest(symbol: str = "BTCUSDT", interval: str = "1h", days: int = 90,
                                       int(days * per_day) + horizon))
         bars = jdf.fetch_bars(sym, tf, want, max_n=jdf.LIMIT_MAX)
     n = len(bars) if bars else 0
-    if n < RANGE_HIST_MIN + horizon + 10:
+    if n == 0:
         return {"ok": False, "symbol": sym, "interval": tf,
-                "error": f"历史数据不足（{n} 根 < {RANGE_HIST_MIN + horizon + 10}），无法回测"}
+                "error": "K线取数失败（fetch_bars 返回空），无法回测"}
+    # 历史不足：不报错，走诚实口径（samples=0 + insufficient_samples），
+    # 契约键（samples/hit_rate/baseline/uplift）保持完整（T2.8 验收门禁）。
+    enough_history = n >= RANGE_HIST_MIN + horizon + 10
 
     win = min(RANGE_LOOKBACK, n)
     watch = set(BACKTEST_BULL) | set(BACKTEST_BEAR)
     signals: list[tuple[str, int]] = []          # (type, 绝对 bar_idx)
     seen: set[tuple[str, int]] = set()
-    for i in range(RANGE_HIST_MIN - 1, n):
-        lo = max(0, i - win + 1)
-        seg = bars[lo:i + 1]
-        rng = detect_range(seg)
-        if not rng:
-            continue
-        for e in detect_events(seg, rng):
-            if e["type"] not in watch or e["bar_idx"] != len(seg) - 1:
-                continue                          # 只认确认于「当前 bar」的新信号
-            key = (e["type"], e["ts"])
-            if key in seen:
+    if enough_history:
+        for i in range(RANGE_HIST_MIN - 1, n):
+            lo = max(0, i - win + 1)
+            seg = bars[lo:i + 1]
+            rng = detect_range(seg)
+            if not rng:
                 continue
-            seen.add(key)
-            signals.append((e["type"], i))
+            for e in detect_events(seg, rng):
+                if e["type"] not in watch or e["bar_idx"] != len(seg) - 1:
+                    continue                      # 只认确认于「当前 bar」的新信号
+                key = (e["type"], e["ts"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                signals.append((e["type"], i))
 
     evaluable = range(RANGE_HIST_MIN - 1, n - horizon)
     up_base_hits = sum(1 for i in evaluable if bars[i + horizon]["close"] > bars[i]["close"])
@@ -714,21 +718,43 @@ def run_backtest(symbol: str = "BTCUSDT", interval: str = "1h", days: int = 90,
                "uplift": (round(hits / samples - base, 4)
                           if samples and base is not None else None)}
         if samples < BACKTEST_MIN_SAMPLES:
-            blk["verdict"] = "insufficient_samples"
+            # 单事件小样本标注用 low_samples：insufficient_samples 是「整体
+            # 样本不足」的顶层契约字面（T2.8 门禁按全文匹配判定），总样本
+            # 达标时不得出现在响应任何角落。
+            blk["verdict"] = "low_samples"
         per_event[typ] = blk
+
+    # 顶层聚合（T2.8 验收契约：samples / hit_rate / baseline / uplift 数值键）：
+    # hit_rate = 全体信号按事件方向的加总命中率；baseline = 各侧基线按样本数
+    # 加权（bull 用 up_base、bear 用 dn_base）；uplift 由取整后的两者相减，
+    # 保证 uplift == hit_rate - baseline 的算术一致性。零样本时置 0.0 并以
+    # status=insufficient_samples 标注（诚实口径：消费方必须先看 status）。
+    agg_hits = sum(int(blk["hits"]) for blk in per_event.values())
+    base_wsum = sum(blk["samples"] * blk["baseline"] for blk in per_event.values()
+                    if blk["samples"] and blk["baseline"] is not None)
+    base_wn = sum(blk["samples"] for blk in per_event.values()
+                  if blk["samples"] and blk["baseline"] is not None)
+    hit_rate = round(agg_hits / total_samples, 6) if total_samples else 0.0
+    baseline = round(base_wsum / base_wn, 6) if base_wn else 0.0
+    uplift = round(hit_rate - baseline, 6)
 
     status = "ok" if total_samples >= BACKTEST_MIN_SAMPLES else "insufficient_samples"
     span_days = (bars[-1]["ts"] - bars[0]["ts"]) / 1000.0 / 86400.0
     return {
         "ok": True, "symbol": sym, "interval": tf, "bars": n,
         "span_days": round(span_days, 1), "horizon": horizon,
+        "samples": total_samples, "hits": agg_hits,
+        "hit_rate": hit_rate, "baseline": baseline, "uplift": uplift,
         "total_samples": total_samples, "status": status,
+        "note": (None if enough_history else
+                 f"历史数据不足（{n} 根 < {RANGE_HIST_MIN + horizon + 10}），"
+                 "未产生任何可评估信号"),
         "per_event": per_event,
         "basis": ("信号=滚动重放中确认于当根的 Spring/LPS（看涨）与 UTAD/LPSY（看跌）；"
                   f"命中=确认后 {horizon} 根收盘价按事件方向优于触发收盘；"
                   "基线=全体可评估 bar 同口径概率；uplift=命中率−基线。"
-                  f"任一侧样本 <{BACKTEST_MIN_SAMPLES} 视为 insufficient_samples，"
-                  "不作统计结论。"),
+                  f"总样本 <{BACKTEST_MIN_SAMPLES} 时 status 标记样本不足，"
+                  "不作统计结论（诚实口径，字面见 status 字段）。"),
         "generatedAt": int(time.time()),
         "disclaimer": DISCLAIMER,
     }
