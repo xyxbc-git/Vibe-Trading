@@ -5067,6 +5067,113 @@ def api_twelve_signal_stats(symbol: str | None = None, direction: str | None = N
         return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
 
 
+# S6 门禁链 reject_reason 枚举（S1-S5 各门禁的拦截标识；门禁链未落库时计数为 0）
+_TWELVE_REJECT_REASONS = ("sl_too_tight", "fee_negative_ev", "rr_too_low",
+                          "circuit_breaker", "tf_gate", "counter_trend")
+
+
+@app.get("/api/twelve/attribution")
+def api_twelve_attribution(days: int = 7):
+    """12 系统亏损归因报表（S6 · R10 取证 SQL 固化，1h 缓存）。
+
+    按 信号系统×TF×平仓原因 聚合 净利/胜率/费用/笔数（twelve_sim_trade 已平仓，
+    近 ?days=7 天，按 exit_ts 过滤），外加门禁 rejected 统计（twelve_sim_position
+    status='rejected' 按 reject_reason 分组；S1-S5 门禁链未 merge 落库时计数为 0）。
+    费用与平仓口径一致：(entry+exit)*qty*单边费率%（费率已计入 pnl，此处单列便于归因）。
+    响应：{ok, days, since_ts, fee_pct_per_side, summary, attribution:[...], rejected}
+    """
+    import jarvis_twelve_trader as jtt
+    try:
+        d = max(1, min(365, int(days)))
+    except (TypeError, ValueError):
+        d = 7
+
+    def _calc():
+        jtt._ensure_init()
+        since = time.time() - d * 86400.0
+        fee_side_pct = jtt._fee_pct()   # 单边手续费%（按名义），与平仓扣费同源
+        with jtt._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT system, MAX(name_cn) AS name_cn, tf, exit_reason,
+                       COUNT(*) AS trades,
+                       SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins,
+                       SUM(pnl) AS net_pnl,
+                       SUM((entry_price + exit_price) * qty) AS notional
+                FROM twelve_sim_trade
+                WHERE exit_ts >= ?
+                GROUP BY system, tf, exit_reason
+                """, (since,)).fetchall()
+        cells = []
+        for r in rows:
+            r = dict(r)
+            n = int(r["trades"] or 0)
+            wins = int(r["wins"] or 0)
+            cells.append({
+                "system": r["system"], "name_cn": r.get("name_cn"),
+                "tf": r["tf"], "exit_reason": r["exit_reason"],
+                "trades": n, "wins": wins,
+                "win_rate_pct": round(wins / n * 100.0, 2) if n else None,
+                "net_pnl": round(float(r["net_pnl"] or 0.0), 4),
+                "fee": round(float(r["notional"] or 0.0) * fee_side_pct / 100.0, 4),
+            })
+        cells.sort(key=lambda c: c["net_pnl"])   # 最亏的组合排最前，归因直读
+
+        total_trades = sum(c["trades"] for c in cells)
+        total_wins = sum(c["wins"] for c in cells)
+        total_pnl = round(sum(c["net_pnl"] for c in cells), 4)
+        total_fee = round(sum(c["fee"] for c in cells), 4)
+        by_reason: dict[str, dict] = {}
+        for c in cells:
+            agg = by_reason.setdefault(
+                c["exit_reason"], {"trades": 0, "wins": 0, "net_pnl": 0.0, "fee": 0.0})
+            agg["trades"] += c["trades"]
+            agg["wins"] += c["wins"]
+            agg["net_pnl"] = round(agg["net_pnl"] + c["net_pnl"], 4)
+            agg["fee"] = round(agg["fee"] + c["fee"], 4)
+        for reason, agg in by_reason.items():
+            agg["win_rate_pct"] = (round(agg["wins"] / agg["trades"] * 100.0, 2)
+                                   if agg["trades"] else None)
+            agg["trade_share_pct"] = (round(agg["trades"] / total_trades * 100.0, 2)
+                                      if total_trades else None)
+
+        rejected = {"total": 0,
+                    "by_reason": {k: 0 for k in _TWELVE_REJECT_REASONS}}
+        try:
+            with jtt._conn() as conn:
+                rrows = conn.execute(
+                    "SELECT reject_reason, COUNT(*) AS n FROM twelve_sim_position "
+                    "WHERE status='rejected' AND entry_ts >= ? "
+                    "GROUP BY reject_reason", (since,)).fetchall()
+            for rr in rrows:
+                rr = dict(rr)
+                reason = str(rr.get("reject_reason") or "unknown")
+                rejected["by_reason"][reason] = (
+                    rejected["by_reason"].get(reason, 0) + int(rr["n"] or 0))
+            rejected["total"] = sum(rejected["by_reason"].values())
+        except Exception:  # noqa: BLE001 — reject_reason 列未上线（S1-S5 未 merge）
+            rejected["note"] = "门禁链(S1-S5)尚未落库 reject_reason，暂无拦截数据"
+
+        return {
+            "ok": True, "days": d, "since_ts": since,
+            "generated_at": time.time(), "fee_pct_per_side": fee_side_pct,
+            "summary": {
+                "trades": total_trades, "wins": total_wins,
+                "win_rate_pct": (round(total_wins / total_trades * 100.0, 2)
+                                 if total_trades else None),
+                "net_pnl": total_pnl, "fee": total_fee,
+                "by_exit_reason": by_reason,
+            },
+            "attribution": cells,
+            "rejected": rejected,
+        }
+
+    try:
+        return JSONResponse(_cached(f"twelve:attr:{d}", 3600, _calc))
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
+
+
 @app.post("/api/twelve/replay")
 def api_twelve_replay(data: dict | None = None):
     """启动 12 系统历史回放预积累（异步后台线程，进度查 /api/twelve/replay/status）。
