@@ -62,6 +62,11 @@ jtt.mark_price_of = lambda cfg, s: None   # 离线：标记价缺失→爆仓判
 jtt._fetch_bars = lambda symbol, tf: None
 # 手续费打桩：基础用例免手续费保持整数断言；手续费用例单独开 0.05
 jtt._fee_pct = lambda: 0.0
+# 威科夫趋势语境打桩：全局中性（真实 _trend_context 会联网取 1h 威科夫——
+# 若线上恰处 dist/acc 阶段，会把 S1e/S2d 等真实配置层用例的多/空单拦成
+# counter_trend，测试结果随行情漂移）；S5 用例分节自行打桩/还原真实链路
+_REAL_TREND_CTX = jtt._trend_context
+jtt._trend_context = lambda sym: (None, None)
 
 # ── 门禁配置隔离（亏损止血 S1+ 开仓门禁链）────────────────────────────────
 # jarvis_config 路径指到临时目录：冒烟绝不读/写用户真实 ~/.vibe-trading 配置
@@ -1008,7 +1013,7 @@ check("S5 配置登记：twelve_trend_filter_enabled 默认开",
       jc.default_config().get("twelve_trend_filter_enabled") is True)
 
 _GATES["twelve_trend_filter_enabled"] = 1.0
-_orig_trend_ctx = jtt._trend_context
+_orig_trend_ctx = _REAL_TREND_CTX   # S5e 真实链路用例还原用（顶部全局中性桩的原函数）
 jtt._trend_context = lambda sym: ("dist", "C")   # mock 1h 派发 Phase C（跌势语境）
 _PRICE["v"] = 100.0
 
@@ -1087,8 +1092,8 @@ check("S5f：twelve_trend_filter_enabled 关闭 → dist-C 语境 5m 多单也�
       len(op) == 1, str((out["symbols"][SYM]["opened"],
                          out["symbols"][SYM]["rejected"])))
 
-# 复位：旧口径 + 清场
-jtt._trend_context = _orig_trend_ctx
+# 复位：旧口径 + 清场（回全局中性桩，防真实威科夫数据污染后续用例）
+jtt._trend_context = lambda sym: (None, None)
 with jtt._conn() as conn:
     conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
     conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
