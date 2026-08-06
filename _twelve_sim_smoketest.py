@@ -63,6 +63,23 @@ jtt._fetch_bars = lambda symbol, tf: None
 # 手续费打桩：基础用例免手续费保持整数断言；手续费用例单独开 0.05
 jtt._fee_pct = lambda: 0.0
 
+# ── 门禁配置隔离（亏损止血 S1+ 开仓门禁链）────────────────────────────────
+# jarvis_config 路径指到临时目录：冒烟绝不读/写用户真实 ~/.vibe-trading 配置
+import jarvis_config as jc  # noqa: E402
+jc.CONFIG_PATH = os.path.join(_d, "cfg.json")
+jc.YAML_CONFIG_PATH = os.path.join(_d, "cfg.yaml")
+jc._LOAD_CACHE.clear()
+
+# 旧用例按「改造前口径」跑（门禁全关 / 旧自动杠杆 0.5×顶格20）保证零回归；
+# 各 S 任务新用例在文件末尾分节自行开门禁并验证新默认
+_GATES: dict = {
+    "twelve_auto_lev_loss_frac": 0.5,
+    "twelve_max_leverage": {tf: 20.0 for tf in jtt.TFS},
+    "twelve_min_sl_pct": {tf: 0.0 for tf in jtt.TFS},
+}
+_orig_gate_cfg = jtt._gate_cfg
+jtt._gate_cfg = lambda key, default: _GATES.get(key, default)
+
 # ═══════════ 1. 建表幂等 + 配置 upsert/合并 ═══════════
 jsh.init_db()
 jtt.init_db()
@@ -616,6 +633,106 @@ with jtt._conn() as conn:
 out_none = jtt.run_cycle(cfg={})
 check("无启用币种 → note 提示不报错", "note" in out_none and not out_none["symbols"],
       str(out_none))
+
+# ═══════════ 15. S1 止损最小距离门禁 + 杠杆与止损解耦 ═══════════
+jtt.upsert_config(SYM, enabled=True)   # 恢复 14 节停用的币种级行
+with jtt._conn() as conn:              # 清场：平掉在途/挂单 + 钱包复位
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+    conn.execute("DELETE FROM twelve_sim_position WHERE status='pending'")
+    conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
+for _tf, _sys in [("1h", "turtle"), ("4h", "dow"), ("5m", "gap"),
+                  ("15m", "elliott"), ("30m", "gann"), ("1d", "martingale")]:
+    set_signal(_tf, _sys, "neutral", None)
+
+check("S1 配置登记：min_sl/loss_frac/max_lev 三键默认值",
+      jc.default_config().get("twelve_min_sl_pct", {}).get("5m") == 0.5
+      and jc.default_config().get("twelve_auto_lev_loss_frac") == 0.25
+      and jc.default_config().get("twelve_max_leverage", {}).get("5m") == 5)
+
+# 开 S1 门禁（新默认口径）
+_GATES["twelve_min_sl_pct"] = dict(jtt.MIN_SL_PCT_BY_TF)
+_GATES["twelve_auto_lev_loss_frac"] = 0.25
+_GATES["twelve_max_leverage"] = dict(jtt.MAX_LEVERAGE_BY_TF)
+_PRICE["v"] = 100.0
+
+# a) 5m SL 距离 0.3% < 下限 0.5% → 拒单 sl_too_tight（不建仓、留痕可复盘）
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.7, "take_profit": 101.5})
+out = jtt.run_cycle(cfg={})
+r_sym = out["symbols"][SYM]
+rej = [r for r in r_sym["rejected"] if (r["tf"], r["system"]) == ("5m", "gap")]
+check("S1a：5m SL 0.3% < 下限 0.5% → 拒单 sl_too_tight 不开仓",
+      len(rej) == 1 and rej[0]["reason"] == "sl_too_tight"
+      and not r_sym["opened"] and not r_sym["planned"],
+      str((r_sym["rejected"], r_sym["opened"])))
+rrows = jtt.rejected_positions(SYM, "5m", "gap")
+check("S1a：拒单落 status='rejected' + reject_reason 行留痕",
+      len(rrows) == 1 and rrows[0]["reject_reason"] == "sl_too_tight"
+      and rrows[0]["qty"] == 0 and rrows[0]["margin"] == 0, str(rrows))
+rlogs = [l for l in jtt.signal_logs(SYM, "5m", "gap")
+         if l["change_kinds"] == "reject"]
+check("S1a：拒单落 signal_log（change_kinds=reject + note 中文原因）",
+      len(rlogs) == 1 and "止损距离" in str(rlogs[0]["note"]), str(rlogs[:1]))
+
+# b) 同信号下一轮防重：不重复落 rejected 行
+out = jtt.run_cycle(cfg={})
+check("S1b：同信号重复拒单防重（rejected 行数不变）",
+      not out["symbols"][SYM]["rejected"]
+      and len(jtt.rejected_positions(SYM, "5m", "gap")) == 1,
+      str(out["symbols"][SYM]["rejected"]))
+
+# c) 5m SL 0.8% ≥ 下限 → 放行；自动杠杆解耦：floor(0.25/0.008)=31 → 夹 5m 上限 5
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.2, "take_profit": 102.0})
+out = jtt.run_cycle(cfg={})
+op = [o for o in out["symbols"][SYM]["opened"] if (o["tf"], o["system"]) == ("5m", "gap")]
+check("S1c：5m SL 0.8% 放行且自动杠杆夹 TF 上限 5（不再顶格 20）",
+      len(op) == 1 and abs(op[0]["leverage"] - 5.0) < 1e-9, str(op))
+
+# d) 显式杠杆尊重显式值但夹 TF 上限：15m 配置 20× → 夹 8
+jtt.upsert_config(SYM, "15m", "elliott", leverage=20.0)
+set_signal("15m", "elliott", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 98.0, "take_profit": 105.0})
+out = jtt.run_cycle(cfg={})
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("15m", "elliott")]
+check("S1d：显式杠杆 20 → 夹 15m 分层上限 8", len(op) == 1
+      and abs(op[0]["leverage"] - 8.0) < 1e-9, str(op))
+
+# e) 配置热加载（真实 jarvis_config YAML 链路，不打桩）：5m 下限收紧到 2% →
+#    原本放行的 0.8% 单转拒；改回默认 → 再次放行
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+jtt._gate_cfg = _orig_gate_cfg   # 摘掉打桩，走真实配置层
+jc.save({"twelve_min_sl_pct": {"5m": 2.0, "15m": 0.7, "30m": 1.0,
+                               "1h": 1.2, "4h": 2.0, "1d": 3.0},
+         "twelve_auto_lev_loss_frac": 0.25,
+         "twelve_max_leverage": {"5m": 5, "15m": 8, "30m": 10,
+                                 "1h": 12, "4h": 15, "1d": 20}},
+        source="smoketest", note="S1 热加载用例")
+out = jtt.run_cycle(cfg={})
+rej = [r for r in out["symbols"][SYM]["rejected"]
+       if (r["tf"], r["system"]) == ("5m", "gap")]
+check("S1e：YAML 改 5m 下限 2% 热加载 → 0.8% 单转拒",
+      len(rej) == 1 and rej[0]["reason"] == "sl_too_tight",
+      str(out["symbols"][SYM]["rejected"]))
+jc.save({"twelve_min_sl_pct": {"5m": 0.5, "15m": 0.7, "30m": 1.0,
+                               "1h": 1.2, "4h": 2.0, "1d": 3.0}},
+        source="smoketest", note="S1 热加载改回")
+out = jtt.run_cycle(cfg={})
+op = [o for o in out["symbols"][SYM]["opened"] if (o["tf"], o["system"]) == ("5m", "gap")]
+check("S1e：改回 0.5% 热加载 → 再次放行", len(op) == 1, str(op))
+
+# 复位：重挂门禁打桩 + 回旧口径参数，防止影响后续节
+_GATES.update({"twelve_min_sl_pct": {tf: 0.0 for tf in jtt.TFS},
+               "twelve_auto_lev_loss_frac": 0.5,
+               "twelve_max_leverage": {tf: 20.0 for tf in jtt.TFS}})
+jtt._gate_cfg = lambda key, default: _GATES.get(key, default)
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+    conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
+for _tf, _sys in [("5m", "gap"), ("15m", "elliott")]:
+    set_signal(_tf, _sys, "neutral", None)
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS ✅")

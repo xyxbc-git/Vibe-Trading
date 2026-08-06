@@ -46,9 +46,15 @@
        （change_kinds=cancel）；失效后价格再触达旧点位也不成交，一切以最新信号
        为准（撤销判定先于触达成交判定）；canceled 行保留 7 天后清理
        （日志表留痕永久）；全程不产生 twelve_sim_trade；
+  4.8 开仓门禁链（2026-08-06 亏损止血 S1+）：合成参数后过 _risk_gate——
+     止损最小距离（twelve_min_sl_pct 按 TF 分层）等门禁不满足 → 拒单不入场，
+     落 status='rejected' + reject_reason 行 + signal_log 留痕（不静默丢弃，
+     S6 归因报表可按原因聚合）；挂单在成交时刻同样再验一次门禁；
   5. 参数：止损/止盈/杠杆/仓位% 优先用 twelve_sim_config 覆盖
      （优先级 信号级 > tf组级 > 币种级），否则用 plan_json 系统推荐；杠杆双兜底：
-     配置/plan 均未给时按止损距离自动推荐（打到止损亏≈保证金50%，夹 [1,20]）；
+     配置/plan 均未给时按止损距离自动推荐（S1 解耦：打到止损亏≈保证金25%
+     twelve_auto_lev_loss_frac，夹 [1, TF 分层上限 twelve_max_leverage]；
+     显式杠杆尊重显式值但同样夹 TF 上限）；
   6. 逐仓口径：margin = balance × position_pct%，qty = margin × leverage / entry；
      爆仓价 = entry × (1 ∓ 1/leverage)，触发即以爆仓价强平 pnl=-margin；
      开/平双边手续费按名义单边 0.05%（jarvis_config: twelve_sim_fee_pct 可配）
@@ -109,9 +115,29 @@ DEFAULT_FEE_PCT = 0.05        # 单边手续费%（按名义；jarvis_config: tw
 # 各 TF 时间止损（天），口径对齐 jarvis_paper_trader._TWELVE_TIME_STOP
 TF_TIME_STOP_DAYS = {"5m": 1, "15m": 1, "30m": 2, "1h": 3, "4h": 7, "1d": 14}
 
-# 自动杠杆推荐：打到止损时目标亏损占保证金比例，与杠杆上限
-AUTO_LEV_SL_LOSS_FRAC = 0.5
+# 自动杠杆推荐（2026-08-06 亏损止血 S1，杠杆与止损解耦）：打到止损时目标亏损占
+# 保证金比例（旧 0.5 顶格制造「窄止损×20×」出血点，现降 0.25），杠杆上限按 TF
+# 分层封顶；均可经 jarvis_config（twelve_auto_lev_loss_frac / twelve_max_leverage）
+# 热加载覆盖，MAX_AUTO_LEVERAGE 为任何配置都不放行的绝对硬顶。
+AUTO_LEV_SL_LOSS_FRAC = 0.25
 MAX_AUTO_LEVERAGE = 20.0
+MAX_LEVERAGE_BY_TF = {"5m": 5.0, "15m": 8.0, "30m": 10.0,
+                      "1h": 12.0, "4h": 15.0, "1d": 20.0}
+
+# 止损最小距离门禁（S1，单位 %，按 TF 分层；jarvis_config: twelve_min_sl_pct）：
+# SL 距离低于该 TF 下限 → 拒单 reject_reason='sl_too_tight'——R10 取证 5m 中位
+# SL 距离 0.172% 在噪声带内，sl 平仓 228 笔胜率仅 4.4%，窄止损单不再入场。
+MIN_SL_PCT_BY_TF = {"5m": 0.5, "15m": 0.7, "30m": 1.0,
+                    "1h": 1.2, "4h": 2.0, "1d": 3.0}
+
+# 拒单(rejected)留痕行保留天数（与 canceled 同哲学：窗口期可复盘，到期物理清理；
+# twelve_sim_signal_log 的 reject 留痕永久保留）
+REJECTED_RETENTION_DAYS = 7
+
+# 门禁拒单原因 → 中文留痕说明（写进 twelve_sim_signal_log.note，看板/复盘直读）
+REJECT_REASON_CN = {
+    "sl_too_tight": "止损距离低于该周期下限",
+}
 
 # 点位跟随：SL/TP 相对变化 ≥ 此阈值(%)才算实质变更（对齐 jarvis_signal_history
 # 计划价 0.2% 变更判定，滤掉浮点噪音与微调抖动）
@@ -201,7 +227,8 @@ def init_db() -> None:
         # 旧库升级：R3 失效留痕列（SQLite 无 IF NOT EXISTS，重复加列抛错=已升级过；
         # jarvis_db 兼容层对 pg 自动翻译为 ADD COLUMN IF NOT EXISTS 幂等）
         for _ddl in ("ALTER TABLE twelve_sim_position ADD COLUMN cancel_reason TEXT",
-                     "ALTER TABLE twelve_sim_position ADD COLUMN canceled_ts REAL"):
+                     "ALTER TABLE twelve_sim_position ADD COLUMN canceled_ts REAL",
+                     "ALTER TABLE twelve_sim_position ADD COLUMN reject_reason TEXT"):
             try:
                 conn.execute(_ddl)
             except Exception:  # noqa: BLE001 — duplicate column = 已升级过
@@ -340,6 +367,47 @@ def _fee_pct() -> float:
         return max(0.0, float(v)) if v is not None else DEFAULT_FEE_PCT
     except Exception:  # noqa: BLE001 — 配置层异常回退默认，不拖垮交易循环
         return DEFAULT_FEE_PCT
+
+
+def _gate_cfg(key: str, default):
+    """读 jarvis_config 门禁键（YAML 热加载即生效）；异常/缺失回退默认值。
+
+    开仓门禁链（S1-S5/S7）全部经由本函数取参——冒烟测试对本函数打桩即可
+    整体控制门禁口径；配置层任何异常绝不拖垮交易循环。
+    """
+    try:
+        import jarvis_config as jc
+        v = jc.get(key)
+        return default if v is None else v
+    except Exception:  # noqa: BLE001 — 配置层异常回退默认
+        return default
+
+
+def _gate_num(key: str, default: float) -> float:
+    """数值门禁键：类型异常回退默认。"""
+    try:
+        return float(_gate_cfg(key, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _tf_gate_num(key: str, tf: str, defaults: dict, fallback: float = 0.0) -> float:
+    """按 TF 分层的数值门禁键：配置(dict / JSON 串) > 内置分层默认 > fallback。"""
+    raw = _gate_cfg(key, None)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = None
+    if isinstance(raw, dict) and raw.get(tf) is not None:
+        try:
+            return float(raw[tf])
+        except (TypeError, ValueError):
+            pass
+    try:
+        return float(defaults.get(tf, fallback))
+    except (TypeError, ValueError):
+        return float(fallback)
 
 
 def _fetch_bars(symbol: str, tf: str) -> list[dict] | None:
@@ -620,10 +688,21 @@ def read_signals(symbol: str) -> dict[tuple[str, str], dict]:
 
 # ─────────────────────────── 开仓参数解析 ───────────────────────────
 
-def _auto_leverage(entry: float, stop_loss: float) -> float:
-    """按止损距离反推推荐杠杆：打到止损亏损 ≈ 保证金 50%，夹到 [1, 20]。
+def _tf_max_leverage(tf: str | None) -> float:
+    """TF 分层杠杆上限（S1）：配置 twelve_max_leverage > 内置分层默认；
+    任何来源都不越过 MAX_AUTO_LEVERAGE 绝对硬顶。tf 未知回退硬顶。"""
+    if not tf:
+        return MAX_AUTO_LEVERAGE
+    cap = _tf_gate_num("twelve_max_leverage", tf, MAX_LEVERAGE_BY_TF, MAX_AUTO_LEVERAGE)
+    return max(1.0, min(MAX_AUTO_LEVERAGE, cap))
 
-    （移植自原 jarvis_sim_trader.recommend_leverage，仅在配置/plan 均无杠杆时用。）
+
+def _auto_leverage(entry: float, stop_loss: float, tf: str | None = None) -> float:
+    """按止损距离反推推荐杠杆（S1 解耦版）：打到止损亏损 ≈ 保证金
+    twelve_auto_lev_loss_frac（默认 25%），夹到 [1, TF 分层上限]。
+
+    旧口径（0.5 / 顶格 20×）与窄止损强耦合——止损越窄杠杆越顶格，等于专挑
+    噪声带下最大注（R10 取证 402/406 笔全 20×）；现降目标亏损比例并按 TF 封顶。
     """
     import math
     try:
@@ -632,14 +711,31 @@ def _auto_leverage(entry: float, stop_loss: float) -> float:
         return 1.0
     if not math.isfinite(dist) or dist <= 0:
         return 1.0
-    return float(max(1.0, min(MAX_AUTO_LEVERAGE, math.floor(AUTO_LEV_SL_LOSS_FRAC / dist))))
+    frac = _gate_num("twelve_auto_lev_loss_frac", AUTO_LEV_SL_LOSS_FRAC)
+    return float(max(1.0, min(_tf_max_leverage(tf), math.floor(frac / dist))))
+
+
+def _risk_gate(tf: str, entry: float, params: dict) -> str | None:
+    """开仓风控门禁链（合成参数后的最终校验）→ reject_reason 或 None（放行）。
+
+    S1 止损最小距离：SL 距离(%) < 该 TF 下限 → 'sl_too_tight'。
+    被拦信号不静默丢弃——调用方负责落 status='rejected' + reject_reason 留痕。
+    """
+    try:
+        sl_dist = abs(entry - float(params["stop_loss"])) / entry * 100.0
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    if sl_dist < _tf_gate_num("twelve_min_sl_pct", tf, MIN_SL_PCT_BY_TF, 0.0):
+        return "sl_too_tight"
+    return None
 
 
 def _resolve_entry_params(direction: str, price: float, eff: dict,
-                          plan: dict | None) -> dict | None:
+                          plan: dict | None, tf: str | None = None) -> dict | None:
     """合成一笔开仓参数：配置覆盖 > plan_json 推荐 > 默认/自动推荐。
 
-    杠杆兜底顺序：配置 > plan_json > 按止损距离自动推荐（夹 [1,20]）。
+    杠杆兜底顺序：配置 > plan_json > 按止损距离自动推荐（S1：显式杠杆尊重
+    显式值但夹 TF 分层上限；自动推荐按 twelve_auto_lev_loss_frac 解耦）。
     返回 {stop_loss, take_profit, leverage, position_pct} 或 None（点位不自洽，
     如现价已越过计划止损/止盈 → 宁缺毋滥不硬开）。
     """
@@ -675,7 +771,11 @@ def _resolve_entry_params(direction: str, price: float, eff: dict,
     lev = eff.get("leverage")
     if lev is None:
         lev = plan.get("leverage")
-    lev = max(1.0, float(lev)) if lev else _auto_leverage(price, sl)
+    if lev:
+        # 显式杠杆（配置/plan）尊重显式值，只夹 TF 分层上限（S1）
+        lev = min(max(1.0, float(lev)), _tf_max_leverage(tf))
+    else:
+        lev = _auto_leverage(price, sl, tf)
     return {"stop_loss": sl, "take_profit": tp,
             "leverage": lev, "position_pct": pos_pct}
 
@@ -698,7 +798,7 @@ def _do_open(conn, sym: str, tf: str, system: str,
              params: dict, now: float) -> dict:
     margin = round(min(balance, balance * params["position_pct"] / 100.0), 8)
     qty = round(margin * params["leverage"] / price, 8)
-    conn.execute(
+    cur = conn.execute(
         """
         INSERT INTO twelve_sim_position
           (symbol, tf, system, direction, entry_price, entry_ts, qty, margin,
@@ -712,7 +812,7 @@ def _do_open(conn, sym: str, tf: str, system: str,
     return {"symbol": sym, "tf": tf, "system": system, "direction": direction,
             "entry_price": price, "qty": qty, "margin": margin,
             "leverage": params["leverage"], "stop_loss": params["stop_loss"],
-            "take_profit": params["take_profit"]}
+            "take_profit": params["take_profit"], "position_id": cur.lastrowid}
 
 
 def _do_close(conn, pos: dict, exit_price: float, reason: str, now: float) -> dict:
@@ -976,6 +1076,103 @@ def _cancel_plan(conn, pen: dict, reason: str, price: float, now: float) -> dict
             "reason": reason}
 
 
+def _do_reject(conn, sym: str, tf: str, system: str, direction: str,
+               reason: str, entry: float, sl: float | None, tp: float | None,
+               price: float, now: float) -> dict | None:
+    """门禁拒单留痕（公共纪律：不静默丢弃）：落 status='rejected' + reject_reason
+    行 + twelve_sim_signal_log（change_kinds=reject），S6 归因报表可按原因聚合。
+
+    防重：该槽位同方向最近一条 rejected 行原因相同且点位无实质变化
+    （SLTP_MIN_CHANGE_PCT 同阈值）→ 不重复落行（信号每轮常驻，防行数爆炸）；
+    返回 None 表示防重跳过。rejected 行 qty/margin=0，不动钱包/胜率/台账。
+    """
+    last = conn.execute(
+        "SELECT reject_reason, entry_price, stop_loss, take_profit "
+        "FROM twelve_sim_position WHERE symbol=? AND tf=? AND system=? "
+        "AND direction=? AND status='rejected' ORDER BY id DESC LIMIT 1",
+        (sym, tf, system, direction)).fetchone()
+    if last is not None and str(last["reject_reason"] or "") == reason:
+        old_sl = float(last["stop_loss"]) if last["stop_loss"] is not None else None
+        old_tp = float(last["take_profit"]) if last["take_profit"] is not None else None
+        if (not _sltp_changed(float(last["entry_price"]), entry)
+                and not _sltp_changed(old_sl, sl)
+                and not _sltp_changed(old_tp, tp)):
+            return None
+    cur = conn.execute(
+        """
+        INSERT INTO twelve_sim_position
+          (symbol, tf, system, direction, entry_price, entry_ts, qty, margin,
+           leverage, position_pct, stop_loss, take_profit, cur_price,
+           unrealized_pnl, status, reject_reason)
+        VALUES (?,?,?,?,?,?,0,0,1,NULL,?,?,?,0,'rejected',?)
+        """,
+        (sym, tf, system, direction, entry, now, sl, tp, price, reason))
+    pid = cur.lastrowid
+    conn.execute(
+        """
+        INSERT INTO twelve_sim_signal_log
+          (ts, symbol, tf, system, name_cn, position_id,
+           prev_entry, prev_sl, prev_tp, new_entry, new_sl, new_tp,
+           price, change_kinds, applied, note)
+        VALUES (?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,?,'reject',0,?)
+        """,
+        (now, sym, tf, system, NAME_CN.get(system, system), pid,
+         entry, sl, tp, price,
+         f"开仓被门禁拦截（{REJECT_REASON_CN.get(reason, reason)}），"
+         f"只推送信号不开仓"))
+    return {"symbol": sym, "tf": tf, "system": system, "direction": direction,
+            "reason": reason, "entry": entry, "position_id": pid}
+
+
+def _reject_plan(conn, pen: dict, reason: str, price: float, now: float) -> dict:
+    """挂单(pending)在成交时刻被门禁拦截：行保留为 status='rejected' +
+    reject_reason（同 _cancel_plan 留痕哲学，用 canceled_ts 记终态时刻），
+    并落 twelve_sim_signal_log；不产生持仓/台账，不影响钱包。"""
+    conn.execute(
+        "UPDATE twelve_sim_position SET status='rejected', reject_reason=?, "
+        "canceled_ts=?, cur_price=? WHERE id=? AND status='pending'",
+        (reason, now, price, pen["id"]))
+    old_sl = float(pen["stop_loss"]) if pen.get("stop_loss") is not None else None
+    old_tp = float(pen["take_profit"]) if pen.get("take_profit") is not None else None
+    conn.execute(
+        """
+        INSERT INTO twelve_sim_signal_log
+          (ts, symbol, tf, system, name_cn, position_id,
+           prev_entry, prev_sl, prev_tp, new_entry, new_sl, new_tp,
+           price, change_kinds, applied, note)
+        VALUES (?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,'reject',0,?)
+        """,
+        (now, pen["symbol"], pen["tf"], pen["system"],
+         NAME_CN.get(str(pen["system"]), str(pen["system"])), pen["id"],
+         float(pen["entry_price"]), old_sl, old_tp, price,
+         f"计划触达但被门禁拦截未成交（{REJECT_REASON_CN.get(reason, reason)}）"))
+    return {"symbol": pen["symbol"], "tf": pen["tf"], "system": pen["system"],
+            "direction": pen["direction"], "reason": reason,
+            "entry": float(pen["entry_price"]), "position_id": pen["id"]}
+
+
+def rejected_positions(symbol: str | None = None, tf: str | None = None,
+                       system: str | None = None, limit: int = 200) -> list[dict]:
+    """门禁拒单(rejected)留痕行查询（保留 7 天；看板/归因/冒烟/调试用）。"""
+    _ensure_init()
+    cond, args = ["status='rejected'"], []
+    if symbol:
+        cond.append("symbol=?")
+        args.append(_norm_symbol(symbol))
+    if tf:
+        cond.append("tf=?")
+        args.append(tf)
+    if system:
+        cond.append("system=?")
+        args.append(system)
+    with _conn() as conn:
+        cur = conn.execute(
+            "SELECT * FROM twelve_sim_position WHERE " + " AND ".join(cond)
+            + " ORDER BY entry_ts DESC, id DESC LIMIT ?",
+            (*args, max(1, int(limit))))
+        return [dict(r) for r in cur.fetchall()]
+
+
 def _maybe_update_plan(conn, pen: dict, pts: dict, price: float,
                        now: float) -> dict | None:
     """计划未成交期间信号点位跟随：entry/SL/TP 实质变化（≥0.2% 同阈值）
@@ -1025,12 +1222,18 @@ def _fill_plan(conn, pen: dict, plan: dict | None, eff: dict, balance: float,
     SL/TP/杠杆/qty 经 _resolve_entry_params 基于 entry 价合成回填；
     成交落 twelve_sim_signal_log 留痕（change_kinds=fill）。
 
-    点位相对 entry 不自洽（配置/信号漂移）→ 返回 None，由调用方撤销计划。
+    点位相对 entry 不自洽（配置/信号漂移）→ 返回 None，由调用方撤销计划；
+    风控门禁（_risk_gate）拦截 → 返回 {"rejected": True, "reason": ...}，
+    由调用方 _reject_plan 留痕（挂单期间配置可能已收紧，成交时刻再验一次）。
     """
     entry = float(pen["entry_price"])
-    params = _resolve_entry_params(str(pen["direction"]), entry, eff, plan)
+    tf = str(pen["tf"])
+    params = _resolve_entry_params(str(pen["direction"]), entry, eff, plan, tf)
     if params is None:
         return None
+    risk = _risk_gate(tf, entry, params)
+    if risk:
+        return {"rejected": True, "reason": risk}
     margin = round(min(balance, balance * params["position_pct"] / 100.0), 8)
     qty = round(margin * params["leverage"] / entry, 8)
     conn.execute(
@@ -1199,7 +1402,7 @@ def _cycle_symbol(sym: str, cfg: dict, now: float | None = None) -> dict:
     signals = read_signals(sym)
     res = {"price": price, "closed": [], "opened": [], "holds": 0,
            "sltp_updates": [], "planned": [], "filled": [], "canceled": [],
-           "plan_updates": []}
+           "plan_updates": [], "rejected": []}
 
     with _conn() as conn:
         pos_rows = [dict(p) for p in conn.execute(
@@ -1269,6 +1472,12 @@ def _cycle_symbol(sym: str, cfg: dict, now: float | None = None) -> dict:
                     # 点位相对 entry 不自洽（配置/信号漂移）→ 宁缺毋滥失效
                     res["canceled"].append(
                         _cancel_plan(conn, pen, "incoherent", price, ts))
+                    pendings.pop(slot)
+                    continue
+                if filled.get("rejected"):
+                    # 成交时刻风控门禁拦截（S1+）→ 拒单留痕，不成交
+                    res["rejected"].append(
+                        _reject_plan(conn, pen, filled["reason"], price, ts))
                     pendings.pop(slot)
                     continue
                 res["filled"].append(filled)
@@ -1357,25 +1566,38 @@ def _cycle_symbol(sym: str, cfg: dict, now: float | None = None) -> dict:
                     _do_plan(conn, sym, tf, system, direction, pts, eff, price, ts))
                 continue
             # 计划缺失（无点位可比）/ 现价已处于可成交侧 → 按现价立即成交（现有口径）
-            params = _resolve_entry_params(direction, price, eff, plan)
+            params = _resolve_entry_params(direction, price, eff, plan, tf)
             if params is None:
                 continue   # 点位缺失或不自洽，宁缺毋滥
+            risk = _risk_gate(tf, price, params)
+            if risk:
+                # 风控门禁拦截（S1+）→ 拒单留痕，不静默丢弃
+                rej = _do_reject(conn, sym, tf, system, direction, risk,
+                                 price, params["stop_loss"],
+                                 params["take_profit"], price, ts)
+                if rej:
+                    res["rejected"].append(rej)
+                continue
             opened = _do_open(conn, sym, tf, system,
                               direction, price, balance, params, ts)
             res["opened"].append(opened)
 
-        # 3) 已失效(canceled)留痕行到期清理（日志表留痕永久，行级留痕仅保窗口期）
+        # 3) 已失效(canceled)/已拒单(rejected)留痕行到期清理
+        #    （日志表留痕永久，行级留痕仅保窗口期）
         conn.execute(
-            "DELETE FROM twelve_sim_position WHERE symbol=? AND status='canceled' "
-            "AND canceled_ts IS NOT NULL AND canceled_ts < ?",
-            (sym, ts - CANCELED_RETENTION_DAYS * 86400.0))
+            "DELETE FROM twelve_sim_position WHERE symbol=? AND ("
+            "(status='canceled' AND canceled_ts IS NOT NULL AND canceled_ts < ?) "
+            "OR (status='rejected' AND COALESCE(canceled_ts, entry_ts) < ?))",
+            (sym, ts - CANCELED_RETENTION_DAYS * 86400.0,
+             ts - REJECTED_RETENTION_DAYS * 86400.0))
 
     if (res["closed"] or res["opened"] or res["sltp_updates"] or res["planned"]
-            or res["filled"] or res["canceled"] or res["plan_updates"]):
+            or res["filled"] or res["canceled"] or res["plan_updates"]
+            or res["rejected"]):
         _log(f"🧭 {sym} 槽位轮：价 {price} / 平 {len(res['closed'])} "
              f"/ 开 {len(res['opened'])} / 持 {res['holds']} "
              f"/ 计划 +{len(res['planned'])} 成交 {len(res['filled'])} "
-             f"撤 {len(res['canceled'])} "
+             f"撤 {len(res['canceled'])} 拒 {len(res['rejected'])} "
              f"/ 点位跟随 {len(res['sltp_updates']) + len(res['plan_updates'])}")
     return res
 
@@ -1468,6 +1690,7 @@ def main() -> int:
                           f"/ 计划 +{len(r.get('planned') or [])} "
                           f"成交 {len(r.get('filled') or [])} "
                           f"撤 {len(r.get('canceled') or [])} "
+                          f"拒 {len(r.get('rejected') or [])} "
                           f"/ 点位跟随 {len(r.get('sltp_updates') or []) + len(r.get('plan_updates') or [])}")
             if out.get("note"):
                 print(out["note"])

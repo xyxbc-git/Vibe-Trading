@@ -196,6 +196,14 @@ DEFAULTS: dict = {
     # 独立引擎，不影响 12 信号主链路；参数主要走 twelve_sim_config 表分层覆盖，
     # 此处仅登记全局费率（数据经 jarvis_sync 旁路同步到 RuoYi 分析）。
     "twelve_sim_fee_pct": 0.05,       # 单边手续费%（按名义，开/平双边各收一次）
+    # ── 12信号亏损止血 S1：止损最小距离门禁 + 杠杆与止损解耦（2026-08-06）────────
+    # R10 取证：sl 平仓 228 笔胜率 4.4%、5m 中位 SL 距离 0.172% 在噪声带内，
+    # 且旧自动杠杆 floor(0.5/SL距离) 顶格 20×——止损越窄杠杆越大。
+    "twelve_min_sl_pct": {            # SL 距离下限（%，按 TF 分层）；更窄一律拒单
+        "5m": 0.5, "15m": 0.7, "30m": 1.0, "1h": 1.2, "4h": 2.0, "1d": 3.0},
+    "twelve_auto_lev_loss_frac": 0.25,  # 自动杠杆目标：打到 SL 亏保证金 25%（旧 0.5）
+    "twelve_max_leverage": {          # 杠杆上限（按 TF 分层）；显式杠杆也夹此上限
+        "5m": 5, "15m": 8, "30m": 10, "1h": 12, "4h": 15, "1d": 20},
 }
 
 # ── YAML 分组 schema：key → 组名（trading/risk/signal/data/notify/system）────────
@@ -247,6 +255,9 @@ GROUPS: dict[str, str] = {
     "sl_atr_buffer_mult": "risk",
     "cooldown_hours": "risk",
     "sl_proximity_warn_pct": "risk",
+    "twelve_min_sl_pct": "risk",
+    "twelve_auto_lev_loss_frac": "risk",
+    "twelve_max_leverage": "risk",
     # signal——信号/决策层
     "intraday_min_prob": "signal",
     "debate_enabled": "signal",
@@ -368,6 +379,7 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "twelve_max_open_positions": (1, 20),
     "twelve_reopen_cooldown_min": (0, 1440),  # 0=关闭 ~ 24 小时
     "twelve_sim_fee_pct": (0.0, 1.0),         # 模拟交易器单边费率%
+    "twelve_auto_lev_loss_frac": (0.05, 1.0),  # 打到 SL 目标亏损占保证金比例
 }
 
 # 允许的枚举键。
@@ -409,6 +421,10 @@ def _coerce(key: str, value):
             else:
                 items = [s.strip() for s in str(value).split(",") if s.strip()]
             return items if keep_case else [s.upper() for s in items]
+        if isinstance(dv, dict) and isinstance(value, str):
+            # 按 TF 分层等 dict 键：环境变量/手写字符串按 JSON 解析
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else dv
         return value
     except Exception:  # noqa: BLE001
         return value
@@ -666,6 +682,9 @@ def init_yaml_template(yaml_path: str | None = None, *, force: bool = False) -> 
             hint = f"  # {'；'.join(hint_parts)}" if hint_parts else ""
             if isinstance(dv, list):
                 lines.append(f"  {k}: {json.dumps(cv if isinstance(cv, list) else dv)}{hint}")
+            elif isinstance(dv, dict):
+                # dict 键写成 JSON flow mapping（合法 YAML），避免 Python repr 串味
+                lines.append(f"  {k}: {json.dumps(cv if isinstance(cv, dict) else dv, ensure_ascii=False)}{hint}")
             elif isinstance(dv, bool):
                 lines.append(f"  {k}: {str(bool(cv)).lower()}{hint}")
             elif isinstance(dv, str):
