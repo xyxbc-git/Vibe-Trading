@@ -79,6 +79,7 @@ _GATES: dict = {
     "twelve_min_rr": 1.0,           # 旧口径无 RR 门禁（取安全区间下限=事实关闭）
     "twelve_fee_burden_mult": 0.0,  # 旧口径无费用负担门禁
     "twelve_cb_min_trades": 9999,   # 旧口径无战绩熔断（样本门槛推到不可达）
+    "twelve_tf_min_confidence": {tf: 0.0 for tf in jtt.TFS},  # 旧口径无置信档
 }
 _orig_gate_cfg = jtt._gate_cfg
 jtt._gate_cfg = lambda key, default: _GATES.get(key, default)
@@ -704,8 +705,12 @@ check("S1d：显式杠杆 20 → 夹 15m 分层上限 8", len(op) == 1
 
 # e) 配置热加载（真实 jarvis_config YAML 链路，不打桩）：5m 下限收紧到 2% →
 #    原本放行的 0.8% 单转拒；改回默认 → 再次放行
+#    （强度 0.9 过 S4 真实默认 5m 置信档 0.75，本用例只验 S1 键）
 with jtt._conn() as conn:
     conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.2, "take_profit": 102.0},
+           strength=0.9)
 jtt._gate_cfg = _orig_gate_cfg   # 摘掉打桩，走真实配置层
 jc.save({"twelve_min_sl_pct": {"5m": 2.0, "15m": 0.7, "30m": 1.0,
                                "1h": 1.2, "4h": 2.0, "1d": 3.0},
@@ -932,6 +937,69 @@ with jtt._conn() as conn:
     conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
     conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
 set_signal("4h", "dow", "neutral", None)
+
+# ═══════════ 18. S4 周期再平衡：5m 严门禁（TF 开关 + 按 TF 置信档） ═══════════
+check("S4 配置登记：twelve_tf_enabled 全开 / twelve_tf_min_confidence 5m=0.75",
+      jc.default_config().get("twelve_tf_enabled", {}).get("5m") == 1
+      and jc.default_config().get("twelve_tf_min_confidence", {}).get("5m") == 0.75
+      and jc.default_config().get("twelve_tf_min_confidence", {}).get("15m") == 0.0)
+
+_GATES["twelve_tf_min_confidence"] = dict(jtt.TF_MIN_CONF_DEFAULT)   # 开 S4 置信档
+_PRICE["v"] = 100.0
+
+# a) 5m 低置信（0.6 < 0.75）→ 拒单 tf_gate
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.2, "take_profit": 102.0},
+           strength=0.6)
+out = jtt.run_cycle(cfg={})
+rej = [r for r in out["symbols"][SYM]["rejected"]
+       if (r["tf"], r["system"]) == ("5m", "gap")]
+check("S4a：5m 强度 0.6 < 置信档 0.75 → 拒单 tf_gate",
+      len(rej) == 1 and rej[0]["reason"] == "tf_gate"
+      and not out["symbols"][SYM]["opened"], str(out["symbols"][SYM]["rejected"]))
+
+# b) 15m 同强度 0.6（置信档 0）→ 正常放行
+set_signal("15m", "elliott", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 98.0, "take_profit": 105.0},
+           strength=0.6)
+out = jtt.run_cycle(cfg={})
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("15m", "elliott")]
+check("S4b：15m 同强度 0.6 正常放行（置信档仅 5m 收紧）", len(op) == 1,
+      str((out["symbols"][SYM]["opened"], out["symbols"][SYM]["rejected"])))
+
+# c) 5m 高置信（0.8 ≥ 0.75）→ 放行
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.2, "take_profit": 102.0},
+           strength=0.8)
+out = jtt.run_cycle(cfg={})
+op = [o for o in out["symbols"][SYM]["opened"] if (o["tf"], o["system"]) == ("5m", "gap")]
+check("S4c：5m 强度 0.8 ≥ 0.75 → 放行开仓", len(op) == 1,
+      str((out["symbols"][SYM]["opened"], out["symbols"][SYM]["rejected"])))
+
+# d) 配置关掉 5m → 该 TF 全拒（高置信也拦）
+_GATES["twelve_tf_enabled"] = {"5m": 0, "15m": 1, "30m": 1, "1h": 1, "4h": 1, "1d": 1}
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.0, "take_profit": 103.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={})
+rej = [r for r in out["symbols"][SYM]["rejected"]
+       if (r["tf"], r["system"]) == ("5m", "gap")]
+check("S4d：twelve_tf_enabled 关掉 5m → 高置信 0.9 也全拒 tf_gate",
+      len(rej) == 1 and rej[0]["reason"] == "tf_gate"
+      and not [o for o in out["symbols"][SYM]["opened"]
+               if o["tf"] == "5m"], str(out["symbols"][SYM]["rejected"]))
+
+# 复位：旧口径 + 清场
+_GATES["twelve_tf_enabled"] = {tf: 1 for tf in jtt.TFS}
+_GATES["twelve_tf_min_confidence"] = {tf: 0.0 for tf in jtt.TFS}
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+    conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
+for _tf, _sys in [("5m", "gap"), ("15m", "elliott")]:
+    set_signal(_tf, _sys, "neutral", None)
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS ✅")

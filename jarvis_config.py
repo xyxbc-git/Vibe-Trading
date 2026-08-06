@@ -218,6 +218,13 @@ DEFAULTS: dict = {
     "twelve_cb_min_winrate": 15.0,    # 胜率下限%（低于且亏损超阈值才熔断）
     "twelve_cb_max_loss": 10.0,       # 窗口净亏阈值 U（净亏 < -该值才熔断）
     "twelve_cb_cooldown_hours": 24.0, # 熔断冷却时长（小时），期满半开试探
+    # ── 12信号亏损止血 S4：周期再平衡·5m 严门禁（2026-08-06）───────────────────
+    # R10 取证：5m 占 202/406 笔亏 -57.7U、费用占该轴亏损 66%、信号 4 天翻动
+    # 3383 次——5m 不直接禁用（保留验证价值），只放行高置信信号。
+    "twelve_tf_enabled": {            # TF 开关（0=该周期全拒 reject_reason='tf_gate'）
+        "5m": 1, "15m": 1, "30m": 1, "1h": 1, "4h": 1, "1d": 1},
+    "twelve_tf_min_confidence": {     # 信号强度下限（0~1，按 TF 分层）；低于拒单
+        "5m": 0.75, "15m": 0.0, "30m": 0.0, "1h": 0.0, "4h": 0.0, "1d": 0.0},
 }
 
 # ── YAML 分组 schema：key → 组名（trading/risk/signal/data/notify/system）────────
@@ -279,6 +286,8 @@ GROUPS: dict[str, str] = {
     "twelve_cb_min_winrate": "risk",
     "twelve_cb_max_loss": "risk",
     "twelve_cb_cooldown_hours": "risk",
+    "twelve_tf_enabled": "risk",
+    "twelve_tf_min_confidence": "risk",
     # signal——信号/决策层
     "intraday_min_prob": "signal",
     "debate_enabled": "signal",

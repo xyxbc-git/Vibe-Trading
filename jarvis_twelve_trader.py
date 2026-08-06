@@ -47,7 +47,10 @@
        为准（撤销判定先于触达成交判定）；canceled 行保留 7 天后清理
        （日志表留痕永久）；全程不产生 twelve_sim_trade；
   4.8 开仓门禁链（2026-08-06 亏损止血 S1+）：
-     - 信号级前置门禁 _pre_gate（开仓/挂计划/成交时刻都先过）：S3 战绩熔断——
+     - 信号级前置门禁 _pre_gate（开仓/挂计划/成交时刻都先过）：
+       S4 周期门禁——twelve_tf_enabled 停用的 TF 全拒、信号强度低于
+       twelve_tf_min_confidence 该 TF 置信档（5m 默认 0.75）拒 'tf_gate'；
+       S3 战绩熔断——
        滚动窗口（twelve_cb_window 笔、恢复时刻后）胜率 < twelve_cb_min_winrate
        且净亏超 twelve_cb_max_loss → 该 信号×周期 熔断（twelve_sim_breaker 表
        持久化，只推信号不开仓）；冷却 twelve_cb_cooldown_hours 期满半开放行
@@ -158,12 +161,19 @@ CB_MIN_WINRATE_DEFAULT = 15.0
 CB_MAX_LOSS_DEFAULT = 10.0
 CB_COOLDOWN_HOURS_DEFAULT = 24.0
 
+# 周期再平衡（S4）：TF 开关 + 按 TF 信号强度下限——R10 取证 5m 占 202/406 笔
+# 亏 -57.7U、费用占该轴亏损 66%；5m 保留验证价值但只放行高置信（strength≥0.75）信号。
+TF_ENABLED_DEFAULT = {"5m": 1, "15m": 1, "30m": 1, "1h": 1, "4h": 1, "1d": 1}
+TF_MIN_CONF_DEFAULT = {"5m": 0.75, "15m": 0.0, "30m": 0.0,
+                       "1h": 0.0, "4h": 0.0, "1d": 0.0}
+
 # 门禁拒单原因 → 中文留痕说明（写进 twelve_sim_signal_log.note，看板/复盘直读）
 REJECT_REASON_CN = {
     "sl_too_tight": "止损距离低于该周期下限",
     "rr_too_low": "盈亏比低于下限",
     "fee_negative_ev": "止盈不足以覆盖费用负担（负期望）",
     "circuit_breaker": "信号×周期战绩熔断中",
+    "tf_gate": "周期门禁（TF 停用或信号置信不足）",
 }
 
 # 点位跟随：SL/TP 相对变化 ≥ 此阈值(%)才算实质变更（对齐 jarvis_signal_history
@@ -1370,10 +1380,16 @@ def breaker_states(symbol: str | None = None) -> list[dict]:
 
 def _pre_gate(conn, sym: str, tf: str, system: str, direction: str,
               strength: float, now: float) -> tuple[str | None, bool]:
-    """信号级门禁链（参数无关，开仓/挂计划前置）→ (reject_reason|None, 试探标记)。
+    """信号级门禁链（参数无关，开仓/挂计划/成交前置）→ (reject_reason|None, 试探标记)。
 
-    S3 战绩熔断（后续 S4 周期门禁 / S5 逆势过滤在此链上扩展）。
+    链序：S4 周期门禁（TF 开关 + 置信档）→ S3 战绩熔断（S5 逆势过滤在此链上扩展）。
     """
+    # S4 周期再平衡：TF 停用 / 信号强度低于该 TF 置信档 → 拒 'tf_gate'
+    if _tf_gate_num("twelve_tf_enabled", tf, TF_ENABLED_DEFAULT, 1.0) < 0.5:
+        return "tf_gate", False
+    if strength < _tf_gate_num("twelve_tf_min_confidence", tf,
+                               TF_MIN_CONF_DEFAULT, 0.0):
+        return "tf_gate", False
     return _breaker_gate(conn, sym, tf, system, now)
 
 
