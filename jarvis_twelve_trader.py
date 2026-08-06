@@ -46,10 +46,18 @@
        （change_kinds=cancel）；失效后价格再触达旧点位也不成交，一切以最新信号
        为准（撤销判定先于触达成交判定）；canceled 行保留 7 天后清理
        （日志表留痕永久）；全程不产生 twelve_sim_trade；
-  4.8 开仓门禁链（2026-08-06 亏损止血 S1+）：合成参数后过 _risk_gate——
-     止损最小距离（twelve_min_sl_pct 按 TF 分层）等门禁不满足 → 拒单不入场，
-     落 status='rejected' + reject_reason 行 + signal_log 留痕（不静默丢弃，
-     S6 归因报表可按原因聚合）；挂单在成交时刻同样再验一次门禁；
+  4.8 开仓门禁链（2026-08-06 亏损止血 S1+）：
+     - 信号级前置门禁 _pre_gate（开仓/挂计划/成交时刻都先过）：S3 战绩熔断——
+       滚动窗口（twelve_cb_window 笔、恢复时刻后）胜率 < twelve_cb_min_winrate
+       且净亏超 twelve_cb_max_loss → 该 信号×周期 熔断（twelve_sim_breaker 表
+       持久化，只推信号不开仓）；冷却 twelve_cb_cooldown_hours 期满半开放行
+       1 笔试探单，盈利恢复（战绩窗口重起算）/ 否则续熔断重计冷却；
+       熔断/半开/恢复事件落 signal_log（change_kinds=breaker）可审计；
+     - 参数级门禁 _risk_gate（合成参数后）：止损最小距离（twelve_min_sl_pct
+       按 TF 分层）、最小盈亏比（twelve_min_rr）、费用负担
+       （twelve_fee_burden_mult × 双边费用）不满足 → 拒单不入场；
+     - 两级门禁拒单统一落 status='rejected' + reject_reason 行 + signal_log
+       留痕（不静默丢弃，S6 归因报表可按原因聚合）；挂单在成交时刻同样再验一次；
   5. 参数：止损/止盈/杠杆/仓位% 优先用 twelve_sim_config 覆盖
      （优先级 信号级 > tf组级 > 币种级），否则用 plan_json 系统推荐；杠杆双兜底：
      配置/plan 均未给时按止损距离自动推荐（S1 解耦：打到止损亏≈保证金25%
@@ -60,7 +68,7 @@
      开/平双边手续费按名义单边 0.05%（jarvis_config: twelve_sim_fee_pct 可配）
      折进净 pnl；单笔最大亏损钳到 -margin（不倒欠）。
 
-五张本地表（经 jarvis_db 兼容层懒建，pg 可切）：
+六张本地表（经 jarvis_db 兼容层懒建，pg 可切）：
   twelve_sim_wallet     槽位虚拟钱包 + 累计战绩（UNIQUE symbol,tf,system）
   twelve_sim_position   计划/在途持仓（status pending计划未成交 / open持仓 /
                         closed已平 / canceled已失效；pending 行 entry_price=计划
@@ -73,6 +81,8 @@
   twelve_sim_config     参数配置（scope_tf/scope_system 可 NULL 分层覆盖；
                         内容由 RuoYi 同步链路回读落地，本模块只负责
                         建表 + 读取 + 提供 upsert_config 函数）
+  twelve_sim_breaker    信号×周期战绩熔断器状态（S3：tripped/probing/recovered
+                        + trip_count/reset_ts，进程重启熔断态不丢）
 
 用法：
   python jarvis_twelve_trader.py config-set ETHUSDT                # 启用币种（币种级配置）
@@ -139,11 +149,21 @@ REJECTED_RETENTION_DAYS = 7
 MIN_RR_DEFAULT = 1.5
 FEE_BURDEN_MULT_DEFAULT = 3.0
 
+# 信号×周期战绩熔断器（S3）默认：滚动窗口内 胜率<下限 且 净亏超阈值 → 熔断
+# 只推信号不开仓；冷却期满半开放行 1 笔试探，赢了恢复（窗口重起算）输了续熔断。
+# R10 取证：elliott 胜率 7% 连亏 38 笔不停——弱组合必须自动止血。
+CB_WINDOW_DEFAULT = 30
+CB_MIN_TRADES_DEFAULT = 10
+CB_MIN_WINRATE_DEFAULT = 15.0
+CB_MAX_LOSS_DEFAULT = 10.0
+CB_COOLDOWN_HOURS_DEFAULT = 24.0
+
 # 门禁拒单原因 → 中文留痕说明（写进 twelve_sim_signal_log.note，看板/复盘直读）
 REJECT_REASON_CN = {
     "sl_too_tight": "止损距离低于该周期下限",
     "rr_too_low": "盈亏比低于下限",
     "fee_negative_ev": "止盈不足以覆盖费用负担（负期望）",
+    "circuit_breaker": "信号×周期战绩熔断中",
 }
 
 # 点位跟随：SL/TP 相对变化 ≥ 此阈值(%)才算实质变更（对齐 jarvis_signal_history
@@ -314,6 +334,26 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tssl_slot "
             "ON twelve_sim_signal_log(symbol, tf, system, ts)"
+        )
+        # S3 信号×周期战绩熔断器状态（落库持久化，进程重启不丢）：
+        # state: tripped=熔断中 / probing=半开试探单在途 / recovered=已恢复；
+        # reset_ts=战绩窗口起点（恢复时刻起算，避免旧亏损战绩立刻再触发）
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS twelve_sim_breaker (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol            TEXT NOT NULL,
+                tf                TEXT NOT NULL,
+                system            TEXT NOT NULL,
+                state             TEXT NOT NULL,
+                tripped_ts        REAL,
+                probe_position_id INTEGER,
+                reset_ts          REAL NOT NULL DEFAULT 0,
+                trip_count        INTEGER NOT NULL DEFAULT 0,
+                updated_ts        REAL,
+                UNIQUE (symbol, tf, system)
+            )
+            """
         )
     _INITED = True
 
@@ -906,6 +946,8 @@ def _do_close(conn, pos: dict, exit_price: float, reason: str, now: float) -> di
          round(gross_win / gross_loss, 3) if gross_loss > 0 else None,
          _max_drawdown_pct(principal, [float(r["balance_after"]) for r in rows]),
          now, sym, tf, system))
+    # S3 熔断器簿记：试探单结算（恢复/继续熔断）或滚动战绩评估触发熔断
+    _breaker_on_close(conn, pos, pnl, exit_price, now)
     return {"symbol": sym, "tf": tf, "system": system,
             "direction": pos["direction"], "entry_price": entry,
             "exit_price": exit_price, "exit_reason": reason, "pnl": pnl,
@@ -1190,6 +1232,149 @@ def rejected_positions(symbol: str | None = None, tf: str | None = None,
             + " ORDER BY entry_ts DESC, id DESC LIMIT ?",
             (*args, max(1, int(limit))))
         return [dict(r) for r in cur.fetchall()]
+
+
+# ─────────────────────────── S3 信号×周期战绩熔断器 ───────────────────────────
+
+def _breaker_row(conn, sym: str, tf: str, system: str) -> dict | None:
+    r = conn.execute(
+        "SELECT * FROM twelve_sim_breaker WHERE symbol=? AND tf=? AND system=?",
+        (sym, tf, system)).fetchone()
+    return dict(r) if r else None
+
+
+def _breaker_log(conn, sym: str, tf: str, system: str, note: str,
+                 price: float, now: float, position_id: int | None = None) -> None:
+    """熔断/半开/恢复事件写 twelve_sim_signal_log（change_kinds=breaker）可审计。"""
+    conn.execute(
+        """
+        INSERT INTO twelve_sim_signal_log
+          (ts, symbol, tf, system, name_cn, position_id,
+           prev_entry, prev_sl, prev_tp, new_entry, new_sl, new_tp,
+           price, change_kinds, applied, note)
+        VALUES (?,?,?,?,?,?,NULL,NULL,NULL,NULL,NULL,NULL,?,'breaker',1,?)
+        """,
+        (now, sym, tf, system, NAME_CN.get(system, system), position_id,
+         price, note))
+
+
+def _breaker_gate(conn, sym: str, tf: str, system: str,
+                  now: float) -> tuple[str | None, bool]:
+    """熔断门禁 → (reject_reason|None, 半开试探标记)。
+
+    tripped 且冷却未满 / probing（试探单在途）→ 拒 'circuit_breaker'；
+    tripped 且冷却期满 → 放行并标记「本次开仓为试探单」（由调用方
+    _breaker_mark_probe 落状态）；无记录 / recovered → 正常放行。
+    """
+    row = _breaker_row(conn, sym, tf, system)
+    if row is None or row["state"] == "recovered":
+        return None, False
+    if row["state"] == "probing":
+        return "circuit_breaker", False
+    cd_s = _gate_num("twelve_cb_cooldown_hours", CB_COOLDOWN_HOURS_DEFAULT) * 3600.0
+    if now - float(row["tripped_ts"] or 0.0) >= cd_s:
+        return None, True   # 冷却期满：半开，放行 1 笔试探
+    return "circuit_breaker", False
+
+
+def _breaker_mark_probe(conn, sym: str, tf: str, system: str,
+                        position_id: int, price: float, now: float) -> None:
+    """半开试探单已开仓：熔断状态 tripped → probing（试探期间其余信号仍拒）。"""
+    conn.execute(
+        "UPDATE twelve_sim_breaker SET state='probing', probe_position_id=?, "
+        "updated_ts=? WHERE symbol=? AND tf=? AND system=?",
+        (position_id, now, sym, tf, system))
+    _breaker_log(conn, sym, tf, system,
+                 "熔断冷却期满半开：放行 1 笔试探单（赢了恢复，输了继续熔断）",
+                 price, now, position_id)
+
+
+def _breaker_on_close(conn, pos: dict, pnl: float, exit_price: float,
+                      now: float) -> None:
+    """每笔平仓后的熔断器簿记（_do_close 内调用，同一连接）。
+
+    1) 平的是试探单 → 盈利恢复（reset_ts=now 战绩窗口重起算）/ 否则继续熔断
+       （重新计冷却，trip_count+1）；
+    2) 无激活熔断 → 评估滚动窗口（最近 twelve_cb_window 笔、恢复时刻之后）：
+       样本 ≥ twelve_cb_min_trades 且 胜率 < 下限 且 净亏 < -阈值 → 熔断。
+    """
+    sym, tf, system = str(pos["symbol"]), str(pos["tf"]), str(pos["system"])
+    row = _breaker_row(conn, sym, tf, system)
+    if (row and row["state"] == "probing"
+            and row.get("probe_position_id") == pos["id"]):
+        if pnl > 0:
+            conn.execute(
+                "UPDATE twelve_sim_breaker SET state='recovered', reset_ts=?, "
+                "probe_position_id=NULL, updated_ts=? WHERE id=?",
+                (now, now, row["id"]))
+            _breaker_log(conn, sym, tf, system,
+                         f"试探单盈利 {round(pnl, 4)}U：熔断解除，战绩窗口重新起算",
+                         exit_price, now, pos["id"])
+        else:
+            conn.execute(
+                "UPDATE twelve_sim_breaker SET state='tripped', tripped_ts=?, "
+                "probe_position_id=NULL, trip_count=trip_count+1, updated_ts=? "
+                "WHERE id=?", (now, now, row["id"]))
+            _breaker_log(conn, sym, tf, system,
+                         f"试探单未盈利（{round(pnl, 4)}U）：继续熔断，重新计冷却",
+                         exit_price, now, pos["id"])
+        return
+    if row and row["state"] in ("tripped", "probing"):
+        return   # 熔断中（非试探平仓，如存量持仓自然退出）：不重复评估
+    window = max(1, int(_gate_num("twelve_cb_window", CB_WINDOW_DEFAULT)))
+    min_trades = max(1, int(_gate_num("twelve_cb_min_trades", CB_MIN_TRADES_DEFAULT)))
+    reset_ts = float(row["reset_ts"] or 0.0) if row else 0.0
+    rows = conn.execute(
+        "SELECT pnl FROM twelve_sim_trade WHERE symbol=? AND tf=? AND system=? "
+        "AND exit_ts>? ORDER BY exit_ts DESC, id DESC LIMIT ?",
+        (sym, tf, system, reset_ts, window)).fetchall()
+    pnls = [float(r["pnl"]) for r in rows]
+    if len(pnls) < min_trades:
+        return
+    win_rate = 100.0 * sum(1 for x in pnls if x > 0) / len(pnls)
+    net = sum(pnls)
+    min_wr = _gate_num("twelve_cb_min_winrate", CB_MIN_WINRATE_DEFAULT)
+    max_loss = _gate_num("twelve_cb_max_loss", CB_MAX_LOSS_DEFAULT)
+    if win_rate < min_wr and net < -max_loss:
+        cd_h = _gate_num("twelve_cb_cooldown_hours", CB_COOLDOWN_HOURS_DEFAULT)
+        if row:
+            conn.execute(
+                "UPDATE twelve_sim_breaker SET state='tripped', tripped_ts=?, "
+                "probe_position_id=NULL, trip_count=trip_count+1, updated_ts=? "
+                "WHERE id=?", (now, now, row["id"]))
+        else:
+            conn.execute(
+                "INSERT INTO twelve_sim_breaker (symbol, tf, system, state, "
+                "tripped_ts, probe_position_id, reset_ts, trip_count, updated_ts) "
+                "VALUES (?,?,?,'tripped',?,NULL,?,1,?)",
+                (sym, tf, system, now, reset_ts, now))
+        _breaker_log(conn, sym, tf, system,
+                     f"信号×周期熔断触发：近 {len(pnls)} 笔胜率 {win_rate:.1f}% "
+                     f"净亏 {net:.2f}U（阈值 胜率<{min_wr:g}% 且 净亏<-{max_loss:g}U），"
+                     f"只推信号不开仓，{cd_h:g}h 后半开试探", exit_price, now)
+
+
+def breaker_states(symbol: str | None = None) -> list[dict]:
+    """熔断器状态查询（看板/归因/冒烟/调试用）。"""
+    _ensure_init()
+    with _conn() as conn:
+        if symbol:
+            cur = conn.execute(
+                "SELECT * FROM twelve_sim_breaker WHERE symbol=? "
+                "ORDER BY tf, system", (_norm_symbol(symbol),))
+        else:
+            cur = conn.execute(
+                "SELECT * FROM twelve_sim_breaker ORDER BY symbol, tf, system")
+        return [dict(r) for r in cur.fetchall()]
+
+
+def _pre_gate(conn, sym: str, tf: str, system: str, direction: str,
+              strength: float, now: float) -> tuple[str | None, bool]:
+    """信号级门禁链（参数无关，开仓/挂计划前置）→ (reject_reason|None, 试探标记)。
+
+    S3 战绩熔断（后续 S4 周期门禁 / S5 逆势过滤在此链上扩展）。
+    """
+    return _breaker_gate(conn, sym, tf, system, now)
 
 
 def _maybe_update_plan(conn, pen: dict, pts: dict, price: float,
@@ -1485,6 +1670,14 @@ def _cycle_symbol(sym: str, cfg: dict, now: float | None = None) -> dict:
                     res["canceled"].append(_cancel_plan(conn, pen, "broke", price, ts))
                     pendings.pop(slot)
                     continue
+                # S3+：成交时刻再过一次信号级门禁（挂单期间战绩/配置可能已恶化）
+                gate, probe = _pre_gate(conn, sym, tf_, system_,
+                                        str(pen["direction"]),
+                                        float((sig or {}).get("strength") or 0.0), ts)
+                if gate:
+                    res["rejected"].append(_reject_plan(conn, pen, gate, price, ts))
+                    pendings.pop(slot)
+                    continue
                 filled = _fill_plan(conn, pen, (sig or {}).get("plan"),
                                     eff, balance, price, ts)
                 if filled is None:
@@ -1499,6 +1692,9 @@ def _cycle_symbol(sym: str, cfg: dict, now: float | None = None) -> dict:
                         _reject_plan(conn, pen, filled["reason"], price, ts))
                     pendings.pop(slot)
                     continue
+                if probe:
+                    _breaker_mark_probe(conn, sym, tf_, system_,
+                                        int(filled["position_id"]), price, ts)
                 res["filled"].append(filled)
                 filled_dirs.setdefault(slot, set()).add(str(pen["direction"]))
                 pendings.pop(slot)
@@ -1578,6 +1774,17 @@ def _cycle_symbol(sym: str, cfg: dict, now: float | None = None) -> dict:
                 continue   # 槽位已爆仓，停开
             plan = sig.get("plan")
             pts = _plan_points(plan)
+            # S3+ 信号级门禁链（战绩熔断等）：开仓与挂计划都在此前置拦截
+            gate, probe = _pre_gate(conn, sym, tf, system, direction,
+                                    float(sig.get("strength") or 0.0), ts)
+            if gate:
+                rej = _do_reject(conn, sym, tf, system, direction, gate,
+                                 float((pts or {}).get("entry") or price),
+                                 (pts or {}).get("stop_loss"),
+                                 (pts or {}).get("take_profit"), price, ts)
+                if rej:
+                    res["rejected"].append(rej)
+                continue
             if (pts and not _entry_touched(direction, pts["entry_type"],
                                            pts["entry"], price, None, ts)):
                 # 有点位且现价未触达 → 只挂计划(pending)，价到才成交（规则1）
@@ -1599,6 +1806,9 @@ def _cycle_symbol(sym: str, cfg: dict, now: float | None = None) -> dict:
                 continue
             opened = _do_open(conn, sym, tf, system,
                               direction, price, balance, params, ts)
+            if probe:
+                _breaker_mark_probe(conn, sym, tf, system,
+                                    int(opened["position_id"]), price, ts)
             res["opened"].append(opened)
 
         # 3) 已失效(canceled)/已拒单(rejected)留痕行到期清理

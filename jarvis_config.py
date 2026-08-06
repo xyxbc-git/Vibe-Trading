@@ -209,6 +209,15 @@ DEFAULTS: dict = {
     # 赢了也喂手续费。费率复用 twelve_sim_fee_pct（单边 0.05%，按名义）。
     "twelve_min_rr": 1.5,             # 最小盈亏比 TP距离/SL距离；更低拒单 rr_too_low
     "twelve_fee_burden_mult": 3.0,    # 单笔止盈收益须 ≥ 该倍数×双边费用，否则 fee_negative_ev
+    # ── 12信号亏损止血 S3：信号×周期战绩熔断器（2026-08-06）─────────────────
+    # R10 取证：elliott 胜率 7% 最大连亏 38 笔不停、triple_rsi 一家亏 -57.6U——
+    # 弱组合无战绩熔断。滚动窗口内 胜率<下限 且 净亏超阈值 → 熔断只推信号不开仓；
+    # 冷却期满自动半开放行 1 笔试探，赢了恢复（窗口重新起算）输了继续熔断。
+    "twelve_cb_window": 30,           # 滚动战绩窗口（最近 N 笔已平仓）
+    "twelve_cb_min_trades": 10,       # 触发熔断的最小样本数（防小样本误杀）
+    "twelve_cb_min_winrate": 15.0,    # 胜率下限%（低于且亏损超阈值才熔断）
+    "twelve_cb_max_loss": 10.0,       # 窗口净亏阈值 U（净亏 < -该值才熔断）
+    "twelve_cb_cooldown_hours": 24.0, # 熔断冷却时长（小时），期满半开试探
 }
 
 # ── YAML 分组 schema：key → 组名（trading/risk/signal/data/notify/system）────────
@@ -265,6 +274,11 @@ GROUPS: dict[str, str] = {
     "twelve_max_leverage": "risk",
     "twelve_min_rr": "risk",
     "twelve_fee_burden_mult": "risk",
+    "twelve_cb_window": "risk",
+    "twelve_cb_min_trades": "risk",
+    "twelve_cb_min_winrate": "risk",
+    "twelve_cb_max_loss": "risk",
+    "twelve_cb_cooldown_hours": "risk",
     # signal——信号/决策层
     "intraday_min_prob": "signal",
     "debate_enabled": "signal",
@@ -389,6 +403,11 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "twelve_auto_lev_loss_frac": (0.05, 1.0),  # 打到 SL 目标亏损占保证金比例
     "twelve_min_rr": (1.0, 10.0),              # 最小盈亏比（<1 无意义）
     "twelve_fee_burden_mult": (0.0, 50.0),     # 止盈/费用最小倍数（0=关闭该门禁）
+    "twelve_cb_window": (5, 500),              # 熔断滚动窗口笔数
+    "twelve_cb_min_trades": (1, 500),          # 熔断最小样本数
+    "twelve_cb_min_winrate": (0.0, 100.0),     # 熔断胜率下限%
+    "twelve_cb_max_loss": (0.0, 100000.0),     # 熔断净亏阈值 U
+    "twelve_cb_cooldown_hours": (0.1, 720.0),  # 熔断冷却（小时）
 }
 
 # 允许的枚举键。

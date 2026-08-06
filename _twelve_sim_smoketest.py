@@ -78,6 +78,7 @@ _GATES: dict = {
     "twelve_min_sl_pct": {tf: 0.0 for tf in jtt.TFS},
     "twelve_min_rr": 1.0,           # 旧口径无 RR 门禁（取安全区间下限=事实关闭）
     "twelve_fee_burden_mult": 0.0,  # 旧口径无费用负担门禁
+    "twelve_cb_min_trades": 9999,   # 旧口径无战绩熔断（样本门槛推到不可达）
 }
 _orig_gate_cfg = jtt._gate_cfg
 jtt._gate_cfg = lambda key, default: _GATES.get(key, default)
@@ -807,6 +808,130 @@ with jtt._conn() as conn:
     conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
 for _tf, _sys in [("1h", "turtle"), ("30m", "gann")]:
     set_signal(_tf, _sys, "neutral", None)
+
+# ═══════════ 17. S3 信号×周期战绩熔断器（熔断→拒单→半开试探→输续熔/赢恢复） ═══════════
+check("S3 配置登记：cb 五键默认值（窗口30/样本10/胜率15/净亏10U/冷却24h）",
+      jc.default_config().get("twelve_cb_window") == 30
+      and jc.default_config().get("twelve_cb_min_trades") == 10
+      and jc.default_config().get("twelve_cb_min_winrate") == 15.0
+      and jc.default_config().get("twelve_cb_max_loss") == 10.0
+      and jc.default_config().get("twelve_cb_cooldown_hours") == 24.0)
+
+_GATES["twelve_cb_min_trades"] = 10   # 开熔断（其余四键走新默认）
+T5 = time.time()
+with jtt._conn() as conn:   # 清掉 4h/dow 槽位历史台账，战绩窗口从注入数据起算
+    conn.execute("DELETE FROM twelve_sim_trade WHERE symbol=? AND tf='4h' "
+                 "AND system='dow'", (SYM,))
+    conn.execute("DELETE FROM twelve_sim_position WHERE symbol=? AND tf='4h' "
+                 "AND system='dow'", (SYM,))
+    conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100 "
+                 "WHERE symbol=? AND tf='4h' AND system='dow'", (SYM,))
+    # 注入 29 笔亏损战绩（胜率 0%、净亏 -29U）：R10 弱组合场景复刻
+    for i in range(29):
+        conn.execute(
+            "INSERT INTO twelve_sim_trade (symbol, tf, system, name_cn, "
+            "direction, entry_price, entry_ts, exit_price, exit_ts, qty, "
+            "margin, leverage, exit_reason, pnl, pnl_pct, balance_after, "
+            "holding_minutes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (SYM, "4h", "dow", "道氏理论", "long", 100.0, T5 - 3600 - i * 60,
+             99.0, T5 - 1800 - i * 60, 1.0, 10.0, 10.0, "sl", -1.0, -10.0,
+             100.0, 30.0))
+
+# a) 第 30 笔真实亏损平仓 → 触发熔断；同轮后续信号立即被拒 circuit_breaker
+_PRICE["v"] = 100.0
+set_signal("4h", "dow", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 95.0, "take_profit": 110.0})
+out = jtt.run_cycle(cfg={}, now=T5)
+check("S3a：熔断前正常开仓（无熔断记录不拦截）",
+      len([o for o in out["symbols"][SYM]["opened"]
+           if (o["tf"], o["system"]) == ("4h", "dow")]) == 1,
+      str(out["symbols"][SYM]["opened"]))
+_PRICE["v"] = 95.0   # 触 SL 平仓亏损 → 30 笔窗口 胜率0% 净亏-34U → 熔断
+out = jtt.run_cycle(cfg={}, now=T5 + 60)
+r_sym = out["symbols"][SYM]
+bs = [b for b in jtt.breaker_states(SYM) if (b["tf"], b["system"]) == ("4h", "dow")]
+check("S3a：第 30 笔亏损平仓 → 熔断 tripped（trip_count=1）",
+      len(r_sym["closed"]) == 1 and len(bs) == 1 and bs[0]["state"] == "tripped"
+      and bs[0]["trip_count"] == 1, str(bs))
+rej = [r for r in r_sym["rejected"] if (r["tf"], r["system"]) == ("4h", "dow")]
+check("S3a：熔断后同轮信号被拒 circuit_breaker（只推信号不开仓）",
+      len(rej) == 1 and rej[0]["reason"] == "circuit_breaker", str(r_sym["rejected"]))
+blogs = [l for l in jtt.signal_logs(SYM, "4h", "dow")
+         if l["change_kinds"] == "breaker"]
+check("S3a：熔断事件落 signal_log（change_kinds=breaker + 战绩说明）",
+      len(blogs) >= 1 and "胜率" in str(blogs[-1]["note"]), str(blogs[-1:]))
+
+# b) 冷却未满：持续拒单（防重不重复落行）
+out = jtt.run_cycle(cfg={}, now=T5 + 120)
+check("S3b：冷却未满持续拦截 + 拒单防重（rejected 行数不变）",
+      not out["symbols"][SYM]["rejected"]
+      and len(jtt.rejected_positions(SYM, "4h", "dow")) == 1,
+      str(jtt.rejected_positions(SYM, "4h", "dow")))
+
+# c) 冷却期满（24h）半开：放行 1 笔试探单 → 状态 probing；试探在途其余信号仍拒
+T6 = T5 + 25 * 3600
+_PRICE["v"] = 100.0
+out = jtt.run_cycle(cfg={}, now=T6)
+bs = [b for b in jtt.breaker_states(SYM) if (b["tf"], b["system"]) == ("4h", "dow")]
+check("S3c：冷却期满半开 → 放行 1 笔试探单（state=probing 且记录 position_id）",
+      len([o for o in out["symbols"][SYM]["opened"]
+           if (o["tf"], o["system"]) == ("4h", "dow")]) == 1
+      and bs[0]["state"] == "probing"
+      and bs[0]["probe_position_id"] is not None, str(bs))
+set_signal("4h", "dow", "bearish",   # 试探在途：反向新信号也要拒
+           {"side": "short", "entry": 100.0, "stop_loss": 106.0, "take_profit": 90.0})
+out = jtt.run_cycle(cfg={}, now=T6 + 60)
+rej = [r for r in out["symbols"][SYM]["rejected"]
+       if (r["tf"], r["system"]) == ("4h", "dow")]
+check("S3c：试探单在途 → 同槽位其余信号仍拒 circuit_breaker",
+      len(rej) == 1 and rej[0]["reason"] == "circuit_breaker",
+      str(out["symbols"][SYM]["rejected"]))
+
+# d) 试探单亏损 → 继续熔断（trip_count+1，重新计冷却）
+_PRICE["v"] = 95.0   # 试探多单触 SL
+out = jtt.run_cycle(cfg={}, now=T6 + 120)
+bs = [b for b in jtt.breaker_states(SYM) if (b["tf"], b["system"]) == ("4h", "dow")]
+check("S3d：试探单亏损 → 续熔断（state=tripped / trip_count=2 / 冷却重计）",
+      len(out["symbols"][SYM]["closed"]) == 1 and bs[0]["state"] == "tripped"
+      and bs[0]["trip_count"] == 2
+      and abs(float(bs[0]["tripped_ts"]) - (T6 + 120)) < 1.0, str(bs))
+
+# e) 第二次冷却期满 → 试探单盈利 → 熔断解除（recovered，窗口重起算）
+T7 = T6 + 26 * 3600
+_PRICE["v"] = 100.0
+set_signal("4h", "dow", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 95.0, "take_profit": 110.0})
+out = jtt.run_cycle(cfg={}, now=T7)
+check("S3e：二次半开 → 试探单放行",
+      len([o for o in out["symbols"][SYM]["opened"]
+           if (o["tf"], o["system"]) == ("4h", "dow")]) == 1,
+      str(out["symbols"][SYM]["opened"]))
+_PRICE["v"] = 110.0   # 触 TP 盈利
+out = jtt.run_cycle(cfg={}, now=T7 + 60)
+bs = [b for b in jtt.breaker_states(SYM) if (b["tf"], b["system"]) == ("4h", "dow")]
+check("S3e：试探单盈利 → 熔断解除（state=recovered / reset_ts 重起算窗口）",
+      len(out["symbols"][SYM]["closed"]) == 1 and bs[0]["state"] == "recovered"
+      and float(bs[0]["reset_ts"]) > T7 and bs[0]["probe_position_id"] is None,
+      str(bs))
+
+# f) 恢复后正常放行（历史 30 连亏在 reset_ts 之前，不再重复触发）
+set_signal("4h", "dow", "neutral", None)
+jtt.run_cycle(cfg={}, now=T7 + 90)   # 撤掉平仓轮残留的 pending 计划
+set_signal("4h", "dow", "bullish",
+           {"side": "long", "entry": 110.0, "stop_loss": 104.0, "take_profit": 122.0})
+out = jtt.run_cycle(cfg={}, now=T7 + 120)
+r_sym = out["symbols"][SYM]
+check("S3f：recovered 后正常开仓（reset 前旧战绩不再触发熔断）",
+      len([o for o in r_sym["opened"]
+           if (o["tf"], o["system"]) == ("4h", "dow")]) == 1
+      and not r_sym["rejected"], str((r_sym["opened"], r_sym["rejected"])))
+
+# 复位：关熔断 + 清场
+_GATES["twelve_cb_min_trades"] = 9999
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+    conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
+set_signal("4h", "dow", "neutral", None)
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS ✅")
