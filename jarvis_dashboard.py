@@ -4092,6 +4092,24 @@ def api_twelve_consensus(symbol: str = "BTCUSDT"):
                         merged["whale_check"] = wc  # 安全带层不可用时顶层保底
         except Exception:  # noqa: BLE001
             pass
+        # [P2 T2.7] 威科夫阶段可选因子：共识方向逆主力吸筹/派发节奏（dist-C/D
+        # 对多头、acc-C/D 对空头）→ 提醒不阻断。开关 signal.wyckoff_seatbelt_enabled
+        # 默认关闭零回归；引擎 ok:false / 非 C-D 阶段 wyckoff_check 返回 None 不挂键。
+        try:
+            import jarvis_config as jc_mod
+            if bool(jc_mod.get("wyckoff_seatbelt_enabled")):
+                import jarvis_seatbelt as jsb_mod
+                wk = jsb_mod.wyckoff_check(
+                    merged.get("direction") or "neutral",
+                    _wyckoff_payload_cached(sym, "1h"))
+                if wk is not None:
+                    sb = merged.get("seatbelt")
+                    if isinstance(sb, dict):
+                        sb["wyckoff"] = wk        # 挂进安全带层（只增不改原字段）
+                    else:
+                        merged["wyckoff_check"] = wk  # 安全带层不可用时顶层保底
+        except Exception:  # noqa: BLE001
+            pass
         return {"ok": bool(tf_cons), "symbol": sym, "price": price,
                 "tf_available": sorted(tf_cons.keys()), "consensus": merged}
 

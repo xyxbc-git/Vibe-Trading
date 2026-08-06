@@ -290,7 +290,40 @@ for typ in ("utad", "sow", "lpsy"):
         break
 check("防前瞻：尾段事件在前缀重放中可复现（dist×3）", lookahead_ok2, detail2)
 
-# ══════════════════ 7. 性能纪律（bars=500 单次全链 < 50ms） ══════════════════
+# ══════════════════ 7. T2.7 配置契约（安全带因子，默认关零回归） ══════════════════
+import jarvis_config as _jc          # noqa: E402 — 离线纯读 DEFAULTS/GROUPS
+import jarvis_seatbelt as _jsb       # noqa: E402 — wyckoff_check 纯函数
+
+check("T2.7 配置-DEFAULTS 含 wyckoff_seatbelt_enabled 且默认 False",
+      _jc.DEFAULTS.get("wyckoff_seatbelt_enabled") is False,
+      f"DEFAULTS 值={_jc.DEFAULTS.get('wyckoff_seatbelt_enabled')!r}")
+check("T2.7 配置-GROUPS 归入 signal 组",
+      _jc.GROUPS.get("wyckoff_seatbelt_enabled") == "signal",
+      f"GROUPS 值={_jc.GROUPS.get('wyckoff_seatbelt_enabled')!r}")
+
+_WK_DIST_C = {"ok": True, "state": {"side": "dist", "phase": "C"},
+              "verdict_hint": "UTAD 已确认"}
+_WK_ACC_D = {"ok": True, "state": {"side": "acc", "phase": "D"}}
+_WK_ACC_B = {"ok": True, "state": {"side": "acc", "phase": "B"}}
+
+_w1 = _jsb.wyckoff_check("bullish", _WK_DIST_C)
+check("T2.7 因子-多头×dist-C 出警示（含 against=long）",
+      isinstance(_w1, dict) and _w1.get("status") == "warning"
+      and _w1.get("against") == "long" and _w1.get("phase") == "C",
+      str(_w1))
+_w2 = _jsb.wyckoff_check("bearish", _WK_ACC_D)
+check("T2.7 因子-空头×acc-D 镜像警示（against=short）",
+      isinstance(_w2, dict) and _w2.get("against") == "short", str(_w2))
+check("T2.7 因子-同向（多头×acc-D）不警示返回 None",
+      _jsb.wyckoff_check("bullish", _WK_ACC_D) is None)
+check("T2.7 因子-非 C/D 阶段（acc-B）返回 None",
+      _jsb.wyckoff_check("bearish", _WK_ACC_B) is None)
+check("T2.7 因子-引擎 ok:false 降级返回 None",
+      _jsb.wyckoff_check("bullish", {"ok": False, "error": "x"}) is None)
+check("T2.7 因子-中性方向返回 None",
+      _jsb.wyckoff_check("neutral", _WK_DIST_C) is None)
+
+# ══════════════════ 8. 性能纪律（bars=500 单次全链 < 50ms） ══════════════════
 BARS_PERF = acc_bars(markup=False, tail=36)          # 176 根
 while len(BARS_PERF) < 500:                          # 平移复制填满 500 根
     BARS_PERF = BARS_PERF + [
