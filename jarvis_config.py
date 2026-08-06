@@ -204,6 +204,11 @@ DEFAULTS: dict = {
     "twelve_auto_lev_loss_frac": 0.25,  # 自动杠杆目标：打到 SL 亏保证金 25%（旧 0.5）
     "twelve_max_leverage": {          # 杠杆上限（按 TF 分层）；显式杠杆也夹此上限
         "5m": 5, "15m": 8, "30m": 10, "1h": 12, "4h": 15, "1d": 20},
+    # ── 12信号亏损止血 S2：费用感知期望值门禁（2026-08-06）───────────────────
+    # R10 取证：总费 77.64U = 净亏 44%，5m 轴费用占该轴亏损 66%——止盈太近的单
+    # 赢了也喂手续费。费率复用 twelve_sim_fee_pct（单边 0.05%，按名义）。
+    "twelve_min_rr": 1.5,             # 最小盈亏比 TP距离/SL距离；更低拒单 rr_too_low
+    "twelve_fee_burden_mult": 3.0,    # 单笔止盈收益须 ≥ 该倍数×双边费用，否则 fee_negative_ev
 }
 
 # ── YAML 分组 schema：key → 组名（trading/risk/signal/data/notify/system）────────
@@ -258,6 +263,8 @@ GROUPS: dict[str, str] = {
     "twelve_min_sl_pct": "risk",
     "twelve_auto_lev_loss_frac": "risk",
     "twelve_max_leverage": "risk",
+    "twelve_min_rr": "risk",
+    "twelve_fee_burden_mult": "risk",
     # signal——信号/决策层
     "intraday_min_prob": "signal",
     "debate_enabled": "signal",
@@ -380,6 +387,8 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "twelve_reopen_cooldown_min": (0, 1440),  # 0=关闭 ~ 24 小时
     "twelve_sim_fee_pct": (0.0, 1.0),         # 模拟交易器单边费率%
     "twelve_auto_lev_loss_frac": (0.05, 1.0),  # 打到 SL 目标亏损占保证金比例
+    "twelve_min_rr": (1.0, 10.0),              # 最小盈亏比（<1 无意义）
+    "twelve_fee_burden_mult": (0.0, 50.0),     # 止盈/费用最小倍数（0=关闭该门禁）
 }
 
 # 允许的枚举键。

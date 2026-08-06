@@ -134,9 +134,16 @@ MIN_SL_PCT_BY_TF = {"5m": 0.5, "15m": 0.7, "30m": 1.0,
 # twelve_sim_signal_log 的 reject 留痕永久保留）
 REJECTED_RETENTION_DAYS = 7
 
+# 费用感知期望值门禁（S2）：最小盈亏比 + 止盈须覆盖 N 倍双边费用——R10 取证
+# 总费 77.64U = 净亏 44%，止盈太近的单赢了也在喂手续费。
+MIN_RR_DEFAULT = 1.5
+FEE_BURDEN_MULT_DEFAULT = 3.0
+
 # 门禁拒单原因 → 中文留痕说明（写进 twelve_sim_signal_log.note，看板/复盘直读）
 REJECT_REASON_CN = {
     "sl_too_tight": "止损距离低于该周期下限",
+    "rr_too_low": "盈亏比低于下限",
+    "fee_negative_ev": "止盈不足以覆盖费用负担（负期望）",
 }
 
 # 点位跟随：SL/TP 相对变化 ≥ 此阈值(%)才算实质变更（对齐 jarvis_signal_history
@@ -718,15 +725,27 @@ def _auto_leverage(entry: float, stop_loss: float, tf: str | None = None) -> flo
 def _risk_gate(tf: str, entry: float, params: dict) -> str | None:
     """开仓风控门禁链（合成参数后的最终校验）→ reject_reason 或 None（放行）。
 
-    S1 止损最小距离：SL 距离(%) < 该 TF 下限 → 'sl_too_tight'。
+    S1 止损最小距离：SL 距离(%) < 该 TF 下限 → 'sl_too_tight'；
+    S2 最小盈亏比：TP距离/SL距离 < twelve_min_rr → 'rr_too_low'；
+    S2 费用负担：单笔止盈收益(占保证金%) < twelve_fee_burden_mult ×
+       双边费用(占保证金% = 单边费率×2×杠杆) → 'fee_negative_ev'。
     被拦信号不静默丢弃——调用方负责落 status='rejected' + reject_reason 留痕。
     """
     try:
         sl_dist = abs(entry - float(params["stop_loss"])) / entry * 100.0
+        tp_dist = abs(float(params["take_profit"]) - entry) / entry * 100.0
     except (TypeError, ValueError, ZeroDivisionError):
         return None
     if sl_dist < _tf_gate_num("twelve_min_sl_pct", tf, MIN_SL_PCT_BY_TF, 0.0):
         return "sl_too_tight"
+    if sl_dist <= 0 or tp_dist / sl_dist < _gate_num("twelve_min_rr", MIN_RR_DEFAULT):
+        return "rr_too_low"
+    lev = float(params.get("leverage") or 1.0)
+    fee_of_margin = _fee_pct() * 2.0 * lev   # 双边费用占保证金%（名义≈入场名义）
+    if (fee_of_margin > 0
+            and tp_dist * lev < _gate_num("twelve_fee_burden_mult",
+                                          FEE_BURDEN_MULT_DEFAULT) * fee_of_margin):
+        return "fee_negative_ev"
     return None
 
 

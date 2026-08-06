@@ -76,6 +76,8 @@ _GATES: dict = {
     "twelve_auto_lev_loss_frac": 0.5,
     "twelve_max_leverage": {tf: 20.0 for tf in jtt.TFS},
     "twelve_min_sl_pct": {tf: 0.0 for tf in jtt.TFS},
+    "twelve_min_rr": 1.0,           # 旧口径无 RR 门禁（取安全区间下限=事实关闭）
+    "twelve_fee_burden_mult": 0.0,  # 旧口径无费用负担门禁
 }
 _orig_gate_cfg = jtt._gate_cfg
 jtt._gate_cfg = lambda key, default: _GATES.get(key, default)
@@ -732,6 +734,78 @@ with jtt._conn() as conn:
     conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
     conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
 for _tf, _sys in [("5m", "gap"), ("15m", "elliott")]:
+    set_signal(_tf, _sys, "neutral", None)
+
+# ═══════════ 16. S2 费用感知期望值门禁（最小盈亏比 + 费用负担） ═══════════
+check("S2 配置登记：twelve_min_rr=1.5 / twelve_fee_burden_mult=3",
+      jc.default_config().get("twelve_min_rr") == 1.5
+      and jc.default_config().get("twelve_fee_burden_mult") == 3.0)
+
+_GATES["twelve_min_rr"] = 1.5
+_GATES["twelve_fee_burden_mult"] = 3.0
+_PRICE["v"] = 100.0
+
+# a) TP/SL 比 1.2 < 1.5 → 拒单 rr_too_low（SL 5% 过 S1 的 1h 下限 1.2%）
+set_signal("1h", "turtle", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 95.0, "take_profit": 106.0})
+out = jtt.run_cycle(cfg={})
+r_sym = out["symbols"][SYM]
+rej = [r for r in r_sym["rejected"] if (r["tf"], r["system"]) == ("1h", "turtle")]
+check("S2a：RR=1.2 < 1.5 → 拒单 rr_too_low", len(rej) == 1
+      and rej[0]["reason"] == "rr_too_low" and not r_sym["opened"],
+      str((r_sym["rejected"], r_sym["opened"])))
+check("S2a：rejected 行 + reject 日志留痕",
+      len(jtt.rejected_positions(SYM, "1h", "turtle")) == 1
+      and any(l["change_kinds"] == "reject"
+              for l in jtt.signal_logs(SYM, "1h", "turtle")),
+      str(jtt.rejected_positions(SYM, "1h", "turtle")))
+
+# b) 费用负担：开 0.05% 费率，TP 距离 0.2% < 3×双边费用 0.3% → fee_negative_ev
+#    （RR=2 先过 rr 门禁；min_sl 临时归零让窄 SL 到达费用门禁）
+jtt._fee_pct = lambda: 0.05
+_GATES["twelve_min_sl_pct"] = {tf: 0.0 for tf in jtt.TFS}
+set_signal("30m", "gann", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.9, "take_profit": 100.2})
+out = jtt.run_cycle(cfg={})
+rej = [r for r in out["symbols"][SYM]["rejected"]
+       if (r["tf"], r["system"]) == ("30m", "gann")]
+check("S2b：TP 距 0.2% × 杠杆 < 3×双边费用 → 拒单 fee_negative_ev",
+      len(rej) == 1 and rej[0]["reason"] == "fee_negative_ev",
+      str(out["symbols"][SYM]["rejected"]))
+
+# c) 正常单放行：RR=3、TP 距 6% 远超费用负担（费率仍 0.05）
+set_signal("30m", "gann", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 98.0, "take_profit": 106.0})
+out = jtt.run_cycle(cfg={})
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("30m", "gann")]
+check("S2c：RR=3 / TP 距 6% 正常单放行", len(op) == 1,
+      str((out["symbols"][SYM]["opened"], out["symbols"][SYM]["rejected"])))
+
+# d) 热加载（真实配置层）：min_rr 收紧到 4 → RR=3 的同类单转拒
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+jtt._gate_cfg = _orig_gate_cfg
+jc.save({"twelve_min_rr": 4.0}, source="smoketest", note="S2 热加载用例")
+set_signal("30m", "gann", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 98.0, "take_profit": 106.1})
+out = jtt.run_cycle(cfg={})
+rej = [r for r in out["symbols"][SYM]["rejected"]
+       if (r["tf"], r["system"]) == ("30m", "gann")]
+check("S2d：YAML 改 min_rr=4 热加载 → RR=3 单转拒 rr_too_low",
+      len(rej) == 1 and rej[0]["reason"] == "rr_too_low",
+      str(out["symbols"][SYM]["rejected"]))
+jc.save({"twelve_min_rr": 1.5}, source="smoketest", note="S2 热加载改回")
+
+# 复位：旧口径 + 免手续费 + 清场
+jtt._fee_pct = lambda: 0.0
+_GATES.update({"twelve_min_rr": 1.0, "twelve_fee_burden_mult": 0.0,
+               "twelve_min_sl_pct": {tf: 0.0 for tf in jtt.TFS}})
+jtt._gate_cfg = lambda key, default: _GATES.get(key, default)
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+    conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
+for _tf, _sys in [("1h", "turtle"), ("30m", "gann")]:
     set_signal(_tf, _sys, "neutral", None)
 
 print()
