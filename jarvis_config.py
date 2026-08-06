@@ -230,6 +230,10 @@ DEFAULTS: dict = {
     # 1h 威科夫阶段。dist-C/D/E 拒多、acc-C/D/E 拒空，仅 5m/15m/30m 生效；
     # 威科夫数据 stale/不可用时放行不阻塞（可用性优先，与 seatbelt 同哲学）。
     "twelve_trend_filter_enabled": True,
+    # ── 12信号亏损止血 S7：资金费率模拟（2026-08-06）───────────────────────────
+    # 永续合约口径补齐：持仓每满 8h 按 entry 名义计提一次资金费。
+    # rate>0 多头付/空头收（负值反向）；平仓时折进净 pnl 并单列 funding_fee 留痕。
+    "twelve_funding_rate": 0.0001,
 }
 
 # ── YAML 分组 schema：key → 组名（trading/risk/signal/data/notify/system）────────
@@ -294,6 +298,7 @@ GROUPS: dict[str, str] = {
     "twelve_tf_enabled": "risk",
     "twelve_tf_min_confidence": "risk",
     "twelve_trend_filter_enabled": "risk",
+    "twelve_funding_rate": "risk",
     # signal——信号/决策层
     "intraday_min_prob": "signal",
     "debate_enabled": "signal",
@@ -423,6 +428,7 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "twelve_cb_min_winrate": (0.0, 100.0),     # 熔断胜率下限%
     "twelve_cb_max_loss": (0.0, 100000.0),     # 熔断净亏阈值 U
     "twelve_cb_cooldown_hours": (0.1, 720.0),  # 熔断冷却（小时）
+    "twelve_funding_rate": (-0.01, 0.01),      # 每 8h 资金费率（可为负=空头付）
 }
 
 # 允许的枚举键。

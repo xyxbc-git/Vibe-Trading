@@ -72,7 +72,9 @@
   6. 逐仓口径：margin = balance × position_pct%，qty = margin × leverage / entry；
      爆仓价 = entry × (1 ∓ 1/leverage)，触发即以爆仓价强平 pnl=-margin；
      开/平双边手续费按名义单边 0.05%（jarvis_config: twelve_sim_fee_pct 可配）
-     折进净 pnl；单笔最大亏损钳到 -margin（不倒欠）。
+     折进净 pnl；资金费模拟（S7）：持仓每满 8h 按 entry 名义 × twelve_funding_rate
+     计提一次（rate>0 多头付/空头收），折进净 pnl 并单列 trade.funding_fee 留痕；
+     爆仓不另计费；单笔最大亏损钳到 -margin（不倒欠）。
 
 六张本地表（经 jarvis_db 兼容层懒建，pg 可切）：
   twelve_sim_wallet     槽位虚拟钱包 + 累计战绩（UNIQUE symbol,tf,system）
@@ -176,6 +178,11 @@ TREND_FILTER_ENABLED_DEFAULT = True
 TREND_FILTER_TFS = ("5m", "15m", "30m")
 TREND_FILTER_PHASES = ("C", "D", "E")
 
+# 资金费率模拟（S7）：持仓每满 8h 按 entry 名义计提一次（永续合约口径补齐）；
+# rate>0 多头付/空头收，平仓折进净 pnl 并单列 funding_fee 留痕（正=支出 负=收入）。
+FUNDING_RATE_DEFAULT = 0.0001
+FUNDING_INTERVAL_HOURS = 8.0
+
 # 门禁拒单原因 → 中文留痕说明（写进 twelve_sim_signal_log.note，看板/复盘直读）
 REJECT_REASON_CN = {
     "sl_too_tight": "止损距离低于该周期下限",
@@ -275,7 +282,8 @@ def init_db() -> None:
         # jarvis_db 兼容层对 pg 自动翻译为 ADD COLUMN IF NOT EXISTS 幂等）
         for _ddl in ("ALTER TABLE twelve_sim_position ADD COLUMN cancel_reason TEXT",
                      "ALTER TABLE twelve_sim_position ADD COLUMN canceled_ts REAL",
-                     "ALTER TABLE twelve_sim_position ADD COLUMN reject_reason TEXT"):
+                     "ALTER TABLE twelve_sim_position ADD COLUMN reject_reason TEXT",
+                     "ALTER TABLE twelve_sim_trade ADD COLUMN funding_fee REAL"):
             try:
                 conn.execute(_ddl)
             except Exception:  # noqa: BLE001 — duplicate column = 已升级过
@@ -904,11 +912,19 @@ def _do_close(conn, pos: dict, exit_price: float, reason: str, now: float) -> di
     margin = float(pos["margin"])
     sign = 1.0 if pos["direction"] == "long" else -1.0
     if reason == "liq":
-        pnl = -margin   # 爆仓：损失以保证金为上限，手续费不再另计
+        pnl = -margin   # 爆仓：损失以保证金为上限，手续费/资金费不再另计
+        funding = 0.0
     else:
         gross = (exit_price - entry) * qty * sign
         fee = (entry * qty + exit_price * qty) * _fee_pct() / 100.0
-        pnl = max(gross - fee, -margin)   # 逐仓：最大亏损=保证金，不倒欠
+        # S7 资金费：持仓每满 8h 按 entry 名义计提一次；rate>0 多头付/空头收
+        # （正=支出 负=收入），折进净 pnl 并单列 funding_fee 留痕
+        periods = int((now - float(pos["entry_ts"]))
+                      // (FUNDING_INTERVAL_HOURS * 3600.0))
+        funding = round(periods
+                        * _gate_num("twelve_funding_rate", FUNDING_RATE_DEFAULT)
+                        * entry * qty * sign, 8)
+        pnl = max(gross - fee - funding, -margin)   # 逐仓：最大亏损=保证金，不倒欠
     pnl = round(pnl, 8)
     pnl_pct = round(pnl / margin * 100.0, 2) if margin > 0 else None
     sl, tp = pos.get("stop_loss"), pos.get("take_profit")
@@ -934,13 +950,14 @@ def _do_close(conn, pos: dict, exit_price: float, reason: str, now: float) -> di
         INSERT INTO twelve_sim_trade
           (symbol, tf, system, name_cn, direction, entry_price, entry_ts,
            exit_price, exit_ts, qty, margin, leverage, stop_loss, take_profit,
-           exit_reason, pnl, pnl_pct, rr, balance_after, holding_minutes)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           exit_reason, pnl, pnl_pct, rr, balance_after, holding_minutes,
+           funding_fee)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (sym, tf, system, NAME_CN.get(system, system), pos["direction"],
          entry, pos["entry_ts"], exit_price, now, qty, margin,
          pos.get("leverage") or 1.0, sl, tp, reason, pnl, pnl_pct, rr,
-         balance_after, holding_min))
+         balance_after, holding_min, funding))
 
     # 钱包战绩重算（该槽位全量台账，72 槽位×小样本，代价可忽略）
     rows = conn.execute(

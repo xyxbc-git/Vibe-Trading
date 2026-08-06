@@ -81,6 +81,7 @@ _GATES: dict = {
     "twelve_cb_min_trades": 9999,   # 旧口径无战绩熔断（样本门槛推到不可达）
     "twelve_tf_min_confidence": {tf: 0.0 for tf in jtt.TFS},  # 旧口径无置信档
     "twelve_trend_filter_enabled": 0.0,  # 旧口径无逆势过滤（且离线不触 wyckoff）
+    "twelve_funding_rate": 0.0,     # 旧口径无资金费（保持整数 pnl 断言）
 }
 _orig_gate_cfg = jtt._gate_cfg
 jtt._gate_cfg = lambda key, default: _GATES.get(key, default)
@@ -1094,6 +1095,78 @@ with jtt._conn() as conn:
 for _tf, _sys in [("5m", "gap"), ("15m", "elliott"), ("30m", "gann"),
                   ("1h", "turtle")]:
     set_signal(_tf, _sys, "neutral", None)
+
+# ═══════════ 20. S7 资金费率模拟（每满 8h 按 entry 名义计提，多付/空收） ═══════════
+check("S7 配置登记：twelve_funding_rate 默认 0.0001",
+      jc.default_config().get("twelve_funding_rate") == 0.0001)
+
+_GATES["twelve_funding_rate"] = 0.001   # 放大费率便于断言
+T8 = time.time()
+
+# a) 多头持仓 25h（3 个 8h 周期）→ 资金费支出：pnl = 10 - 3×0.001×100×1 = 9.7
+_PRICE["v"] = 100.0
+set_signal("1h", "turtle", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 95.0, "take_profit": 110.0})
+out = jtt.run_cycle(cfg={}, now=T8)
+check("S7a：多单开仓（qty=1 便于对账）",
+      len([o for o in out["symbols"][SYM]["opened"]
+           if (o["tf"], o["system"]) == ("1h", "turtle")]) == 1,
+      str(out["symbols"][SYM]["opened"]))
+_PRICE["v"] = 110.0
+out = jtt.run_cycle(cfg={}, now=T8 + 25 * 3600)   # 1h TF 时间止损 3 天，25h 不触
+cl = [c for c in out["symbols"][SYM]["closed"]
+      if (c["tf"], c["system"]) == ("1h", "turtle")]
+with jtt._conn() as conn:
+    tr = conn.execute(
+        "SELECT pnl, funding_fee FROM twelve_sim_trade WHERE symbol=? AND tf='1h' "
+        "AND system='turtle' ORDER BY id DESC LIMIT 1", (SYM,)).fetchone()
+check("S7a：多单持仓 25h → 计提 3 期资金费 0.3U（pnl 10→9.7，funding_fee=0.3）",
+      len(cl) == 1 and cl[0]["exit_reason"] == "tp"
+      and abs(float(tr["pnl"]) - 9.7) < 1e-6
+      and abs(float(tr["funding_fee"]) - 0.3) < 1e-6, str(dict(tr)))
+
+# b) 空头持仓 9h（1 期）→ 资金费收入：funding_fee<0，pnl 增加
+_PRICE["v"] = 100.0
+set_signal("1h", "turtle", "neutral", None)
+set_signal("4h", "dow", "bearish",
+           {"side": "short", "entry": 100.0, "stop_loss": 106.0, "take_profit": 90.0})
+T9 = T8 + 30 * 3600
+out = jtt.run_cycle(cfg={}, now=T9)
+_PRICE["v"] = 90.0
+out = jtt.run_cycle(cfg={}, now=T9 + 9 * 3600)
+with jtt._conn() as conn:
+    tr = conn.execute(
+        "SELECT pnl, funding_fee, qty FROM twelve_sim_trade WHERE symbol=? "
+        "AND tf='4h' AND system='dow' ORDER BY id DESC LIMIT 1", (SYM,)).fetchone()
+check("S7b：空单持仓 9h → 1 期资金费为收入（funding_fee<0，pnl=毛利+|资金费|）",
+      float(tr["funding_fee"]) < 0
+      and abs(float(tr["funding_fee"]) + 0.001 * 100.0 * float(tr["qty"])) < 1e-6
+      and abs(float(tr["pnl"]) - (10.0 * float(tr["qty"])
+                                  - float(tr["funding_fee"]))) < 1e-6, str(dict(tr)))
+
+# c) 持仓不足 8h → 不计提（funding_fee=0，pnl 不受影响）
+_PRICE["v"] = 100.0
+set_signal("4h", "dow", "neutral", None)
+set_signal("30m", "gann", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 98.0, "take_profit": 106.0})
+T10 = T9 + 20 * 3600
+out = jtt.run_cycle(cfg={}, now=T10)
+_PRICE["v"] = 106.0
+out = jtt.run_cycle(cfg={}, now=T10 + 3600)
+with jtt._conn() as conn:
+    tr = conn.execute(
+        "SELECT pnl, funding_fee FROM twelve_sim_trade WHERE symbol=? AND tf='30m' "
+        "AND system='gann' ORDER BY id DESC LIMIT 1", (SYM,)).fetchone()
+check("S7c：持仓 1h < 8h → 不计提资金费（funding_fee=0）",
+      abs(float(tr["funding_fee"])) < 1e-9 and abs(float(tr["pnl"]) - 12.0) < 1e-6,
+      str(dict(tr)))
+
+# 复位：旧口径 + 清场
+_GATES["twelve_funding_rate"] = 0.0
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+    conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
+set_signal("30m", "gann", "neutral", None)
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS ✅")
