@@ -321,7 +321,7 @@ function DepthLadder({
           : "买卖均衡";
 
   return (
-    <div className="card p-3 flex flex-col min-w-0">
+    <div className="card p-3 flex flex-col min-w-0 flex-1 min-h-0">
       {/* 标题行：market 标签 + 桶宽 + stale 提示 */}
       <p className="stat-label mb-2 flex items-center gap-1.5 text-xs flex-wrap">
         <BookOpenCheck size={14} />
@@ -381,8 +381,9 @@ function DepthLadder({
       </div>
 
       {/* 阶梯主体（滚动容器；offsetTop 相对本容器，供 mid 自动居中）——
-          xl 起卡片被网格拉通到左列总高，此处 flex-1 吃掉剩余空间显示更多
-          档位；xl 以下（纵向堆叠）回退固定 480px 上限防止页面被撑爆 */}
+          xl 起外层 absolute 内胆给了本卡确定高度（=左列自然内容高），此处
+          flex-1 吃掉剩余空间显示更多档位、超出内部滚动；xl 以下（纵向堆叠）
+          回退固定 480px 上限防止页面被撑爆 */}
       <div
         ref={ladderRef}
         className="relative overflow-y-auto max-h-[480px] xl:max-h-none xl:flex-1 min-h-0 pr-0.5"
@@ -1429,7 +1430,9 @@ function MacdPane({
 
 export default function DepthView() {
   const { symbol } = useSymbol();
-  const [tf, setTf] = useState<Timeframe>("1m");
+  // 默认主周期 15m：1m 噪声大且轮询最密，作为进页默认过于激进；用户会话内
+  // 切换即时生效（本页周期无 localStorage 持久化，每次进页回到 15m）
+  const [tf, setTf] = useState<Timeframe>("15m");
 
   // ② K 线取数（仿 Chart.tsx：1m 10s 轮询，其余 60s）
   const {
@@ -1771,12 +1774,20 @@ export default function DepthView() {
               足够横向空间不再拥挤；1m 噪声过大且不在分析周期集合内，映射到 5m */}
           <SupplyDemandCard symbol={symbol} interval={tf === "1m" ? "5m" : tf} />
         </div>
-        <DepthLadder
-          depth={depthPoll.data}
-          loading={depthPoll.loading}
-          error={depthPoll.error}
-          symbol={symbol}
-        />
+        {/* 深度阶梯：xl 起用「relative 外壳 + absolute 内胆」把本列内容高度
+            从网格行高计算中剥离——行高完全由左列（主图 + 底牌卡）自然内容
+            决定，阶梯在该高度内填满并内部滚动。此前阶梯全量档位的自然高度
+            会反向撑高行高，把左列拉出大片死白，此结构从根上杜绝 */}
+        <div className="min-w-0 xl:relative">
+          <div className="xl:absolute xl:inset-0 flex flex-col min-h-0">
+            <DepthLadder
+              depth={depthPoll.data}
+              loading={depthPoll.loading}
+              error={depthPoll.error}
+              symbol={symbol}
+            />
+          </div>
+        </div>
       </div>
 
       {/* ④ 成交流区标题栏：WS 状态 + 视图切换（柱状图|列表）+ 柱状图专属控件 */}
