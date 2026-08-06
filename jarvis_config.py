@@ -225,6 +225,11 @@ DEFAULTS: dict = {
         "5m": 1, "15m": 1, "30m": 1, "1h": 1, "4h": 1, "1d": 1},
     "twelve_tf_min_confidence": {     # 信号强度下限（0~1，按 TF 分层）；低于拒单
         "5m": 0.75, "15m": 0.0, "30m": 0.0, "1h": 0.0, "4h": 0.0, "1d": 0.0},
+    # ── 12信号亏损止血 S5：高周期趋势逆势过滤（2026-08-06）─────────────────────
+    # R10 取证：short -123.2U vs long -53.1U（取证窗口 ETH 上行）——短周期单不逆
+    # 1h 威科夫阶段。dist-C/D/E 拒多、acc-C/D/E 拒空，仅 5m/15m/30m 生效；
+    # 威科夫数据 stale/不可用时放行不阻塞（可用性优先，与 seatbelt 同哲学）。
+    "twelve_trend_filter_enabled": True,
 }
 
 # ── YAML 分组 schema：key → 组名（trading/risk/signal/data/notify/system）────────
@@ -288,6 +293,7 @@ GROUPS: dict[str, str] = {
     "twelve_cb_cooldown_hours": "risk",
     "twelve_tf_enabled": "risk",
     "twelve_tf_min_confidence": "risk",
+    "twelve_trend_filter_enabled": "risk",
     # signal——信号/决策层
     "intraday_min_prob": "signal",
     "debate_enabled": "signal",

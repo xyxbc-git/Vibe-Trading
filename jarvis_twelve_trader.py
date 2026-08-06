@@ -50,6 +50,9 @@
      - 信号级前置门禁 _pre_gate（开仓/挂计划/成交时刻都先过）：
        S4 周期门禁——twelve_tf_enabled 停用的 TF 全拒、信号强度低于
        twelve_tf_min_confidence 该 TF 置信档（5m 默认 0.75）拒 'tf_gate'；
+       S5 逆势过滤——1h 威科夫 dist-C/D/E 拒多、acc-C/D/E 拒空
+       （twelve_trend_filter_enabled，仅 5m/15m/30m 生效，复用 jarvis_wyckoff
+       进程内缓存；数据 stale/不可用放行不阻塞）拒 'counter_trend'；
        S3 战绩熔断——
        滚动窗口（twelve_cb_window 笔、恢复时刻后）胜率 < twelve_cb_min_winrate
        且净亏超 twelve_cb_max_loss → 该 信号×周期 熔断（twelve_sim_breaker 表
@@ -167,6 +170,12 @@ TF_ENABLED_DEFAULT = {"5m": 1, "15m": 1, "30m": 1, "1h": 1, "4h": 1, "1d": 1}
 TF_MIN_CONF_DEFAULT = {"5m": 0.75, "15m": 0.0, "30m": 0.0,
                        "1h": 0.0, "4h": 0.0, "1d": 0.0}
 
+# 高周期趋势逆势过滤（S5）：1h 威科夫 dist-C/D/E 拒多、acc-C/D/E 拒空，仅短周期
+# 生效——R10 取证 short -123.2U vs long -53.1U（取证窗口 ETH 上行，全程逆势做空）。
+TREND_FILTER_ENABLED_DEFAULT = True
+TREND_FILTER_TFS = ("5m", "15m", "30m")
+TREND_FILTER_PHASES = ("C", "D", "E")
+
 # 门禁拒单原因 → 中文留痕说明（写进 twelve_sim_signal_log.note，看板/复盘直读）
 REJECT_REASON_CN = {
     "sl_too_tight": "止损距离低于该周期下限",
@@ -174,6 +183,7 @@ REJECT_REASON_CN = {
     "fee_negative_ev": "止盈不足以覆盖费用负担（负期望）",
     "circuit_breaker": "信号×周期战绩熔断中",
     "tf_gate": "周期门禁（TF 停用或信号置信不足）",
+    "counter_trend": "逆 1h 威科夫高周期趋势（短周期不逆势）",
 }
 
 # 点位跟随：SL/TP 相对变化 ≥ 此阈值(%)才算实质变更（对齐 jarvis_signal_history
@@ -1378,11 +1388,29 @@ def breaker_states(symbol: str | None = None) -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
+def _trend_context(sym: str) -> tuple[str | None, str | None]:
+    """1h 威科夫趋势语境 → (side, phase)；复用 jarvis_wyckoff.analyze 的进程内
+    指纹缓存（新 1h bar 才重算，不新增出网压力）。
+
+    数据不可用 / ok:false / stale → (None, None)：S5 放行不阻塞
+    （可用性优先，与 seatbelt 同哲学——过滤器坏了不能把交易引擎卡死）。
+    """
+    try:
+        import jarvis_wyckoff as jw
+        out = jw.analyze(sym, "1h")
+        if not isinstance(out, dict) or not out.get("ok") or out.get("stale"):
+            return None, None
+        st = out.get("state") or {}
+        return st.get("side"), st.get("phase")
+    except Exception:  # noqa: BLE001 — 过滤器故障=放行，绝不拖垮开仓主链路
+        return None, None
+
+
 def _pre_gate(conn, sym: str, tf: str, system: str, direction: str,
               strength: float, now: float) -> tuple[str | None, bool]:
     """信号级门禁链（参数无关，开仓/挂计划/成交前置）→ (reject_reason|None, 试探标记)。
 
-    链序：S4 周期门禁（TF 开关 + 置信档）→ S3 战绩熔断（S5 逆势过滤在此链上扩展）。
+    链序：S4 周期门禁（TF 开关 + 置信档）→ S5 高周期逆势过滤 → S3 战绩熔断。
     """
     # S4 周期再平衡：TF 停用 / 信号强度低于该 TF 置信档 → 拒 'tf_gate'
     if _tf_gate_num("twelve_tf_enabled", tf, TF_ENABLED_DEFAULT, 1.0) < 0.5:
@@ -1390,6 +1418,15 @@ def _pre_gate(conn, sym: str, tf: str, system: str, direction: str,
     if strength < _tf_gate_num("twelve_tf_min_confidence", tf,
                                TF_MIN_CONF_DEFAULT, 0.0):
         return "tf_gate", False
+    # S5 高周期趋势逆势过滤：仅短周期生效；1h 威科夫 dist-C/D/E 拒多、acc-C/D/E 拒空
+    if (tf in TREND_FILTER_TFS
+            and _gate_num("twelve_trend_filter_enabled",
+                          float(TREND_FILTER_ENABLED_DEFAULT)) >= 0.5):
+        side, phase = _trend_context(sym)
+        if phase in TREND_FILTER_PHASES and (
+                (side == "dist" and direction == "long")
+                or (side == "acc" and direction == "short")):
+            return "counter_trend", False
     return _breaker_gate(conn, sym, tf, system, now)
 
 

@@ -80,6 +80,7 @@ _GATES: dict = {
     "twelve_fee_burden_mult": 0.0,  # 旧口径无费用负担门禁
     "twelve_cb_min_trades": 9999,   # 旧口径无战绩熔断（样本门槛推到不可达）
     "twelve_tf_min_confidence": {tf: 0.0 for tf in jtt.TFS},  # 旧口径无置信档
+    "twelve_trend_filter_enabled": 0.0,  # 旧口径无逆势过滤（且离线不触 wyckoff）
 }
 _orig_gate_cfg = jtt._gate_cfg
 jtt._gate_cfg = lambda key, default: _GATES.get(key, default)
@@ -999,6 +1000,99 @@ with jtt._conn() as conn:
     conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
     conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
 for _tf, _sys in [("5m", "gap"), ("15m", "elliott")]:
+    set_signal(_tf, _sys, "neutral", None)
+
+# ═══════════ 19. S5 高周期趋势逆势过滤（1h 威科夫 Phase，仅短周期生效） ═══════════
+check("S5 配置登记：twelve_trend_filter_enabled 默认开",
+      jc.default_config().get("twelve_trend_filter_enabled") is True)
+
+_GATES["twelve_trend_filter_enabled"] = 1.0
+_orig_trend_ctx = jtt._trend_context
+jtt._trend_context = lambda sym: ("dist", "C")   # mock 1h 派发 Phase C（跌势语境）
+_PRICE["v"] = 100.0
+
+# a) dist-C：5m 多单 → 拒 counter_trend
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.0, "take_profit": 103.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={})
+rej = [r for r in out["symbols"][SYM]["rejected"]
+       if (r["tf"], r["system"]) == ("5m", "gap")]
+check("S5a：1h dist-C 语境 → 5m 多单拒 counter_trend",
+      len(rej) == 1 and rej[0]["reason"] == "counter_trend"
+      and not out["symbols"][SYM]["opened"], str(out["symbols"][SYM]["rejected"]))
+
+# b) dist-C：5m 空单（顺势）→ 放行
+set_signal("5m", "gap", "bearish",
+           {"side": "short", "entry": 100.0, "stop_loss": 101.0, "take_profit": 97.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={})
+op = [o for o in out["symbols"][SYM]["opened"] if (o["tf"], o["system"]) == ("5m", "gap")]
+check("S5b：dist-C → 5m 空单顺势放行", len(op) == 1 and op[0]["direction"] == "short",
+      str((out["symbols"][SYM]["opened"], out["symbols"][SYM]["rejected"])))
+
+# c) dist-C：1h 多单不拦（过滤仅 5m/15m/30m 生效）
+set_signal("1h", "turtle", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 98.0, "take_profit": 106.0})
+out = jtt.run_cycle(cfg={})
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("1h", "turtle")]
+check("S5c：1h 及以上不受逆势过滤（仅短周期生效）", len(op) == 1,
+      str((out["symbols"][SYM]["opened"], out["symbols"][SYM]["rejected"])))
+
+# d) acc-D（涨势语境）：30m 空单 → 拒 counter_trend
+jtt._trend_context = lambda sym: ("acc", "D")
+set_signal("30m", "gann", "bearish",
+           {"side": "short", "entry": 100.0, "stop_loss": 101.5, "take_profit": 96.0})
+out = jtt.run_cycle(cfg={})
+rej = [r for r in out["symbols"][SYM]["rejected"]
+       if (r["tf"], r["system"]) == ("30m", "gann")]
+check("S5d：1h acc-D 语境 → 30m 空单拒 counter_trend",
+      len(rej) == 1 and rej[0]["reason"] == "counter_trend",
+      str(out["symbols"][SYM]["rejected"]))
+
+# e) 可用性优先：威科夫异常 / stale 数据 → 放行不阻塞（走真实 _trend_context）
+jtt._trend_context = _orig_trend_ctx
+import jarvis_wyckoff as jw  # noqa: E402
+_orig_wyckoff_analyze = jw.analyze
+jw.analyze = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("模拟数据层故障"))
+set_signal("15m", "elliott", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 98.0, "take_profit": 105.0})
+out = jtt.run_cycle(cfg={})
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("15m", "elliott")]
+check("S5e：威科夫 analyze 异常 → 放行不阻塞", len(op) == 1,
+      str((out["symbols"][SYM]["opened"], out["symbols"][SYM]["rejected"])))
+jw.analyze = lambda *a, **k: {"ok": True, "stale": True,
+                              "state": {"side": "dist", "phase": "C"}}
+set_signal("30m", "gann", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 98.0, "take_profit": 106.0})
+out = jtt.run_cycle(cfg={})
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("30m", "gann")]
+check("S5e：威科夫数据 stale → 放行不阻塞（dist-C 也不拦）", len(op) == 1,
+      str((out["symbols"][SYM]["opened"], out["symbols"][SYM]["rejected"])))
+jw.analyze = _orig_wyckoff_analyze
+
+# f) 开关关闭 → 逆势语境也放行
+_GATES["twelve_trend_filter_enabled"] = 0.0
+jtt._trend_context = lambda sym: ("dist", "C")
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.0, "take_profit": 103.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={})
+op = [o for o in out["symbols"][SYM]["opened"] if (o["tf"], o["system"]) == ("5m", "gap")]
+check("S5f：twelve_trend_filter_enabled 关闭 → dist-C 语境 5m 多单也放行",
+      len(op) == 1, str((out["symbols"][SYM]["opened"],
+                         out["symbols"][SYM]["rejected"])))
+
+# 复位：旧口径 + 清场
+jtt._trend_context = _orig_trend_ctx
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+    conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
+for _tf, _sys in [("5m", "gap"), ("15m", "elliott"), ("30m", "gann"),
+                  ("1h", "turtle")]:
     set_signal(_tf, _sys, "neutral", None)
 
 print()
