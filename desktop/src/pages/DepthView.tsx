@@ -764,10 +764,14 @@ function FootprintPane({
   resp,
   loading,
   error,
+  live,
 }: {
   resp: TapeFootprintResponse | null;
   loading: boolean;
   error: string | null;
+  /** 顶栏同源实时价（PriceProvider context，零新增请求）：存在时最新一根
+   *  进行中柱的白框收盘档跟随该价，与顶栏 / K 线主图同步 */
+  live?: { price: number; timeSec: number } | null;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -778,6 +782,13 @@ function FootprintPane({
   );
 
   const bars = useMemo(() => resp?.bars ?? [], [resp]);
+
+  // 矩阵数据时戳：记录本地收到当前 resp 的时刻，展示层标注让用户知道
+  // 买卖量明细的刷新节奏（轮询 + 后端 3s 缓存），与白框实时价区分开
+  const [updatedAt, setUpdatedAt] = useState<number | null>(null);
+  useEffect(() => {
+    if (resp) setUpdatedAt(Date.now());
+  }, [resp]);
 
   // 全局价格轴布局：桶宽优先接口 bucket，缺失时从相邻档价差推导
   const layout = useMemo<FpLayout | null>(() => {
@@ -923,8 +934,15 @@ function FootprintPane({
         ctx.fillText(fmtCompact(r.buy), cx + 5, cy);
       });
 
-      // 收盘价档白描边（标记该柱收在哪个价位）
-      const closeIdx = Math.round((maxPrice - b.close) / step);
+      // 收盘价档白描边（标记该柱收在哪个价位）；最新一根进行中柱跟随顶栏
+      // 同源实时价——报价须不早于该柱开始时间，且能映射进当前价格档范围
+      // 才采用，否则回退服务端 close（防切币瞬间旧报价错画 / 白框消失）
+      let closePx = b.close;
+      if (ci === bars.length - 1 && live && live.timeSec >= toSec(b.ts)) {
+        const liveIdx = Math.round((maxPrice - live.price) / step);
+        if (liveIdx >= 0 && liveIdx < nRows) closePx = live.price;
+      }
+      const closeIdx = Math.round((maxPrice - closePx) / step);
       if (closeIdx >= 0 && closeIdx < nRows) {
         const y0 = FP_HEADER_H + closeIdx * FP_CELL_H;
         ctx.strokeStyle = "#e6edf3";
@@ -997,7 +1015,7 @@ function FootprintPane({
     ctx.moveTo(0, gridY + 1.5);
     ctx.lineTo(layout.width, gridY + 1.5);
     ctx.stroke();
-  }, [bars, layout]);
+  }, [bars, layout, live]);
 
   // 数据更新后：仍贴右缘时自动滚到最新柱
   useEffect(() => {
@@ -1085,17 +1103,27 @@ function FootprintPane({
     <div>
       <div className="flex items-center justify-between gap-2 px-1 pb-1 flex-wrap">
         <span className="text-[10px] text-jarvis-text-secondary font-mono truncate">
-          每格「卖 × 买」 · 浓度 = 该档额 / 柱内最大档 · 黄框 = 失衡档 · 白框 = 收盘档 ·
-          虚线柱 = 仅量价汇总（该时段无档位明细，悬停看说明）
+          每格「卖 × 买」 · 浓度 = 该档额 / 柱内最大档 · 黄框 = 失衡档 · 白框 =
+          收盘档（最新柱实时跟随顶栏价） · 虚线柱 = 仅量价汇总（该时段无档位明细，悬停看说明）
         </span>
-        {resp?.source && (
-          <span
-            className="text-[9px] px-1.5 py-0.5 rounded border bg-jarvis-border/30 text-jarvis-text-secondary border-jarvis-border whitespace-nowrap"
-            title="数据来源"
-          >
-            {resp.source}
-          </span>
-        )}
+        <span className="flex items-center gap-1.5 whitespace-nowrap">
+          {updatedAt != null && (
+            <span
+              className="text-[9px] px-1.5 py-0.5 rounded border bg-jarvis-border/30 text-jarvis-text-secondary border-jarvis-border"
+              title="买卖量矩阵最近一次刷新时刻（轮询 + 后端 3s 缓存聚合，明细以此为准）；最新柱白框价格档已实时跟随顶栏现价，无需等待矩阵刷新"
+            >
+              明细 {timeHms(updatedAt)}
+            </span>
+          )}
+          {resp?.source && (
+            <span
+              className="text-[9px] px-1.5 py-0.5 rounded border bg-jarvis-border/30 text-jarvis-text-secondary border-jarvis-border"
+              title="数据来源"
+            >
+              {resp.source}
+            </span>
+          )}
+        </span>
       </div>
       {placeholder ? (
         <div
@@ -1838,6 +1866,7 @@ export default function DepthView() {
               resp={footprint}
               loading={fpPoll.loading}
               error={fpPoll.error}
+              live={liveForChart}
             />
           </div>
         </div>
