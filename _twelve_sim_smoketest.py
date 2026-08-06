@@ -72,6 +72,9 @@ jtt._trend_context = lambda sym: (None, None)
 jtt._market_context = lambda sym, tf, now: {}
 # D2 量能核验打桩：全局无核验结果（真实 provider 拉 K 线出网）；D2 用例分节换桩
 jtt._volume_context = lambda sym, tf: None
+# D3 市场状态打桩：全局无分类结果（真实 provider 经 regime_classifier 拉 3×200
+# 根 K 线出网）；D3 用例分节换桩
+jtt._ctx_regime_of = lambda sym: None
 
 # ── 门禁配置隔离（亏损止血 S1+ 开仓门禁链）────────────────────────────────
 # jarvis_config 路径指到临时目录：冒烟绝不读/写用户真实 ~/.vibe-trading 配置
@@ -1018,6 +1021,7 @@ check("S5 配置登记：twelve_trend_filter_enabled 默认开",
       jc.default_config().get("twelve_trend_filter_enabled") is True)
 
 _GATES["twelve_trend_filter_enabled"] = 1.0
+_GATES["twelve_trend_filter_mode"] = "reject"   # 本节验 S5 旧硬拒单口径（D3 后为回退档）
 _orig_trend_ctx = _REAL_TREND_CTX   # S5e 真实链路用例还原用（顶部全局中性桩的原函数）
 jtt._trend_context = lambda sym: ("dist", "C")   # mock 1h 派发 Phase C（跌势语境）
 _PRICE["v"] = 100.0
@@ -1097,8 +1101,10 @@ check("S5f：twelve_trend_filter_enabled 关闭 → dist-C 语境 5m 多单也�
       len(op) == 1, str((out["symbols"][SYM]["opened"],
                          out["symbols"][SYM]["rejected"])))
 
-# 复位：旧口径 + 清场（回全局中性桩，防真实威科夫数据污染后续用例）
+# 复位：旧口径 + 清场（回全局中性桩，防真实威科夫数据污染后续用例；
+# mode 回 D3 默认 deweight）
 jtt._trend_context = lambda sym: (None, None)
+_GATES["twelve_trend_filter_mode"] = "deweight"
 with jtt._conn() as conn:
     conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
     conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
@@ -1388,6 +1394,99 @@ with jtt._conn() as conn:
     conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
 for _tf, _sys in [("1h", "turtle"), ("4h", "dow"), ("15m", "elliott"),
                   ("30m", "gann"), ("5m", "gap")]:
+    set_signal(_tf, _sys, "neutral", None)
+
+# ═══════════ 23. D3 多周期趋势/regime 上下文层 + S5 逆势过滤 mode 化 ═══════════
+from types import SimpleNamespace  # noqa: E402
+
+check("D3 配置登记：trend_filter_mode 默认 deweight + 降权系数/均值回归表",
+      jc.default_config().get("twelve_trend_filter_mode") == "deweight"
+      and jc.default_config().get("twelve_ctx_deweight_regime") == 0.5
+      and jc.default_config().get("twelve_ctx_deweight_counter") == 0.5
+      and jc.default_config().get("twelve_ctx_meanrev_systems")
+      == ["oscillator", "triple_rsi"])
+
+T13 = T12 + 96 * 3600
+_PRICE["v"] = 100.0
+_GATES["twelve_trend_filter_enabled"] = 1.0   # S5f 关掉了，本节重新打开
+
+# a) mode=deweight（默认）：dist-C 语境 5m 多单 → 成交但打标降权（S5 语义翻转）
+jtt._trend_context = lambda sym: ("dist", "C")
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.0, "take_profit": 103.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T13)
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("5m", "gap")]
+check("D3a：dist-C + mode=deweight → 5m 多单成交（不拒单）且 margin 减半 + counter_trend",
+      len(op) == 1 and abs(op[0]["margin"] - 5.0) < 1e-9
+      and op[0]["context_tags"] == "counter_trend"
+      and op[0]["size_factor"] == 0.5,
+      str((op, out["symbols"][SYM]["rejected"])))
+
+# b) mode=reject（回退档）：同语境同信号 → 拒单 counter_trend（S5 旧行为零回归）
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+_GATES["twelve_trend_filter_mode"] = "reject"
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.0, "take_profit": 103.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T13 + 60)
+rej = [r for r in out["symbols"][SYM]["rejected"]
+       if (r["tf"], r["system"]) == ("5m", "gap")]
+check("D3b：dist-C + mode=reject → 拒单 counter_trend（回退旧口径）",
+      len(rej) == 1 and rej[0]["reason"] == "counter_trend"
+      and not out["symbols"][SYM]["opened"], str(rej))
+_GATES["twelve_trend_filter_mode"] = "deweight"
+jtt._trend_context = lambda sym: (None, None)
+set_signal("5m", "gap", "neutral", None)
+
+# c) regime=trending/bearish：oscillator 逆势多单 → osc_in_trend 降权；
+#    turtle 顺势多单不受 regime 层影响（非均值回归系统 + 非震荡市）
+jtt._ctx_regime_of = lambda sym: SimpleNamespace(
+    regime="trending", direction="bearish", confidence=0.8)
+set_signal("15m", "oscillator", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 97.0, "take_profit": 106.0})
+set_signal("1h", "turtle", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 95.0, "take_profit": 110.0})
+out = jtt.run_cycle(cfg={}, now=T13 + 120)
+op_osc = [o for o in out["symbols"][SYM]["opened"]
+          if (o["tf"], o["system"]) == ("15m", "oscillator")]
+op_tur = [o for o in out["symbols"][SYM]["opened"]
+          if (o["tf"], o["system"]) == ("1h", "turtle")]
+check("D3c：趋势市逆势 oscillator → osc_in_trend 降权（margin 10→5）",
+      len(op_osc) == 1 and abs(op_osc[0]["margin"] - 5.0) < 1e-9
+      and op_osc[0]["context_tags"] == "osc_in_trend", str(op_osc))
+check("D3c：turtle 不在均值回归表 → regime 层不打标（margin=20 无标签）",
+      len(op_tur) == 1 and abs(op_tur[0]["margin"] - 20.0) < 1e-9
+      and op_tur[0]["context_tags"] is None, str(op_tur))
+
+# d) regime=ranging：突破系 gap → breakout_in_range 降权；叠加威科夫逆势 → 系数连乘
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+set_signal("15m", "oscillator", "neutral", None)
+set_signal("1h", "turtle", "neutral", None)
+jtt._ctx_regime_of = lambda sym: SimpleNamespace(
+    regime="ranging", direction="neutral", confidence=0.7)
+jtt._trend_context = lambda sym: ("dist", "C")
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.0, "take_profit": 103.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T13 + 180)
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("5m", "gap")]
+check("D3d：震荡市突破系 + 威科夫逆势 → 双标签系数连乘（margin 10→2.5）",
+      len(op) == 1 and abs(op[0]["margin"] - 2.5) < 1e-9
+      and op[0]["context_tags"] == "breakout_in_range,counter_trend"
+      and op[0]["size_factor"] == 0.25, str(op))
+
+# 复位：regime/威科夫回全局中性桩 + 清场
+jtt._ctx_regime_of = lambda sym: None
+jtt._trend_context = lambda sym: (None, None)
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+    conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
+for _tf, _sys in [("5m", "gap"), ("15m", "oscillator"), ("1h", "turtle")]:
     set_signal(_tf, _sys, "neutral", None)
 
 print()

@@ -212,9 +212,19 @@ CTX_FIELDS = tuple(c for c, _ in CTX_COLUMNS_DDL if c not in
 CTX_DEWEIGHT_SUSPECT_DEFAULT = 0.5
 CTX_VOL_SYSTEMS_DEFAULT = ("turtle", "rule123", "gap", "dow", "chanlun")
 CTX_MIN_SIZE_FACTOR = 0.05    # 降权系数连乘下限：绝不降到 0（=变相关闭断样本）
+# D3 多周期趋势/regime 上下文：均值回归系统在趋势市逆势 / 突破系统在震荡市 /
+# 短周期逆 1h 威科夫 → 打标降权。S5 逆势过滤增加 mode 开关：默认 deweight
+# （打标降权继续跑，本层承接），reject 档回退旧硬拒单行为（零回归通道）。
+TREND_FILTER_MODE_DEFAULT = "deweight"
+CTX_DEWEIGHT_REGIME_DEFAULT = 0.5
+CTX_DEWEIGHT_COUNTER_DEFAULT = 0.5
+CTX_MEANREV_SYSTEMS_DEFAULT = ("oscillator", "triple_rsi")
 CONTEXT_TAG_CN = {
     "vol_suspect": "量能/CVD 不确认突破（假突破嫌疑）",
     "vol_confirmed": "量能/CVD 确认突破",
+    "osc_in_trend": "均值回归系统在趋势市逆势开仓（趋势市毒药语境）",
+    "breakout_in_range": "突破系统在震荡市开仓（假突破高发语境）",
+    "counter_trend": "逆 1h 威科夫高周期趋势（短周期逆势）",
 }
 
 # 门禁拒单原因 → 中文留痕说明（写进 twelve_sim_signal_log.note，看板/复盘直读）
@@ -1158,6 +1168,51 @@ def _context_layers(sym: str, tf: str, system: str, direction: str,
                     _apply_context(params, "vol_confirmed", 1.0)
     except Exception:  # noqa: BLE001
         pass
+    # D3-1/2：市场状态（regime）× 系统性格错配——oscillator 自述「趋势市毒药」，
+    # 突破系在震荡市假突破高发；错配不禁止，打标降权继续攒对照样本
+    try:
+        res = _ctx_regime_of(sym)
+        regime = getattr(res, "regime", None)
+        rdir = getattr(res, "direction", None)
+        if regime == "trending":
+            raw = _gate_cfg("twelve_ctx_meanrev_systems",
+                            list(CTX_MEANREV_SYSTEMS_DEFAULT))
+            if isinstance(raw, str):
+                raw = [s.strip() for s in raw.split(",") if s.strip()]
+            if (system.lower() in {str(s).lower() for s in (raw or [])}
+                    and ((rdir == "bullish" and direction == "short")
+                         or (rdir == "bearish" and direction == "long"))):
+                _apply_context(params, "osc_in_trend",
+                               _gate_num("twelve_ctx_deweight_regime",
+                                         CTX_DEWEIGHT_REGIME_DEFAULT))
+        elif regime == "ranging":
+            raw = _gate_cfg("twelve_ctx_vol_systems", list(CTX_VOL_SYSTEMS_DEFAULT))
+            if isinstance(raw, str):
+                raw = [s.strip() for s in raw.split(",") if s.strip()]
+            if system.lower() in {str(s).lower() for s in (raw or [])}:
+                _apply_context(params, "breakout_in_range",
+                               _gate_num("twelve_ctx_deweight_regime",
+                                         CTX_DEWEIGHT_REGIME_DEFAULT))
+    except Exception:  # noqa: BLE001
+        pass
+    # D3-3：1h 威科夫逆势（S5 同判据）——mode=deweight 时由本层打标降权；
+    # mode=reject 时 _pre_gate 已拒单，到不了这里（互斥不双罚）
+    try:
+        if (tf in TREND_FILTER_TFS
+                and _gate_num("twelve_trend_filter_enabled",
+                              float(TREND_FILTER_ENABLED_DEFAULT)) >= 0.5
+                and str(_gate_cfg("twelve_trend_filter_mode",
+                                  TREND_FILTER_MODE_DEFAULT)).lower() == "deweight"):
+            side, phase = _trend_context(sym)
+            if phase in TREND_FILTER_PHASES and (
+                    (side == "dist" and direction == "long")
+                    or (side == "acc" and direction == "short")):
+                _apply_context(params, "counter_trend",
+                               _gate_num("twelve_ctx_deweight_counter",
+                                         CTX_DEWEIGHT_COUNTER_DEFAULT),
+                               f"{CONTEXT_TAG_CN['counter_trend']}：1h {side}-{phase}")
+    except Exception:  # noqa: BLE001
+        pass
     return params
 
 
@@ -1732,10 +1787,14 @@ def _pre_gate(conn, sym: str, tf: str, system: str, direction: str,
     if strength < _tf_gate_num("twelve_tf_min_confidence", tf,
                                TF_MIN_CONF_DEFAULT, 0.0):
         return "tf_gate", False
-    # S5 高周期趋势逆势过滤：仅短周期生效；1h 威科夫 dist-C/D/E 拒多、acc-C/D/E 拒空
+    # S5 高周期趋势逆势过滤：仅短周期生效；1h 威科夫 dist-C/D/E 逆多、acc-C/D/E 逆空。
+    # D3 起默认 mode=deweight——本处不再拒单，改由 _context_layers 打标降权继续跑
+    # （诊断实验场纪律：不关信号只降权）；mode=reject 回退旧硬拒单（零回归通道）。
     if (tf in TREND_FILTER_TFS
             and _gate_num("twelve_trend_filter_enabled",
-                          float(TREND_FILTER_ENABLED_DEFAULT)) >= 0.5):
+                          float(TREND_FILTER_ENABLED_DEFAULT)) >= 0.5
+            and str(_gate_cfg("twelve_trend_filter_mode",
+                              TREND_FILTER_MODE_DEFAULT)).lower() == "reject"):
         side, phase = _trend_context(sym)
         if phase in TREND_FILTER_PHASES and (
                 (side == "dist" and direction == "long")

@@ -247,6 +247,16 @@ DEFAULTS: dict = {
     "twelve_ctx_deweight_suspect": 0.5,   # vol_suspect 仓位系数（1.0=不降权）
     "twelve_ctx_vol_systems": [           # 适用系统（突破/追价类；小写槽位名）
         "turtle", "rule123", "gap", "dow", "chanlun"],
+    # ── 13诊断 D3：多周期趋势/regime 上下文层 + S5 逆势过滤 mode 化 ─────────────
+    # 均值回归系统在趋势市逆势 → osc_in_trend；突破系统在震荡市 → breakout_in_range；
+    # 短周期逆 1h 威科夫 → counter_trend。全部打标降权不拒单。
+    # twelve_trend_filter_mode：deweight=打标降权继续跑（默认，诊断实验场口径）；
+    # reject=回退 S5 旧硬拒单行为（零回归通道）。enabled=False 仍为总关。
+    "twelve_trend_filter_mode": "deweight",
+    "twelve_ctx_deweight_regime": 0.5,    # regime 错配仓位系数
+    "twelve_ctx_deweight_counter": 0.5,   # 威科夫逆势仓位系数
+    "twelve_ctx_meanrev_systems": [       # 均值回归系统（趋势市毒药自述者）
+        "oscillator", "triple_rsi"],
     # ── 13诊断 D1：归因报表稳定亏识别阈值（jarvis_dashboard /api/twelve/attribution）──
     # stable_losers 候选门槛：样本 ≥ min_samples 且 胜率 < max_winrate 且 净亏，
     # 作 D7 反向影子验证的输入；仅统计筛选，不影响交易引擎。
@@ -344,6 +354,10 @@ GROUPS: dict[str, str] = {
     "twelve_ctx_cache_ttl_s": "signal",
     "twelve_ctx_deweight_suspect": "signal",
     "twelve_ctx_vol_systems": "signal",
+    "twelve_trend_filter_mode": "signal",
+    "twelve_ctx_deweight_regime": "signal",
+    "twelve_ctx_deweight_counter": "signal",
+    "twelve_ctx_meanrev_systems": "signal",
     # data——数据/回测口径
     "backtest_cost_bps": "data",
     "ws_stream_kline": "data",
@@ -457,6 +471,8 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "twelve_diag_max_winrate": (0.0, 100.0),   # 稳定亏候选胜率上限%
     "twelve_ctx_cache_ttl_s": (30, 3600),      # 环境快照缓存 TTL（秒）
     "twelve_ctx_deweight_suspect": (0.05, 1.0),  # 降权下限 0.05：绝不降到 0 断样本
+    "twelve_ctx_deweight_regime": (0.05, 1.0),
+    "twelve_ctx_deweight_counter": (0.05, 1.0),
 }
 
 # 允许的枚举键。
@@ -465,6 +481,7 @@ ENUMS: dict[str, tuple[str, ...]] = {
     "debate_mode": ("warn", "veto"),
     "ws_kline_interval": ("1m", "3m", "5m", "15m", "1h"),
     "ws_depth_speed": ("100ms", "250ms", "500ms"),
+    "twelve_trend_filter_mode": ("reject", "deweight"),
 }
 
 
@@ -476,7 +493,8 @@ def default_config() -> dict:
 
 
 # 保留原文大小写的 list 键（自由文本标签/小写系统槽位名）；watchlist 等币种列表仍统一大写。
-_TEXT_LIST_KEYS = {"journal_tags", "twelve_ctx_vol_systems"}
+_TEXT_LIST_KEYS = {"journal_tags", "twelve_ctx_vol_systems",
+                   "twelve_ctx_meanrev_systems"}
 
 
 def _coerce(key: str, value):
