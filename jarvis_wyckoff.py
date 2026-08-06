@@ -754,15 +754,32 @@ _HINTS = {
 }
 
 
+def _stale_fallback(key: tuple[str, str]) -> dict | None:
+    """数据层失败时回上次成功缓存并标 stale:true（性能纪律 §四 / 计划 §T2.5）。"""
+    with _CACHE_LOCK:
+        hit = _CACHE.get(key)
+    if not hit:
+        return None
+    out = {k: v for k, v in hit.items() if k != "_fp"}
+    out["stale"] = True
+    return out
+
+
 def analyze(symbol: str, interval: str = "1h", limit: int = ANALYZE_LIMIT) -> dict:
     """/api/wyckoff 消费入口：取数 → 区间 → 事件 → 阶段 → 证据绑定。永不抛出。
-    以最后一根已收盘 bar 的 open_time 做指纹，新 bar 出现才重算（性能纪律 §四.3）。"""
+    以最后一根已收盘 bar 的 open_time 做指纹，新 bar 出现才重算（性能纪律 §四.3）；
+    数据层失败回上次成功缓存并标 stale:true，无缓存才 ok:false。"""
+    key: tuple[str, str] | None = None
     try:
         import jarvis_delta_flow as jdf
         sym = jdf._norm_symbol(symbol)
         tf = jdf._norm_tf(interval)
+        key = (sym, tf)
         bars = jdf.fetch_bars(sym, tf, min(int(limit), jdf.LIMIT_MAX))
         if not bars or len(bars) < RANGE_HIST_MIN:
+            stale = _stale_fallback(key)
+            if stale is not None:
+                return stale
             return {"ok": False, "symbol": sym, "interval": tf,
                     "error": f"K线不足（{len(bars) if bars else 0} 根 < {RANGE_HIST_MIN}），"
                              "无法识别威科夫结构", "disclaimer": DISCLAIMER}
@@ -807,12 +824,17 @@ def analyze(symbol: str, interval: str = "1h", limit: int = ANALYZE_LIMIT) -> di
                        for e in events_rich[-MAX_EVENTS_OUT:]],
             "verdict_hint": hint,
             "sd_attached": bool(sd),
+            "stale": False,
             "disclaimer": DISCLAIMER,
         }
         with _CACHE_LOCK:
             _CACHE[key] = {**out, "_fp": fp}
         return out
     except Exception as exc:  # noqa: BLE001 — 引擎层绝不拖垮 dashboard
+        if key is not None:
+            stale = _stale_fallback(key)
+            if stale is not None:
+                return stale
         return {"ok": False, "symbol": (symbol or "").upper(), "interval": interval,
                 "error": repr(exc)[:200], "disclaimer": DISCLAIMER}
 
