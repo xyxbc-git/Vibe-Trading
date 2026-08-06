@@ -49,8 +49,12 @@ RANGE_MAX_ATR_MULT = 8.0     # (high-low)/ATR14 上限（横盘密集，非趋�
 RANGE_LOOKBACK = 240         # 只在最近 N 根内找区间
 MAX_RANGE_STARTS = 12        # 候选起点上限（复杂度护栏：O(12·n)）
 RANGE_MIN_SWINGS = 2         # 区间两侧各需 ≥2 个 swing 点（结构成立）
+RANGE_FORM_BARS = 40         # 边界只取「形成期」（起点后 N 根）的 swing 点：
+                             # 威科夫区间边界由高潮后的 AR/ST 结构确立，后期的
+                             # Spring/UT 扫针与离场段（markup/markdown 尾巴）不得
+                             # 反过来改写边界，否则 mid/low 漂移导致事件误判
 BOUND_Q = 0.75               # 边界聚类分位：高边取 swing 高点 75 分位（低边镜像 25），
-                             # 天然剔除 SC/BC/Spring/UT 扫针极值，不吃单点噪声
+                             # 天然剔除 SC/BC 扫针极值，不吃单点噪声
 
 EVENT_GAP = 5                # 同型事件最小间隔（根），防重复刷屏
 CLIMAX_PREROLL = 15          # SC/BC/AR/ST 允许早于区间起点 N 根（高潮催生区间）
@@ -172,6 +176,9 @@ def detect_range(bars: list) -> dict | None:
     """近端交易区间：swing 高低点（k=5 滚动窗口，O(n)）分位聚类定边界；
     区间成立 = 最近 ≥30 根内，收盘价 ≥80% 时间落在 [low, high] 且
     (high-low)/ATR14 ≤ 8（横盘密集，非趋势段）。
+    边界只由候选起点后 RANGE_FORM_BARS 根内（形成期）的 swing 点决定——
+    后期 Spring/UT 扫针与离场段不改写边界；inside-ratio 与宽度校验仍对
+    整段执行，因此把前置趋势段吸进来的候选会因边界失真被自然淘汰。
     返回 {"high","low","mid","start_ts","bars_in_range","atr"}（含辅助键
     "start_idx"）或 None（趋势段/历史不足）。"""
     n = len(bars) if bars else 0
@@ -200,8 +207,9 @@ def detect_range(bars: list) -> dict | None:
         seg_len = n - s
         if seg_len < RANGE_MIN_BARS:
             continue
-        seg_sh = [bars[i]["high"] for i in sh if i >= s]
-        seg_sl = [bars[i]["low"] for i in sl if i >= s]
+        form_end = s + RANGE_FORM_BARS
+        seg_sh = [bars[i]["high"] for i in sh if s <= i < form_end]
+        seg_sl = [bars[i]["low"] for i in sl if s <= i < form_end]
         if len(seg_sh) < RANGE_MIN_SWINGS or len(seg_sl) < RANGE_MIN_SWINGS:
             continue
         high = _quantile_bound(seg_sh, upper=True)
