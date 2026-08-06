@@ -5071,53 +5071,97 @@ def api_twelve_signal_stats(symbol: str | None = None, direction: str | None = N
 _TWELVE_REJECT_REASONS = ("sl_too_tight", "fee_negative_ev", "rr_too_low",
                           "circuit_breaker", "tf_gate", "counter_trend")
 
+# D1 环境切片维度 → twelve_sim_trade 列（ctx_* 由 D0 落库，可能尚未合入；
+# direction 为建表原生列，恒可用）
+_TWELVE_ATTR_DIMS = {"regime": "ctx_regime", "vol": "ctx_vol_bucket",
+                     "wyckoff": "ctx_wyckoff", "direction": "direction",
+                     "hour": "ctx_hour_utc"}
+
+
+def _twelve_trade_has_col(jtt, col: str) -> bool:
+    """探测 twelve_sim_trade 是否已有某列（D0 加列可能未合入；pg/sqlite 通用）。
+
+    col 只取自 _TWELVE_ATTR_DIMS 白名单，无注入面。独立短连接探测，
+    失败不污染主查询事务（pg 报错会 abort 当前事务）。
+    """
+    try:
+        with jtt._conn() as conn:
+            conn.execute(f"SELECT {col} FROM twelve_sim_trade LIMIT 1").fetchall()
+        return True
+    except Exception:  # noqa: BLE001 — 列不存在（或表未建），按无列处理
+        return False
+
 
 @app.get("/api/twelve/attribution")
-def api_twelve_attribution(days: int = 7):
-    """12 系统亏损归因报表（S6 · R10 取证 SQL 固化，1h 缓存）。
+def api_twelve_attribution(days: int = 7, dim: str | None = None):
+    """12 系统亏损归因报表（S6 · R10 取证 SQL 固化 + D1 环境切片，1h 缓存）。
 
     按 信号系统×TF×平仓原因 聚合 净利/胜率/费用/笔数（twelve_sim_trade 已平仓，
     近 ?days=7 天，按 exit_ts 过滤），外加门禁 rejected 统计（twelve_sim_position
     status='rejected' 按 reject_reason 分组；S1-S5 门禁链未 merge 落库时计数为 0）。
     费用与平仓口径一致：(entry+exit)*qty*单边费率%（费率已计入 pnl，此处单列便于归因）。
-    响应：{ok, days, since_ts, fee_pct_per_side, summary, attribution:[...], rejected}
+
+    D1：`?dim=regime|vol|wyckoff|direction|hour` 时聚合追加对应环境列，单元格增
+    `env` 字段（列不存在/值为 NULL → 'unknown' 桶 + notes），并输出 `stable_losers`
+    （(system,tf,ctx_regime) 非 NULL 组合中 样本≥twelve_diag_min_samples 且
+    胜率<twelve_diag_max_winrate 且净亏 的候选，按 net_pnl 升序；flip_hint 为
+    反向理论值，仅作 D7 候选排序）。非法 dim 按未传处理；**无 dim 时响应与
+    S6 原状同构（零回归）**。
+    响应：{ok, days, since_ts, fee_pct_per_side, summary, attribution:[...],
+    rejected[, dim, stable_losers, stable_losers_note, notes]}
     """
+    import jarvis_config as jc_mod
     import jarvis_twelve_trader as jtt
     try:
         d = max(1, min(365, int(days)))
     except (TypeError, ValueError):
         d = 7
+    dim_key = dim if dim in _TWELVE_ATTR_DIMS else None
 
     def _calc():
         jtt._ensure_init()
         since = time.time() - d * 86400.0
         fee_side_pct = jtt._fee_pct()   # 单边手续费%（按名义），与平仓扣费同源
+        notes: list[str] = []
+        env_col = _TWELVE_ATTR_DIMS[dim_key] if dim_key else None
+        env_col_ok = bool(env_col) and _twelve_trade_has_col(jtt, env_col)
+        if dim_key and not env_col_ok:
+            notes.append(f"维度列 {env_col} 不存在（D0 未合入），该维度全部归 unknown")
+        env_select = f"{env_col} AS env_val, " if env_col_ok else ""
+        env_group = f", {env_col}" if env_col_ok else ""
         with jtt._conn() as conn:
             rows = conn.execute(
-                """
-                SELECT system, MAX(name_cn) AS name_cn, tf, exit_reason,
+                f"""
+                SELECT system, MAX(name_cn) AS name_cn, tf, exit_reason, {env_select}
                        COUNT(*) AS trades,
                        SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins,
                        SUM(pnl) AS net_pnl,
                        SUM((entry_price + exit_price) * qty) AS notional
                 FROM twelve_sim_trade
                 WHERE exit_ts >= ?
-                GROUP BY system, tf, exit_reason
+                GROUP BY system, tf, exit_reason{env_group}
                 """, (since,)).fetchall()
         cells = []
         for r in rows:
             r = dict(r)
             n = int(r["trades"] or 0)
             wins = int(r["wins"] or 0)
-            cells.append({
+            cell = {
                 "system": r["system"], "name_cn": r.get("name_cn"),
                 "tf": r["tf"], "exit_reason": r["exit_reason"],
                 "trades": n, "wins": wins,
                 "win_rate_pct": round(wins / n * 100.0, 2) if n else None,
                 "net_pnl": round(float(r["net_pnl"] or 0.0), 4),
                 "fee": round(float(r["notional"] or 0.0) * fee_side_pct / 100.0, 4),
-            })
+            }
+            if dim_key:
+                env_val = r.get("env_val") if env_col_ok else None
+                cell["env"] = env_val if env_val is not None else "unknown"
+            cells.append(cell)
         cells.sort(key=lambda c: c["net_pnl"])   # 最亏的组合排最前，归因直读
+        if dim_key and env_col_ok and cells and all(
+                c["env"] == "unknown" for c in cells):
+            notes.append(f"维度列 {env_col} 全为 NULL（D0 数据未积累），全部归 unknown")
 
         total_trades = sum(c["trades"] for c in cells)
         total_wins = sum(c["wins"] for c in cells)
@@ -5154,7 +5198,7 @@ def api_twelve_attribution(days: int = 7):
         except Exception:  # noqa: BLE001 — reject_reason 列未上线（S1-S5 未 merge）
             rejected["note"] = "门禁链(S1-S5)尚未落库 reject_reason，暂无拦截数据"
 
-        return {
+        out = {
             "ok": True, "days": d, "since_ts": since,
             "generated_at": time.time(), "fee_pct_per_side": fee_side_pct,
             "summary": {
@@ -5167,9 +5211,54 @@ def api_twelve_attribution(days: int = 7):
             "attribution": cells,
             "rejected": rejected,
         }
+        if not dim_key:      # 无 dim：与 S6 原响应同构（零回归）
+            return out
+
+        # D1 稳定亏识别：(system, tf, ctx_regime) 非 NULL 组合的反向候选
+        out["dim"] = dim_key
+        stable: list[dict] = []
+        if _twelve_trade_has_col(jtt, "ctx_regime"):
+            min_n = int(jc_mod.get("twelve_diag_min_samples") or 20)
+            max_wr = float(jc_mod.get("twelve_diag_max_winrate") or 30.0)
+            with jtt._conn() as conn:
+                srows = conn.execute(
+                    """
+                    SELECT system, tf, ctx_regime AS env, COUNT(*) AS trades,
+                           SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins,
+                           SUM(pnl) AS net_pnl,
+                           SUM((entry_price + exit_price) * qty) AS notional
+                    FROM twelve_sim_trade
+                    WHERE exit_ts >= ? AND ctx_regime IS NOT NULL
+                    GROUP BY system, tf, ctx_regime
+                    """, (since,)).fetchall()
+            for r in srows:
+                r = dict(r)
+                n = int(r["trades"] or 0)
+                wr = (int(r["wins"] or 0) / n * 100.0) if n else 0.0
+                net = float(r["net_pnl"] or 0.0)
+                fee = float(r["notional"] or 0.0) * fee_side_pct / 100.0
+                if n >= min_n and wr < max_wr and net < 0:
+                    # 反向理论口径：gross_flip=-(net+fee) → net_flip=-net-2×fee
+                    stable.append({
+                        "system": r["system"], "tf": r["tf"], "env": r["env"],
+                        "trades": n, "win_rate_pct": round(wr, 2),
+                        "net_pnl": round(net, 4),
+                        "flip_hint": {"win_rate_pct": round(100.0 - wr, 2),
+                                      "net_pnl": round(-net - 2.0 * fee, 4)},
+                    })
+            stable.sort(key=lambda x: x["net_pnl"])
+        else:
+            notes.append("ctx_regime 列不存在（D0 未合入），stable_losers 暂为空")
+        out["stable_losers"] = stable
+        out["stable_losers_note"] = ("flip_hint 为理论口径：未扣滑点、反向后 SL/TP "
+                                     "结构不对称，仅作 D7 反向候选排序，不作收益承诺")
+        if notes:
+            out["notes"] = notes
+        return out
 
     try:
-        return JSONResponse(_cached(f"twelve:attr:{d}", 3600, _calc))
+        cache_key = f"twelve:attr:{d}" + (f":{dim_key}" if dim_key else "")
+        return JSONResponse(_cached(cache_key, 3600, _calc))
     except Exception as exc:  # noqa: BLE001
         return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
 
