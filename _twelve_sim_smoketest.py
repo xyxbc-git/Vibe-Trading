@@ -67,6 +67,9 @@ jtt._fee_pct = lambda: 0.0
 # counter_trend，测试结果随行情漂移）；S5 用例分节自行打桩/还原真实链路
 _REAL_TREND_CTX = jtt._trend_context
 jtt._trend_context = lambda sym: (None, None)
+# D0 环境快照打桩：全局空快照（真实 provider 会拉 regime/ATR/情报数据出网，
+# 冒烟必须离线且快）；D0 用例分节自行换桩验证落库链路
+jtt._market_context = lambda sym, tf, now: {}
 
 # ── 门禁配置隔离（亏损止血 S1+ 开仓门禁链）────────────────────────────────
 # jarvis_config 路径指到临时目录：冒烟绝不读/写用户真实 ~/.vibe-trading 配置
@@ -1172,6 +1175,110 @@ with jtt._conn() as conn:
     conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
     conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
 set_signal("30m", "gann", "neutral", None)
+
+# ═══════════ 21. D0 开仓时刻市场环境快照（诊断实验场基础设施） ═══════════
+check("D0 配置登记：twelve_ctx_snapshot_enabled 默认开 + cache_ttl 默认 300",
+      jc.default_config().get("twelve_ctx_snapshot_enabled") is True
+      and jc.default_config().get("twelve_ctx_cache_ttl_s") == 300)
+
+_CTX_FIXED = {"ctx_regime": "trending", "ctx_regime_dir": "bullish",
+              "ctx_atr_pct": 1.23, "ctx_vol_bucket": "high",
+              "ctx_wyckoff": "acc-C", "ctx_funding": 0.0003,
+              "ctx_oi_btc_chg": 4.2, "ctx_hour_utc": 7,
+              "ctx_btc_trend": "bullish"}
+_ctx_calls = {"n": 0}
+
+
+def _ctx_stub(sym, tf, now):
+    _ctx_calls["n"] += 1
+    return dict(_CTX_FIXED)
+
+
+jtt._market_context = _ctx_stub
+_PRICE["v"] = 100.0
+T11 = T10 + 48 * 3600   # 远离 S7 时间线，避开重开冷却/时间止损干扰
+
+# a) 立即开仓路径：position 行环境快照齐全，size_factor=1.0 / context_tags 空
+set_signal("1h", "turtle", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 95.0, "take_profit": 110.0})
+out = jtt.run_cycle(cfg={}, now=T11)
+pos = {(p["tf"], p["system"]): p for p in jtt.open_positions(SYM)}.get(("1h", "turtle"))
+check("D0a：立即开仓 → position 行 ctx_* 快照齐全",
+      pos is not None and all(pos.get(k) == v for k, v in _CTX_FIXED.items()),
+      str({k: pos.get(k) for k in _CTX_FIXED} if pos else None))
+check("D0a：D2 预留列初值（size_factor=1.0，context_tags 空）",
+      pos is not None and float(pos["size_factor"]) == 1.0
+      and pos.get("context_tags") is None, str(pos and dict(pos)))
+
+# b) 平仓 → trade 行环境快照与 position 原样一致
+_PRICE["v"] = 110.0
+out = jtt.run_cycle(cfg={}, now=T11 + 3600)
+with jtt._conn() as conn:
+    tr = conn.execute(
+        "SELECT * FROM twelve_sim_trade WHERE symbol=? AND tf='1h' "
+        "AND system='turtle' ORDER BY id DESC LIMIT 1", (SYM,)).fetchone()
+tr = dict(tr) if tr else None
+check("D0b：平仓 → trade 行 ctx_* 原样拷入（含 size_factor/context_tags）",
+      tr is not None and all(tr.get(k) == v for k, v in _CTX_FIXED.items())
+      and float(tr["size_factor"]) == 1.0 and tr.get("context_tags") is None,
+      str({k: tr.get(k) for k in _CTX_FIXED} if tr else None))
+
+# c) pending 触达成交路径：成交时刻打快照（非挂计划时刻）
+set_signal("1h", "turtle", "neutral", None)
+_PRICE["v"] = 100.0
+set_signal("4h", "dow", "bullish",
+           {"side": "long", "entry": 105.0, "entry_type": "breakout",
+            "stop_loss": 100.0, "take_profit": 115.0})
+out = jtt.run_cycle(cfg={}, now=T11 + 7200)
+check("D0c：breakout 未触达 → 先挂计划",
+      len(out["symbols"][SYM]["planned"]) == 1
+      and not out["symbols"][SYM]["opened"], str(out["symbols"][SYM]["planned"]))
+_PRICE["v"] = 106.0
+out = jtt.run_cycle(cfg={}, now=T11 + 7260)
+pos = {(p["tf"], p["system"]): p for p in jtt.open_positions(SYM)}.get(("4h", "dow"))
+check("D0c：计划触达成交 → position 行 ctx_* 快照齐全",
+      len(out["symbols"][SYM]["filled"]) == 1 and pos is not None
+      and all(pos.get(k) == v for k, v in _CTX_FIXED.items())
+      and float(pos["size_factor"]) == 1.0,
+      str({k: pos.get(k) for k in _CTX_FIXED} if pos else None))
+
+# d) provider 异常 → 开仓不受阻，ctx_* 全 NULL（seatbelt：眼睛坏了不卡引擎）
+def _ctx_boom(sym, tf, now):
+    raise RuntimeError("模拟环境快照数据层故障")
+
+
+jtt._market_context = _ctx_boom
+set_signal("15m", "elliott", "bullish",
+           {"side": "long", "entry": 106.0, "stop_loss": 103.0, "take_profit": 112.0})
+out = jtt.run_cycle(cfg={}, now=T11 + 7320)
+pos = {(p["tf"], p["system"]): p for p in jtt.open_positions(SYM)}.get(("15m", "elliott"))
+check("D0d：快照 provider 异常 → 开仓仍成功且 ctx_* 全 NULL",
+      pos is not None and all(pos.get(k) is None for k in _CTX_FIXED)
+      and float(pos["size_factor"]) == 1.0,
+      str({k: pos.get(k) for k in _CTX_FIXED} if pos else None))
+
+# e) 总开关关闭 → 不调 provider（零出网增量），字段落 NULL
+jtt._market_context = _ctx_stub
+_ctx_calls["n"] = 0
+_GATES["twelve_ctx_snapshot_enabled"] = 0.0
+set_signal("30m", "gann", "bullish",
+           {"side": "long", "entry": 106.0, "stop_loss": 103.0, "take_profit": 112.0})
+out = jtt.run_cycle(cfg={}, now=T11 + 7380)
+pos = {(p["tf"], p["system"]): p for p in jtt.open_positions(SYM)}.get(("30m", "gann"))
+check("D0e：twelve_ctx_snapshot_enabled=0 → provider 零调用且 ctx_* 全 NULL",
+      pos is not None and _ctx_calls["n"] == 0
+      and all(pos.get(k) is None for k in _CTX_FIXED),
+      str((_ctx_calls["n"], {k: pos.get(k) for k in _CTX_FIXED} if pos else None)))
+_GATES["twelve_ctx_snapshot_enabled"] = 1.0
+
+# 复位：清场 + 信号归中 + 快照回全局空桩
+jtt._market_context = lambda sym, tf, now: {}
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+    conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
+for _tf, _sys in [("1h", "turtle"), ("4h", "dow"), ("15m", "elliott"),
+                  ("30m", "gann")]:
+    set_signal(_tf, _sys, "neutral", None)
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS ✅")

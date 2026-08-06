@@ -183,6 +183,29 @@ TREND_FILTER_PHASES = ("C", "D", "E")
 FUNDING_RATE_DEFAULT = 0.0001
 FUNDING_INTERVAL_HOURS = 8.0
 
+# 13诊断 D0：开仓时刻市场环境快照（诊断实验场基础设施）。开仓那一刻把市场
+# 环境写进 position 行，平仓时原样拷入 trade 行——归因从「哪个信号亏」升级为
+# 「哪个信号在什么环境亏」。取数失败落 NULL，绝不阻塞开仓主链路。
+# context_tags/size_factor 为 D2-D6 上下文标签/降权系数预留列（D0 只建列：
+# tags 恒 NULL、factor 恒 1.0，语义由后续任务接管）。
+CTX_SNAPSHOT_ENABLED_DEFAULT = True
+CTX_CACHE_TTL_DEFAULT = 300.0          # regime/ATR 取数限频（秒）
+CTX_COLUMNS_DDL = (
+    ("ctx_regime", "TEXT"),        # 市场状态 trending/ranging/breakout
+    ("ctx_regime_dir", "TEXT"),    # 状态方向 bullish/bearish/neutral
+    ("ctx_atr_pct", "REAL"),       # 该 TF ATR14 相对收盘价（%）
+    ("ctx_vol_bucket", "TEXT"),    # 波动率分档 low/mid/high（窗口内分位）
+    ("ctx_wyckoff", "TEXT"),       # 1h 威科夫语境 side-phase（如 acc-C）
+    ("ctx_funding", "REAL"),       # 该币最新 8h 资金费率（正=多头付）
+    ("ctx_oi_btc_chg", "REAL"),    # BTC OI 变化%（全市场杠杆水位代理口径）
+    ("ctx_hour_utc", "INTEGER"),   # 开仓 UTC 小时（0-23，时段归因）
+    ("ctx_btc_trend", "TEXT"),     # BTC 1h regime 方向（带动过滤诊断）
+    ("context_tags", "TEXT"),      # D2+ 上下文标签（逗号串）
+    ("size_factor", "REAL"),       # D2+ 降权系数乘积（1.0=无降权）
+)
+CTX_FIELDS = tuple(c for c, _ in CTX_COLUMNS_DDL if c not in
+                   ("context_tags", "size_factor"))
+
 # 门禁拒单原因 → 中文留痕说明（写进 twelve_sim_signal_log.note，看板/复盘直读）
 REJECT_REASON_CN = {
     "sl_too_tight": "止损距离低于该周期下限",
@@ -278,16 +301,6 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_tsp_sym_status "
             "ON twelve_sim_position(symbol, status)"
         )
-        # 旧库升级：R3 失效留痕列（SQLite 无 IF NOT EXISTS，重复加列抛错=已升级过；
-        # jarvis_db 兼容层对 pg 自动翻译为 ADD COLUMN IF NOT EXISTS 幂等）
-        for _ddl in ("ALTER TABLE twelve_sim_position ADD COLUMN cancel_reason TEXT",
-                     "ALTER TABLE twelve_sim_position ADD COLUMN canceled_ts REAL",
-                     "ALTER TABLE twelve_sim_position ADD COLUMN reject_reason TEXT",
-                     "ALTER TABLE twelve_sim_trade ADD COLUMN funding_fee REAL"):
-            try:
-                conn.execute(_ddl)
-            except Exception:  # noqa: BLE001 — duplicate column = 已升级过
-                pass
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS twelve_sim_trade (
@@ -319,6 +332,23 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_tst_slot "
             "ON twelve_sim_trade(symbol, tf, system, exit_ts)"
         )
+        # 旧库升级：R3 失效留痕列 + S7 资金费列 + D0 环境快照列（SQLite 无
+        # IF NOT EXISTS，重复加列抛错=已升级过；jarvis_db 兼容层对 pg 自动翻译
+        # ADD COLUMN IF NOT EXISTS 幂等）。必须放在相关 CREATE TABLE 之后：
+        # 曾放在 twelve_sim_trade CREATE 之前，全新库单次 init 时 ALTER 因表
+        # 不存在被吞、CREATE 又不含新列 → 缺列（冒烟调两次 init 侥幸掩盖）。
+        _upgrades = ["ALTER TABLE twelve_sim_position ADD COLUMN cancel_reason TEXT",
+                     "ALTER TABLE twelve_sim_position ADD COLUMN canceled_ts REAL",
+                     "ALTER TABLE twelve_sim_position ADD COLUMN reject_reason TEXT",
+                     "ALTER TABLE twelve_sim_trade ADD COLUMN funding_fee REAL"]
+        _upgrades += [f"ALTER TABLE {_tbl} ADD COLUMN {_col} {_typ}"
+                      for _tbl in ("twelve_sim_position", "twelve_sim_trade")
+                      for _col, _typ in CTX_COLUMNS_DDL]
+        for _ddl in _upgrades:
+            try:
+                conn.execute(_ddl)
+            except Exception:  # noqa: BLE001 — duplicate column = 已升级过
+                pass
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS twelve_sim_config (
@@ -880,22 +910,155 @@ def _max_drawdown_pct(principal: float, balance_series: list[float]) -> float | 
 
 # ─────────────────────────── 开仓 / 平仓（内部，同一连接内执行） ───────────────────────────
 
+# ─────────────── 13诊断 D0：开仓时刻市场环境快照（装眼睛第一步：先落数据） ───────────────
+
+_CTX_REGIME_CACHE: dict = {}   # sym → (ts, RegimeResult|None)：classify 拉 3×200 根 K 线必须限频
+_CTX_ATR_CACHE: dict = {}      # (sym, tf) → (ts, atr_pct|None, bucket|None)
+
+
+def _ctx_ttl() -> float:
+    return max(30.0, _gate_num("twelve_ctx_cache_ttl_s", CTX_CACHE_TTL_DEFAULT))
+
+
+def _ctx_regime_of(sym: str):
+    """市场状态分类（TTL 缓存，镜像 jarvis_paper_trader._REGIME_CACHE 先例）；
+    失败也缓存 None——防每轮 72 槽位对故障源重试风暴。"""
+    hit = _CTX_REGIME_CACHE.get(sym)
+    if hit and time.time() - hit[0] < _ctx_ttl():
+        return hit[1]
+    res = None
+    try:
+        import jarvis_regime_classifier as jrc
+        res = jrc.classify(sym)
+    except Exception:  # noqa: BLE001 — 快照失败=字段落 NULL，绝不拖垮开仓
+        res = None
+    _CTX_REGIME_CACHE[sym] = (time.time(), res)
+    return res
+
+
+def _ctx_atr(sym: str, tf: str) -> tuple[float | None, str | None]:
+    """该 TF 的 ATR14%（相对最新收盘价）与波动率分档（TTL 缓存）。
+
+    分档口径：80 根窗口内滚动 ATR% 序列的分位——当前值 <30 分位 low、
+    >70 分位 high、其余 mid（自适应各币/各 TF 的波动率基准，无需绝对阈值）。
+    """
+    key = (sym, tf)
+    hit = _CTX_ATR_CACHE.get(key)
+    if hit and time.time() - hit[0] < _ctx_ttl():
+        return hit[1], hit[2]
+    atr_pct = bucket = None
+    try:
+        import jarvis_delta_flow as jdf
+        bars = jdf.fetch_bars(sym, tf, 80)
+        if bars and len(bars) >= 20:
+            trs, prev_close = [], None
+            for b in bars:
+                h, l, c = float(b["high"]), float(b["low"]), float(b["close"])
+                tr = (h - l) if prev_close is None else max(
+                    h - l, abs(h - prev_close), abs(l - prev_close))
+                trs.append(tr / c * 100.0 if c > 0 else 0.0)
+                prev_close = c
+            series = [sum(trs[i - 14:i]) / 14.0 for i in range(14, len(trs) + 1)]
+            atr_pct = round(series[-1], 4)
+            rank = sum(1 for x in series if x < series[-1]) / len(series) * 100.0
+            bucket = "low" if rank < 30 else ("high" if rank > 70 else "mid")
+    except Exception:  # noqa: BLE001 — 同上：落 NULL 不阻塞
+        atr_pct = bucket = None
+    _CTX_ATR_CACHE[key] = (time.time(), atr_pct, bucket)
+    return atr_pct, bucket
+
+
+def _market_context(sym: str, tf: str, now: float) -> dict:
+    """开仓时刻市场环境快照 → {ctx_* 字段: 值|None}（字段口径见 CTX_COLUMNS_DDL）。
+
+    四路取数全部带缓存 + 独立容错：regime/BTC 趋势走 _ctx_regime_of（TTL）、
+    ATR 走 _ctx_atr（TTL）、威科夫复用 _trend_context（指纹缓存）、funding/OI
+    走 jarvis_market_intel.get_intel()（模块级 TTL + 后台刷新）。零新增出网端点；
+    任一路失败对应字段落 None，绝不阻塞开仓主链路（seatbelt 哲学）。
+    """
+    ctx: dict = dict.fromkeys(CTX_FIELDS)
+    try:
+        res = _ctx_regime_of(sym)
+        regime = getattr(res, "regime", None)
+        if regime in ("trending", "ranging", "breakout"):
+            ctx["ctx_regime"] = regime
+        d = getattr(res, "direction", None)
+        if d in ("bullish", "bearish", "neutral"):
+            ctx["ctx_regime_dir"] = d
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        ctx["ctx_atr_pct"], ctx["ctx_vol_bucket"] = _ctx_atr(sym, tf)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        side, phase = _trend_context(sym)
+        if side:
+            ctx["ctx_wyckoff"] = f"{side}-{phase}" if phase else side
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import jarvis_market_intel as jmi
+        intel = jmi.get_intel()
+        rates = intel.get("funding_rate") or {}
+        if rates.get(sym) is not None:
+            ctx["ctx_funding"] = float(rates[sym])
+        oi = intel.get("oi") or {}
+        if oi.get("change_pct") is not None:
+            ctx["ctx_oi_btc_chg"] = float(oi["change_pct"])
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        ctx["ctx_hour_utc"] = int(time.gmtime(now).tm_hour)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if sym == "BTCUSDT":
+            ctx["ctx_btc_trend"] = ctx.get("ctx_regime_dir")
+        else:
+            btc = _ctx_regime_of("BTCUSDT")
+            d = getattr(btc, "direction", None)
+            if d in ("bullish", "bearish", "neutral"):
+                ctx["ctx_btc_trend"] = d
+    except Exception:  # noqa: BLE001
+        pass
+    return ctx
+
+
+def _ctx_snapshot(sym: str, tf: str, now: float) -> dict:
+    """快照总闸：twelve_ctx_snapshot_enabled 关闭时不调 provider（零出网增量）；
+    provider 任何异常返回空 dict（全字段落 NULL）。开仓路径唯一入口。"""
+    if _gate_num("twelve_ctx_snapshot_enabled",
+                 float(CTX_SNAPSHOT_ENABLED_DEFAULT)) < 0.5:
+        return {}
+    try:
+        out = _market_context(sym, tf, now)
+        return out if isinstance(out, dict) else {}
+    except Exception:  # noqa: BLE001 — 眼睛坏了不能把交易引擎卡死
+        return {}
+
+
 def _do_open(conn, sym: str, tf: str, system: str,
              direction: str, price: float, balance: float,
              params: dict, now: float) -> dict:
     margin = round(min(balance, balance * params["position_pct"] / 100.0), 8)
     qty = round(margin * params["leverage"] / price, 8)
+    ctx = _ctx_snapshot(sym, tf, now)   # D0：开仓时刻环境快照（失败=全 NULL）
     cur = conn.execute(
         """
         INSERT INTO twelve_sim_position
           (symbol, tf, system, direction, entry_price, entry_ts, qty, margin,
            leverage, position_pct, stop_loss, take_profit, cur_price,
-           unrealized_pnl, status)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,'open')
+           unrealized_pnl, status,
+           ctx_regime, ctx_regime_dir, ctx_atr_pct, ctx_vol_bucket, ctx_wyckoff,
+           ctx_funding, ctx_oi_btc_chg, ctx_hour_utc, ctx_btc_trend,
+           context_tags, size_factor)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,'open',?,?,?,?,?,?,?,?,?,NULL,1.0)
         """,
         (sym, tf, system, direction, price, now, qty, margin,
          params["leverage"], params["position_pct"],
-         params["stop_loss"], params["take_profit"], price))
+         params["stop_loss"], params["take_profit"], price,
+         *(ctx.get(f) for f in CTX_FIELDS)))
     return {"symbol": sym, "tf": tf, "system": system, "direction": direction,
             "entry_price": price, "qty": qty, "margin": margin,
             "leverage": params["leverage"], "stop_loss": params["stop_loss"],
@@ -951,13 +1114,20 @@ def _do_close(conn, pos: dict, exit_price: float, reason: str, now: float) -> di
           (symbol, tf, system, name_cn, direction, entry_price, entry_ts,
            exit_price, exit_ts, qty, margin, leverage, stop_loss, take_profit,
            exit_reason, pnl, pnl_pct, rr, balance_after, holding_minutes,
-           funding_fee)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           funding_fee,
+           ctx_regime, ctx_regime_dir, ctx_atr_pct, ctx_vol_bucket, ctx_wyckoff,
+           ctx_funding, ctx_oi_btc_chg, ctx_hour_utc, ctx_btc_trend,
+           context_tags, size_factor)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                ?,?,?,?,?,?,?,?,?,?,?)
         """,
         (sym, tf, system, NAME_CN.get(system, system), pos["direction"],
          entry, pos["entry_ts"], exit_price, now, qty, margin,
          pos.get("leverage") or 1.0, sl, tp, reason, pnl, pnl_pct, rr,
-         balance_after, holding_min, funding))
+         balance_after, holding_min, funding,
+         # D0：开仓时刻环境快照原样拷入台账（pos 来自 SELECT *，新列已就位）
+         *(pos.get(f) for f in CTX_FIELDS),
+         pos.get("context_tags"), pos.get("size_factor")))
 
     # 钱包战绩重算（该槽位全量台账，72 槽位×小样本，代价可忽略）
     rows = conn.execute(
@@ -1510,16 +1680,21 @@ def _fill_plan(conn, pen: dict, plan: dict | None, eff: dict, balance: float,
         return {"rejected": True, "reason": risk}
     margin = round(min(balance, balance * params["position_pct"] / 100.0), 8)
     qty = round(margin * params["leverage"] / entry, 8)
+    ctx = _ctx_snapshot(str(pen["symbol"]), tf, now)   # D0：成交时刻=开仓时刻快照
     conn.execute(
         """
         UPDATE twelve_sim_position
         SET entry_ts=?, qty=?, margin=?, leverage=?, position_pct=?,
             stop_loss=?, take_profit=?, cur_price=?, unrealized_pnl=0,
-            status='open'
+            status='open',
+            ctx_regime=?, ctx_regime_dir=?, ctx_atr_pct=?, ctx_vol_bucket=?,
+            ctx_wyckoff=?, ctx_funding=?, ctx_oi_btc_chg=?, ctx_hour_utc=?,
+            ctx_btc_trend=?, context_tags=NULL, size_factor=1.0
         WHERE id=? AND status='pending'
         """,
         (now, qty, margin, params["leverage"], params["position_pct"],
-         params["stop_loss"], params["take_profit"], price, pen["id"]))
+         params["stop_loss"], params["take_profit"], price,
+         *(ctx.get(f) for f in CTX_FIELDS), pen["id"]))
     conn.execute(
         """
         INSERT INTO twelve_sim_signal_log

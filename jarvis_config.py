@@ -234,6 +234,12 @@ DEFAULTS: dict = {
     # 永续合约口径补齐：持仓每满 8h 按 entry 名义计提一次资金费。
     # rate>0 多头付/空头收（负值反向）；平仓时折进净 pnl 并单列 funding_fee 留痕。
     "twelve_funding_rate": 0.0001,
+    # ── 13诊断 D0：开仓时刻市场环境快照（jarvis_twelve_trader）──────────────────
+    # 诊断实验场基础设施：开仓那一刻把市场环境（regime/ATR档/威科夫/资金费/OI/
+    # 时段/BTC趋势）写进 twelve_sim_position/trade 新列，供归因按环境切片。
+    # 取数失败落 NULL 绝不阻塞开仓；关闭开关=全落 NULL 且零出网增量。
+    "twelve_ctx_snapshot_enabled": True,
+    "twelve_ctx_cache_ttl_s": 300,    # 快照取数缓存 TTL（秒）：regime/ATR 拉 K 线限频
     # ── 13诊断 D1：归因报表稳定亏识别阈值（jarvis_dashboard /api/twelve/attribution）──
     # stable_losers 候选门槛：样本 ≥ min_samples 且 胜率 < max_winrate 且 净亏，
     # 作 D7 反向影子验证的输入；仅统计筛选，不影响交易引擎。
@@ -327,6 +333,8 @@ GROUPS: dict[str, str] = {
     "wyckoff_seatbelt_enabled": "signal",
     "twelve_diag_min_samples": "signal",
     "twelve_diag_max_winrate": "signal",
+    "twelve_ctx_snapshot_enabled": "signal",
+    "twelve_ctx_cache_ttl_s": "signal",
     # data——数据/回测口径
     "backtest_cost_bps": "data",
     "ws_stream_kline": "data",
@@ -438,6 +446,7 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "twelve_funding_rate": (-0.01, 0.01),      # 每 8h 资金费率（可为负=空头付）
     "twelve_diag_min_samples": (5, 500),       # 稳定亏候选最小样本数
     "twelve_diag_max_winrate": (0.0, 100.0),   # 稳定亏候选胜率上限%
+    "twelve_ctx_cache_ttl_s": (30, 3600),      # 环境快照缓存 TTL（秒）
 }
 
 # 允许的枚举键。
