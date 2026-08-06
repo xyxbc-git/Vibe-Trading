@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { ViewportState } from "./renderer";
 import {
   AXIS_W,
+  BASE_BAR_W,
+  BASE_ROW_H,
   MAX_ZOOM,
   MIN_ZOOM,
   RIGHT_GAP_BARS_DEFAULT,
@@ -35,6 +37,8 @@ interface GeomRef {
   /** 可见范围价格极值（自动适配用；无数据时 hi<lo） */
   visLo: number;
   visHi: number;
+  /** 当前已加载柱数（动态缩放下限「适应全部数据」用） */
+  barCount: number;
 }
 
 /** 惯性衰减：每帧 ×0.94（60fps 基准，按 dt 换算）；低于 8px/s 停止 */
@@ -44,6 +48,47 @@ const MIN_FLING_SPEED = 8;
 const ZOOM_LERP_PER_FRAME = 0.26;
 /** 轴拖拽缩放灵敏度：每 px 的 zoom 指数增量 */
 const AXIS_DRAG_SENS = 0.006;
+/** 可读性下限：柱宽低于此像素蜡烛/足迹柱已不可辨认，禁止继续缩小 */
+const MIN_READABLE_BAR_W = 5;
+/** 放大上限：单柱不超过图区宽的 1/3（一屏至少看得到 3 根柱） */
+const MAX_BAR_W_RATIO = 1 / 3;
+/** 滚轮缩放灵敏度 + 单次事件倍率限幅（降噪：狂滚也不会一滚到底） */
+const WHEEL_ZOOM_SENS = 0.008;
+const WHEEL_STEP_MAX = 1.25;
+
+export interface ZoomBounds {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+}
+
+/**
+ * 动态缩放边界（防「缩到不可读 + 整屏空白」）：
+ * - X 下限 = max(全部数据恰好填满图区的倍率, 可读柱宽下限)，且封顶 1（默认倍率永远可达）。
+ *   数据少时缩到下限正好「适应全部数据」，不会继续缩出空白；数据多时止步于可读柱宽。
+ * - X 上限 = 单柱 ≤ 图区宽 1/3（与 MAX_ZOOM 取小）。
+ * - Y 下限 = 可见价格范围恰好装满绘图区的倍率（与 autoFit 同口径），封死纵向缩出空白。
+ */
+export function zoomBoundsOf(g: GeomRef): ZoomBounds {
+  let minX = MIN_ZOOM;
+  if (g.barCount > 0 && g.chartW > 0) {
+    const fitX = g.chartW / (g.barCount * BASE_BAR_W);
+    minX = clamp(Math.max(fitX, MIN_READABLE_BAR_W / BASE_BAR_W), MIN_ZOOM, 1);
+  }
+  const maxX = Math.max(
+    minX,
+    Math.min(MAX_ZOOM, (g.chartW * MAX_BAR_W_RATIO) / BASE_BAR_W),
+  );
+
+  let minY = MIN_ZOOM;
+  if (g.visHi > g.visLo && g.plotH > 0) {
+    const span = (g.visHi - g.visLo) / Math.max(g.tick, 1e-9) + 4; // 上下各留 2 行
+    const fitRowH = clamp(g.plotH / span, 1.2, 64);
+    minY = clamp(fitRowH / BASE_ROW_H, MIN_ZOOM, 1);
+  }
+  return { minX, maxX, minY, maxY: Math.max(minY, MAX_ZOOM) };
+}
 
 export function initialViewport(): ViewportState {
   return {
@@ -66,9 +111,11 @@ export function initialViewport(): ViewportState {
  * 状态全存 ref，由主组件的 rAF 循环每帧调用 step(dt) 推进：
  * - 拖拽跟手（指针事件直接写 scrollX，无 React setState）
  * - 松手惯性滑行（velocity 采样 + 指数衰减，可按住打断）
- * - 滚轮缩放向 zoomTarget 平滑插值，光标锚点（柱位 + 价格）全程锁定
+ * - 普通滚轮/触控板双指 = 时间轴平移；Ctrl/⌘+滚轮（含捏合）= 光标锚点缩放，
+ *   向 zoomTarget 平滑插值，缩放范围受 zoomBoundsOf 动态边界约束（不可缩出空白）
  * - 图区右拖越过留白锚点时物化为更大的 rightGapBars（TV 式可调留白）
  * - 价格轴上下拖 = 纵向缩放；时间轴左右拖 = 横向缩放；双击轴 = 自动适配
+ * - 双击图区 = 回到最新 + 默认缩放（一键复位）
  */
 export function useViewport(getGeom: () => GeomRef): ViewportApi {
   const vpRef = useRef<ViewportState>(initialViewport());
@@ -82,12 +129,16 @@ export function useViewport(getGeom: () => GeomRef): ViewportApi {
     setFollowing(vpRef.current.follow);
   }, []);
 
+  /** 一键复位：回到最新 + 默认缩放（迷失后一步找回） */
   const resetFollow = useCallback(() => {
     const vp = vpRef.current;
     vp.follow = true;
     vp.centerPrice = null;
     vp.velX = 0;
     vp.rightGapBars = RIGHT_GAP_BARS_DEFAULT;
+    vp.zoomTargetX = 1;
+    vp.zoomTargetY = 1;
+    vp.anchor = null;
     syncFollow();
   }, [syncFollow]);
 
@@ -141,23 +192,31 @@ export function useViewport(getGeom: () => GeomRef): ViewportApi {
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
       const g = getGeomRef.current();
-      const rect = el.getBoundingClientRect();
       const vp = vpRef.current;
 
-      if (e.shiftKey && !e.ctrlKey) {
-        // 横向平移（Shift+滚轮 / 触控板横扫）
+      if (!e.ctrlKey && !e.metaKey) {
+        // 普通滚轮 / 触控板双指 / Shift+滚轮：沿时间轴平移。
+        // 不再默认缩放——滚一下整图缩没是用户反馈的核心痛点
+        const delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
         const eff = vp.follow ? g.maxScroll : vp.scrollX;
-        const nx = eff + (e.deltaY || e.deltaX);
+        const nx = eff + delta;
         vp.scrollX = nx;
         vp.velX = 0;
         vp.follow = nx >= g.maxScroll - 2;
         syncFollow();
         return;
       }
-      // 滚轮：X/Y 同步缩放（目标各自 clamp）
-      const factor = Math.exp(-e.deltaY * (e.ctrlKey ? 0.012 : 0.0028));
-      vp.zoomTargetX = clamp(vp.zoomTargetX * factor, MIN_ZOOM, MAX_ZOOM);
-      vp.zoomTargetY = clamp(vp.zoomTargetY * factor, MIN_ZOOM, MAX_ZOOM);
+      // Ctrl/⌘+滚轮（含触控板双指捏合）：以光标为锚点 X/Y 同步缩放；
+      // 单次事件倍率限幅 + 动态边界 clamp（缩到下限即「适应全部数据」，不再缩出空白）
+      const rect = el.getBoundingClientRect();
+      const zb = zoomBoundsOf(g);
+      const factor = clamp(
+        Math.exp(-e.deltaY * WHEEL_ZOOM_SENS),
+        1 / WHEEL_STEP_MAX,
+        WHEEL_STEP_MAX,
+      );
+      vp.zoomTargetX = clamp(vp.zoomTargetX * factor, zb.minX, zb.maxX);
+      vp.zoomTargetY = clamp(vp.zoomTargetY * factor, zb.minY, zb.maxY);
       vp.anchor = { mx: e.clientX - rect.left, my: e.clientY - rect.top };
       vp.velX = 0;
     };
@@ -187,13 +246,15 @@ export function useViewport(getGeom: () => GeomRef): ViewportApi {
 
       if (drag.kind === "priceAxis") {
         // 价格轴上下拖：纵向缩放（向下拖 = 拉伸格高，与 TV 一致），锚定图区中心价
-        vp.zoomTargetY = clamp(vp.zoomTargetY * Math.exp(dy * AXIS_DRAG_SENS), MIN_ZOOM, MAX_ZOOM);
+        const zb = zoomBoundsOf(g);
+        vp.zoomTargetY = clamp(vp.zoomTargetY * Math.exp(dy * AXIS_DRAG_SENS), zb.minY, zb.maxY);
         vp.anchor = { mx: g.chartW / 2, my: g.plotH / 2 };
         return;
       }
       if (drag.kind === "timeAxis") {
         // 时间轴左右拖：横向缩放，锚定图区水平中点
-        vp.zoomTargetX = clamp(vp.zoomTargetX * Math.exp(dx * AXIS_DRAG_SENS), MIN_ZOOM, MAX_ZOOM);
+        const zb = zoomBoundsOf(g);
+        vp.zoomTargetX = clamp(vp.zoomTargetX * Math.exp(dx * AXIS_DRAG_SENS), zb.minX, zb.maxX);
         vp.anchor = { mx: g.chartW / 2, my: g.plotH / 2 };
         return;
       }
@@ -260,11 +321,14 @@ export function useViewport(getGeom: () => GeomRef): ViewportApi {
         syncFollow();
         return;
       }
-      // 双击图区：回到最新（原有行为）
+      // 双击图区：回到最新 + 默认缩放（一键复位，迷失后一步找回）
       vp.follow = true;
       vp.centerPrice = null;
       vp.velX = 0;
       vp.rightGapBars = RIGHT_GAP_BARS_DEFAULT;
+      vp.zoomTargetX = 1;
+      vp.zoomTargetY = 1;
+      vp.anchor = null;
       syncFollow();
     };
 

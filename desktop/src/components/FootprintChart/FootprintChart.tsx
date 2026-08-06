@@ -207,6 +207,7 @@ export default function FootprintChart() {
       tick: l?.tick ?? tickRef.current,
       visLo,
       visHi,
+      barCount: barsRef.current.length,
     };
   }, []);
 
@@ -982,6 +983,7 @@ export default function FootprintChart() {
               }}
               className="rounded border px-2 py-1 text-[11px] transition-colors hover:bg-white/5"
               style={{ borderColor: COLORS.border, color: COLORS.text }}
+              title="回到最新柱并恢复默认缩放（也可双击图区触发）"
             >
               回到最新 →
             </button>
@@ -1099,7 +1101,7 @@ export default function FootprintChart() {
         style={{ borderColor: COLORS.border, color: COLORS.dim }}
       >
         <span>
-          拖拽平移（松手惯性滑行）· 滚轮平滑缩放 · Shift+滚轮横移 · 双击回到最新 ·
+          拖拽/滚轮平移（松手惯性滑行）· Ctrl/⌘+滚轮或双指捏合缩放 · 双击图区复位视图 ·
           悬停任意格子/统计行看白话解释
         </span>
         <span>徽标：⚡扫盘 ≣堆积 ◈背离（点击看含义）</span>
