@@ -67,6 +67,9 @@ ST_WITHIN = 40               # ST 须在 SC 后 ≤40 根内
 ST_TOL_ATR = 0.5             # ST 回踩 SC 低点 ±0.5×ATR
 ST_VOL_RATIO = 0.7           # ST 量 < 0.7×SC 量
 SPRING_RECLAIM = 3           # Spring/UT：破位后 ≤3 根收回
+SHAKE_MATURITY = 30          # Spring/UT 属 Phase B/C 摇仓事件：区间发育 <30 根时
+                             # 的破位收回是区间形成期噪声（如 SC bar 自身的下探），
+                             # 不作弹簧/上冲判定
 FOLLOW_WITHIN = 15           # Test/LPS/LPSY 须在前置事件后 ≤15 根内
 QUIET_VOL_RATIO = 0.8        # 缩量判定：量 < 0.8×均量
 QUIET_VOL_BONUS = 0.5        # 缩量加分：量 < 0.5×均量
@@ -346,8 +349,9 @@ def detect_events(bars: list, rng: dict | None) -> list[dict]:
             st = {"idx": i}
             st_done = True
 
-        # ── Spring 弹簧：破区间低点后 ≤3 根收回区间内 ──
-        if spring_ep is None and i >= start and l < r_low and c < r_low:
+        # ── Spring 弹簧：破区间低点后 ≤3 根收回区间内（区间须已发育，
+        #    形成期的下探如 SC bar 自身不算弹簧）──
+        if spring_ep is None and i - start >= SHAKE_MATURITY and l < r_low and c < r_low:
             spring_ep = {"start": i, "low": l, "vol": v, "poke_high": h}
         elif spring_ep is not None:
             spring_ep["low"] = min(spring_ep["low"], l)
@@ -364,7 +368,7 @@ def detect_events(bars: list, rng: dict | None) -> list[dict]:
                 spring_ep = None
             elif i - spring_ep["start"] > SPRING_RECLAIM:
                 spring_ep = None                 # 收不回来 = 真破位，交给 SOW
-        elif i >= start and l < r_low <= c and _gap_ok("spring", i):
+        elif i - start >= SHAKE_MATURITY and l < r_low <= c and _gap_ok("spring", i):
             # 单根下探即收回（影线弹簧）：破位与确认同根
             score = 0.6
             if v < vma:
@@ -416,8 +420,9 @@ def detect_events(bars: list, rng: dict | None) -> list[dict]:
             _emit(i, "lps", l, score)
             lps_done = True
 
-        # ── UT 上冲回落 / UTAD 派发上冲（Phase C 位置的 UT + 量价背离）──
-        if ut_ep is None and i >= start and h > r_high and c > r_high:
+        # ── UT 上冲回落 / UTAD 派发上冲（Phase C 位置的 UT + 量价背离；
+        #    与 Spring 镜像，区间发育 <SHAKE_MATURITY 根不判定）──
+        if ut_ep is None and i - start >= SHAKE_MATURITY and h > r_high and c > r_high:
             ut_ep = {"start": i, "high": h, "vol": v, "poke_low": l}
         elif ut_ep is not None:
             ut_ep["high"] = max(ut_ep["high"], h)
@@ -428,7 +433,8 @@ def detect_events(bars: list, rng: dict | None) -> list[dict]:
                 ut_ep = None
             elif i - ut_ep["start"] > SPRING_RECLAIM:
                 ut_ep = None                     # 收不回来 = 真突破，交给 SOS
-        elif i >= start and h > r_high >= c and _gap_ok("ut", i) and _gap_ok("utad", i):
+        elif (i - start >= SHAKE_MATURITY and h > r_high >= c
+                and _gap_ok("ut", i) and _gap_ok("utad", i)):
             one = {"start": i, "high": h, "vol": v, "poke_low": l}
             _emit_ut_or_utad(bars, i, one, rng, atr_arr, vma_arr, cvd,
                              events, last_emit, _gap_ok)
