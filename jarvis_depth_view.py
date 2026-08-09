@@ -152,8 +152,19 @@ def orderbook(symbol: str, limit: int = 500, bucket: float | None = None,
     else:
         plans.append((FAPI_DEPTH, "futures"))
     plans.append((SPOT_DEPTH, "spot"))
+    # 深度权重随 limit 走（币安：≤50→2 / ≤100→5 / ≤500→10 / ≤1000→20）
+    _cost = 2.0 if lim <= 50 else 5.0 if lim <= 100 else 10.0 if lim <= 500 else 20.0
     for url, mk in plans:
         try:
+            _budget = getattr(_jnet, "budget_take", None)
+            if callable(_budget):
+                try:
+                    _ok = _budget(url, 180, cost=_cost)
+                except TypeError:  # 旧版无 cost 参数
+                    _ok = _budget(url, 180)
+                if not _ok:
+                    errs.append(f"{mk} 分钟预算耗尽（防限频闸拦截）")
+                    continue
             raw = _fetch(url, sym, lim)
             market = mk
             break
@@ -170,6 +181,17 @@ def orderbook(symbol: str, limit: int = 500, bucket: float | None = None,
                 ts = ts / 1000.0 if ts > 1e12 else ts
                 _jnet.report_ban(url, ts)
                 errs.append(f"合约行情接口 IP 限频封禁至 {_ban_hhmm(ts)}，暂不可用")
+            elif code in (418, 429):
+                # [2026-08-09 加固] 429 / 无封禁文案的 418 也登记跨进程冷却，
+                # 禁止各进程继续撞墙升级成 IP 封禁
+                retry_after = 90.0
+                try:
+                    retry_after = max(retry_after, float(
+                        resp.headers.get("Retry-After") or 0)) if resp is not None else retry_after
+                except (TypeError, ValueError):
+                    pass
+                getattr(_jnet, "report_cooldown", lambda *_: None)(url, retry_after)
+                errs.append(f"{mk} HTTP {code} 限流，已登记 {retry_after:.0f}s 全局冷却")
             elif mk == "spot" and code == 400:
                 errs.append(f"现货市场无 {sym} 交易对（该品种仅合约有）")
             else:

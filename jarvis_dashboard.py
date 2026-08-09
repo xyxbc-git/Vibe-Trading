@@ -10,7 +10,7 @@
 
 独立端口运行，不影响 Vibe-Trading 主服务。
 用法：
-  ./.venv/bin/python jarvis_dashboard.py            # 默认 127.0.0.1:7899
+  ./.venv/bin/python jarvis_dashboard.py            # 默认 127.0.0.1:10808
   ./.venv/bin/python jarvis_dashboard.py --port 7899
 """
 
@@ -924,6 +924,58 @@ def series(symbol: str = "BTCUSDT", days: int = 365):
     return JSONResponse(_cached(f"series:{sym}:{days}", 600, _calc))
 
 
+_KLINE_STEP_MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
+                  "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
+
+
+def _ws_kline_tail_rows(sym: str, iv: str) -> list[dict]:
+    """本进程 WS kline 缓冲 → 请求周期的尾部蜡烛行（REST 封禁期实时兜底）。
+
+    [2026-08-09 数据链路修复] fapi 被 418 IP 封禁时 /api/kline 只能吐磁盘旧缓存
+    （最长冻结数天），而 WS 流此时仍实时收数。缓冲存的是 1m kline 增量事件
+    （每根多条），按开盘时间去重取最新事件得 1m 蜡烛，再聚合到请求周期。
+    缓冲深度有限（默认 1000 事件 ≈ 最近半小时），只够补图表尾部；WS 现货回退
+    模式下为现货口径，与合约历史存在基差——冻结数天与尾部微小基差之间取后者。
+    WS 未运行 / 无数据返回空列表，调用方零回归。
+    """
+    try:
+        import jarvis_ws_stream as jws
+        events = jws.latest("kline", sym)
+    except Exception:  # noqa: BLE001
+        return []
+    candles: dict[int, dict] = {}
+    for ev in events:
+        k = (ev or {}).get("k") or {}
+        try:
+            t0 = int(k.get("t") or 0)
+            if t0 > 0:
+                candles[t0] = {"o": float(k["o"]), "h": float(k["h"]),
+                               "l": float(k["l"]), "c": float(k["c"]),
+                               "v": float(k["v"])}
+        except Exception:  # noqa: BLE001 — 单条事件异常不拖垮整体
+            continue
+    if not candles:
+        return []
+    step = _KLINE_STEP_MS.get(iv, 3_600_000)
+    buckets: dict[int, dict] = {}
+    for t0 in sorted(candles):
+        c = candles[t0]
+        b = t0 - t0 % step
+        cur = buckets.get(b)
+        if cur is None:
+            buckets[b] = dict(c)
+        else:
+            cur["h"] = max(cur["h"], c["h"])
+            cur["l"] = min(cur["l"], c["l"])
+            cur["c"] = c["c"]
+            cur["v"] += c["v"]
+    fmt = "%m-%d" if iv == "1d" else "%m-%d %H:%M"
+    return [{"t": time.strftime(fmt, time.localtime(b / 1000)), "ts": b,
+             "o": x["o"], "h": x["h"], "l": x["l"], "c": x["c"],
+             "v": round(x["v"], 2)}
+            for b, x in sorted(buckets.items())]
+
+
 @app.get("/api/kline")
 def kline(
     symbol: str = "BTCUSDT",
@@ -948,24 +1000,67 @@ def kline(
     lim = max(20, min(int(limit), 500))
     end_ms = int(end_time) if end_time and end_time > 0 else None
 
+    iv_sec = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800,
+              "1h": 3600, "4h": 14400, "1d": 86400}[iv]
+
     def _calc():
         params = {"symbol": spot, "interval": iv, "limit": lim}
         if end_ms is not None:
             params["endTime"] = end_ms
+
+        def _parse(raw):
+            """交易所 klines 数组 → 前端行；错误/空返回 None（fapi 与现货同构）。"""
+            if isinstance(raw, dict) or not raw:
+                return None
+            fmt = "%m-%d" if iv in ("1d",) else "%m-%d %H:%M"
+            rows = []
+            for k in raw:
+                ts = time.localtime(k[0] / 1000)
+                rows.append({
+                    "t": time.strftime(fmt, ts),
+                    "ts": int(k[0]),
+                    "o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
+                    "c": float(k[4]), "v": round(float(k[5]), 2),
+                })
+            return rows
+
+        def _is_stale(rows):
+            """最新窗口下末根 bar 开盘时间落后现在超 2.5 个周期视为停更。
+
+            fapi 域被 IP 封禁时 jcd._get 会静默返回磁盘旧缓存（年龄无上限，
+            2026-08-09 K 线冻结 3 天的根因），单看返回结构无法区分新旧，
+            必须用 bar 时间戳判定。历史分页（end_ms 非空）本就是旧数据，不判。
+            """
+            if end_ms is not None:
+                return False
+            if not rows:
+                return True
+            return time.time() - rows[-1]["ts"] / 1000 > iv_sec * 2.5
+
         raw = jcd._get(jcd.FAPI + "/fapi/v1/klines", params, fast=True)
-        if isinstance(raw, dict):
-            return {"error": raw.get("_error", "kline fetch failed"), "rows": []}
-        fmt = "%m-%d" if iv in ("1d",) else "%m-%d %H:%M"
-        rows = []
-        for k in raw:
-            ts = time.localtime(k[0] / 1000)
-            rows.append({
-                "t": time.strftime(fmt, ts),
-                "ts": int(k[0]),
-                "o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
-                "c": float(k[4]), "v": round(float(k[5]), 2),
-            })
-        return {"symbol": spot, "interval": iv, "rows": rows, "end_time": end_ms}
+        rows, source = _parse(raw), "fapi"
+        if rows is None or _is_stale(rows):
+            # 合约域失败/停更 → 切现货域（两域封禁相互独立，现货价差可接受，
+            # source 字段标记回退，恢复后自动切回 fapi 口径）
+            spot_rows = _parse(jcd._get(
+                jcd.SPOT_API + "/api/v3/klines", params, fast=True))
+            if spot_rows and (not rows or spot_rows[-1]["ts"] > rows[-1]["ts"]):
+                rows, source = spot_rows, "spot_fallback"
+        if rows is None or _is_stale(rows):
+            # 两个 REST 域都失败/停更 → 并入本进程 WS 实时蜡烛尾部
+            # （最后一道兜底：REST 全封禁时 WS 流仍在实时收数，图表尾部恢复走动）
+            ws_rows = _ws_kline_tail_rows(spot, iv)
+            if ws_rows and (not rows or ws_rows[-1]["ts"] > rows[-1]["ts"]):
+                merged = {r["ts"]: r for r in (rows or [])}
+                merged.update({r["ts"]: r for r in ws_rows})
+                rows, source = ([merged[t] for t in sorted(merged)][-lim:],
+                                "ws_tail")
+        if rows is None:
+            err = raw.get("_error", "kline fetch failed") \
+                if isinstance(raw, dict) else "kline fetch failed"
+            return {"error": err, "rows": []}
+        return {"symbol": spot, "interval": iv, "rows": rows,
+                "end_time": end_ms, "source": source, "stale": _is_stale(rows)}
 
     if end_ms is None:
         # 旧行为：最新窗口 60s 缓存，key 与旧版保持一致
@@ -4245,9 +4340,13 @@ def api_orderbook_live(symbol: str = "BTCUSDT", bucket: float | None = None,
         except Exception:  # noqa: BLE001 — 引擎不可用走 REST 回退
             pass
         import jarvis_depth_view as jdv
-        fb = jdv.orderbook(sym, 500, bucket, int(max_buckets))
-        fb.update({"source": "rest_fallback", "synced": False})
-        return fb
+        # 防封禁加固：REST 回退复用 /api/depth/orderbook 的 3s 共享缓存——
+        # 原先直连 jdv.orderbook（裸 requests 无 TTL 闸）被本端点 1s 缓存
+        # 放大成每秒 1 次外网 depth 快照，本地簿失同步的降级期正是封禁高危期。
+        # 浅拷贝再打标记，避免污染共享缓存对象。
+        fb = _cached(f"depth:ob:{sym}:500:{bucket or 0}:{int(max_buckets)}", 3,
+                     lambda: jdv.orderbook(sym, 500, bucket, int(max_buckets)))
+        return {**fb, "source": "rest_fallback", "synced": False}
 
     key = f"book:live:{sym}:{bucket or 0}:{int(max_buckets)}"
     return JSONResponse(_cached(key, 1, _calc))
@@ -7794,7 +7893,7 @@ def _start_order_lifecycle_monitor():
 def main() -> int:
     ap = argparse.ArgumentParser(description="贾维斯可视化仪表盘")
     # [Sprint0] 监听地址/端口默认从配置中心读（dashboard_host/dashboard_port，
-    # 默认 127.0.0.1:7899 零回归）；CLI 显式传参仍最高优先。
+    # 默认 127.0.0.1:10808 零回归）；CLI 显式传参仍最高优先。
     import jarvis_config as _jcfg0
     try:
         _dhost = str(_jcfg0.get("dashboard_host") or "127.0.0.1")
