@@ -78,6 +78,9 @@ jtt._ctx_regime_of = lambda sym: None
 # D4 拥挤度打桩：全局无 funding/OI（真实 provider 经 market_intel 出网）；
 # D4 用例分节换桩
 jtt._crowd_context = lambda sym: (None, None)
+# D5 ATR 打桩：全局取不到（真实 _ctx_atr 经 delta_flow 拉 80 根 K 线出网；
+# 取不到=ATR 档放行，静态档兜底——旧用例零回归）；D5 用例分节换桩
+jtt._ctx_atr = lambda sym, tf: (None, None)
 
 # ── 门禁配置隔离（亏损止血 S1+ 开仓门禁链）────────────────────────────────
 # jarvis_config 路径指到临时目录：冒烟绝不读/写用户真实 ~/.vibe-trading 配置
@@ -1576,6 +1579,91 @@ check("D4e：funding 不热 → OI 激增也零标签（margin=10）",
 
 # 复位：拥挤度回全局空桩 + 清场
 jtt._crowd_context = lambda sym: (None, None)
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+    conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
+set_signal("5m", "gap", "neutral", None)
+
+# ═══════════ 25. D5 ATR 自适应止损下限（sl_below_atr 硬拒，唯一新增硬拒档） ═══════════
+check("D5 配置登记：twelve_sl_atr_mult 默认 1.5",
+      jc.default_config().get("twelve_sl_atr_mult") == 1.5)
+
+T15 = T14 + 96 * 3600
+_PRICE["v"] = 100.0
+# 本节开静态档 5m=0.5%（新默认口径），ATR 桩 0.5% → 自适应档 1.5×0.5=0.75%
+_GATES["twelve_min_sl_pct"] = {tf: (0.5 if tf == "5m" else 0.0) for tf in jtt.TFS}
+jtt._ctx_atr = lambda sym, tf: (0.5, "mid")
+
+# a) SL 距离 0.6%：过静态档（>0.5）但 < 0.75 → 拒 sl_below_atr（ATR 档拦截）
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.4, "take_profit": 103.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T15)
+rej = [r for r in out["symbols"][SYM]["rejected"]
+       if (r["tf"], r["system"]) == ("5m", "gap")]
+check("D5a：SL 0.6%（>静态 0.5 但 <1.5×ATR0.5=0.75）→ 拒 sl_below_atr",
+      len(rej) == 1 and rej[0]["reason"] == "sl_below_atr"
+      and not out["symbols"][SYM]["opened"],
+      str((rej, out["symbols"][SYM]["opened"])))
+
+# b) SL 距离 0.8% ≥ 0.75 → 双档全过，正常成交
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.2, "take_profit": 103.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T15 + 60)
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("5m", "gap")]
+check("D5b：SL 0.8% ≥ 0.75 → 放行成交", len(op) == 1, str(op))
+
+# c) ATR 取数失败 → 自适应档放行（静态档仍兜底），SL 0.6% 成交
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+jtt._ctx_atr = lambda sym, tf: (None, None)
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.4, "take_profit": 103.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T15 + 120)
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("5m", "gap")]
+check("D5c：ATR 取数失败 → 放行（可用性优先，静态档兜底）", len(op) == 1, str(op))
+
+# d) twelve_sl_atr_mult=0（关闭）→ ATR 正常也不拦
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+jtt._ctx_atr = lambda sym, tf: (0.5, "mid")
+_GATES["twelve_sl_atr_mult"] = 0.0
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.4, "take_profit": 103.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T15 + 180)
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("5m", "gap")]
+check("D5d：mult=0 关闭 ATR 档 → SL 0.6% 放行", len(op) == 1, str(op))
+del _GATES["twelve_sl_atr_mult"]
+
+# e) 挂计划 → 成交时刻同样过 ATR 档：breakout entry=104，SL 距 entry 0.58%
+#    （<0.75）→ 触达时拒 sl_below_atr（挂单期间配置/波动可能已变化，成交再验）
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 104.0, "entry_type": "breakout",
+            "stop_loss": 103.4, "take_profit": 108.0}, strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T15 + 240)
+check("D5e：SL 距 entry 0.58% 的 breakout 计划先挂单",
+      len([p for p in out["symbols"][SYM]["planned"]
+           if (p["tf"], p["system"]) == ("5m", "gap")]) == 1,
+      str(out["symbols"][SYM]))
+_PRICE["v"] = 105.0
+out = jtt.run_cycle(cfg={}, now=T15 + 300)
+rej = [r for r in out["symbols"][SYM]["rejected"]
+       if (r["tf"], r["system"]) == ("5m", "gap")]
+check("D5e：计划触达 → 成交时刻 ATR 档拦截 sl_below_atr",
+      len(rej) == 1 and rej[0]["reason"] == "sl_below_atr", str(rej))
+
+# 复位：ATR 回全局空桩 + 静态档归零（旧用例口径）+ 清场
+jtt._ctx_atr = lambda sym, tf: (None, None)
+_GATES["twelve_min_sl_pct"] = {tf: 0.0 for tf in jtt.TFS}
+_PRICE["v"] = 100.0
 with jtt._conn() as conn:
     conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
     conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")

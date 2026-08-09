@@ -201,6 +201,11 @@ DEFAULTS: dict = {
     # 且旧自动杠杆 floor(0.5/SL距离) 顶格 20×——止损越窄杠杆越大。
     "twelve_min_sl_pct": {            # SL 距离下限（%，按 TF 分层）；更窄一律拒单
         "5m": 0.5, "15m": 0.7, "30m": 1.0, "1h": 1.2, "4h": 2.0, "1d": 3.0},
+    # ── 13诊断 D5：ATR 自适应止损下限（jarvis_twelve_trader）───────────────────
+    # 静态档之上叠一道波动率自适应档：SL 距离 < N×该 TF ATR14% → 拒单
+    # sl_below_atr（止损埋在噪声带内，扫损概率极高）。0=关闭该门禁；
+    # ATR 取数失败自动放行（可用性优先，静态档仍兜底）。
+    "twelve_sl_atr_mult": 1.5,
     "twelve_auto_lev_loss_frac": 0.25,  # 自动杠杆目标：打到 SL 亏保证金 25%（旧 0.5）
     "twelve_max_leverage": {          # 杠杆上限（按 TF 分层）；显式杠杆也夹此上限
         "5m": 5, "15m": 8, "30m": 10, "1h": 12, "4h": 15, "1d": 20},
@@ -321,6 +326,7 @@ GROUPS: dict[str, str] = {
     "cooldown_hours": "risk",
     "sl_proximity_warn_pct": "risk",
     "twelve_min_sl_pct": "risk",
+    "twelve_sl_atr_mult": "risk",
     "twelve_auto_lev_loss_frac": "risk",
     "twelve_max_leverage": "risk",
     "twelve_min_rr": "risk",
@@ -470,6 +476,7 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "twelve_sim_fee_pct": (0.0, 1.0),         # 模拟交易器单边费率%
     "twelve_auto_lev_loss_frac": (0.05, 1.0),  # 打到 SL 目标亏损占保证金比例
     "twelve_min_rr": (1.0, 10.0),              # 最小盈亏比（<1 无意义）
+    "twelve_sl_atr_mult": (0.0, 5.0),          # SL/ATR 最小倍数（0=关闭该门禁）
     "twelve_fee_burden_mult": (0.0, 50.0),     # 止盈/费用最小倍数（0=关闭该门禁）
     "twelve_cb_window": (5, 500),              # 熔断滚动窗口笔数
     "twelve_cb_min_trades": (1, 500),          # 熔断最小样本数

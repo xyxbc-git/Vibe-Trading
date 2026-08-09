@@ -147,6 +147,10 @@ MAX_LEVERAGE_BY_TF = {"5m": 5.0, "15m": 8.0, "30m": 10.0,
 # SL 距离 0.172% 在噪声带内，sl 平仓 228 笔胜率仅 4.4%，窄止损单不再入场。
 MIN_SL_PCT_BY_TF = {"5m": 0.5, "15m": 0.7, "30m": 1.0,
                     "1h": 1.2, "4h": 2.0, "1d": 3.0}
+# D5 ATR 自适应止损下限：静态档之上叠波动率自适应档——SL 距离 < N×该 TF
+# ATR14% → 拒单 'sl_below_atr'（止损埋在噪声带内，扫损概率极高）。
+# 0=关闭；ATR 取数失败自动放行（可用性优先，静态档仍兜底）。
+SL_ATR_MULT_DEFAULT = 1.5
 
 # 拒单(rejected)留痕行保留天数（与 canceled 同哲学：窗口期可复盘，到期物理清理；
 # twelve_sim_signal_log 的 reject 留痕永久保留）
@@ -239,6 +243,7 @@ CONTEXT_TAG_CN = {
 # 门禁拒单原因 → 中文留痕说明（写进 twelve_sim_signal_log.note，看板/复盘直读）
 REJECT_REASON_CN = {
     "sl_too_tight": "止损距离低于该周期下限",
+    "sl_below_atr": "止损距离低于 ATR 噪声带（波动率自适应下限）",
     "rr_too_low": "盈亏比低于下限",
     "fee_negative_ev": "止盈不足以覆盖费用负担（负期望）",
     "circuit_breaker": "信号×周期战绩熔断中",
@@ -850,10 +855,13 @@ def _auto_leverage(entry: float, stop_loss: float, tf: str | None = None) -> flo
     return float(max(1.0, min(_tf_max_leverage(tf), math.floor(frac / dist))))
 
 
-def _risk_gate(tf: str, entry: float, params: dict) -> str | None:
+def _risk_gate(tf: str, entry: float, params: dict,
+               sym: str | None = None) -> str | None:
     """开仓风控门禁链（合成参数后的最终校验）→ reject_reason 或 None（放行）。
 
     S1 止损最小距离：SL 距离(%) < 该 TF 下限 → 'sl_too_tight'；
+    D5 ATR 自适应档：SL 距离(%) < twelve_sl_atr_mult × 该 TF ATR14% →
+       'sl_below_atr'（sym 缺省 / ATR 取数失败 / mult=0 → 跳过，静态档兜底）；
     S2 最小盈亏比：TP距离/SL距离 < twelve_min_rr → 'rr_too_low'；
     S2 费用负担：单笔止盈收益(占保证金%) < twelve_fee_burden_mult ×
        双边费用(占保证金% = 单边费率×2×杠杆) → 'fee_negative_ev'。
@@ -866,6 +874,15 @@ def _risk_gate(tf: str, entry: float, params: dict) -> str | None:
         return None
     if sl_dist < _tf_gate_num("twelve_min_sl_pct", tf, MIN_SL_PCT_BY_TF, 0.0):
         return "sl_too_tight"
+    # D5：波动率自适应档（复用 D0 环境快照的 _ctx_atr TTL 缓存，零新增出网）
+    mult = _gate_num("twelve_sl_atr_mult", SL_ATR_MULT_DEFAULT)
+    if sym and mult > 0:
+        try:
+            atr_pct, _bucket = _ctx_atr(sym, tf)
+        except Exception:  # noqa: BLE001 — 眼睛坏了=放行，静态档仍兜底
+            atr_pct = None
+        if atr_pct and sl_dist < mult * float(atr_pct):
+            return "sl_below_atr"
     if sl_dist <= 0 or tp_dist / sl_dist < _gate_num("twelve_min_rr", MIN_RR_DEFAULT):
         return "rr_too_low"
     lev = float(params.get("leverage") or 1.0)
@@ -1919,7 +1936,7 @@ def _fill_plan(conn, pen: dict, plan: dict | None, eff: dict, balance: float,
     params = _resolve_entry_params(str(pen["direction"]), entry, eff, plan, tf)
     if params is None:
         return None
-    risk = _risk_gate(tf, entry, params)
+    risk = _risk_gate(tf, entry, params, str(pen["symbol"]))
     if risk:
         return {"rejected": True, "reason": risk}
     _context_layers(str(pen["symbol"]), tf, str(pen["system"]),
@@ -2290,7 +2307,7 @@ def _cycle_symbol(sym: str, cfg: dict, now: float | None = None) -> dict:
             params = _resolve_entry_params(direction, price, eff, plan, tf)
             if params is None:
                 continue   # 点位缺失或不自洽，宁缺毋滥
-            risk = _risk_gate(tf, price, params)
+            risk = _risk_gate(tf, price, params, sym)
             if risk:
                 # 风控门禁拦截（S1+）→ 拒单留痕，不静默丢弃
                 rej = _do_reject(conn, sym, tf, system, direction, risk,
