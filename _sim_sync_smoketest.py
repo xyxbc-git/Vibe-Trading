@@ -15,8 +15,14 @@
      holding_minutes REAL→INT 取整、src_ts=exit_ts
   5.5) 点位跟随变更日志 id 游标：全量/幂等/增量、ts→log_time DATETIME(3)、
      applied INT 直传、position_id 关联
+  5.8) D0 ctx 列镜像（13诊断在途#4）：无 ALTER 权限降级旧映射、缺列自动幂等
+     ALTER 补齐、DDL 已执行零 ALTER、trade/position ctx 值透传与 NULL 透传
   6) 配置回读：懒建 + 业务键 upsert（含 NULL scope / trader 自插行命中更新）、
      重跑幂等、enabled '0'→0、MySQL 不可达静默保留旧配置、远端表未建静默容忍
+
+mock 语义（2026-08-09 对齐现版任务纪律）：写操作（executemany/DELETE/ALTER）
+捕获或按 broken 抛错；读操作（information_schema 探测 / COUNT）恒可用——
+delete-absent、台账重置检测、ctx 列探测都会对 MySQL 发单条语句。
 """
 
 from __future__ import annotations
@@ -45,9 +51,14 @@ def check(name: str, cond: bool, extra: str = "") -> None:
 
 
 class _CapCursor:
-    def __init__(self, sink, broken: bool = False):
-        self.sink = sink
-        self.broken = broken
+    """mock MySQL 游标：写操作（executemany/DELETE/ALTER）捕获或按 broken 抛错；
+    读操作（information_schema 探测 / COUNT）恒可用——对齐现版任务纪律
+    （delete-absent、台账重置检测、ctx 列探测都会发单条语句）。"""
+
+    def __init__(self, conn):
+        self.conn = conn
+        self._rows: list = []
+        self._one = None
 
     def __enter__(self):
         return self
@@ -56,24 +67,58 @@ class _CapCursor:
         pass
 
     def executemany(self, sql, rows):
-        if self.broken:
+        if self.conn.broken:
             raise ConnectionError("simulated mysql down mid-batch")
-        self.sink.append((sql, list(rows)))
+        self.conn.batches.append((sql, list(rows)))
         return len(rows)
 
     def execute(self, sql, params=None):
-        raise AssertionError("镜像任务不应对 MySQL 发单条 execute")
+        s = " ".join(str(sql).split()).lower()
+        if "information_schema.columns" in s:
+            table = (params or ("",))[0]
+            self._rows = [(c,) for c in self.conn.columns.get(table, [])]
+            return len(self._rows)
+        if s.startswith("select count(*)"):
+            self._one = (0, 0)   # 镜像空态：不触发台账重置分支
+            self._rows = [(0, 0)]
+            return 1
+        if s.startswith("alter table"):
+            if not self.conn.allow_alter:
+                raise RuntimeError(
+                    '(1142, "ALTER command denied to user \'jarvis_sync\'")')
+            parts = str(sql).split()
+            self.conn.columns.setdefault(parts[2], []).append(parts[5])
+            self.conn.alters.append(str(sql))
+            return 0
+        if s.startswith("delete from"):
+            if self.conn.broken:
+                raise ConnectionError("simulated mysql down mid-batch")
+            self.conn.deletes.append((str(sql), params))
+            return 0
+        raise AssertionError(f"mock 未支持的 MySQL 语句: {sql}")
+
+    def fetchall(self):
+        return self._rows
+
+    def fetchone(self):
+        return self._one
 
 
 class _CapConn:
-    def __init__(self):
+    def __init__(self, allow_alter: bool = False,
+                 columns: dict[str, list[str]] | None = None):
         self.batches: list[tuple] = []
+        self.deletes: list[tuple] = []
+        self.alters: list[str] = []
         self.commits = 0
         self.rollbacks = 0
         self.broken = False
+        self.allow_alter = allow_alter
+        # information_schema 视图：table -> 已存在列名（默认无 ctx 列）
+        self.columns: dict[str, list[str]] = columns if columns is not None else {}
 
     def cursor(self):
-        return _CapCursor(self.batches, self.broken)
+        return _CapCursor(self)
 
     def commit(self):
         self.commits += 1
@@ -83,8 +128,8 @@ class _CapConn:
 
 
 class _CapMySQL:
-    def __init__(self):
-        self.conn = _CapConn()
+    def __init__(self, **conn_kw):
+        self.conn = _CapConn(**conn_kw)
 
     def get(self):
         return self.conn
@@ -107,12 +152,18 @@ class _FakeCursors:
 
 
 class _Ctx:
-    def __init__(self, mysql=None):
+    def __init__(self, mysql=None, **conn_kw):
         self.config = {"batch_size": 100, "exec_batch": 50}
-        self.mysql = mysql or _CapMySQL()
+        self.mysql = mysql or _CapMySQL(**conn_kw)
         self.cursors = _FakeCursors()
         self.symbols = ["BTCUSDT"]
         self.dry_run = False
+
+
+def _reset_ctx_probe():
+    """ctx 探测为模块级缓存：用例间复位，避免上一用例的降级判定串场。"""
+    ts._ctx_dst_state.clear()
+    ts._ctx_alter_denied = False
 
 
 def _rows_of(conn: _CapConn) -> list[tuple]:
@@ -193,9 +244,21 @@ CREATE TABLE twelve_sim_position (
     leverage       REAL NOT NULL DEFAULT 1,
     position_pct   REAL, stop_loss REAL, take_profit REAL,
     cur_price      REAL, unrealized_pnl REAL,
-    status         TEXT NOT NULL DEFAULT 'open');
-INSERT INTO twelve_sim_position VALUES
-  (1,'BTCUSDT','1h','turtle','long',60000,{NOW - 600},0.01,60,10,10,59000,62000,60500,5,'open');
+    status         TEXT NOT NULL DEFAULT 'open',
+    cancel_reason  TEXT, canceled_ts REAL, reject_reason TEXT,
+    ctx_regime TEXT, ctx_regime_dir TEXT, ctx_atr_pct REAL,
+    ctx_vol_bucket TEXT, ctx_wyckoff TEXT, ctx_funding REAL,
+    ctx_oi_btc_chg REAL, ctx_hour_utc INTEGER, ctx_btc_trend TEXT,
+    context_tags TEXT, size_factor REAL);
+INSERT INTO twelve_sim_position
+  (id, symbol, tf, system, direction, entry_price, entry_ts, qty, margin,
+   leverage, position_pct, stop_loss, take_profit, cur_price, unrealized_pnl,
+   status, ctx_regime, ctx_regime_dir, ctx_atr_pct, ctx_vol_bucket,
+   ctx_wyckoff, ctx_funding, ctx_oi_btc_chg, ctx_hour_utc, ctx_btc_trend,
+   context_tags, size_factor) VALUES
+  (1,'BTCUSDT','1h','turtle','long',60000,{NOW - 600},0.01,60,10,10,59000,
+   62000,60500,5,'open','trending','bullish',1.25,'mid','acc-C',0.0001,3.2,7,
+   'bullish','vol_confirmed',1.0);
 CREATE TABLE twelve_sim_trade (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol          TEXT NOT NULL, tf TEXT NOT NULL, system TEXT NOT NULL,
@@ -212,12 +275,26 @@ CREATE TABLE twelve_sim_trade (
     exit_reason     TEXT NOT NULL,
     pnl             REAL NOT NULL,
     pnl_pct         REAL, rr REAL, balance_after REAL,
-    holding_minutes REAL);
-INSERT INTO twelve_sim_trade VALUES
+    holding_minutes REAL,
+    funding_fee     REAL,
+    ctx_regime TEXT, ctx_regime_dir TEXT, ctx_atr_pct REAL,
+    ctx_vol_bucket TEXT, ctx_wyckoff TEXT, ctx_funding REAL,
+    ctx_oi_btc_chg REAL, ctx_hour_utc INTEGER, ctx_btc_trend TEXT,
+    context_tags TEXT, size_factor REAL);
+INSERT INTO twelve_sim_trade
+  (id, symbol, tf, system, name_cn, direction, entry_price, entry_ts,
+   exit_price, exit_ts, qty, margin, leverage, stop_loss, take_profit,
+   exit_reason, pnl, pnl_pct, rr, balance_after, holding_minutes,
+   ctx_regime, ctx_regime_dir, ctx_atr_pct, ctx_vol_bucket, ctx_wyckoff,
+   ctx_funding, ctx_oi_btc_chg, ctx_hour_utc, ctx_btc_trend, context_tags,
+   size_factor) VALUES
   (1,'BTCUSDT','1h','turtle','海龟','long',60000,{NOW - 7200},61000,{NOW - 3600},
-   0.01,60,10,59000,62000,'tp',10,16.67,2.0,110,60.4),
+   0.01,60,10,59000,62000,'tp',10,16.67,2.0,110,60.4,
+   'ranging','neutral',0.85,'low','dist-B',-0.0002,-1.5,3,'bearish',
+   'osc_in_trend,counter_trend',0.25),
   (2,'BTCUSDT','4h','gann','江恩','short',61000,{NOW - 7000},60500,{NOW - 3500},
-   0.02,120,10,62000,60000,'sl',-10,-8.33,-1.0,90,58.6);
+   0.02,120,10,62000,60000,'sl',-10,-8.33,-1.0,90,58.6,
+   NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);
 CREATE TABLE twelve_sim_signal_log (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     ts           REAL NOT NULL,
@@ -298,8 +375,12 @@ check("5.entry/exit epoch→DATETIME(3)", bool(t1) and isinstance(t1[7], str)
 res5b = ts.sync_sim_trade(ctx5)
 check("5.重跑幂等 0 新行，游标不动", res5b.rows == 0
       and ctx5.cursors.get("jarvis_sim_trade") == "2")
+_TRADE_INS_COLS = ("(id, symbol, tf, system, name_cn, direction, entry_price, "
+                   "entry_ts, exit_price, exit_ts, qty, margin, leverage, "
+                   "stop_loss, take_profit, exit_reason, pnl, pnl_pct, rr, "
+                   "balance_after, holding_minutes)")
 ac = sqlite3.connect(src_db)
-ac.execute(f"INSERT INTO twelve_sim_trade VALUES "
+ac.execute(f"INSERT INTO twelve_sim_trade {_TRADE_INS_COLS} VALUES "
            f"(3,'BTCUSDT','1d','martingale','马丁','long',60000,{NOW - 100},60100,"
            f"{NOW - 50},0.01,60,10,59000,61000,'flip',1,1.67,0.5,111,0.8)")
 ac.commit()
@@ -310,7 +391,7 @@ check("5.新增后只推增量 1 行，游标=3", res5c.rows == 1
 # 断网仿真：sink 抛错 → 任务上抛（框架记 error），游标必须不动
 ctx5.mysql.conn.broken = True
 ac = sqlite3.connect(src_db)
-ac.execute(f"INSERT INTO twelve_sim_trade VALUES "
+ac.execute(f"INSERT INTO twelve_sim_trade {_TRADE_INS_COLS} VALUES "
            f"(4,'BTCUSDT','1h','gap','缺口','short',60000,{NOW - 40},59900,{NOW - 20},"
            f"0.01,60,10,60500,59500,'timeout',1,1.67,1.0,112,0.3)")
 ac.commit()
@@ -364,6 +445,50 @@ lc.close()
 res55c = ts.sync_sim_signal_log(ctx55)
 check("5.5.新增后只推增量 1 行，游标=3", res55c.rows == 1
       and ctx55.cursors.get("jarvis_sim_signal_log") == "3")
+
+# ══════════ 5.8) D0 ctx 列镜像（13诊断在途#4）══════════
+print("\n── 用例5.8 ctx 镜像：无权限降级 / ALTER 补列 / DDL 已执行零 ALTER ──")
+
+# a) 前述用例默认 conn 无 ALTER 权限 → 已降级旧映射：trade 行应为 22 列
+check("5.8.无 ALTER 权限降级旧映射（trade 22 列）", bool(t1) and len(t1) == 22,
+      f"len={t1 and len(t1)}")
+
+# b) allow_alter=True：幂等 ALTER 只补缺失列 → 行尾带 11 ctx 值
+_reset_ctx_probe()
+ctx58 = _Ctx(allow_alter=True)
+res58 = ts.sync_sim_trade(ctx58)
+rows58 = _rows_of(ctx58.mysql.conn)
+r1 = next((r for r in rows58 if r[0] == 1), None)
+r2 = next((r for r in rows58 if r[0] == 2), None)
+check("5.8.缺列自动 ALTER 补齐（11 条）", len(ctx58.mysql.conn.alters) == 11
+      and res58.rows == 4, f"alters={len(ctx58.mysql.conn.alters)} rows={res58.rows}")
+check("5.8.trade 带 ctx（22+11=33 列）且值透传", bool(r1) and len(r1) == 33
+      and r1[22] == "ranging" and r1[26] == "dist-B" and r1[29] == 3
+      and r1[31] == "osc_in_trend,counter_trend"
+      and abs(float(r1[32]) - 0.25) < 1e-9, str(r1 and r1[22:]))
+check("5.8.源 ctx 全 NULL 行透传 NULL", bool(r2) and len(r2) == 33
+      and r2[22] is None and r2[32] is None)
+
+# c) DDL 已手动执行（列已存在）→ 零 ALTER 直接带 ctx
+_reset_ctx_probe()
+ctx58c = _Ctx(columns={ts.TRADE_TABLE: ["id", "symbol"]
+                       + list(ts._CTX_COL_NAMES)})
+res58c = ts.sync_sim_trade(ctx58c)
+r1c = next((r for r in _rows_of(ctx58c.mysql.conn) if r[0] == 1), None)
+check("5.8.列已存在零 ALTER 且带 ctx", not ctx58c.mysql.conn.alters
+      and bool(r1c) and len(r1c) == 33, f"alters={ctx58c.mysql.conn.alters}")
+
+# d) position 同款：ALTER 补列 + 值透传（19+11=30 列）
+_reset_ctx_probe()
+ctx58d = _Ctx(allow_alter=True)
+res58d = ts.sync_sim_position(ctx58d)
+p_rows58 = _rows_of(ctx58d.mysql.conn)
+p1d = p_rows58[0] if p_rows58 else None
+check("5.8.position 带 ctx（30 列）且值透传", bool(p1d) and len(p1d) == 30
+      and p1d[19] == "trending" and p1d[23] == "acc-C"
+      and abs(float(p1d[29]) - 1.0) < 1e-9,
+      str(p1d and p1d[19:]))
+_reset_ctx_probe()
 
 # ══════════ 6) 配置回读 ══════════
 print("\n── 用例6 配置回读：懒建/业务键 upsert/幂等/断供静默 ──")

@@ -21,6 +21,12 @@
                           持仓点位跟随变更日志，关联 position_id；残留检测同 trade）
   jarvis_sim_config     ← MySQL jarvis_sim_config **反向回读** → 本地 twelve_sim_config
 
+13诊断 D0 ctx 镜像（2026-08-09，在途任务#4）：twelve_sim_position/trade 的
+11 个环境快照列（9×ctx_* + context_tags + size_factor）镜像到 MySQL 同名列。
+双端就绪才带 ctx（源缺列=旧 trader、镜像缺列=DDL 未执行时自动降级旧映射，
+同步永不因 ctx 断流）；镜像缺列时尽力幂等 ALTER 补齐，无 ALTER 权限则提示
+以 root 执行 sql/jarvis_sim_ctx_columns.sql（探测 600s 缓存，执行后自动升级）。
+
 源表列名依据（实读 jarvis_twelve_trader.py init_db()，勿凭契约草案猜列）：
   twelve_sim_wallet   : id symbol tf system name_cn principal balance equity
                         total_trades win_trades total_pnl win_rate profit_factor
@@ -33,10 +39,12 @@
                         cur_price unrealized_pnl status cancel_reason
                         canceled_ts(epoch) —— 无 unrealized_pnl_pct 列，
                         镜像侧按源同口径推导（close 口径 pnl/margin*100，见 trader L542）
+                        + D0 11 ctx 列（见 _CTX_MIRROR_COLS）
   twelve_sim_trade    : id symbol tf system name_cn direction entry_price entry_ts
                         exit_price exit_ts qty margin leverage stop_loss take_profit
                         exit_reason pnl pnl_pct rr balance_after holding_minutes(REAL)
                         —— 无独立 ts 列，镜像 src_ts 取 exit_ts（行的业务时间）
+                        + D0 11 ctx 列（见 _CTX_MIRROR_COLS）
   twelve_sim_config   : id symbol scope_tf scope_system principal leverage
                         position_pct stop_loss_pct take_profit_pct enabled(INTEGER)
                         UNIQUE(symbol, scope_tf, scope_system) —— 无 remark/时间列，
@@ -159,6 +167,107 @@ def _delete_absent(mysql_conn, table: str, seen_ids: list[int]) -> None:
         except Exception:  # noqa: BLE001 — 连接已断时 rollback 可失败，不掩盖原异常
             pass
         raise
+
+
+# ══════════════════════════════════ D0 ctx 环境快照列镜像（13诊断在途#4）
+# 列名/语义逐字对齐 jarvis_twelve_trader.CTX_COLUMNS_DDL（9×ctx_* + context_tags
+# + size_factor = 11 列，position/trade 双表同款）；MySQL 类型按 RuoYi 镜像表
+# 惯例取 VARCHAR/DECIMAL。此表同时是 sql/jarvis_sim_ctx_columns.sql 的单一事实源。
+
+_CTX_MIRROR_COLS: tuple[tuple[str, str], ...] = (
+    ("ctx_regime", "VARCHAR(16) DEFAULT NULL COMMENT '开仓时刻市场状态（trending/ranging/breakout）'"),
+    ("ctx_regime_dir", "VARCHAR(16) DEFAULT NULL COMMENT '状态方向（bullish/bearish/neutral）'"),
+    ("ctx_atr_pct", "DECIMAL(10,4) DEFAULT NULL COMMENT '该TF ATR14相对收盘价（%）'"),
+    ("ctx_vol_bucket", "VARCHAR(8) DEFAULT NULL COMMENT '波动率分档（low/mid/high）'"),
+    ("ctx_wyckoff", "VARCHAR(16) DEFAULT NULL COMMENT '1h威科夫语境 side-phase（如 acc-C）'"),
+    ("ctx_funding", "DECIMAL(12,8) DEFAULT NULL COMMENT '该币最新8h资金费率（正=多头付）'"),
+    ("ctx_oi_btc_chg", "DECIMAL(10,4) DEFAULT NULL COMMENT 'BTC OI变化%（全市场杠杆水位代理口径）'"),
+    ("ctx_hour_utc", "INT DEFAULT NULL COMMENT '开仓UTC小时（0-23，时段归因）'"),
+    ("ctx_btc_trend", "VARCHAR(16) DEFAULT NULL COMMENT 'BTC 1h regime方向（带动过滤诊断）'"),
+    ("context_tags", "VARCHAR(255) DEFAULT NULL COMMENT 'D2+上下文标签（逗号串）'"),
+    ("size_factor", "DECIMAL(10,4) DEFAULT NULL COMMENT 'D2+降权系数乘积（1.0=无降权）'"),
+)
+_CTX_COL_NAMES = tuple(c for c, _ in _CTX_MIRROR_COLS)
+
+# 镜像侧 ctx 就绪探测缓存：table -> (probe_ts, ready)。ready=True 终身有效；
+# False 带 TTL——手动执行 DDL 后运行中的 sync 最迟 10 分钟自动带上 ctx 列。
+_CTX_PROBE_TTL_S = 600.0
+_ctx_dst_state: dict[str, tuple[float, bool]] = {}
+_ctx_alter_denied = False   # 无 ALTER 权限时进程内只试一轮，不刷日志
+
+
+def _src_has_ctx(src_table: str) -> bool:
+    """源表（本地 twelve_sim_*）是否已有 11 个 ctx 列（旧 trader 库降级判定）。"""
+    try:
+        with _local_db() as src:
+            src.execute(
+                f"SELECT {', '.join(_CTX_COL_NAMES)} FROM {src_table} LIMIT 1"
+            ).fetchall()
+        return True
+    except Exception:  # noqa: BLE001 — 缺表/缺列都按「源未就绪」降级
+        return False
+
+
+def _ctx_missing_cols(mysql_conn, table: str) -> list[tuple[str, str]]:
+    with mysql_conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = DATABASE() AND table_name = %s", (table,))
+        have = {str(r[0]).lower() for r in cur.fetchall()}
+    return [(c, ddl) for c, ddl in _CTX_MIRROR_COLS if c.lower() not in have]
+
+
+def _ctx_dst_ready(mysql_conn, table: str) -> bool:
+    """镜像表 11 个 ctx 列是否可写；缺列时尽力幂等 ALTER（只补缺失列）。
+
+    无 ALTER 权限（1142/1044/1227 等）→ 降级为旧列映射继续同步（ctx 留
+    NULL），并提示以 root 执行 sql/jarvis_sim_ctx_columns.sql；探测结果按
+    _CTX_PROBE_TTL_S 缓存，DDL 手动执行后自动升级，同步永不因 ctx 断流。
+    """
+    global _ctx_alter_denied
+    now = time.time()
+    hit = _ctx_dst_state.get(table)
+    if hit and (hit[1] or now - hit[0] < _CTX_PROBE_TTL_S):
+        return hit[1]
+    try:
+        missing = _ctx_missing_cols(mysql_conn, table)
+    except Exception as e:  # noqa: BLE001 — 探测失败按未就绪，不影响主同步
+        log.warning("[%s] ctx 列探测失败（%s），本轮按旧列映射同步", table, e)
+        _ctx_dst_state[table] = (now, False)
+        return False
+    if not missing:
+        _ctx_dst_state[table] = (now, True)
+        return True
+    if not _ctx_alter_denied:
+        try:
+            with mysql_conn.cursor() as cur:
+                for col, ddl in missing:
+                    cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+            mysql_conn.commit()
+            log.info("[%s] 已幂等补齐 %s 个 ctx 镜像列", table, len(missing))
+            _ctx_dst_state[table] = (now, True)
+            return True
+        except Exception as e:  # noqa: BLE001 — 权限不足走 DDL 文件路线
+            try:
+                mysql_conn.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            _ctx_alter_denied = True
+            log.warning(
+                "[%s] ctx 列缺失且 ALTER 被拒（%s）——按旧列映射降级同步，"
+                "请以 root 执行 sql/jarvis_sim_ctx_columns.sql，执行后自动升级",
+                table, e)
+    _ctx_dst_state[table] = (now, False)
+    return False
+
+
+def _ctx_enabled(mysql_conn, table: str, src_table: str) -> bool:
+    """双端就绪才带 ctx 列（任一端缺列自动降级旧映射，同步不断流）。"""
+    return _ctx_dst_ready(mysql_conn, table) and _src_has_ctx(src_table)
+
+
+def _ctx_values(r) -> tuple:
+    return tuple(r[c] for c in _CTX_COL_NAMES)
 
 
 # hist 归档列（去掉 create_time；trade_id 对应镜像列 id，reset_epoch/archived_at 归档侧生成）
@@ -353,29 +462,32 @@ def sync_sim_wallet(ctx: SyncContext) -> TaskResult:
 # ══════════════════════════════════════════════════════ 持仓（全量镜像 status）
 
 
-_SQL_POSITION_SRC = (
-    "SELECT id, symbol, tf, system, direction, entry_price, entry_ts, qty, "
+_POSITION_SRC_COLS = (
+    "id, symbol, tf, system, direction, entry_price, entry_ts, qty, "
     "margin, leverage, position_pct, stop_loss, take_profit, cur_price, "
-    "unrealized_pnl, status, cancel_reason, canceled_ts "
-    "FROM twelve_sim_position WHERE id > ? ORDER BY id LIMIT ?"
+    "unrealized_pnl, status, cancel_reason, canceled_ts"
 )
 
-_SQL_POSITION_DST = (
-    f"INSERT INTO {POSITION_TABLE} "
-    "(id, symbol, tf, system_code, direction, entry_price, entry_time, qty, "
-    " margin, leverage, position_pct, stop_loss, take_profit, cur_price, "
-    " unrealized_pnl, unrealized_pnl_pct, status, cancel_reason, cancel_time) "
-    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-    "ON DUPLICATE KEY UPDATE "
-    "symbol=VALUES(symbol), tf=VALUES(tf), system_code=VALUES(system_code), "
-    "direction=VALUES(direction), entry_price=VALUES(entry_price), "
-    "entry_time=VALUES(entry_time), qty=VALUES(qty), margin=VALUES(margin), "
-    "leverage=VALUES(leverage), position_pct=VALUES(position_pct), "
-    "stop_loss=VALUES(stop_loss), take_profit=VALUES(take_profit), "
-    "cur_price=VALUES(cur_price), unrealized_pnl=VALUES(unrealized_pnl), "
-    "unrealized_pnl_pct=VALUES(unrealized_pnl_pct), status=VALUES(status), "
-    "cancel_reason=VALUES(cancel_reason), cancel_time=VALUES(cancel_time)"
+_POSITION_DST_COLS = (
+    "id", "symbol", "tf", "system_code", "direction", "entry_price",
+    "entry_time", "qty", "margin", "leverage", "position_pct", "stop_loss",
+    "take_profit", "cur_price", "unrealized_pnl", "unrealized_pnl_pct",
+    "status", "cancel_reason", "cancel_time",
 )
+
+
+def _upsert_sql(table: str, cols: tuple[str, ...], with_ctx: bool) -> str:
+    """镜像 upsert SQL 构建（PK=id 覆盖式）；with_ctx 时尾接 11 个 ctx 列。"""
+    all_cols = cols + (_CTX_COL_NAMES if with_ctx else ())
+    ph = ",".join(["%s"] * len(all_cols))
+    upd = ", ".join(f"{c}=VALUES({c})" for c in all_cols if c != "id")
+    return (f"INSERT INTO {table} ({', '.join(all_cols)}) VALUES ({ph}) "
+            f"ON DUPLICATE KEY UPDATE {upd}")
+
+
+def _src_sql(base_cols: str, src_table: str, with_ctx: bool) -> str:
+    cols = base_cols + (", " + ", ".join(_CTX_COL_NAMES) if with_ctx else "")
+    return f"SELECT {cols} FROM {src_table} WHERE id > ? ORDER BY id LIMIT ?"
 
 
 def _upnl_pct(pnl, margin) -> Optional[float]:
@@ -404,11 +516,14 @@ def sync_sim_position(ctx: SyncContext) -> TaskResult:
         return TaskResult(error="mysql unavailable (backoff)")
     batch = int(ctx.config["batch_size"])
     exec_batch = int(ctx.config["exec_batch"])
+    with_ctx = _ctx_enabled(mysql_conn, POSITION_TABLE, "twelve_sim_position")
+    src_sql = _src_sql(_POSITION_SRC_COLS, "twelve_sim_position", with_ctx)
+    dst_sql = _upsert_sql(POSITION_TABLE, _POSITION_DST_COLS, with_ctx)
 
     total = 0
     seen_ids: list[int] = []
     try:
-        for rows in _paged_full_scan(_SQL_POSITION_SRC, batch):
+        for rows in _paged_full_scan(src_sql, batch):
             payload = [(
                 r["id"], r["symbol"], r["tf"], r["system"], r["direction"],
                 r["entry_price"], _dt8(r["entry_ts"]), r["qty"], r["margin"],
@@ -416,9 +531,9 @@ def sync_sim_position(ctx: SyncContext) -> TaskResult:
                 r["cur_price"], r["unrealized_pnl"],
                 _upnl_pct(r["unrealized_pnl"], r["margin"]), r["status"],
                 r["cancel_reason"], _dt8(r["canceled_ts"]),
-            ) for r in rows]
+            ) + (_ctx_values(r) if with_ctx else ()) for r in rows]
             seen_ids.extend(int(r["id"]) for r in rows)
-            _upsert_many(mysql_conn, _SQL_POSITION_DST, payload, exec_batch)
+            _upsert_many(mysql_conn, dst_sql, payload, exec_batch)
             total += len(payload)
     except Exception as e:  # noqa: BLE001 — 源表懒建容忍
         tol = _tolerate_missing(POSITION_TABLE, e)
@@ -433,29 +548,17 @@ def sync_sim_position(ctx: SyncContext) -> TaskResult:
 # ══════════════════════════════════════════════════════ 成交流水（id 游标增量）
 
 
-_SQL_TRADE_SRC = (
-    "SELECT id, symbol, tf, system, name_cn, direction, entry_price, entry_ts, "
+_TRADE_SRC_COLS = (
+    "id, symbol, tf, system, name_cn, direction, entry_price, entry_ts, "
     "exit_price, exit_ts, qty, margin, leverage, stop_loss, take_profit, "
-    "exit_reason, pnl, pnl_pct, rr, balance_after, holding_minutes "
-    "FROM twelve_sim_trade WHERE id > ? ORDER BY id LIMIT ?"
+    "exit_reason, pnl, pnl_pct, rr, balance_after, holding_minutes"
 )
 
-_SQL_TRADE_DST = (
-    f"INSERT INTO {TRADE_TABLE} "
-    "(id, symbol, tf, system_code, name_cn, direction, entry_price, entry_time, "
-    " exit_price, exit_time, qty, margin, leverage, stop_loss, take_profit, "
-    " exit_reason, pnl, pnl_pct, rr, balance_after, holding_minutes, src_ts) "
-    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-    "ON DUPLICATE KEY UPDATE "
-    "symbol=VALUES(symbol), tf=VALUES(tf), system_code=VALUES(system_code), "
-    "name_cn=VALUES(name_cn), direction=VALUES(direction), "
-    "entry_price=VALUES(entry_price), entry_time=VALUES(entry_time), "
-    "exit_price=VALUES(exit_price), exit_time=VALUES(exit_time), "
-    "qty=VALUES(qty), margin=VALUES(margin), leverage=VALUES(leverage), "
-    "stop_loss=VALUES(stop_loss), take_profit=VALUES(take_profit), "
-    "exit_reason=VALUES(exit_reason), pnl=VALUES(pnl), pnl_pct=VALUES(pnl_pct), "
-    "rr=VALUES(rr), balance_after=VALUES(balance_after), "
-    "holding_minutes=VALUES(holding_minutes), src_ts=VALUES(src_ts)"
+_TRADE_DST_COLS = (
+    "id", "symbol", "tf", "system_code", "name_cn", "direction", "entry_price",
+    "entry_time", "exit_price", "exit_time", "qty", "margin", "leverage",
+    "stop_loss", "take_profit", "exit_reason", "pnl", "pnl_pct", "rr",
+    "balance_after", "holding_minutes", "src_ts",
 )
 
 
@@ -472,6 +575,9 @@ def sync_sim_trade(ctx: SyncContext) -> TaskResult:
         return TaskResult(error="mysql unavailable (backoff)")
     batch = int(ctx.config["batch_size"])
     exec_batch = int(ctx.config["exec_batch"])
+    with_ctx = _ctx_enabled(mysql_conn, TRADE_TABLE, "twelve_sim_trade")
+    src_sql = _src_sql(_TRADE_SRC_COLS, "twelve_sim_trade", with_ctx)
+    dst_sql = _upsert_sql(TRADE_TABLE, _TRADE_DST_COLS, with_ctx)
     state = {"cursor": int(ctx.cursors.get(TRADE_TABLE) or 0)}
     try:
         state["cursor"] = _detect_source_reset(
@@ -488,7 +594,7 @@ def sync_sim_trade(ctx: SyncContext) -> TaskResult:
     while True:
         try:
             with _local_db() as src:
-                rows = src.execute(_SQL_TRADE_SRC, (state["cursor"], batch)).fetchall()
+                rows = src.execute(src_sql, (state["cursor"], batch)).fetchall()
         except Exception as e:  # noqa: BLE001 — 源表懒建容忍
             tol = _tolerate_missing(TRADE_TABLE, e)
             if tol is not None:
@@ -513,8 +619,8 @@ def sync_sim_trade(ctx: SyncContext) -> TaskResult:
                 r["leverage"], r["stop_loss"], r["take_profit"], r["exit_reason"],
                 r["pnl"], r["pnl_pct"], r["rr"], r["balance_after"],
                 int(round(float(hold))) if hold is not None else None, exit_ts,
-            ))
-        _upsert_many(mysql_conn, _SQL_TRADE_DST, payload, exec_batch)
+            ) + (_ctx_values(r) if with_ctx else ()))
+        _upsert_many(mysql_conn, dst_sql, payload, exec_batch)
         # 游标从不后退：写 MySQL commit 成功后才推进并落盘
         state["cursor"] = int(rows[-1]["id"])
         ctx.cursors.set(TRADE_TABLE, str(state["cursor"]))
