@@ -219,12 +219,21 @@ TREND_FILTER_MODE_DEFAULT = "deweight"
 CTX_DEWEIGHT_REGIME_DEFAULT = 0.5
 CTX_DEWEIGHT_COUNTER_DEFAULT = 0.5
 CTX_MEANREV_SYSTEMS_DEFAULT = ("oscillator", "triple_rsi")
+# D4 funding/OI 拥挤度：资金费率热且顺拥挤方向 → crowded_side 降权（拥挤侧遇
+# 反向清算级联最受伤）；叠加 OI 24h 激增 → 追加 crowded_hot 再乘一次系数；
+# 反拥挤侧 → contrarian_side 纯标记（factor=1，归因对照组）。
+CTX_FUNDING_HOT_DEFAULT = 0.0005      # 每 8h 费率绝对值阈值
+CTX_OI_SURGE_PCT_DEFAULT = 5.0        # OI 24h 激增阈值（%）
+CTX_DEWEIGHT_CROWDED_DEFAULT = 0.6
 CONTEXT_TAG_CN = {
     "vol_suspect": "量能/CVD 不确认突破（假突破嫌疑）",
     "vol_confirmed": "量能/CVD 确认突破",
     "osc_in_trend": "均值回归系统在趋势市逆势开仓（趋势市毒药语境）",
     "breakout_in_range": "突破系统在震荡市开仓（假突破高发语境）",
     "counter_trend": "逆 1h 威科夫高周期趋势（短周期逆势）",
+    "crowded_side": "顺资金费拥挤方向开仓（拥挤侧清算级联风险）",
+    "crowded_hot": "拥挤侧叠加 OI 激增（杠杆快速堆积）",
+    "contrarian_side": "逆资金费拥挤方向开仓（反拥挤侧对照组）",
 }
 
 # 门禁拒单原因 → 中文留痕说明（写进 twelve_sim_signal_log.note，看板/复盘直读）
@@ -1138,6 +1147,28 @@ def _volume_context(sym: str, tf: str) -> dict | None:
     return out
 
 
+def _crowd_context(sym: str) -> tuple[float | None, float | None]:
+    """D4 拥挤度取数 → (该币 funding 费率, OI 24h 变化率%)；任一不可得落 None。
+
+    复用 jarvis_market_intel.get_intel()（模块级 TTL + 后台刷新，与 D0 快照
+    同一数据源，零新增出网端点）。OI 变化率是 intel 的 BTC 口径（市场杠杆
+    温度计代理指标），与 ctx_oi_btc_chg 落库字段同源同义。
+    """
+    funding = oi_chg = None
+    try:
+        import jarvis_market_intel as jmi
+        intel = jmi.get_intel()
+        rates = intel.get("funding_rate") or {}
+        if rates.get(sym) is not None:
+            funding = float(rates[sym])
+        oi = intel.get("oi") or {}
+        if oi.get("change_pct") is not None:
+            oi_chg = float(oi["change_pct"])
+    except Exception:  # noqa: BLE001 — 眼睛坏了=不打标，绝不阻塞
+        return None, None
+    return funding, oi_chg
+
+
 def _context_layers(sym: str, tf: str, system: str, direction: str,
                     params: dict, now: float) -> dict:
     """信号侧上下文层总装（开仓/成交前对 params 打标降权；逐层独立容错）。
@@ -1211,6 +1242,33 @@ def _context_layers(sym: str, tf: str, system: str, direction: str,
                                _gate_num("twelve_ctx_deweight_counter",
                                          CTX_DEWEIGHT_COUNTER_DEFAULT),
                                f"{CONTEXT_TAG_CN['counter_trend']}：1h {side}-{phase}")
+    except Exception:  # noqa: BLE001
+        pass
+    # D4：funding/OI 拥挤度——资金费率热时，顺拥挤方向（funding>0 做多 /
+    # funding<0 做空）打 crowded_side 降权；叠加 OI 24h 激增追加 crowded_hot
+    # 再乘一次系数；反拥挤侧打 contrarian_side 纯标记（factor=1 对照组）。
+    # funding 不热 / 取数失败 → 本层零动作。
+    try:
+        funding, oi_chg = _crowd_context(sym)
+        hot = _gate_num("twelve_ctx_funding_hot", CTX_FUNDING_HOT_DEFAULT)
+        if funding is not None and hot > 0 and abs(funding) >= hot:
+            crowded_dir = "long" if funding > 0 else "short"
+            if direction == crowded_dir:
+                dw = _gate_num("twelve_ctx_deweight_crowded",
+                               CTX_DEWEIGHT_CROWDED_DEFAULT)
+                _apply_context(
+                    params, "crowded_side", dw,
+                    f"{CONTEXT_TAG_CN['crowded_side']}：funding={funding:+.4%}")
+                if (oi_chg is not None
+                        and oi_chg >= _gate_num("twelve_ctx_oi_surge_pct",
+                                                CTX_OI_SURGE_PCT_DEFAULT)):
+                    _apply_context(
+                        params, "crowded_hot", dw,
+                        f"{CONTEXT_TAG_CN['crowded_hot']}：OI 24h {oi_chg:+.1f}%")
+            else:
+                _apply_context(params, "contrarian_side", 1.0,
+                               f"{CONTEXT_TAG_CN['contrarian_side']}"
+                               f"：funding={funding:+.4%}")
     except Exception:  # noqa: BLE001
         pass
     return params

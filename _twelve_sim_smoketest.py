@@ -75,6 +75,9 @@ jtt._volume_context = lambda sym, tf: None
 # D3 市场状态打桩：全局无分类结果（真实 provider 经 regime_classifier 拉 3×200
 # 根 K 线出网）；D3 用例分节换桩
 jtt._ctx_regime_of = lambda sym: None
+# D4 拥挤度打桩：全局无 funding/OI（真实 provider 经 market_intel 出网）；
+# D4 用例分节换桩
+jtt._crowd_context = lambda sym: (None, None)
 
 # ── 门禁配置隔离（亏损止血 S1+ 开仓门禁链）────────────────────────────────
 # jarvis_config 路径指到临时目录：冒烟绝不读/写用户真实 ~/.vibe-trading 配置
@@ -1488,6 +1491,95 @@ with jtt._conn() as conn:
     conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
 for _tf, _sys in [("5m", "gap"), ("15m", "oscillator"), ("1h", "turtle")]:
     set_signal(_tf, _sys, "neutral", None)
+
+# ═══════════ 24. D4 funding/OI 拥挤度上下文层（打标降权，绝不拒单） ═══════════
+check("D4 配置登记：funding_hot 0.0005 + oi_surge 5.0 + deweight_crowded 0.6",
+      jc.default_config().get("twelve_ctx_funding_hot") == 0.0005
+      and jc.default_config().get("twelve_ctx_oi_surge_pct") == 5.0
+      and jc.default_config().get("twelve_ctx_deweight_crowded") == 0.6)
+
+T14 = T13 + 96 * 3600
+_PRICE["v"] = 100.0
+
+# a) funding 热（+0.001 > 0.0005 且 > 0）→ 多单=顺拥挤方向 crowded_side 降权
+#    0.6（margin 10→6）；OI 不激增（None）不追加 crowded_hot
+jtt._crowd_context = lambda sym: (0.001, None)
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.0, "take_profit": 103.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T14)
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("5m", "gap")]
+check("D4a：funding 热顺拥挤多单 → 成交（不拒单）margin 10→6 + crowded_side",
+      len(op) == 1 and abs(op[0]["margin"] - 6.0) < 1e-9
+      and op[0]["context_tags"] == "crowded_side"
+      and op[0]["size_factor"] == 0.6,
+      str((op, out["symbols"][SYM]["rejected"])))
+
+# b) 同 funding 语境反向空单 = 反拥挤侧 → contrarian_side 纯标记不降权
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+set_signal("5m", "gap", "bearish",
+           {"side": "short", "entry": 100.0, "stop_loss": 101.0, "take_profit": 97.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T14 + 60)
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("5m", "gap")]
+check("D4b：反拥挤空单 → contrarian_side 纯标记（margin=10 不降权）",
+      len(op) == 1 and abs(op[0]["margin"] - 10.0) < 1e-9
+      and op[0]["context_tags"] == "contrarian_side"
+      and op[0]["size_factor"] == 1.0, str(op))
+
+# c) funding 热 + OI 24h 激增（+6% ≥ 5%）→ crowded_side + crowded_hot 系数
+#    连乘（0.6×0.6=0.36，margin 10→3.6）
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+jtt._crowd_context = lambda sym: (0.001, 6.0)
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.0, "take_profit": 103.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T14 + 120)
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("5m", "gap")]
+check("D4c：拥挤 + OI 激增 → 双标签连乘 margin 10→3.6（0.6×0.6）",
+      len(op) == 1 and abs(op[0]["margin"] - 3.6) < 1e-9
+      and op[0]["context_tags"] == "crowded_side,crowded_hot"
+      and abs(op[0]["size_factor"] - 0.36) < 1e-9, str(op))
+
+# d) funding 负热（-0.001）→ 空单成拥挤方向降权；funding 不热（0.0001）→ 零标签
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+jtt._crowd_context = lambda sym: (-0.001, None)
+set_signal("5m", "gap", "bearish",
+           {"side": "short", "entry": 100.0, "stop_loss": 101.0, "take_profit": 97.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T14 + 180)
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("5m", "gap")]
+check("D4d：负 funding 热 → 空单为拥挤方向（margin 10→6 + crowded_side）",
+      len(op) == 1 and abs(op[0]["margin"] - 6.0) < 1e-9
+      and op[0]["context_tags"] == "crowded_side", str(op))
+
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+jtt._crowd_context = lambda sym: (0.0001, 8.0)   # 不热：OI 激增也不打标（先决条件）
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.0, "take_profit": 103.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T14 + 240)
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("5m", "gap")]
+check("D4e：funding 不热 → OI 激增也零标签（margin=10）",
+      len(op) == 1 and abs(op[0]["margin"] - 10.0) < 1e-9
+      and op[0]["context_tags"] is None
+      and op[0]["size_factor"] == 1.0, str(op))
+
+# 复位：拥挤度回全局空桩 + 清场
+jtt._crowd_context = lambda sym: (None, None)
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+    conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
+set_signal("5m", "gap", "neutral", None)
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS ✅")

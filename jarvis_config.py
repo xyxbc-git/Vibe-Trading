@@ -257,6 +257,13 @@ DEFAULTS: dict = {
     "twelve_ctx_deweight_counter": 0.5,   # 威科夫逆势仓位系数
     "twelve_ctx_meanrev_systems": [       # 均值回归系统（趋势市毒药自述者）
         "oscillator", "triple_rsi"],
+    # ── 13诊断 D4：funding/OI 拥挤度上下文层（jarvis_twelve_trader）─────────────
+    # 资金费率热（|funding| ≥ 阈值）时顺拥挤方向开仓 → crowded_side 打标降权
+    # （拥挤侧遇反向清算级联最受伤）；叠加 OI 24h 激增 → 追加 crowded_hot
+    # 再乘一次系数；反拥挤侧 → contrarian_side 纯标记（归因对照组）。
+    "twelve_ctx_funding_hot": 0.0005,     # funding 热阈值（每 8h 费率绝对值）
+    "twelve_ctx_oi_surge_pct": 5.0,       # OI 24h 激增阈值（%，正向增仓）
+    "twelve_ctx_deweight_crowded": 0.6,   # 拥挤侧仓位系数（1.0=不降权）
     # ── 13诊断 D1：归因报表稳定亏识别阈值（jarvis_dashboard /api/twelve/attribution）──
     # stable_losers 候选门槛：样本 ≥ min_samples 且 胜率 < max_winrate 且 净亏，
     # 作 D7 反向影子验证的输入；仅统计筛选，不影响交易引擎。
@@ -358,6 +365,9 @@ GROUPS: dict[str, str] = {
     "twelve_ctx_deweight_regime": "signal",
     "twelve_ctx_deweight_counter": "signal",
     "twelve_ctx_meanrev_systems": "signal",
+    "twelve_ctx_funding_hot": "signal",
+    "twelve_ctx_oi_surge_pct": "signal",
+    "twelve_ctx_deweight_crowded": "signal",
     # data——数据/回测口径
     "backtest_cost_bps": "data",
     "ws_stream_kline": "data",
@@ -473,6 +483,9 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "twelve_ctx_deweight_suspect": (0.05, 1.0),  # 降权下限 0.05：绝不降到 0 断样本
     "twelve_ctx_deweight_regime": (0.05, 1.0),
     "twelve_ctx_deweight_counter": (0.05, 1.0),
+    "twelve_ctx_funding_hot": (0.00001, 0.01),   # 每 8h 费率绝对值阈值
+    "twelve_ctx_oi_surge_pct": (0.5, 100.0),     # OI 24h 激增阈值（%）
+    "twelve_ctx_deweight_crowded": (0.05, 1.0),  # 降权下限 0.05：绝不降到 0 断样本
 }
 
 # 允许的枚举键。
