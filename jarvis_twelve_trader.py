@@ -229,6 +229,13 @@ CTX_MEANREV_SYSTEMS_DEFAULT = ("oscillator", "triple_rsi")
 CTX_FUNDING_HOT_DEFAULT = 0.0005      # 每 8h 费率绝对值阈值
 CTX_OI_SURGE_PCT_DEFAULT = 5.0        # OI 24h 激增阈值（%）
 CTX_DEWEIGHT_CROWDED_DEFAULT = 0.6
+# D6 S3/S4 门禁模式化：熔断/低置信拒单=样本断流（诊断实验场最怕），默认
+# deweight 打标降权继续跑；reject 回退旧硬拒单（零回归通道）。TF 显式停用
+# （twelve_tf_enabled=0）是运营指令，两种 mode 下都保持硬拒。
+CB_MODE_DEFAULT = "deweight"
+TF_GATE_MODE_DEFAULT = "deweight"
+CB_DEWEIGHT_DEFAULT = 0.25
+TF_DEWEIGHT_DEFAULT = 0.5
 CONTEXT_TAG_CN = {
     "vol_suspect": "量能/CVD 不确认突破（假突破嫌疑）",
     "vol_confirmed": "量能/CVD 确认突破",
@@ -238,6 +245,14 @@ CONTEXT_TAG_CN = {
     "crowded_side": "顺资金费拥挤方向开仓（拥挤侧清算级联风险）",
     "crowded_hot": "拥挤侧叠加 OI 激增（杠杆快速堆积）",
     "contrarian_side": "逆资金费拥挤方向开仓（反拥挤侧对照组）",
+    "breaker_deweight": "信号×周期战绩熔断中（降权观察继续攒样本）",
+    "tf_lowconf": "信号置信低于该周期置信档（降权放行）",
+}
+
+# D6 门禁降权标签 → (系数配置键, 默认系数)；_apply_gate_tags 查表打标
+GATE_TAG_FACTORS = {
+    "breaker_deweight": ("twelve_cb_deweight", CB_DEWEIGHT_DEFAULT),
+    "tf_lowconf": ("twelve_tf_deweight", TF_DEWEIGHT_DEFAULT),
 }
 
 # 门禁拒单原因 → 中文留痕说明（写进 twelve_sim_signal_log.note，看板/复盘直读）
@@ -1114,6 +1129,16 @@ def _ctx_tags_str(params: dict) -> str | None:
     return ",".join(t["tag"] for t in tags) or None
 
 
+def _apply_gate_tags(params: dict, tags: list[str] | None) -> dict:
+    """D6：_pre_gate 返回的门禁降权标签落进 params（查 GATE_TAG_FACTORS 取
+    系数，复用 _apply_context 幂等连乘 + 留痕链路）。未知标签忽略。"""
+    for t in tags or []:
+        key, dft = GATE_TAG_FACTORS.get(t, (None, None))
+        if key:
+            _apply_context(params, t, _gate_num(key, dft))
+    return params
+
+
 def _log_context(conn, sym: str, tf: str, system: str, position_id: int,
                  price: float, now: float, params: dict) -> None:
     """上下文打标留痕（change_kinds='context'）：不静默丢弃降权原因，
@@ -1851,17 +1876,28 @@ def _trend_context(sym: str) -> tuple[str | None, str | None]:
 
 
 def _pre_gate(conn, sym: str, tf: str, system: str, direction: str,
-              strength: float, now: float) -> tuple[str | None, bool]:
-    """信号级门禁链（参数无关，开仓/挂计划/成交前置）→ (reject_reason|None, 试探标记)。
+              strength: float, now: float) -> tuple[str | None, bool, list[str]]:
+    """信号级门禁链（参数无关，开仓/挂计划/成交前置）
+    → (reject_reason|None, 试探标记, 门禁降权标签列表)。
 
     链序：S4 周期门禁（TF 开关 + 置信档）→ S5 高周期逆势过滤 → S3 战绩熔断。
+    D6 起 S4 置信档 / S3 熔断默认 mode=deweight：不拒单，返回标签由调用方经
+    _apply_gate_tags 打标降权（tf_lowconf×0.5 / breaker_deweight×0.25），信号
+    继续跑、样本继续攒；mode=reject 回退旧硬拒单（零回归通道，行为与 D6 前
+    字节级一致）。TF 显式停用（twelve_tf_enabled=0）是运营指令，两种 mode
+    下都保持硬拒。deweight 模式下熔断半开试探自动旁路（一直在跑无需试探），
+    _breaker_on_close 战绩簿记与 trip/recover 状态机原样保留。
     """
-    # S4 周期再平衡：TF 停用 / 信号强度低于该 TF 置信档 → 拒 'tf_gate'
+    tags: list[str] = []
+    # S4 周期再平衡：TF 停用 → 拒 'tf_gate'（mode 无关）；置信不足 → 按 mode
     if _tf_gate_num("twelve_tf_enabled", tf, TF_ENABLED_DEFAULT, 1.0) < 0.5:
-        return "tf_gate", False
+        return "tf_gate", False, []
     if strength < _tf_gate_num("twelve_tf_min_confidence", tf,
                                TF_MIN_CONF_DEFAULT, 0.0):
-        return "tf_gate", False
+        if str(_gate_cfg("twelve_tf_gate_mode",
+                         TF_GATE_MODE_DEFAULT)).lower() == "reject":
+            return "tf_gate", False, []
+        tags.append("tf_lowconf")
     # S5 高周期趋势逆势过滤：仅短周期生效；1h 威科夫 dist-C/D/E 逆多、acc-C/D/E 逆空。
     # D3 起默认 mode=deweight——本处不再拒单，改由 _context_layers 打标降权继续跑
     # （诊断实验场纪律：不关信号只降权）；mode=reject 回退旧硬拒单（零回归通道）。
@@ -1874,8 +1910,16 @@ def _pre_gate(conn, sym: str, tf: str, system: str, direction: str,
         if phase in TREND_FILTER_PHASES and (
                 (side == "dist" and direction == "long")
                 or (side == "acc" and direction == "short")):
-            return "counter_trend", False
-    return _breaker_gate(conn, sym, tf, system, now)
+            return "counter_trend", False, []
+    # S3 战绩熔断：mode=reject 走旧 _breaker_gate（拒单/冷却半开试探）；
+    # mode=deweight 熔断中（tripped/probing）打标降权继续跑，试探机制旁路
+    if str(_gate_cfg("twelve_cb_mode", CB_MODE_DEFAULT)).lower() == "reject":
+        reason, probe = _breaker_gate(conn, sym, tf, system, now)
+        return reason, probe, ([] if reason else tags)
+    row = _breaker_row(conn, sym, tf, system)
+    if row and str(row["state"]) in ("tripped", "probing"):
+        tags.append("breaker_deweight")
+    return None, False, tags
 
 
 def _maybe_update_plan(conn, pen: dict, pts: dict, price: float,
@@ -1922,7 +1966,8 @@ def _maybe_update_plan(conn, pen: dict, pts: dict, price: float,
 
 
 def _fill_plan(conn, pen: dict, plan: dict | None, eff: dict, balance: float,
-               price: float, now: float) -> dict | None:
+               price: float, now: float,
+               pre_tags: list[str] | None = None) -> dict | None:
     """计划触达成交：以计划 entry 价转正式持仓（entry_ts=成交时刻），
     SL/TP/杠杆/qty 经 _resolve_entry_params 基于 entry 价合成回填；
     成交落 twelve_sim_signal_log 留痕（change_kinds=fill）。
@@ -1941,6 +1986,7 @@ def _fill_plan(conn, pen: dict, plan: dict | None, eff: dict, balance: float,
         return {"rejected": True, "reason": risk}
     _context_layers(str(pen["symbol"]), tf, str(pen["system"]),
                     str(pen["direction"]), params, now)   # D2+：成交时刻打标降权
+    _apply_gate_tags(params, pre_tags)   # D6：成交时刻门禁降权标签（同时刻重评）
     sf = float(params.get("size_factor") or 1.0)
     margin = round(min(balance, balance * params["position_pct"] / 100.0 * sf), 8)
     qty = round(margin * params["leverage"] / entry, 8)
@@ -2183,15 +2229,15 @@ def _cycle_symbol(sym: str, cfg: dict, now: float | None = None) -> dict:
                     pendings.pop(slot)
                     continue
                 # S3+：成交时刻再过一次信号级门禁（挂单期间战绩/配置可能已恶化）
-                gate, probe = _pre_gate(conn, sym, tf_, system_,
-                                        str(pen["direction"]),
-                                        float((sig or {}).get("strength") or 0.0), ts)
+                gate, probe, gtags = _pre_gate(
+                    conn, sym, tf_, system_, str(pen["direction"]),
+                    float((sig or {}).get("strength") or 0.0), ts)
                 if gate:
                     res["rejected"].append(_reject_plan(conn, pen, gate, price, ts))
                     pendings.pop(slot)
                     continue
                 filled = _fill_plan(conn, pen, (sig or {}).get("plan"),
-                                    eff, balance, price, ts)
+                                    eff, balance, price, ts, pre_tags=gtags)
                 if filled is None:
                     # 点位相对 entry 不自洽（配置/信号漂移）→ 宁缺毋滥失效
                     res["canceled"].append(
@@ -2286,9 +2332,11 @@ def _cycle_symbol(sym: str, cfg: dict, now: float | None = None) -> dict:
                 continue   # 槽位已爆仓，停开
             plan = sig.get("plan")
             pts = _plan_points(plan)
-            # S3+ 信号级门禁链（战绩熔断等）：开仓与挂计划都在此前置拦截
-            gate, probe = _pre_gate(conn, sym, tf, system, direction,
-                                    float(sig.get("strength") or 0.0), ts)
+            # S3+ 信号级门禁链（战绩熔断等）：开仓与挂计划都在此前置拦截。
+            # D6：gtags 门禁降权标签——立即开仓在下方落 params；挂计划(pending)
+            # 不落（成交时刻 _pre_gate 重评，用成交时刻的门禁状态打标）
+            gate, probe, gtags = _pre_gate(conn, sym, tf, system, direction,
+                                           float(sig.get("strength") or 0.0), ts)
             if gate:
                 rej = _do_reject(conn, sym, tf, system, direction, gate,
                                  float((pts or {}).get("entry") or price),
@@ -2316,6 +2364,7 @@ def _cycle_symbol(sym: str, cfg: dict, now: float | None = None) -> dict:
                 if rej:
                     res["rejected"].append(rej)
                 continue
+            _apply_gate_tags(params, gtags)   # D6：门禁降权标签落 params
             opened = _do_open(conn, sym, tf, system,
                               direction, price, balance, params, ts)
             if probe:

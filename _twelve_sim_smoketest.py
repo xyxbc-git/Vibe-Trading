@@ -844,6 +844,7 @@ check("S3 配置登记：cb 五键默认值（窗口30/样本10/胜率15/净亏1
       and jc.default_config().get("twelve_cb_cooldown_hours") == 24.0)
 
 _GATES["twelve_cb_min_trades"] = 10   # 开熔断（其余四键走新默认）
+_GATES["twelve_cb_mode"] = "reject"   # 本节验 S3 旧硬拒单口径（D6 后为回退档）
 T5 = time.time()
 with jtt._conn() as conn:   # 清掉 4h/dow 槽位历史台账，战绩窗口从注入数据起算
     conn.execute("DELETE FROM twelve_sim_trade WHERE symbol=? AND tf='4h' "
@@ -952,8 +953,9 @@ check("S3f：recovered 后正常开仓（reset 前旧战绩不再触发熔断）
            if (o["tf"], o["system"]) == ("4h", "dow")]) == 1
       and not r_sym["rejected"], str((r_sym["opened"], r_sym["rejected"])))
 
-# 复位：关熔断 + 清场
+# 复位：关熔断 + mode 回 D6 默认 deweight + 清场
 _GATES["twelve_cb_min_trades"] = 9999
+del _GATES["twelve_cb_mode"]
 with jtt._conn() as conn:
     conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
     conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
@@ -966,6 +968,7 @@ check("S4 配置登记：twelve_tf_enabled 全开 / twelve_tf_min_confidence 5m=
       and jc.default_config().get("twelve_tf_min_confidence", {}).get("15m") == 0.0)
 
 _GATES["twelve_tf_min_confidence"] = dict(jtt.TF_MIN_CONF_DEFAULT)   # 开 S4 置信档
+_GATES["twelve_tf_gate_mode"] = "reject"   # 本节验 S4 旧硬拒单口径（D6 后为回退档）
 _PRICE["v"] = 100.0
 
 # a) 5m 低置信（0.6 < 0.75）→ 拒单 tf_gate
@@ -1013,9 +1016,10 @@ check("S4d：twelve_tf_enabled 关掉 5m → 高置信 0.9 也全拒 tf_gate",
       and not [o for o in out["symbols"][SYM]["opened"]
                if o["tf"] == "5m"], str(out["symbols"][SYM]["rejected"]))
 
-# 复位：旧口径 + 清场
+# 复位：旧口径 + mode 回 D6 默认 deweight + 清场
 _GATES["twelve_tf_enabled"] = {tf: 1 for tf in jtt.TFS}
 _GATES["twelve_tf_min_confidence"] = {tf: 0.0 for tf in jtt.TFS}
+del _GATES["twelve_tf_gate_mode"]
 with jtt._conn() as conn:
     conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
     conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
@@ -1668,6 +1672,148 @@ with jtt._conn() as conn:
     conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
     conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
 set_signal("5m", "gap", "neutral", None)
+
+# ═══════════ 26. D6 S3 熔断 / S4 置信档 → 标签+动态降权模式改造 ═══════════
+check("D6 配置登记：cb/tf_gate mode 默认 deweight + 降权 0.25/0.5",
+      jc.default_config().get("twelve_cb_mode") == "deweight"
+      and jc.default_config().get("twelve_tf_gate_mode") == "deweight"
+      and jc.default_config().get("twelve_cb_deweight") == 0.25
+      and jc.default_config().get("twelve_tf_deweight") == 0.5)
+
+T16 = T15 + 96 * 3600
+_PRICE["v"] = 100.0
+
+
+def _inject_breaker(tf: str, system: str, ts: float) -> None:
+    """直接注入 tripped 熔断行（簿记事实来源；模拟熔断中组合）。"""
+    with jtt._conn() as conn:
+        conn.execute("DELETE FROM twelve_sim_breaker WHERE symbol=? AND tf=? "
+                     "AND system=?", (SYM, tf, system))
+        conn.execute(
+            "INSERT INTO twelve_sim_breaker (symbol, tf, system, state, "
+            "tripped_ts, probe_position_id, reset_ts, trip_count, updated_ts) "
+            "VALUES (?,?,?,'tripped',?,NULL,0,1,?)", (SYM, tf, system, ts, ts))
+
+
+# a) mode=deweight（默认）：熔断中信号 → 成交且 margin×0.25 + breaker_deweight，
+#    breaker 状态仍 tripped（簿记保留），无半开试探
+_inject_breaker("4h", "dow", T16)
+set_signal("4h", "dow", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 95.0, "take_profit": 110.0})
+out = jtt.run_cycle(cfg={}, now=T16)
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("4h", "dow")]
+bs = [b for b in jtt.breaker_states(SYM) if (b["tf"], b["system"]) == ("4h", "dow")]
+check("D6a：熔断中 + mode=deweight → 成交（不拒单）margin 10→2.5 + breaker_deweight",
+      len(op) == 1 and abs(op[0]["margin"] - 2.5) < 1e-9
+      and op[0]["context_tags"] == "breaker_deweight"
+      and op[0]["size_factor"] == 0.25,
+      str((op, out["symbols"][SYM]["rejected"])))
+check("D6a：熔断簿记保留（state 仍 tripped，无试探标记）",
+      len(bs) == 1 and bs[0]["state"] == "tripped"
+      and bs[0]["probe_position_id"] is None, str(bs))
+
+# b) mode=reject（回退档）：同熔断同信号 → 拒单 circuit_breaker（S3 旧口径零回归）
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+_GATES["twelve_cb_mode"] = "reject"
+set_signal("4h", "dow", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 95.0, "take_profit": 110.0})
+out = jtt.run_cycle(cfg={}, now=T16 + 60)
+rej = [r for r in out["symbols"][SYM]["rejected"]
+       if (r["tf"], r["system"]) == ("4h", "dow")]
+check("D6b：同熔断 + mode=reject → 拒单 circuit_breaker（回退旧口径）",
+      len(rej) == 1 and rej[0]["reason"] == "circuit_breaker"
+      and not out["symbols"][SYM]["opened"], str(rej))
+del _GATES["twelve_cb_mode"]
+set_signal("4h", "dow", "neutral", None)
+
+# c) S4 置信档 mode=deweight：5m 强度 0.6 < 0.75 → 成交且 margin×0.5 + tf_lowconf
+_GATES["twelve_tf_min_confidence"] = dict(jtt.TF_MIN_CONF_DEFAULT)
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.0, "take_profit": 103.0},
+           strength=0.6)
+out = jtt.run_cycle(cfg={}, now=T16 + 120)
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("5m", "gap")]
+check("D6c：5m 低置信 + mode=deweight → 成交 margin 10→5 + tf_lowconf",
+      len(op) == 1 and abs(op[0]["margin"] - 5.0) < 1e-9
+      and op[0]["context_tags"] == "tf_lowconf"
+      and op[0]["size_factor"] == 0.5,
+      str((op, out["symbols"][SYM]["rejected"])))
+
+# d) S4 mode=reject（回退档）：同信号 → 拒单 tf_gate（S4 旧口径零回归）
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+_GATES["twelve_tf_gate_mode"] = "reject"
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.0, "take_profit": 103.0},
+           strength=0.6)
+out = jtt.run_cycle(cfg={}, now=T16 + 180)
+rej = [r for r in out["symbols"][SYM]["rejected"]
+       if (r["tf"], r["system"]) == ("5m", "gap")]
+check("D6d：5m 低置信 + mode=reject → 拒单 tf_gate（回退旧口径）",
+      len(rej) == 1 and rej[0]["reason"] == "tf_gate"
+      and not out["symbols"][SYM]["opened"], str(rej))
+del _GATES["twelve_tf_gate_mode"]
+
+# e) TF 显式停用是运营指令：deweight 模式下也硬拒 tf_gate（语义不变）。
+#    点位与 D6d 拉开 >0.2%（_do_reject 同因同点位防重，避免留痕被去重跳过）
+_GATES["twelve_tf_enabled"] = {"5m": 0, "15m": 1, "30m": 1, "1h": 1, "4h": 1, "1d": 1}
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 98.5, "take_profit": 104.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T16 + 240)
+rej = [r for r in out["symbols"][SYM]["rejected"]
+       if (r["tf"], r["system"]) == ("5m", "gap")]
+check("D6e：twelve_tf_enabled=0 → deweight 模式下仍硬拒 tf_gate（运营开关语义不变）",
+      len(rej) == 1 and rej[0]["reason"] == "tf_gate"
+      and not out["symbols"][SYM]["opened"], str(rej))
+_GATES["twelve_tf_enabled"] = {tf: 1 for tf in jtt.TFS}
+
+# f) 双标签连乘：5m 槽位熔断中 + 低置信 → tf_lowconf,breaker_deweight
+#    0.5×0.25=0.125（margin 10→1.25）
+_inject_breaker("5m", "gap", T16)
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.0, "take_profit": 103.0},
+           strength=0.6)
+out = jtt.run_cycle(cfg={}, now=T16 + 300)
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("5m", "gap")]
+check("D6f：低置信 + 熔断中双标签连乘 → margin 10→1.25（0.5×0.25）",
+      len(op) == 1 and abs(op[0]["margin"] - 1.25) < 1e-9
+      and op[0]["context_tags"] == "tf_lowconf,breaker_deweight"
+      and abs(op[0]["size_factor"] - 0.125) < 1e-9, str(op))
+
+# g) 挂计划 → 成交时刻重评门禁标签：熔断中 breakout 计划触达 → 成交时刻
+#    打 breaker_deweight（高置信 0.9 无 tf_lowconf）
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 104.0, "entry_type": "breakout",
+            "stop_loss": 99.0, "take_profit": 112.0}, strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T16 + 360)
+check("D6g：熔断中 breakout 计划先挂单（deweight 不拦挂计划）",
+      len([p for p in out["symbols"][SYM]["planned"]
+           if (p["tf"], p["system"]) == ("5m", "gap")]) == 1,
+      str(out["symbols"][SYM]))
+_PRICE["v"] = 105.0
+out = jtt.run_cycle(cfg={}, now=T16 + 420)
+fl = [f for f in out["symbols"][SYM]["filled"]
+      if (f["tf"], f["system"]) == ("5m", "gap")]
+check("D6g：计划触达 → 成交时刻打 breaker_deweight（size_factor=0.25）",
+      len(fl) == 1 and fl[0]["context_tags"] == "breaker_deweight"
+      and fl[0]["size_factor"] == 0.25, str(fl))
+
+# 复位：清熔断注入 + 置信档归零 + 清场
+_GATES["twelve_tf_min_confidence"] = {tf: 0.0 for tf in jtt.TFS}
+_PRICE["v"] = 100.0
+with jtt._conn() as conn:
+    conn.execute("DELETE FROM twelve_sim_breaker WHERE symbol=?", (SYM,))
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+    conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
+for _tf, _sys in [("5m", "gap"), ("4h", "dow")]:
+    set_signal(_tf, _sys, "neutral", None)
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS ✅")

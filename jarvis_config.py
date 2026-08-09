@@ -269,6 +269,15 @@ DEFAULTS: dict = {
     "twelve_ctx_funding_hot": 0.0005,     # funding 热阈值（每 8h 费率绝对值）
     "twelve_ctx_oi_surge_pct": 5.0,       # OI 24h 激增阈值（%，正向增仓）
     "twelve_ctx_deweight_crowded": 0.6,   # 拥挤侧仓位系数（1.0=不降权）
+    # ── 13诊断 D6：S3 熔断 / S4 置信档 → 标签+动态降权模式改造 ──────────────────
+    # 熔断/低置信拒单 = 该组合样本断流（诊断实验场最怕）；默认 deweight：
+    # 信号继续跑，熔断中打 breaker_deweight×0.25、低置信打 tf_lowconf×0.5。
+    # reject=回退旧硬拒单行为（零回归通道）。twelve_tf_enabled=0 显式停用
+    # 是运营指令，两种 mode 下都保持硬拒。熔断战绩簿记/状态机原样保留。
+    "twelve_cb_mode": "deweight",
+    "twelve_tf_gate_mode": "deweight",
+    "twelve_cb_deweight": 0.25,           # 熔断中仓位系数（1.0=不降权）
+    "twelve_tf_deweight": 0.5,            # 低置信仓位系数（1.0=不降权）
     # ── 13诊断 D1：归因报表稳定亏识别阈值（jarvis_dashboard /api/twelve/attribution）──
     # stable_losers 候选门槛：样本 ≥ min_samples 且 胜率 < max_winrate 且 净亏，
     # 作 D7 反向影子验证的输入；仅统计筛选，不影响交易引擎。
@@ -374,6 +383,10 @@ GROUPS: dict[str, str] = {
     "twelve_ctx_funding_hot": "signal",
     "twelve_ctx_oi_surge_pct": "signal",
     "twelve_ctx_deweight_crowded": "signal",
+    "twelve_cb_mode": "risk",
+    "twelve_tf_gate_mode": "risk",
+    "twelve_cb_deweight": "risk",
+    "twelve_tf_deweight": "risk",
     # data——数据/回测口径
     "backtest_cost_bps": "data",
     "ws_stream_kline": "data",
@@ -493,6 +506,8 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "twelve_ctx_funding_hot": (0.00001, 0.01),   # 每 8h 费率绝对值阈值
     "twelve_ctx_oi_surge_pct": (0.5, 100.0),     # OI 24h 激增阈值（%）
     "twelve_ctx_deweight_crowded": (0.05, 1.0),  # 降权下限 0.05：绝不降到 0 断样本
+    "twelve_cb_deweight": (0.05, 1.0),
+    "twelve_tf_deweight": (0.05, 1.0),
 }
 
 # 允许的枚举键。
@@ -502,6 +517,8 @@ ENUMS: dict[str, tuple[str, ...]] = {
     "ws_kline_interval": ("1m", "3m", "5m", "15m", "1h"),
     "ws_depth_speed": ("100ms", "250ms", "500ms"),
     "twelve_trend_filter_mode": ("reject", "deweight"),
+    "twelve_cb_mode": ("reject", "deweight"),
+    "twelve_tf_gate_mode": ("reject", "deweight"),
 }
 
 
