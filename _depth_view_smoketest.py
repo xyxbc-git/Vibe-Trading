@@ -67,6 +67,49 @@ out4 = jdv.aggregate_book([["abc", "1"], ["59990", "-2"], ["59980", "1"]],
                           [["60010", "x"]], bucket=10)
 check("坏数据-跳过", len(out4["bids"]) == 1 and out4["asks"] == [])
 
+# ── 8) futures_snapshot_book：方案 A 合约快照纠偏（注入 jcd._get / 封禁）──
+import time as _time  # noqa: E402
+
+import jarvis_crypto_data as _jcd  # noqa: E402
+import jarvis_net as _jnet  # noqa: E402
+
+_orig_get = _jcd._get
+_orig_ban = _jnet.banned_until
+_now_ms = lambda: _time.time() * 1000.0  # noqa: E731
+
+try:
+    _jnet.banned_until = lambda *_: 0.0
+    _jcd._get = lambda url, params=None, **kw: {
+        "lastUpdateId": 1, "E": _now_ms(),
+        "bids": [["60000", "1"], ["59990", "2"]],
+        "asks": [["60010", "1.5"]]}
+    fb = jdv.futures_snapshot_book("btcusdt", bucket=10)
+    check("方案A-新鲜快照出载荷", bool(fb) and fb["ok"] and fb["market"] == "futures"
+          and fb["symbol"] == "BTCUSDT" and fb["mid"] == 60005
+          and fb["bids"] and fb["asks"], repr(fb)[:120])
+
+    _jcd._get = lambda url, params=None, **kw: {
+        "lastUpdateId": 1, "E": _now_ms() - 60_000,
+        "bids": [["60000", "1"]], "asks": [["60010", "1"]]}
+    check("方案A-陈旧缓存拒绝（E 龄>15s）",
+          jdv.futures_snapshot_book("BTCUSDT") is None)
+
+    _jcd._get = lambda url, params=None, **kw: {"_error": "banned"}
+    check("方案A-_error 回退 None", jdv.futures_snapshot_book("BTCUSDT") is None)
+
+    _jcd._get = lambda url, params=None, **kw: {"lastUpdateId": 1, "E": _now_ms(),
+                                                "bids": [], "asks": []}
+    check("方案A-空簿回退 None", jdv.futures_snapshot_book("BTCUSDT") is None)
+
+    called = []
+    _jcd._get = lambda url, params=None, **kw: called.append(url) or {}
+    _jnet.banned_until = lambda *_: _time.time() + 60
+    check("方案A-封禁短路零出网",
+          jdv.futures_snapshot_book("BTCUSDT") is None and not called)
+finally:
+    _jcd._get = _orig_get
+    _jnet.banned_until = _orig_ban
+
 print()
 if _FAILED:
     print(f"FAILED: {len(_FAILED)} → {_FAILED}")

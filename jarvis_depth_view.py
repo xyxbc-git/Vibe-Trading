@@ -217,6 +217,54 @@ def orderbook(symbol: str, limit: int = 500, bucket: float | None = None,
     return out
 
 
+def futures_snapshot_book(symbol: str, *, bucket: float | None = None,
+                          max_buckets: int = 30, limit: int = 500,
+                          ttl: float = 2.5, max_age_s: float = 15.0
+                          ) -> dict | None:
+    """合约 REST 深度快照 → DOM 载荷（深度阶梯方案 A：现货 WS 簿口径纠偏）。
+
+    背景：代理丢 fstream 数据帧时 WS 增量簿回退现货域，而行情主链路（顶栏价/
+    K 线）是合约口径——本地簿 mid 与顶栏存在基差。本函数拉合约域快照，供
+    /api/orderbook/live 在「WS 簿=spot 且合约域可用」时替换返回。
+
+    取数纪律（2026-08-09 防封禁加固语义，绝不裸 requests）：
+      - 走 jarvis_crypto_data._get 三道闸：ttl 秒内 TTL 直出（即本函数的限频闸）、
+        封禁短路、跨进程分钟权重预算；响应头权重水位自动记账；
+      - 出网前先查 jarvis_net 共享封禁登记，封禁期直接返回 None 零出网；
+      - _get 失败回退磁盘缓存可能给出陈旧快照（对实时 DOM 是错误语义）——
+        按响应 E 字段（事件毫秒时戳）做新鲜度门禁，龄 > max_age_s 视同失败。
+
+    返回载荷形状与 orderbook() 一致（market 恒 "futures"）；封禁/失败/陈旧
+    返回 None，调用方回退现货 WS 簿（封禁期内回退属预期行为）。
+    """
+    sym = (symbol or "BTCUSDT").upper()
+    try:
+        if _jnet.banned_until(FAPI_DEPTH):
+            return None
+        import jarvis_crypto_data as jcd
+        raw = jcd._get(FAPI_DEPTH, {"symbol": sym, "limit": int(limit)},
+                       fast=True, ttl=float(ttl))
+    except Exception:  # noqa: BLE001 — 取数层异常一律回退调用方
+        return None
+    if (not isinstance(raw, dict) or "_error" in raw
+            or not raw.get("bids") or not raw.get("asks")):
+        return None
+    try:
+        ev_ms = float(raw.get("E") or raw.get("T") or 0)
+    except (TypeError, ValueError):
+        ev_ms = 0.0
+    if ev_ms and time.time() - ev_ms / 1000.0 > max_age_s:
+        return None
+    return {
+        "ok": True,
+        "symbol": sym,
+        "market": "futures",
+        "ts": time.time(),
+        **aggregate_book(raw.get("bids") or [], raw.get("asks") or [],
+                         bucket=bucket, max_buckets=max_buckets),
+    }
+
+
 if __name__ == "__main__":
     import json
     import sys

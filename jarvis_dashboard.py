@@ -4326,20 +4326,38 @@ def api_orderbook_live(symbol: str = "BTCUSDT", bucket: float | None = None,
 
     载荷形状与 /api/depth/orderbook 一致（前端零改造）；本地簿未就绪时自动
     回退 REST 快照路径（source=rest_fallback），DepthView 永不留白。
+
+    深度阶梯方案 A（13诊断在途#3）：WS 簿回退到现货域（fstream 被代理丢帧）
+    而行情主链路是合约口径时，本地簿 mid 与顶栏价存在基差——此时改返合约
+    REST 快照（source=rest_futures，jcd._get 三道闸限频 TTL 2.5s + 新鲜度
+    门禁）；合约域封禁/失败则回退现货 WS 簿（source=ws_book，封禁期属预期），
+    代理放行 fstream 后 WS 簿回到合约域，本路径自动退位（方案 C 兼容）。
     """
     sym = symbol.upper().replace("-", "").replace("/", "")
     if not sym.endswith(("USDT", "USDC")):
         sym += "USDT"
 
     def _calc():
+        ws_spot_book = None
         try:
             import jarvis_orderbook as job
             out = job.book(sym, max_buckets=int(max_buckets), bucket=bucket)
             if out.get("ok"):
-                return out
+                if out.get("market") != "spot":
+                    return out
+                ws_spot_book = out   # 现货口径簿：先试合约快照纠偏（方案 A）
         except Exception:  # noqa: BLE001 — 引擎不可用走 REST 回退
             pass
         import jarvis_depth_view as jdv
+        if ws_spot_book is not None:
+            try:
+                fut = jdv.futures_snapshot_book(
+                    sym, bucket=bucket, max_buckets=int(max_buckets))
+            except Exception:  # noqa: BLE001 — 纠偏失败回退现货簿
+                fut = None
+            if fut and fut.get("ok"):
+                return {**fut, "source": "rest_futures", "synced": False}
+            return ws_spot_book
         # 防封禁加固：REST 回退复用 /api/depth/orderbook 的 3s 共享缓存——
         # 原先直连 jdv.orderbook（裸 requests 无 TTL 闸）被本端点 1s 缓存
         # 放大成每秒 1 次外网 depth 快照，本地簿失同步的降级期正是封禁高危期。
