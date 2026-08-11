@@ -303,7 +303,7 @@ GRANT SELECT, INSERT, UPDATE ON `jiaweisi`.`jarvis_signal_state` TO 'jarvis_sync
     "database": "jiaweisi",
     "ssl_mode": "PREFERRED", "connect_timeout": 5
   },
-  "dashboard_base_url": "http://127.0.0.1:7899",
+  "dashboard_base_url": "http://127.0.0.1:10808",
   "symbols": null,
   "table_prefix": "jarvis_",
   "groups": {

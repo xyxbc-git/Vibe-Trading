@@ -22,14 +22,9 @@ from __future__ import annotations
 import threading
 import time
 
-import requests
-
-import jarvis_net
-
 FAPI = "https://fapi.binance.com"
 FNG_API = "https://api.alternative.me/fng/"
-TIMEOUT = 5
-_HEADERS = {"User-Agent": "jarvis-market-intel/1.0"}
+TIMEOUT = 5   # 并行拉取线程 join 的等待基准（HTTP 超时已由 jcd._get 统一管理）
 
 # 资金费率展示币种（2026-08-05 任务K：对齐用户 watchlist 8 品种，premiumIndex
 # 全量拉取天然覆盖）；OI / 多空比与页面主语境一致用 BTC
@@ -48,10 +43,19 @@ _STORE: dict[str, dict] = {}
 
 
 def _get_json(url: str, params: dict | None = None):
-    jarvis_net.ensure_proxy()
-    r = requests.get(url, params=params, headers=_HEADERS, timeout=TIMEOUT)
-    r.raise_for_status()
-    return r.json()
+    """经 jcd._get 三道闸出网（TTL 直出 / 封禁短路 / 权重预算）。
+
+    [2026-08-09 封禁成因加固] 本模块此前裸 requests.get 直连——不受封禁短路
+    与分钟预算约束，且全量 ticker/24hr 单次权重 40、全量 premiumIndex 权重 10，
+    是撞爆 IP 权重额度的未记账大户。改走 jcd._get 后自动获得端点 TTL 缓存、
+    封禁/冷却短路、权重计费与降级旧缓存；失败语义保持 raise（调用方已有
+    per-项容错）。
+    """
+    import jarvis_crypto_data as jcd
+    data = jcd._get(url, params, fast=True)
+    if isinstance(data, dict) and "_error" in data:
+        raise RuntimeError(f"fetch failed: {data.get('_error')}")
+    return data
 
 
 def _display_symbols() -> tuple:

@@ -160,7 +160,7 @@ def load_config(path: str) -> dict:
         groups["market_snapshot"]["period_s"] = flat_ms
 
     # ── 其余键补默认（计划 §4）──
-    cfg.setdefault("dashboard_base_url", "http://127.0.0.1:7899")
+    cfg.setdefault("dashboard_base_url", "http://127.0.0.1:10808")
     cfg.setdefault("symbols", None)
     cfg.setdefault("table_prefix", "jarvis_")
     cfg.setdefault("batch_size", 5000)

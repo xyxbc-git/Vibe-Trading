@@ -200,7 +200,7 @@ check("默认 cb_drawdown_halt_pct=20", d["cb_drawdown_halt_pct"] == 20.0)
 check("默认 cb_position_loss_halt_pct=25", d["cb_position_loss_halt_pct"] == 25.0)
 check("默认 cb_flash_crash_24h_pct=15", d["cb_flash_crash_24h_pct"] == 15.0)
 check("默认 daemon_interval_hours=24", d["daemon_interval_hours"] == 24.0)
-check("默认 dashboard 127.0.0.1:7899",
+check("默认 dashboard 127.0.0.1:10808",
       d["dashboard_host"] == "127.0.0.1" and d["dashboard_port"] == 7899)
 check("默认 notify_timeout_s=15", d["notify_timeout_s"] == 15)
 check("每个键都有分组", all(k in jcfg.GROUPS for k in d if k != "meta"),

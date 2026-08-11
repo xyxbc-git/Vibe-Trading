@@ -610,13 +610,31 @@ def current_price(symbol: str) -> float | None:
     [任务H 方案1] fast 短预算：本函数在 /api/alerts/price 请求线程与提醒巡检里
     高频调用，上游劣化时快速失败切 OKX / 返回 None，不再拖 15s×4 重试。
     """
+    sym = _normalize_symbol(symbol)
+    # 0) WS 内存价优先（防封禁加固）：本进程 WS 引擎的 aggTrade 缓冲 15s 内
+    #    有成交直接取最新价，零 REST 出网——dashboard 顶栏 10s 轮询与提醒巡检
+    #    的价格请求在此吸收；WS 未运行/停更时才落到下方 REST 路径。
+    try:
+        import jarvis_ws_stream as jws
+        rows = jws.latest("aggTrade", sym, 1)
+        if rows:
+            d = rows[-1]
+            ts = float(d.get("T") or d.get("E") or 0) / 1000.0
+            p = float(d.get("p") or 0)
+            if p > 0 and time.time() - ts < 15.0:
+                return p
+    except Exception:  # noqa: BLE001
+        pass
     if jcd is None:
         return None
-    sym = _normalize_symbol(symbol)
     try:
-        r = jcd._get(jcd.FAPI + "/fapi/v1/ticker/price", {"symbol": sym}, fast=True)
-        if isinstance(r, dict) and r.get("price"):
-            return float(r["price"])
+        # 封禁短路：fapi 域被 IP 封禁时 _get 会静默返回磁盘旧缓存（年龄无上限，
+        # 2026-08-09 顶栏价格冻结 3 天的根因），此时跳过主源直接走 OKX 实时兜底。
+        if not jcd.jarvis_net.banned_until(jcd.FAPI):
+            r = jcd._get(jcd.FAPI + "/fapi/v1/ticker/price",
+                         {"symbol": sym}, fast=True)
+            if isinstance(r, dict) and r.get("price"):
+                return float(r["price"])
     except Exception:  # noqa: BLE001
         pass
     try:

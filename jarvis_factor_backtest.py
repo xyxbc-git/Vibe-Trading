@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -40,17 +41,45 @@ _HEADERS = {"User-Agent": "jarvis-factor-backtest/1.0"}
 
 
 def _get(url: str, params: Optional[dict] = None, retries: int = 4) -> Any:
+    """回测取数 GET。
+
+    [2026-08-09 封禁成因加固] 原版 418/429 后 sleep 重试继续撞墙（封禁期每撞
+    一次延长封禁）。现在：出网前查跨进程封禁登记短路；吃到 418/429 解析
+    "banned until" 登记共享封禁（无文案按 Retry-After/90s 登记冷却）并立即
+    停止重试。
+    """
     delay = 1.5
     last_err = None
     jarvis_net.ensure_proxy()
     for _ in range(retries):
         try:
+            ban_ts = float(jarvis_net.banned_until(url) or 0)
+        except Exception:  # noqa: BLE001
+            ban_ts = 0.0
+        if ban_ts:
+            return {"_error": "IP rate-limit banned until "
+                              + time.strftime("%H:%M:%S", time.localtime(ban_ts))}
+        try:
             r = requests.get(url, params=params, headers=_HEADERS, timeout=TIMEOUT)
             if r.status_code in (418, 429):
                 last_err = f"HTTP {r.status_code}"
-                time.sleep(delay)
-                delay *= 2
-                continue
+                body_msg = ""
+                try:
+                    body_msg = str((r.json() or {}).get("msg", ""))
+                except Exception:  # noqa: BLE001
+                    pass
+                m = re.search(r"banned until (\d{10,16})", body_msg, re.I)
+                if m:
+                    ts = float(m.group(1))
+                    jarvis_net.report_ban(url, ts / 1000.0 if ts > 1e12 else ts)
+                else:
+                    cd = 90.0
+                    try:
+                        cd = max(cd, float(r.headers.get("Retry-After") or 0))
+                    except (TypeError, ValueError):
+                        pass
+                    getattr(jarvis_net, "report_cooldown", lambda *_: None)(url, cd)
+                break
             return r.json()
         except Exception as e:  # noqa: BLE001
             last_err = repr(e)[:200]

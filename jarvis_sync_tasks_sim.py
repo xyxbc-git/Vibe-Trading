@@ -37,7 +37,8 @@
   twelve_sim_position : id symbol tf system direction entry_price entry_ts(epoch)
                         qty margin leverage position_pct stop_loss take_profit
                         cur_price unrealized_pnl status cancel_reason
-                        canceled_ts(epoch) —— 无 unrealized_pnl_pct 列，
+                        canceled_ts(epoch) reject_reason(S1 门禁拒单原因码)
+                        —— 无 unrealized_pnl_pct 列，
                         镜像侧按源同口径推导（close 口径 pnl/margin*100，见 trader L542）
                         + D0 11 ctx 列（见 _CTX_MIRROR_COLS）
   twelve_sim_trade    : id symbol tf system name_cn direction entry_price entry_ts
@@ -465,14 +466,14 @@ def sync_sim_wallet(ctx: SyncContext) -> TaskResult:
 _POSITION_SRC_COLS = (
     "id, symbol, tf, system, direction, entry_price, entry_ts, qty, "
     "margin, leverage, position_pct, stop_loss, take_profit, cur_price, "
-    "unrealized_pnl, status, cancel_reason, canceled_ts"
+    "unrealized_pnl, status, cancel_reason, canceled_ts, reject_reason"
 )
 
 _POSITION_DST_COLS = (
     "id", "symbol", "tf", "system_code", "direction", "entry_price",
     "entry_time", "qty", "margin", "leverage", "position_pct", "stop_loss",
     "take_profit", "cur_price", "unrealized_pnl", "unrealized_pnl_pct",
-    "status", "cancel_reason", "cancel_time",
+    "status", "cancel_reason", "cancel_time", "reject_reason",
 )
 
 
@@ -530,7 +531,7 @@ def sync_sim_position(ctx: SyncContext) -> TaskResult:
                 r["leverage"], r["position_pct"], r["stop_loss"], r["take_profit"],
                 r["cur_price"], r["unrealized_pnl"],
                 _upnl_pct(r["unrealized_pnl"], r["margin"]), r["status"],
-                r["cancel_reason"], _dt8(r["canceled_ts"]),
+                r["cancel_reason"], _dt8(r["canceled_ts"]), r["reject_reason"],
             ) + (_ctx_values(r) if with_ctx else ()) for r in rows]
             seen_ids.extend(int(r["id"]) for r in rows)
             _upsert_many(mysql_conn, dst_sql, payload, exec_batch)

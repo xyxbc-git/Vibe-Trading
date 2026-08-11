@@ -478,17 +478,43 @@ r1c = next((r for r in _rows_of(ctx58c.mysql.conn) if r[0] == 1), None)
 check("5.8.列已存在零 ALTER 且带 ctx", not ctx58c.mysql.conn.alters
       and bool(r1c) and len(r1c) == 33, f"alters={ctx58c.mysql.conn.alters}")
 
-# d) position 同款：ALTER 补列 + 值透传（19+11=30 列）
+# d) position 同款：ALTER 补列 + 值透传（20+11=31 列）
 _reset_ctx_probe()
 ctx58d = _Ctx(allow_alter=True)
 res58d = ts.sync_sim_position(ctx58d)
 p_rows58 = _rows_of(ctx58d.mysql.conn)
 p1d = p_rows58[0] if p_rows58 else None
-check("5.8.position 带 ctx（30 列）且值透传", bool(p1d) and len(p1d) == 30
-      and p1d[19] == "trending" and p1d[23] == "acc-C"
-      and abs(float(p1d[29]) - 1.0) < 1e-9,
-      str(p1d and p1d[19:]))
+check("5.8.position 带 ctx（31 列）且值透传", bool(p1d) and len(p1d) == 31
+      and p1d[20] == "trending" and p1d[24] == "acc-C"
+      and abs(float(p1d[30]) - 1.0) < 1e-9,
+      str(p1d and p1d[20:]))
 _reset_ctx_probe()
+
+# ══════════ 5.9) 拒单原因镜像（若依端复盘「为什么没成交」的唯一数据源）══════════
+print("\n── 用例5.9 reject_reason 镜像：门禁拒单留痕透传 ──")
+rc = sqlite3.connect(src_db)
+rc.execute(
+    "INSERT INTO twelve_sim_position (id, symbol, tf, system, direction, "
+    "entry_price, entry_ts, qty, margin, leverage, stop_loss, take_profit, "
+    "status, reject_reason) VALUES "
+    f"(99,'BTCUSDT','15m','turtle','long',60000,{NOW - 60},0.01,60,10,59900,"
+    "60200,'rejected','sl_too_tight')")
+rc.commit()
+rc.close()
+ctx59 = _Ctx()
+res59 = ts.sync_sim_position(ctx59)
+p_rows59 = _rows_of(ctx59.mysql.conn)
+p_rej = next((r for r in p_rows59 if r[0] == 99), None)
+p_open = next((r for r in p_rows59 if r[0] == 1), None)
+check("5.9.无 ctx 时基础列 20 列（含 reject_reason）",
+      bool(p_rej) and len(p_rej) == 20, f"len={p_rej and len(p_rej)}")
+check("5.9.rejected 行 reject_reason 透传", bool(p_rej)
+      and p_rej[16] == "rejected" and p_rej[19] == "sl_too_tight",
+      str(p_rej and p_rej[16:]))
+check("5.9.非拒单行 reject_reason 留 NULL 不误填", bool(p_open)
+      and p_open[19] is None, str(p_open and p_open[19]))
+check("5.9.拒单行不污染成交口径（status 原样镜像不转 closed）",
+      bool(p_rej) and p_rej[16] == "rejected")
 
 # ══════════ 6) 配置回读 ══════════
 print("\n── 用例6 配置回读：懒建/业务键 upsert/幂等/断供静默 ──")

@@ -285,12 +285,38 @@ def ingest(symbol: str, data: dict) -> None:
 
 
 def _fetch_snapshot(symbol: str, market: str) -> dict | None:
-    """拉一次深度快照（418/429 → 设全局冷却并返回 None）。仅同步线程调用。"""
+    """拉一次深度快照（418/429 → 设全局冷却并返回 None）。仅同步线程调用。
+
+    [2026-08-09 封禁成因加固] 冷却从进程内升级为跨进程：出网前查 jarvis_net
+    共享封禁登记（别的进程撞出的 418 也短路本模块）；本模块吃到 418/429 时
+    反向登记共享冷却，全系统一起退避。快照 limit=1000 权重 20，纳入共享
+    权重预算记账。
+    """
     import requests
 
     import jarvis_net as _jnet
     _jnet.ensure_proxy()
     url = FAPI_DEPTH if market == "futures" else SPOT_DEPTH
+    ban_ts = 0.0
+    try:
+        ban_ts = float(_jnet.banned_until(url) or 0)
+    except Exception:  # noqa: BLE001 — 登记层异常不阻断快照
+        pass
+    if ban_ts:
+        _SNAP["ban_until"] = max(_SNAP["ban_until"], ban_ts)
+        return None
+    try:
+        _budget = getattr(_jnet, "budget_take", None)
+        if callable(_budget):
+            try:
+                ok = _budget(url, 180, cost=20.0)
+            except TypeError:  # 旧版无 cost 参数
+                ok = _budget(url, 180)
+            if not ok:
+                _log(f"{symbol} 快照因分钟预算耗尽跳过（下轮重试）")
+                return None
+    except Exception:  # noqa: BLE001
+        pass
     try:
         r = requests.get(url, params={"symbol": symbol, "limit": SNAPSHOT_LIMIT},
                          headers=_HEADERS, timeout=TIMEOUT)
@@ -298,8 +324,26 @@ def _fetch_snapshot(symbol: str, market: str) -> dict | None:
             retry_after = float(r.headers.get("Retry-After") or 0) or BAN_DEFAULT_S
             _SNAP["ban_until"] = time.time() + retry_after
             _SNAP["bans"] += 1
+            # 反向登记共享冷却：418 尝试解析 "banned until" 精确截止，
+            # 解析不到 / 429 按 Retry-After 冷却
+            try:
+                body_msg = ""
+                try:
+                    body_msg = str((r.json() or {}).get("msg", ""))
+                except Exception:  # noqa: BLE001
+                    pass
+                import re as _re
+                m = _re.search(r"banned until (\d{10,16})", body_msg, _re.I)
+                if m:
+                    ts = float(m.group(1))
+                    _jnet.report_ban(url, ts / 1000.0 if ts > 1e12 else ts)
+                else:
+                    getattr(_jnet, "report_cooldown",
+                            lambda *_: None)(url, retry_after)
+            except Exception:  # noqa: BLE001
+                pass
             _log(f"⚠️ REST {r.status_code}（限流/封禁），全局冷却 {retry_after:.0f}s"
-                 "——冷却期内快照请求零发出")
+                 "——冷却期内快照请求零发出（已同步登记跨进程冷却）")
             return None
         r.raise_for_status()
         data = r.json()

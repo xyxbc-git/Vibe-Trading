@@ -138,6 +138,7 @@ _ENDPOINT_TTL: tuple[tuple[str, float], ...] = (
     ("/fapi/v1/premiumIndex", 30.0),
     ("/fapi/v1/fundingRate", 300.0),
     ("/fapi/v1/openInterest", 60.0),
+    ("/fapi/v1/ticker/24hr", 60.0),     # 全量无 symbol 权重 40，必须 TTL 摊薄
     ("/futures/data/", 300.0),          # OI 历史 / 多空账户比 / 主动买卖比
     ("api.alternative.me", 600.0),
     ("api.coingecko.com", 300.0),
@@ -163,19 +164,72 @@ def _budget_per_min() -> int:
         return 180
 
 
-def _budget_take(host: str, *, block: bool) -> bool:
-    """占用一次对该主机的出网额度；block=True 时最多等 15s 让滑窗腾位。
+# ── Binance 请求权重表（2026-08-09 封禁成因加固）─────────────────────────────
+# 币安按「权重/分钟/IP」限频（fapi 2400、spot 6000），不是按请求次数——
+# klines limit=500 权重 5 倍于 limit<100，全量 ticker/24hr 一次 40。旧预算按
+# 次数记账严重低估真实消耗，是反复 429→418 的成因之一。此表按官方文档估算
+# （宁高勿低），未列端点按 1 计。
+
+def _req_weight(url: str, params: Optional[dict] = None) -> float:
+    """按端点 + 参数估算币安请求权重；非币安主机返回 1。"""
+    try:
+        p = params or {}
+        lim = int(p.get("limit") or 0)
+        if "/klines" in url:
+            if lim and lim < 100:
+                return 1.0
+            if lim < 500:
+                return 2.0
+            return 5.0 if lim <= 1000 else 10.0
+        if "/depth" in url:
+            if lim and lim <= 50:
+                return 2.0
+            if lim <= 100:
+                return 5.0
+            return 10.0 if lim <= 500 else 20.0
+        if "/ticker/24hr" in url:
+            return 1.0 if p.get("symbol") else 40.0
+        if "/premiumIndex" in url:
+            return 1.0 if p.get("symbol") else 10.0
+        if "/ticker/price" in url:
+            return 1.0 if p.get("symbol") else 2.0
+        if "/exchangeInfo" in url:
+            return 1.0
+    except Exception:  # noqa: BLE001 — 权重估算失败按 1 兜底
+        pass
+    return 1.0
+
+
+def _weight_threshold() -> float:
+    """IP 维度已用权重的主动刹车水位（读响应头 X-MBX-USED-WEIGHT-1M 对比）。
+
+    fapi 官方 2400/min/IP；出口 IP 为共享代理（还有别家流量），阈值取
+    1200（50%）留足余量。配置中心 rest_weight_brake 可调。
+    """
+    try:
+        import jarvis_config as _jc
+        return float(_jc.get("rest_weight_brake") or 1200)
+    except Exception:  # noqa: BLE001
+        return 1200.0
+
+
+def _budget_take(host: str, *, block: bool, cost: float = 1.0) -> bool:
+    """占用对该主机的出网额度（权重计费）；block=True 时最多等 15s 让滑窗腾位。
 
     [任务L 治本] 优先走 jarvis_net 跨进程共享预算——daemon / dashboard / sync /
     twelvesim 多进程共用一个 IP 级真实额度（rest_max_per_min 此时语义为「全局
-    每分钟出网上限」）。共享层不可用（旧版 jarvis_net / 平台无 fcntl / 文件故障）
-    时回退进程内滑窗（原逻辑），保证向后兼容、绝不因共享层故障阻断出网。
+    每分钟出网上限」，配合 cost 即权重/分钟）。共享层不可用（旧版 jarvis_net /
+    平台无 fcntl / 文件故障）时回退进程内滑窗（次数语义），保证向后兼容、
+    绝不因共享层故障阻断出网。
     """
     budget = _budget_per_min()
     try:
         _shared = getattr(jarvis_net, "budget_take", None)
         if callable(_shared):
-            return _shared(host, budget, block=block)
+            try:
+                return _shared(host, budget, cost=cost, block=block)
+            except TypeError:  # 旧版 jarvis_net 无 cost 参数
+                return _shared(host, budget, block=block)
     except Exception:  # noqa: BLE001 — 共享层异常回退进程内
         pass
     deadline = time.time() + (15.0 if block else 0.0)
@@ -249,14 +303,31 @@ def _get(url: str, params: Optional[dict] = None, retries: Optional[int] = None,
     delay = 0.5 if fast else 1.5
     last_err = None
     host = jarvis_net._ban_key(url)
+    is_binance = host.endswith("binance.com")
+    cost = _req_weight(url, params) if is_binance else 1.0
     jarvis_net.ensure_proxy()
     for attempt in range(retries):
         last_try = attempt >= retries - 1
-        if not _budget_take(host, block=(not fast and attempt == 0)):
+        # [2026-08-09 加固] 权重水位刹车：响应头回报的 IP 已用权重逼近阈值时
+        # 主动停手（IP 是共享代理出口，本地预算看不见别家流量，响应头才是真相）
+        if is_binance and not getattr(jarvis_net, "weight_headroom",
+                                      lambda *_: True)(host, _weight_threshold()):
+            last_err = "IP 已用权重逼近上限（权重刹车拦截）"
+            break
+        if not _budget_take(host, block=(not fast and attempt == 0), cost=cost):
             last_err = "REST 分钟预算耗尽（防限频闸拦截）"
             break
         try:
             r = requests.get(url, params=params, headers=_HEADERS, timeout=TIMEOUT)
+            if is_binance:
+                try:
+                    w = float(r.headers.get("X-MBX-USED-WEIGHT-1M")
+                              or r.headers.get("x-mbx-used-weight-1m") or 0)
+                    if w > 0:
+                        getattr(jarvis_net, "report_weight",
+                                lambda *_: None)(host, w)
+                except Exception:  # noqa: BLE001 — 水位登记失败不影响主链路
+                    pass
             if r.status_code in (418, 429):
                 last_err = f"HTTP {r.status_code} rate-limited"
                 try:
@@ -266,19 +337,26 @@ def _get(url: str, params: Optional[dict] = None, retries: Optional[int] = None,
                 if _note_ban(url, body_msg):
                     last_err = body_msg or last_err
                     break
-                if not last_try:
-                    time.sleep(delay)
-                    delay *= 2
-                continue
+                # [2026-08-09 加固] 429 立即全局熔断：登记跨进程冷却
+                # （遵守 Retry-After，缺省 90s）并停止本次重试——今天正是
+                # 429 后各进程继续撞墙才升级成 418 IP 封禁。
+                cd = 90.0
+                try:
+                    cd = max(cd, float(r.headers.get("Retry-After") or 0))
+                except (TypeError, ValueError):
+                    pass
+                getattr(jarvis_net, "report_cooldown", lambda *_: None)(url, cd)
+                _degrade_log(f"429 冷却登记 host={host} {cd:.0f}s（全进程短路）")
+                break
             data = r.json()
             if isinstance(data, dict) and data.get("code") == -1003:
                 last_err = data.get("msg", "rate-limited")
-                if _note_ban(url, last_err):
-                    break
-                if not last_try:
-                    time.sleep(delay)
-                    delay *= 2
-                continue
+                if not _note_ban(url, last_err):
+                    # -1003 未携带封禁时间戳也一律全局冷却，禁止继续撞墙
+                    getattr(jarvis_net, "report_cooldown",
+                            lambda *_: None)(url, 90.0)
+                    _degrade_log(f"-1003 冷却登记 host={host} 90s（全进程短路）")
+                break
             if _is_ok(data):
                 _cache_write(key, data)
             return data

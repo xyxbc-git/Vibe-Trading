@@ -82,7 +82,7 @@ echo "      授权后 sync 下一轮自动清 tape_bar 旧 5 币（signal_change
 
 echo "==============================================="
 echo " 完成。验证："
-echo "  - curl -s http://127.0.0.1:7899/api/watchlist   应=[BTCUSDT,ETHUSDT]"
+echo "  - curl -s http://127.0.0.1:10808/api/watchlist   应=[BTCUSDT,ETHUSDT]"
 echo "  - tail -f ~/.vibe-trading/jarvis_data_degrade.log   看 418 是否消失"
 echo "  - 桌面顶栏价/K线随行情更新；顶栏「+ 添加币种」可用"
 echo "==============================================="

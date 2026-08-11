@@ -413,14 +413,22 @@ def classify_multi_tf(
 # ═══════════════════════════ K线拉取（复用 crypto_data 逻辑） ═══════════════════════════
 
 def _fetch_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame | None:
-    """从 Binance Futures 拉取 K 线。"""
+    """从 Binance Futures 拉取 K 线（经 jcd._get 三道闸 + 30s TTL 缓存）。
+
+    [2026-08-09 封禁成因加固] 此前裸 requests.get 直连（无代理外零防护）：
+    不受封禁短路 / 分钟预算 / TTL 缓存约束，封禁期持续撞墙延长封禁。
+    改走 jcd._get 后与全系统共用一套限频纪律，降级时回磁盘旧缓存。
+    """
     try:
-        import requests
-        url = "https://fapi.binance.com/fapi/v1/klines"
-        params = {"symbol": symbol, "interval": interval, "limit": limit}
-        resp = requests.get(url, params=params, timeout=15)
-        resp.raise_for_status()
-        raw = resp.json()
+        import jarvis_crypto_data as jcd
+        raw = jcd._get(jcd.FAPI + "/fapi/v1/klines",
+                       {"symbol": symbol, "interval": interval, "limit": limit},
+                       fast=True)
+        if not isinstance(raw, list) or not raw:
+            print(f"[REGIME] K线拉取失败 {symbol} {interval}: "
+                  f"{raw.get('_error') if isinstance(raw, dict) else '空返回'}",
+                  file=sys.stderr)
+            return None
         rows = []
         for k in raw:
             rows.append({

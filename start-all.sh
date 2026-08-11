@@ -52,4 +52,4 @@ echo "== 6. 启动 dashboard + 桌面（复用 start.sh）=="
 
 echo ""
 echo "== 全部启动完成（手动模式，无自愈；进程挂了自己重跑本脚本）=="
-echo "验证： curl -s http://127.0.0.1:7899/api/watchlist   应=[BTCUSDT,ETHUSDT]"
+echo "验证： curl -s http://127.0.0.1:10808/api/watchlist   应=[BTCUSDT,ETHUSDT]"

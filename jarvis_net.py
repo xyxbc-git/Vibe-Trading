@@ -195,10 +195,26 @@ _BUDGET_PATH = os.path.expanduser("~/.vibe-trading/net_budget.json")
 _BUDGET_WINDOW_S = 60.0
 
 
-def _budget_try(host: str, limit: int, now: float) -> tuple[bool, float]:
+def _win_entry(t) -> tuple[float, float] | None:
+    """窗口条目归一化：旧格式裸时间戳(视为 cost=1) / 新格式 [ts, cost]。"""
+    if isinstance(t, (int, float)):
+        return float(t), 1.0
+    if isinstance(t, (list, tuple)) and len(t) == 2:
+        try:
+            return float(t[0]), max(0.0, float(t[1]))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _budget_try(host: str, limit: int, now: float,
+                cost: float = 1.0) -> tuple[bool, float]:
     """加锁读改写共享窗口：授权记账返回 (True, 0)，超限返回 (False, 需等秒数)。
 
-    平台无 fcntl / 文件异常时抛出，由 budget_take 兜底放行。
+    [2026-08-09 权重计费] 窗口条目由裸时间戳升级为 [ts, cost]（读侧兼容旧格式），
+    limit 语义随调用方传入的 cost 而定：cost 恒为 1 时即旧「次数/分钟」，
+    传交易所权重时即「权重/分钟」。平台无 fcntl / 文件异常时抛出，由
+    budget_take 兜底放行。
     """
     import fcntl
     os.makedirs(os.path.dirname(_BUDGET_PATH), exist_ok=True)
@@ -213,22 +229,24 @@ def _budget_try(host: str, limit: int, now: float) -> tuple[bool, float]:
                     raw = {}
             except Exception:  # noqa: BLE001 — 文件损坏视为空窗口
                 raw = {}
-            win = [float(t) for t in raw.get(host, [])
-                   if isinstance(t, (int, float))]
-            win = [t for t in win if now - t < _BUDGET_WINDOW_S]
-            if len(win) < limit:
-                win.append(now)
+            win = [e for e in (_win_entry(t) for t in raw.get(host, []))
+                   if e is not None and now - e[0] < _BUDGET_WINDOW_S]
+            used = sum(c for _, c in win)
+            if used + cost <= limit:
+                win.append((now, cost))
                 granted, wait = True, 0.0
             else:
-                granted, wait = False, (win[0] + _BUDGET_WINDOW_S) - now
-            raw[host] = win
+                granted = False
+                wait = (win[0][0] + _BUDGET_WINDOW_S) - now if win else 1.0
+            raw[host] = [[t, c] for t, c in win]
             # 顺带清理其它 host 过期窗口，防共享文件无界增长
             for h in list(raw.keys()):
                 if h == host:
                     continue
-                kept = [t for t in raw.get(h, [])
-                        if isinstance(t, (int, float))
-                        and now - t < _BUDGET_WINDOW_S]
+                kept = [[t, c] for t, c in
+                        (e for e in (_win_entry(x) for x in raw.get(h, []))
+                         if e is not None)
+                        if now - t < _BUDGET_WINDOW_S]
                 if kept:
                     raw[h] = kept
                 else:
@@ -242,16 +260,19 @@ def _budget_try(host: str, limit: int, now: float) -> tuple[bool, float]:
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
-def budget_take(host: str, limit: int, *, block: bool = False,
+def budget_take(host: str, limit: int, *, cost: float = 1.0, block: bool = False,
                 max_wait: float = 15.0) -> bool:
-    """占用一次对 host 的 IP 级出网额度（跨进程共享 60s 滑动窗口）。
+    """占用对 host 的 IP 级出网额度（跨进程共享 60s 滑动窗口，支持权重计费）。
 
-    block=True 时最多等 max_wait 秒让滑窗腾位；limit ≤ 0 视为不限。
-    任何异常（平台无 fcntl / 文件故障）静默放行 True，由调用方进程内预算兜底。
+    cost 缺省 1（次数语义，与旧版完全一致）；传交易所请求权重时 limit 即
+    「权重/分钟」上限。block=True 时最多等 max_wait 秒让滑窗腾位；limit ≤ 0
+    视为不限。任何异常（平台无 fcntl / 文件故障）静默放行 True，由调用方
+    进程内预算兜底。
     """
     try:
         host = _ban_key(host)
         limit = int(limit)
+        cost = max(0.0, float(cost))
     except Exception:  # noqa: BLE001
         return True
     if not host or limit <= 0:
@@ -260,7 +281,7 @@ def budget_take(host: str, limit: int, *, block: bool = False,
     while True:
         now = time.time()
         try:
-            granted, wait = _budget_try(host, limit, now)
+            granted, wait = _budget_try(host, limit, now, cost)
         except Exception:  # noqa: BLE001 — 锁 / IO / 平台不支持 → 放行兜底
             return True
         if granted:
@@ -268,6 +289,72 @@ def budget_take(host: str, limit: int, *, block: bool = False,
         if now >= deadline:
             return False
         time.sleep(min(max(wait, 0.05), 0.5))
+
+
+# ── 交易所权重水位登记（X-MBX-USED-WEIGHT-1M 响应头，跨进程共享）────────────
+# 背景（2026-08-09 封禁成因加固）：本地预算只统计自家请求，但出口 IP 是共享
+# 代理——币安按 IP 计权（fapi 2400 weight/min）。响应头回报的是 IP 维度真实
+# 已用权重，把它落盘共享后，任何进程发现水位逼近阈值即主动降速，比本地
+# 预算更接近真相。登记/查询永不抛出。
+
+_WEIGHT_PATH = os.path.expanduser("~/.vibe-trading/net_weight.json")
+_WEIGHT_FRESH_S = 75.0   # 权重水位记录的有效期（超过视为过期不再拦截）
+
+
+def report_weight(url_or_host: str, used_1m: float) -> None:
+    """登记主机最近一次响应头回报的 1 分钟已用权重。写盘失败静默。"""
+    try:
+        host = _ban_key(url_or_host)
+        used = float(used_1m)
+        if not host or used <= 0:
+            return
+        data: dict = {}
+        try:
+            with open(_WEIGHT_PATH, encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                data = raw
+        except Exception:  # noqa: BLE001 — 文件缺失/损坏视为空
+            pass
+        data[host] = {"w": used, "ts": time.time()}
+        tmp = _WEIGHT_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, _WEIGHT_PATH)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def weight_headroom(url_or_host: str, threshold: float) -> bool:
+    """True=水位安全可出网；False=75s 内见过 ≥threshold 的已用权重应降速。
+
+    无记录 / 记录过期 / 任何异常一律放行 True——本函数只做「已知超标时
+    主动刹车」，不承担唯一限流职责（分钟预算仍在）。
+    """
+    try:
+        host = _ban_key(url_or_host)
+        with open(_WEIGHT_PATH, encoding="utf-8") as f:
+            raw = json.load(f)
+        rec = raw.get(host) or {}
+        if (float(rec.get("w") or 0) >= float(threshold)
+                and time.time() - float(rec.get("ts") or 0) < _WEIGHT_FRESH_S):
+            return False
+    except Exception:  # noqa: BLE001
+        pass
+    return True
+
+
+def report_cooldown(url_or_host: str, seconds: float) -> None:
+    """登记短时冷却（429 未附封禁时间时用）——复用封禁登记表跨进程短路。
+
+    与 report_ban 的差别仅在语义：这是「主动退避」而非「已被封」，但对
+    调用方的行为要求一致（冷却期内不得出网），故共用一套登记/查询。
+    只延后不提前：已有更晚的登记时不覆盖。
+    """
+    try:
+        report_ban(url_or_host, time.time() + max(1.0, float(seconds)))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 if __name__ == "__main__":
