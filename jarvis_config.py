@@ -305,6 +305,14 @@ DEFAULTS: dict = {
     # 「触发位与快照价取更差」行为（零回归通道）。止盈限价语义不动。
     "twelve_sl_slippage_pct": 0.02,   # 止损市价单常数滑点%（方向恒不利）
     "twelve_sl_fill_mode": "bar",     # bar=触发bar结算（新默认）/ poll=旧行为回退
+    # ── T2 S1 由「拒单」改「改写止损+同比例缩仓」（2026-08-11 正期望重建）────────
+    # 裁决3：止损距离区分盈亏的能力 p=0.973，S1 却拿它拒掉 65% 拒单量、把成交
+    # 速率从 146 笔/天打到 0。rewrite=SL 拉到地板距离 + qty 同比例缩（1R 守恒）
+    # 落 context_tags='sl_widened'；deweight=打标降权放行（停损切回档）；
+    # reject=回退旧硬拒单。twelve_min_sl_pct 语义降级为改写目标地板，
+    # 仅 reject 档仍用于拒单。
+    "twelve_sl_gate_mode": "rewrite",
+    "twelve_sl_deweight": 0.5,        # deweight 档窄止损仓位系数（1.0=不降权）
     # ── T7 零成交体系处置（2026-08-13 正期望重建：12 套实为 7 套）────────────
     # 诊断结论（一句话+行号，全文见开发计划 §T7）：12 套注册仅 7 套真正成交过。
     #   volatility / martingale / arbitrage —— 设计上恒 neutral 不产生方向信号
@@ -462,6 +470,9 @@ GROUPS: dict[str, str] = {
     # sim——twelve 模拟盘结算口径（T1 正期望重建）
     "twelve_sl_slippage_pct": "sim",
     "twelve_sl_fill_mode": "sim",
+    # risk——T2 窄止损改写档（正期望重建）
+    "twelve_sl_gate_mode": "risk",
+    "twelve_sl_deweight": "risk",
     # T7 零成交体系处置：12 套体系启停显式标记（dict 键，BOUNDS 不适用）
     "twelve_system_enabled": "signal",
 }

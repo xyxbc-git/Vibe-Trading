@@ -63,9 +63,12 @@
        持久化，只推信号不开仓）；冷却 twelve_cb_cooldown_hours 期满半开放行
        1 笔试探单，盈利恢复（战绩窗口重起算）/ 否则续熔断重计冷却；
        熔断/半开/恢复事件落 signal_log（change_kinds=breaker）可审计；
-     - 参数级门禁 _risk_gate（合成参数后）：止损最小距离（twelve_min_sl_pct
-       按 TF 分层）、最小盈亏比（twelve_min_rr）、费用负担
-       （twelve_fee_burden_mult × 双边费用）不满足 → 拒单不入场；
+     - 参数级门禁（合成参数后）：先过 T2 窄止损处理 _widen_stop_to_floor
+       （twelve_sl_gate_mode：rewrite 新默认=SL 拉到地板距离 + qty 同比例缩
+       （1R 守恒）落 context_tags='sl_widened'；deweight=打标降权放行；
+       reject=回退旧硬拒单 sl_too_tight），再过 _risk_gate：最小盈亏比
+       （twelve_min_rr）、费用负担（twelve_fee_burden_mult × 双边费用）、
+       D5 ATR 下限不满足 → 拒单不入场；
      - 两级门禁拒单统一落 status='rejected' + reject_reason 行 + signal_log
        留痕（不静默丢弃，S6 归因报表可按原因聚合）；挂单在成交时刻同样再验一次；
   5. 参数：止损/止盈/杠杆/仓位% 优先用 twelve_sim_config 覆盖
@@ -168,6 +171,20 @@ SL_ATR_MULT_DEFAULT = 1.5
 SL_SLIPPAGE_PCT_DEFAULT = 0.02
 SL_FILL_MODE_DEFAULT = "bar"
 
+# T2 S1 由「拒单」改「改写止损 + 同比例缩仓」（2026-08-11 正期望重建）。
+# 裁决3：止损距离在自身历史样本上区分盈亏的能力 p=0.973，而 S1 拿它拒掉了
+# 65% 的拒单量（532/823），把成交速率从 146 笔/天打到 0——付出全部样本，
+# 换来一个 p=0.973 的"改善"。但过路费地板真实存在（SL<0.1% 档 95 笔胜率
+# 9.5% 结构性必亏），所以不能删门禁，要把「拒绝」换成「改写」：
+# rewrite（新默认）：SL ← 地板距离（按 entry 重算价位）、qty 同比例缩
+#   （原距离÷地板距离，1R 名义风险守恒），落 context_tags='sl_widened'，
+#   重算 RR 交由 S2 判定，不达标仍拒 rr_too_low；
+# deweight：不改写只打标 sl_tight_deweight 降权放行（停损切回档）；
+# reject：回退旧硬拒单 sl_too_tight（零回归通道）。
+# twelve_min_sl_pct 语义降级为 rewrite/deweight 的目标地板，仅 reject 档拒单。
+SL_GATE_MODE_DEFAULT = "rewrite"
+SL_DEWEIGHT_DEFAULT = 0.5
+
 # 拒单(rejected)留痕行保留天数（与 canceled 同哲学：窗口期可复盘，到期物理清理；
 # twelve_sim_signal_log 的 reject 留痕永久保留）
 REJECTED_RETENTION_DAYS = 7
@@ -263,6 +280,8 @@ CONTEXT_TAG_CN = {
     "contrarian_side": "逆资金费拥挤方向开仓（反拥挤侧对照组）",
     "breaker_deweight": "信号×周期战绩熔断中（降权观察继续攒样本）",
     "tf_lowconf": "信号置信低于该周期置信档（降权放行）",
+    "sl_widened": "窄止损改写到地板距离 + qty 同比例缩（1R 守恒）",
+    "sl_tight_deweight": "止损距离低于地板（deweight 档降权放行）",
 }
 
 # D6 门禁降权标签 → (系数配置键, 默认系数)；_apply_gate_tags 查表打标
@@ -888,11 +907,67 @@ def _auto_leverage(entry: float, stop_loss: float, tf: str | None = None) -> flo
     return float(max(1.0, min(_tf_max_leverage(tf), math.floor(frac / dist))))
 
 
+def _sl_floor_pct(tf: str) -> float:
+    """SL 距离目标地板（%）：S1 静态分层档 twelve_min_sl_pct（按 TF）。
+
+    T2 起该键语义降级：rewrite/deweight 档作改写目标地板，reject 档才拒单。
+    """
+    return _tf_gate_num("twelve_min_sl_pct", tf, MIN_SL_PCT_BY_TF, 0.0)
+
+
+def _widen_stop_to_floor(tf: str, entry: float, params: dict) -> dict:
+    """T2：窄止损处理（两个 _risk_gate 调用点前调用，按 twelve_sl_gate_mode 分档）。
+
+    rewrite（新默认）——SL 距离 < 地板时改写而非拒绝：
+      · SL ← 地板距离（按 entry 重算价位，方向同侧）；
+      · qty 同比例缩：position_pct ×= 原距离÷地板距离——1R 名义风险守恒
+        （拉宽止损不缩仓等于放大单笔风险；缩仓后过路费绝对额同比例降，
+        fee/R 落到地板值）。缩放走 position_pct 而非 size_factor：
+        size_factor 是 D2+ 降权语义（带 CTX_MIN_SIZE_FACTOR=0.05 下限，
+        连乘会破坏 1R 守恒），二者正交互不干扰；
+      · 落 context_tags='sl_widened'（factor=缩放比），note 留痕原值/新值，
+        经 _log_context 写 signal_log 可复盘；
+      · 改写后 RR 由 _risk_gate 按新 SL 重算，不达标仍拒 rr_too_low。
+    deweight——不改写，打标 sl_tight_deweight 按 twelve_sl_deweight 降权放行；
+    reject——零动作，交由 _risk_gate 旧 sl_too_tight 硬拒（零回归通道）。
+    """
+    mode = str(_gate_cfg("twelve_sl_gate_mode", SL_GATE_MODE_DEFAULT)).lower()
+    if mode not in ("rewrite", "deweight"):
+        return params
+    try:
+        sl = float(params["stop_loss"])
+        dist = abs(entry - sl) / entry * 100.0
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return params
+    floor = _sl_floor_pct(tf)
+    if dist <= 0 or floor <= 0 or dist >= floor:
+        return params   # 达标 / 无地板 / SL 非法：零动作
+    if mode == "deweight":
+        _apply_context(params, "sl_tight_deweight",
+                       _gate_num("twelve_sl_deweight", SL_DEWEIGHT_DEFAULT),
+                       f"{CONTEXT_TAG_CN['sl_tight_deweight']}："
+                       f"SL 距离 {dist:.4g}% < 地板 {floor:.4g}%")
+        return params
+    new_sl = entry * (1.0 - floor / 100.0) if sl < entry \
+        else entry * (1.0 + floor / 100.0)
+    ratio = dist / floor
+    tags = params.setdefault("context_tags", [])
+    tags.append({"tag": "sl_widened", "factor": round(ratio, 6),
+                 "note": f"{CONTEXT_TAG_CN['sl_widened']}：SL {sl:g}→{new_sl:g}"
+                         f"（距离 {dist:.4g}%→{floor:.4g}%），"
+                         f"qty 同比例缩 ×{ratio:.4g}"})
+    params["stop_loss"] = new_sl
+    params["position_pct"] = max(1e-6, float(params["position_pct"]) * ratio)
+    return params
+
+
 def _risk_gate(tf: str, entry: float, params: dict,
                sym: str | None = None) -> str | None:
     """开仓风控门禁链（合成参数后的最终校验）→ reject_reason 或 None（放行）。
 
-    S1 止损最小距离：SL 距离(%) < 该 TF 下限 → 'sl_too_tight'；
+    S1 止损最小距离：仅 twelve_sl_gate_mode='reject' 档生效——SL 距离(%) <
+       该 TF 下限 → 'sl_too_tight'（rewrite/deweight 档由调用方先过
+       _widen_stop_to_floor 改写/降权，本档不再拒单）；
     D5 ATR 自适应档：SL 距离(%) < twelve_sl_atr_mult × 该 TF ATR14% →
        'sl_below_atr'（sym 缺省 / ATR 取数失败 / mult=0 → 跳过，静态档兜底）；
     S2 最小盈亏比：TP距离/SL距离 < twelve_min_rr → 'rr_too_low'；
@@ -905,7 +980,9 @@ def _risk_gate(tf: str, entry: float, params: dict,
         tp_dist = abs(float(params["take_profit"]) - entry) / entry * 100.0
     except (TypeError, ValueError, ZeroDivisionError):
         return None
-    if sl_dist < _tf_gate_num("twelve_min_sl_pct", tf, MIN_SL_PCT_BY_TF, 0.0):
+    if (str(_gate_cfg("twelve_sl_gate_mode", SL_GATE_MODE_DEFAULT)).lower()
+            == "reject"
+            and sl_dist < _sl_floor_pct(tf)):
         return "sl_too_tight"
     # D5：波动率自适应档（复用 D0 环境快照的 _ctx_atr TTL 缓存，零新增出网）
     mult = _gate_num("twelve_sl_atr_mult", SL_ATR_MULT_DEFAULT)
@@ -2041,6 +2118,7 @@ def _fill_plan(conn, pen: dict, plan: dict | None, eff: dict, balance: float,
     params = _resolve_entry_params(str(pen["direction"]), entry, eff, plan, tf)
     if params is None:
         return None
+    _widen_stop_to_floor(tf, entry, params)   # T2：窄止损先改写/降权再过门禁
     risk = _risk_gate(tf, entry, params, str(pen["symbol"]))
     if risk:
         return {"rejected": True, "reason": risk}
@@ -2415,6 +2493,7 @@ def _cycle_symbol(sym: str, cfg: dict, now: float | None = None) -> dict:
             params = _resolve_entry_params(direction, price, eff, plan, tf)
             if params is None:
                 continue   # 点位缺失或不自洽，宁缺毋滥
+            _widen_stop_to_floor(tf, price, params)   # T2：窄止损先改写/降权
             risk = _risk_gate(tf, price, params, sym)
             if risk:
                 # 风控门禁拦截（S1+）→ 拒单留痕，不静默丢弃

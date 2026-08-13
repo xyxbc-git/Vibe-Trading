@@ -102,6 +102,7 @@ _GATES: dict = {
     "twelve_trend_filter_enabled": 0.0,  # 旧口径无逆势过滤（且离线不触 wyckoff）
     "twelve_funding_rate": 0.0,     # 旧口径无资金费（保持整数 pnl 断言）
     "twelve_sl_slippage_pct": 0.0,  # T1 后默认 0.02：旧用例免滑点保持「结算=触发位」断言
+    "twelve_sl_gate_mode": "reject",  # T2 后默认 rewrite：旧用例按旧硬拒单口径跑
 }
 _orig_gate_cfg = jtt._gate_cfg
 jtt._gate_cfg = lambda key, default: _GATES.get(key, default)
@@ -738,7 +739,9 @@ jc.save({"twelve_min_sl_pct": {"5m": 2.0, "15m": 0.7, "30m": 1.0,
                                "1h": 1.2, "4h": 2.0, "1d": 3.0},
          "twelve_auto_lev_loss_frac": 0.25,
          "twelve_max_leverage": {"5m": 5, "15m": 8, "30m": 10,
-                                 "1h": 12, "4h": 15, "1d": 20}},
+                                 "1h": 12, "4h": 15, "1d": 20},
+         # T2 后 rewrite 为新默认：本用例验 S1 旧硬拒单口径，钉回退档
+         "twelve_sl_gate_mode": "reject"},
         source="smoketest", note="S1 热加载用例")
 out = jtt.run_cycle(cfg={})
 rej = [r for r in out["symbols"][SYM]["rejected"]
@@ -1943,6 +1946,125 @@ with jtt._conn() as conn:
 for _tf, _sys in [("5m", "gap"), ("30m", "gann"), ("15m", "oscillator"),
                   ("4h", "turtle"), ("1d", "oscillator")]:
     set_signal(_tf, _sys, "neutral", None)
+
+# ═══════════ 28. T2 S1 由「拒单」改「改写止损+同比例缩仓」（2026-08-11 正期望重建） ═══════════
+check("T2 配置登记：twelve_sl_gate_mode='rewrite' / twelve_sl_deweight=0.5 + 枚举/护栏",
+      jc.default_config().get("twelve_sl_gate_mode") == "rewrite"
+      and jc.default_config().get("twelve_sl_deweight") == 0.5
+      and jc.ENUMS.get("twelve_sl_gate_mode") == ("rewrite", "deweight", "reject")
+      and jc.BOUNDS.get("twelve_sl_deweight") == (0.05, 1.0))
+
+T18 = T17 + 96 * 3600
+_PRICE["v"] = 100.0
+# 本节口径：5m 地板 0.5%（新默认），其余 TF 无地板；杠杆走顶部旧桩（frac 0.5/cap 20）
+_GATES["twelve_min_sl_pct"] = {tf: (0.5 if tf == "5m" else 0.0) for tf in jtt.TFS}
+_GATES["twelve_sl_gate_mode"] = "rewrite"
+
+# a) rewrite（新默认档）：5m SL 距离 0.1% < 地板 0.5% → 不再拒单，改写成交：
+#    SL 99.9→99.5、pos_pct 10%→2%（×0.2）、1R 名义风险守恒（相对误差<0.5%）
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.9, "take_profit": 103.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T18)
+r_sym = out["symbols"][SYM]
+op = [o for o in r_sym["opened"] if (o["tf"], o["system"]) == ("5m", "gap")]
+check("T2a：窄止损不再拒单（rewrite 档成交，无 sl_too_tight）",
+      len(op) == 1 and not r_sym["rejected"], str((r_sym["opened"], r_sym["rejected"])))
+check("T2a：SL 改写到地板距离（99.9→99.5）且 context_tags 含 sl_widened",
+      op and abs(op[0]["stop_loss"] - 99.5) < 1e-9
+      and "sl_widened" in str(op[0]["context_tags"]), str(op))
+# 1R 守恒：改写后 |entry−SL|×qty ≈ 未改写口径 |entry−SL_old|×qty_old（同杠杆）
+_lev = op[0]["leverage"]
+_qty_old = 100.0 * 0.10 * _lev / 100.0        # balance100 × pos10% × lev ÷ entry100
+_r_old = abs(100.0 - 99.9) * _qty_old
+_r_new = abs(100.0 - op[0]["stop_loss"]) * op[0]["qty"]
+check("T2a：1R 守恒（|entry−SL|×qty 改写前后相对误差 < 0.5%）",
+      _r_old > 0 and abs(_r_new - _r_old) / _r_old < 0.005,
+      f"r_old={_r_old} r_new={_r_new} lev={_lev} qty={op[0]['qty']}")
+check("T2a：qty 同比例缩（margin 10→2，×0.2）",
+      abs(op[0]["margin"] - 2.0) < 1e-9, str(op[0]["margin"]))
+wlogs = [x for x in jtt.signal_logs(SYM, "5m", "gap")
+         if x.get("change_kinds") == "context" and "sl_widened" in str(x.get("note"))]
+check("T2a：signal_log 留痕原值/新值（99.9→99.5）",
+      wlogs and "99.9" in str(wlogs[0]["note"]) and "99.5" in str(wlogs[0]["note"]),
+      str(wlogs[:1]))
+
+# b) reject 回退档：同信号 → 拒单 sl_too_tight（与改前行为一致，零回归）
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+_GATES["twelve_sl_gate_mode"] = "reject"
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.9, "take_profit": 103.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T18 + 60)
+rej = [r for r in out["symbols"][SYM]["rejected"]
+       if (r["tf"], r["system"]) == ("5m", "gap")]
+check("T2b：reject 回退档 → 拒单 sl_too_tight（旧行为零回归）",
+      len(rej) == 1 and rej[0]["reason"] == "sl_too_tight"
+      and not out["symbols"][SYM]["opened"], str(rej))
+
+# c) deweight 档：不改写 SL（保持 99.9），打标 sl_tight_deweight 降权 ×0.5 放行
+_GATES["twelve_sl_gate_mode"] = "deweight"
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.88, "take_profit": 103.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T18 + 120)
+op = [o for o in out["symbols"][SYM]["opened"] if (o["tf"], o["system"]) == ("5m", "gap")]
+check("T2c：deweight 档 → SL 不改写（99.88）+ sl_tight_deweight 降权（margin 10→5）",
+      len(op) == 1 and abs(op[0]["stop_loss"] - 99.88) < 1e-9
+      and op[0]["context_tags"] == "sl_tight_deweight"
+      and abs(op[0]["margin"] - 5.0) < 1e-9 and op[0]["size_factor"] == 0.5,
+      str(op))
+
+# d) 挂计划触达成交路径（:1984 调用点）同样改写：breakout entry 104 / SL 103.9
+#    （距 entry 0.096% < 0.5%）→ 成交时刻 SL 改写到 104×0.995=103.48 + sl_widened
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+_GATES["twelve_sl_gate_mode"] = "rewrite"
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 104.0, "entry_type": "breakout",
+            "stop_loss": 103.9, "take_profit": 112.0}, strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T18 + 180)
+check("T2d：窄止损 breakout 先挂计划（rewrite 不拦挂单）",
+      len([p for p in out["symbols"][SYM]["planned"]
+           if (p["tf"], p["system"]) == ("5m", "gap")]) == 1,
+      str(out["symbols"][SYM]))
+_PRICE["v"] = 105.0
+out = jtt.run_cycle(cfg={}, now=T18 + 240)
+fl = [f for f in out["symbols"][SYM]["filled"]
+      if (f["tf"], f["system"]) == ("5m", "gap")]
+check("T2d：计划触达成交 → 成交时刻改写 SL（103.9→103.48）+ sl_widened",
+      len(fl) == 1 and abs(fl[0]["stop_loss"] - 104.0 * 0.995) < 1e-9
+      and "sl_widened" in str(fl[0]["context_tags"]), str(fl))
+_r_old = abs(104.0 - 103.9) * (100.0 * 0.10 * fl[0]["leverage"] / 104.0)
+_r_new = abs(104.0 - fl[0]["stop_loss"]) * fl[0]["qty"]
+check("T2d：成交路径 1R 守恒（相对误差 < 0.5%）",
+      _r_old > 0 and abs(_r_new - _r_old) / _r_old < 0.005,
+      f"r_old={_r_old} r_new={_r_new}")
+
+# e) SL 距离达标（0.8% ≥ 0.5%）→ 不改写不打标（零动作）
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+_PRICE["v"] = 100.0
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.2, "take_profit": 103.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T18 + 300)
+op = [o for o in out["symbols"][SYM]["opened"] if (o["tf"], o["system"]) == ("5m", "gap")]
+check("T2e：SL 距离达标 → 不改写不打标（SL 99.2 / margin 10 / 无标签）",
+      len(op) == 1 and abs(op[0]["stop_loss"] - 99.2) < 1e-9
+      and abs(op[0]["margin"] - 10.0) < 1e-9 and op[0]["context_tags"] is None,
+      str(op))
+
+# 复位：门禁模式回旧硬拒单桩 + 地板归零 + 清场
+_GATES["twelve_sl_gate_mode"] = "reject"
+_GATES["twelve_min_sl_pct"] = {tf: 0.0 for tf in jtt.TFS}
+_PRICE["v"] = 100.0
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+    conn.execute("DELETE FROM twelve_sim_position WHERE status='pending'")
+    conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
+set_signal("5m", "gap", "neutral", None)
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS ✅")
