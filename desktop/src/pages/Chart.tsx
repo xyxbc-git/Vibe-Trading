@@ -1232,7 +1232,8 @@ export default function Chart() {
   const [pdOn, setPdOn] = useState(toggleOr(persistedToggles, "pdOn", false));
   const smcActive = fvgOn || bosOn || pdOn;
   const { data: fvgResp } = usePolling(
-    () => (smcActive ? api.fvg(symbol, tfSettled) : Promise.resolve(null)),
+    // [R12] max_zones=30（后端 clamp 上限）：数量不设人为上限，质量过滤把关
+    () => (smcActive ? api.fvg(symbol, tfSettled, 30) : Promise.resolve(null)),
     smcActive ? 60_000 : 0,
     [smcActive, symbol, tfSettled],
   );
@@ -1242,16 +1243,15 @@ export default function Chart() {
     if (isStaleEcho(symbol, fvgResp.symbol) || (fvgResp.tf != null && fvgResp.tf !== tfSettled)) {
       return null;
     }
-    // [R10/R11] 裁剪规则：只留「还有交易价值的活缺口」——高回补（≥80%）/完全
-    // 回补/过老（>200 根）隐藏；同屏最多 6 个（检测器已按未回补优先+新鲜排序）。
+    // [R10/R11/R12] 质量过滤（「不合适」的定义）：高回补（≥80%）/完全回补/
+    // 过老（>200 根）隐藏；**数量不设上限**（R12 用户明确要求：合适的都展示；
+    // primitive 批量绘制，30 个量级无性能压力）。
     // [R11] LuxAlgo 风格画法：部分回补的缺口不截长度、改剔除已回补段——
     // 残余未回补窄带持续延伸到右缘（半回补缺口的残余仍是活跃磁吸/入场区）
     const HIDE_FILL_PCT = 80;
     const HIDE_AGE_BARS = 200;
-    const MAX_SHOWN = 6;
     const out: FvgZoneView[] = [];
     for (const z of fvgResp.zones ?? []) {
-      if (out.length >= MAX_SHOWN) break;
       if (z.mitigated || z.created_ts == null) continue;
       if ((z.fill_pct ?? 0) >= HIDE_FILL_PCT) continue;
       if ((z.age_bars ?? 0) > HIDE_AGE_BARS) continue;
