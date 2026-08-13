@@ -301,6 +301,7 @@ export default function LedgerPage() {
               <th className="px-2 py-2.5 font-medium">时间</th>
               <th className="px-2 py-2.5 font-medium">币种/方向</th>
               <th className="px-2 py-2.5 font-medium">点位（入场/止损/止盈）</th>
+              <th className="px-2 py-2.5 font-medium">本金</th>
               <th className="px-2 py-2.5 font-medium">RR</th>
               <th className="px-2 py-2.5 font-medium">情绪</th>
               <th className="px-2 py-2.5 font-medium">结果</th>
@@ -310,15 +311,19 @@ export default function LedgerPage() {
           <tbody>
             {rows.length === 0 && (
               <tr>
-                <td colSpan={8} className="px-4 py-10 text-center text-jarvis-text-secondary">
+                <td colSpan={9} className="px-4 py-10 text-center text-jarvis-text-secondary">
                   {loading ? "加载中…" : "还没有计划记录——去「写计划」提交第一单，让导师开始攒证据。"}
                 </td>
               </tr>
             )}
             {rows.map((r) => {
-              const light = r.verdict?.light;
+              // R1 热修：后端 light 值防御——非法值不进 LIGHT_CN/LIGHT_DOT 查表（避免 undefined 崩溃）
+              const rawLight = r.verdict?.light;
+              const light: MentorLight | undefined =
+                rawLight === "green" || rawLight === "yellow" || rawLight === "red" ? rawLight : undefined;
               const rr = calcRR(r.direction, Number(r.entry), Number(r.stop_loss), Number(r.take_profit));
               const intent = !r.outcome ? recallIntent(r.id) : null;
+              const principalN = Number(r.principal);
               return (
                 <tr key={String(r.id)} className="border-b border-jarvis-border/50 hover:bg-white/[0.02]">
                   <td className="px-4 py-2.5">
@@ -346,6 +351,9 @@ export default function LedgerPage() {
                   </td>
                   <td className="whitespace-nowrap px-2 py-2.5 font-mono text-xs text-jarvis-text-secondary">
                     {Number(r.entry)} / {Number(r.stop_loss)} / {Number(r.take_profit)}
+                  </td>
+                  <td className="whitespace-nowrap px-2 py-2.5 font-mono text-xs text-jarvis-text-secondary">
+                    {Number.isFinite(principalN) && principalN > 0 ? `${principalN}U` : "—"}
                   </td>
                   <td className={clsx("px-2 py-2.5 font-mono text-xs", rr != null && rr < 1.5 ? "text-jarvis-red" : "text-jarvis-text")}>
                     {rr != null ? rr.toFixed(2) : "—"}

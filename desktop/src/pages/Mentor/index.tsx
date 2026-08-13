@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { clsx } from "clsx";
 import { GraduationCap, NotebookPen, BookOpenCheck } from "lucide-react";
+import ErrorBoundary from "@/components/common/ErrorBoundary";
 import PlanForm from "./PlanForm";
 import VerdictCard from "./VerdictCard";
 import LedgerPage from "./LedgerPage";
@@ -71,11 +72,15 @@ export default function Mentor() {
               <div className="card mb-3 border-jarvis-red/40 text-sm text-jarvis-red">{submitErr}</div>
             )}
             {current ? (
-              <VerdictCard
-                planId={current.plan_id}
-                verdict={current.verdict}
-                mock={current.mock}
-              />
+              /* R1 热修：卡片级错误边界——后端字段形态漂移导致的渲染异常
+                 只碎裁决卡（可点重新加载），不再拖崩整个导师页 */
+              <ErrorBoundary fallbackTitle="裁决卡片渲染异常">
+                <VerdictCard
+                  planId={current.plan_id}
+                  verdict={current.verdict}
+                  mock={current.mock}
+                />
+              </ErrorBoundary>
             ) : (
               <div className="card flex h-full min-h-[280px] flex-col items-center justify-center text-center">
                 <GraduationCap size={40} className="mb-3 text-jarvis-text-secondary/50" />
@@ -91,7 +96,9 @@ export default function Mentor() {
           </div>
         </div>
       ) : (
-        <LedgerPage />
+        <ErrorBoundary fallbackTitle="复盘台账渲染异常">
+          <LedgerPage />
+        </ErrorBoundary>
       )}
     </div>
   );

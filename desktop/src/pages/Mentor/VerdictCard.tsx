@@ -12,6 +12,7 @@ import {
 import {
   mentorExplainStream,
   rememberIntent,
+  fmtEvidence,
   LIGHT_CN,
   type MentorVerdict,
   type MentorLight,
@@ -185,27 +186,34 @@ export default function VerdictCard({
           <p className="text-lg font-bold" style={{ color: LIGHT_COLOR[light] }}>
             {LIGHT_CN[light]}
           </p>
-          <p className="mt-0.5 text-sm text-jarvis-text-secondary">{summary}</p>
+          {/* R1 热修：summary/evidence/detail 一律经 fmtEvidence——后端可能给对象，
+              直接作为 React child 渲染会整页崩溃 */}
+          <p className="mt-0.5 text-sm text-jarvis-text-secondary">{fmtEvidence(summary)}</p>
         </div>
       </div>
 
       {/* 逐条证据 */}
       <div className="mb-4 space-y-2">
-        {items.map((it) => (
-          <div
-            key={it.key}
-            className="flex items-start gap-2 rounded-lg border border-jarvis-border/60 bg-jarvis-bg/60 px-3 py-2"
-          >
-            <LevelIcon level={it.level} />
-            <div className="min-w-0">
-              <p className="text-sm text-jarvis-text">{it.evidence}</p>
-              {it.detail && <p className="mt-0.5 text-xs text-jarvis-text-secondary">{it.detail}</p>}
+        {items.map((it) => {
+          const detailText = fmtEvidence(it.detail);
+          return (
+            <div
+              key={it.key}
+              className="flex items-start gap-2 rounded-lg border border-jarvis-border/60 bg-jarvis-bg/60 px-3 py-2"
+            >
+              <LevelIcon level={it.level} />
+              <div className="min-w-0">
+                <p className="text-sm text-jarvis-text">{fmtEvidence(it.evidence)}</p>
+                {detailText !== "—" && (
+                  <p className="mt-0.5 text-xs text-jarvis-text-secondary">{detailText}</p>
+                )}
+              </div>
+              <span className="ml-auto shrink-0 font-mono text-[10px] text-jarvis-text-secondary">
+                权重{it.weight}
+              </span>
             </div>
-            <span className="ml-auto shrink-0 font-mono text-[10px] text-jarvis-text-secondary">
-              权重{it.weight}
-            </span>
-          </div>
-        ))}
+          );
+        })}
       </div>
 
       {/* 红灯冷静期 */}

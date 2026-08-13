@@ -20,14 +20,17 @@ export type MentorLight = "green" | "yellow" | "red";
 export type MentorDirection = "long" | "short";
 export type MentorOutcomeResult = "win" | "loss" | "scratch" | "skipped";
 
-/** 逐条裁决证据行 */
+/** 逐条裁决证据行。
+ * evidence/detail 契约上是字符串，但真实后端（任务 M 实测）detail 会给结构化
+ * 对象（如 {direction, confidence} / {warns:[], passes:[]}），渲染层必须经
+ * fmtEvidence 格式化，禁止直接作为 React child 输出。 */
 export interface MentorVerdictItem {
   key: string;
   level: "pass" | "warn" | "fail";
   weight: number;
-  /** 系统实时证据原文（如「4h CVD 与价格背离」） */
-  evidence: string;
-  detail?: string;
+  /** 系统实时证据原文（可能为任意形态，渲染前过 fmtEvidence） */
+  evidence: unknown;
+  detail?: unknown;
 }
 
 export interface MentorVerdict {
@@ -47,6 +50,8 @@ export interface MentorPlanInput {
   entry: number;
   stop_loss: number;
   take_profit: number;
+  /** 本金 USDT（R1 新增，可选；配合杠杆算名义价值与最大亏损） */
+  principal?: number;
   position_pct?: number;
   leverage?: number;
   reason_text?: string;
@@ -81,6 +86,7 @@ export interface MentorPlanRow {
   entry: number;
   stop_loss: number;
   take_profit: number;
+  principal?: number | null;
   position_pct?: number | null;
   leverage?: number | null;
   reason_text?: string | null;
@@ -115,6 +121,108 @@ export interface MentorStats {
   not_followed: { trades: number; win_rate_pct: number | null; total_pnl_pct: number };
   mock?: boolean;
   error?: string;
+}
+
+// ─── 裁决字段防御性格式化（热修 R1：后端字段可能是对象，直接渲染会崩 React） ───
+
+/** detail 对象键 → 中文名（拼人话用；未收录的键原样展示） */
+const DETAIL_KEY_CN: Record<string, string> = {
+  direction: "方向",
+  confidence: "置信度",
+  rr: "盈亏比",
+  sl_dist_pct: "止损距离%",
+  tp_dist_pct: "止盈距离%",
+  toll_ratio: "过路费占比",
+  fee_pct: "费率%",
+  plan_min_rr: "RR门槛",
+  against: "逆势",
+  reversal: "反转分",
+  available: "数据可用",
+  warns: "警示",
+  passes: "通过",
+  score: "分数",
+  note: "说明",
+};
+
+/** 枚举值 → 中文（direction 等常见后端枚举） */
+const DETAIL_VALUE_CN: Record<string, string> = {
+  bullish: "看涨",
+  bearish: "看跌",
+  neutral: "中性",
+  long: "做多",
+  short: "做空",
+};
+
+/**
+ * 任意后端值 → 可渲染字符串（渲染层唯一入口，任何形态都不崩）：
+ * string 直出；number 最多 4 位小数去尾零；boolean 是/否；数组分号连接；
+ * 对象提取键值拼人话（0-1 的 confidence 转百分比）；空值/空对象 → "—"；
+ * 兜底 JSON.stringify。
+ */
+export function fmtEvidence(v: unknown): string {
+  if (v == null) return "—";
+  if (typeof v === "string") {
+    const s = v.trim();
+    return s ? (DETAIL_VALUE_CN[s] ?? s) : "—";
+  }
+  if (typeof v === "number") {
+    if (!Number.isFinite(v)) return "—";
+    return Number.isInteger(v) ? String(v) : String(Number(v.toFixed(4)));
+  }
+  if (typeof v === "boolean") return v ? "是" : "否";
+  if (Array.isArray(v)) {
+    const parts = v.map(fmtEvidence).filter((s) => s !== "—");
+    return parts.length ? parts.join("；") : "—";
+  }
+  if (typeof v === "object") {
+    const entries = Object.entries(v as Record<string, unknown>).filter(
+      ([, val]) => val != null && val !== "",
+    );
+    if (!entries.length) return "—";
+    const parts = entries.map(([k, val]) => {
+      // confidence 0-1 → 百分比人话
+      if (k === "confidence" && typeof val === "number" && val >= 0 && val <= 1) {
+        return `置信度 ${Math.round(val * 100)}%`;
+      }
+      return `${DETAIL_KEY_CN[k] ?? k} ${fmtEvidence(val)}`;
+    });
+    return parts.join(" · ");
+  }
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
+}
+
+/** 后端 verdict 归一化：light/score/items 容错（字段缺失/形态漂移不崩 UI） */
+export function normalizeVerdict(raw: unknown): MentorVerdict | null {
+  if (!raw || typeof raw !== "object") return null;
+  const v = raw as Record<string, unknown>;
+  const light: MentorLight =
+    v.light === "green" || v.light === "yellow" || v.light === "red"
+      ? v.light
+      : "yellow";
+  const score = Number(v.score);
+  const items = Array.isArray(v.items)
+    ? (v.items as Record<string, unknown>[]).map((it, i) => ({
+        key: typeof it.key === "string" ? it.key : `item${i}`,
+        level: (it.level === "pass" || it.level === "warn" || it.level === "fail"
+          ? it.level
+          : "warn") as "pass" | "warn" | "fail",
+        weight: Number.isFinite(Number(it.weight)) ? Number(it.weight) : 0,
+        evidence: it.evidence,
+        detail: it.detail,
+      }))
+    : [];
+  const cooldown = Number(v.cooldown_min);
+  return {
+    light,
+    score: Number.isFinite(score) ? Math.round(score) : 0,
+    items,
+    summary: fmtEvidence(v.summary),
+    ...(Number.isFinite(cooldown) && cooldown > 0 ? { cooldown_min: cooldown } : {}),
+  };
 }
 
 // ─── RR 计算（表单实时显示与引擎门禁同口径） ───
@@ -360,7 +468,11 @@ export const mentorApi = {
   async submitPlan(input: MentorPlanInput): Promise<MentorPlanResponse> {
     try {
       const d = await post<MentorPlanResponse>("/mentor/plan", input);
-      if (d && d.ok !== false && d.verdict) return d;
+      if (d && d.ok !== false && d.verdict) {
+        // R1 热修：真实后端 verdict 字段形态漂移（detail 为对象等），入口归一化
+        const verdict = normalizeVerdict(d.verdict);
+        if (verdict) return { ok: true, plan_id: d.plan_id, verdict };
+      }
       throw new Error(d?.error || "裁决响应异常");
     } catch {
       const verdict = mockVerdict(input);

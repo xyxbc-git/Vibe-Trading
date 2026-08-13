@@ -66,6 +66,7 @@ export default function PlanForm({
   const [entry, setEntry] = useState("");
   const [stopLoss, setStopLoss] = useState("");
   const [takeProfit, setTakeProfit] = useState("");
+  const [principal, setPrincipal] = useState("");
   const [positionPct, setPositionPct] = useState("");
   const [leverage, setLeverage] = useState("");
   const [tags, setTags] = useState<string[]>([]);
@@ -84,6 +85,15 @@ export default function PlanForm({
   const incoherent = pointsFilled && rr == null;
   const rrTooLow = rr != null && rr < MIN_RR;
 
+  // R1：本金风险速览——名义价值 = 本金×杠杆；预计最大亏损 ≈ 名义价值×止损距离%
+  const principalN = Number(principal);
+  const levN = leverage !== "" ? Number(leverage) : 1;
+  const slDistPct =
+    entryN > 0 && slN > 0 && !incoherent ? (Math.abs(entryN - slN) / entryN) * 100 : null;
+  const notional =
+    principal !== "" && principalN > 0 && levN > 0 ? principalN * levN : null;
+  const maxLoss = notional != null && slDistPct != null ? (notional * slDistPct) / 100 : null;
+
   const canSubmit =
     !submitting && symbol && entryN > 0 && slN > 0 && tpN > 0 && !incoherent;
 
@@ -99,6 +109,7 @@ export default function PlanForm({
       entry: entryN,
       stop_loss: slN,
       take_profit: tpN,
+      principal: principal !== "" && principalN > 0 ? principalN : undefined,
       position_pct: positionPct !== "" ? Number(positionPct) : undefined,
       leverage: leverage !== "" ? Number(leverage) : undefined,
       reason_tags: tags,
@@ -184,10 +195,27 @@ export default function PlanForm({
         )}
       </div>
 
-      {/* 仓位 / 杠杆（可选） */}
-      <div className="mb-4 grid grid-cols-2 gap-3">
+      {/* 本金 / 仓位 / 杠杆（可选） */}
+      <div className="mb-1 grid grid-cols-3 gap-3">
+        <NumField label="本金（USDT，可选）" value={principal} onChange={setPrincipal} placeholder="100" suffix="U" />
         <NumField label="仓位（可选）" value={positionPct} onChange={setPositionPct} placeholder="10" suffix="%" />
         <NumField label="杠杆（可选）" value={leverage} onChange={setLeverage} placeholder="3" suffix="x" />
+      </div>
+      {/* 本金风险速览：填了本金才显示——下单前先看到「这单最多亏多少」 */}
+      <div className="mb-4 min-h-[18px] text-xs">
+        {notional != null && (
+          <span className="font-mono text-jarvis-text-secondary">
+            名义价值 <span className="text-jarvis-text">{notional.toFixed(2)}U</span>
+            {leverage === "" && "（未填杠杆按 1x 算）"}
+            {maxLoss != null && (
+              <>
+                {" · "}打到止损预计亏 <span className="text-jarvis-red">-{maxLoss.toFixed(2)}U</span>
+                （占本金 {principalN > 0 ? ((maxLoss / principalN) * 100).toFixed(1) : "—"}%）
+              </>
+            )}
+            {maxLoss == null && " · 填齐入场/止损后估算最大亏损"}
+          </span>
+        )}
       </div>
 
       {/* 理由标签 */}
