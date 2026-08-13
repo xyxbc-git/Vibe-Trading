@@ -6,16 +6,22 @@ import {
   type MouseEvent as ReactMouseEvent,
 } from "react";
 import { clsx } from "clsx";
+import { useNavigate } from "react-router-dom";
 import {
   Activity,
   AlertTriangle,
   BookOpenCheck,
+  CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Fingerprint,
+  GraduationCap,
   LayoutGrid,
   List,
   Radio,
   Target,
   Users,
+  XCircle,
 } from "lucide-react";
 import { usePolling } from "@/hooks/useApi";
 import { useSymbol } from "@/hooks/useSymbol";
@@ -198,6 +204,119 @@ function ClsBadge({ cls, clsCn }: { cls: TapeActor; clsCn: string }) {
       {clsCn}
     </span>
   );
+}
+
+/* ─────────── ④-D2 画像 P0：L0/L1 结论层（方案 A1/A2/A3，契约 agent-5 D1） ─────────── */
+
+/** D1 后端契约扩展字段（《成交流画像优化方案》§五；未就绪时前端 mock 兜底） */
+interface TapeFlowExt extends TapeFlowResponse {
+  /** trades 实际覆盖跨度（分钟）——「近 Xmin 实测」的唯一诚实口径 */
+  actual_window_min?: number;
+  /** 覆盖度：continuous / gapped / severe（或后端中文三档） */
+  coverage?: string;
+  /** 置信度三档：high / medium / low（或后端中文） */
+  confidence?: string;
+  /** 后端 L0 结论句（限盘口行为描述，不含方向建议） */
+  l0_text?: string;
+}
+
+/** A1 样本量门禁：actor 桶少于该笔数 → 灰化「样本不足」，不给精确数与方向色 */
+const ACTOR_MIN_TRADES = 10;
+/** verdict 总样本门禁（mock 阈值，D1 后端 confidence 就绪后以后端为准） */
+const VERDICT_MIN_TRADES = 30;
+
+/** 置信度三档展示（en/cn 双键兼容） */
+const CONFIDENCE_CN: Record<string, string> = {
+  high: "证据充分",
+  medium: "证据一般",
+  low: "仅金额分层",
+  证据充分: "证据充分",
+  一般: "证据一般",
+  证据一般: "证据一般",
+  仅金额分层: "仅金额分层",
+};
+
+const COVERAGE_CN: Record<string, string> = {
+  continuous: "连续",
+  gapped: "有断档",
+  severe: "严重断档",
+};
+
+interface L0Result {
+  text: string;
+  /** null = 样本不足（不显置信度徽标） */
+  tierCn: string | null;
+  insufficient: boolean;
+}
+
+/** L0 结论句：后端 l0_text/confidence 优先；未就绪按现有字段 mock 合成。
+ * 纪律（方案 §五）：只描述盘口行为本身，不给方向/开单建议。 */
+function deriveL0(tape: TapeFlowExt, totalTrades: number): L0Result {
+  const insufficient = totalTrades < VERDICT_MIN_TRADES && !tape.l0_text;
+  if (insufficient) {
+    return {
+      text: "样本不足，暂不判定——本窗口数据不足以支撑任何结论",
+      tierCn: null,
+      insufficient: true,
+    };
+  }
+  if (tape.l0_text) {
+    return {
+      text: tape.l0_text,
+      tierCn: tape.confidence ? (CONFIDENCE_CN[tape.confidence] ?? tape.confidence) : null,
+      insufficient: false,
+    };
+  }
+  // mock 合成（D1 未就绪）：verdict.action 是行为词（吸筹/派发/砸盘/拉盘/中性）
+  const v = tape.verdict;
+  if (!v) {
+    return { text: "窗口内数据不足，暂无法判定", tierCn: null, insufficient: true };
+  }
+  const tierCn =
+    totalTrades >= 200 ? "证据充分" : totalTrades >= 50 ? "证据一般" : "仅金额分层";
+  const text =
+    v.action === "中性"
+      ? "主力无明显动作（中性）——非散户净流未过判定阈值"
+      : `主力疑似「${v.action}」${v.note ? `：${v.note}` : ""}`;
+  return { text, tierCn, insufficient: false };
+}
+
+interface EvidenceRow {
+  level: "pass" | "warn" | "fail";
+  text: string;
+}
+
+/** L1 人话证据 ≤3 条（复用导师裁决卡 pass/warn/fail 视觉语言）：
+ * 净流依据（判定阈值显性化，防玄学感）/ 脉冲异动 / 窗口覆盖度 */
+function deriveEvidence(tape: TapeFlowExt, actualMin: number | null): EvidenceRow[] {
+  const rows: EvidenceRow[] = [];
+  const v = tape.verdict;
+  if (v) {
+    const passGate = Math.abs(v.inst_net_usd) >= 100_000;
+    rows.push({
+      level: passGate ? "pass" : "warn",
+      text: `非散户净流 ${fmtSignedUsd(v.inst_net_usd)}（判定阈值 $100K${passGate ? "，已过阈" : "，未过阈→中性依据"}）`,
+    });
+  }
+  if (v?.burst) {
+    rows.push({
+      level: "warn",
+      text: `${v.burst.side === "buy" ? "买向" : "卖向"}脉冲 ${fmtUsd(v.burst.usd)}——短时异动，${v.burst.note}`,
+    });
+  }
+  if (actualMin != null) {
+    const covCn = tape.coverage ? (COVERAGE_CN[tape.coverage] ?? tape.coverage) : null;
+    rows.push({
+      level: covCn === "严重断档" ? "fail" : covCn === "有断档" ? "warn" : "pass",
+      text: `近 ${actualMin} 分钟实测数据${covCn ? `（采集${covCn}）` : ""}`,
+    });
+  } else {
+    rows.push({
+      level: "warn",
+      text: "实测窗口/覆盖度字段待后端接入——当前按标称窗口展示，可能名不副实",
+    });
+  }
+  return rows.slice(0, 3);
 }
 
 /* ────────────────────────── ③ DOM 深度阶梯 ────────────────────────── */
@@ -441,41 +560,120 @@ function DepthLadder({
 
 /* ────────────────────────── ④ 成交流画像三块 ────────────────────────── */
 
-/** (a) 主力判定卡：动作大字 + 非散户占比 + 脉冲警报 + 入场提示 + 四主体结构 */
-function VerdictCard({ tape }: { tape: TapeFlowResponse }) {
+/** L1 证据行图标（复用导师裁决卡 pass/warn/fail 视觉语言） */
+function EvidenceIcon({ level }: { level: "pass" | "warn" | "fail" }) {
+  if (level === "pass")
+    return <CheckCircle2 size={13} className="mt-0.5 flex-shrink-0 text-jarvis-green" />;
+  if (level === "warn")
+    return <AlertTriangle size={13} className="mt-0.5 flex-shrink-0 text-jarvis-yellow" />;
+  return <XCircle size={13} className="mt-0.5 flex-shrink-0 text-jarvis-red" />;
+}
+
+/** (a) 结论卡（D2 重构，方案 A1/A2/A3）：
+ * L0 一句话结论（第一公民，限盘口行为描述）+ 置信度三档 + 「近 Xmin 实测」诚实窗口
+ * + 样本不足强制降级 + 「问导师」入口；L1 ≤3 条人话证据；
+ * 四主体条保留但按 A1 样本门禁灰化（n<10 不给精确数与方向色）。 */
+function VerdictCard({
+  tape,
+  windowMin,
+  onAskMentor,
+}: {
+  tape: TapeFlowExt;
+  windowMin: number;
+  onAskMentor: () => void;
+}) {
   const v = tape.verdict;
   const actors = tape.breakdown?.actors;
+  const totalTrades = actors
+    ? ACTOR_ORDER.reduce((s, a) => s + (actors[a]?.n ?? 0), 0)
+    : 0;
+  const l0 = deriveL0(tape, totalTrades);
+  const actualMin =
+    typeof tape.actual_window_min === "number" && tape.actual_window_min > 0
+      ? Math.round(tape.actual_window_min)
+      : null;
+  const evidence = l0.insufficient ? [] : deriveEvidence(tape, actualMin);
+
   return (
     <div className="card p-4 space-y-3">
       <p className="stat-label mb-0 flex items-center gap-1.5 text-xs">
         <Users size={14} />
-        主力行为判定
-        {v && (
+        成交流结论
+        {/* 诚实窗口口径：实测优先；无实测字段时显标称并 tooltip 说明（A1 收敛：单数字） */}
+        <span
+          className="text-[10px] px-1.5 py-0.5 rounded-full bg-jarvis-border/40 text-jarvis-text-secondary cursor-help"
+          title={
+            actualMin != null
+              ? `trades 实际覆盖 ${actualMin} 分钟（标称窗口 ${windowMin} 分钟）`
+              : `标称窗口 ${windowMin} 分钟；实测覆盖字段待后端接入，高活跃期实际覆盖可能远小于标称`
+          }
+        >
+          {actualMin != null ? `近 ${actualMin}min 实测` : `窗口 ${windowMin}min`}
+        </span>
+        {v && !l0.insufficient && (
           <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-jarvis-border/40 text-jarvis-text-secondary">
             主导·{v.dominant_cn}
           </span>
         )}
       </p>
 
-      {v ? (
-        <>
-          {/* 动作大字（砸盘红 / 拉盘绿 / 吸筹蓝 / 派发橙 / 中性灰）+ 说明 */}
-          <div>
-            <p
+      {/* L0 一句话结论（第一公民） */}
+      <div>
+        <p
+          className={clsx(
+            "text-base font-bold leading-snug",
+            l0.insufficient
+              ? "text-jarvis-text-secondary"
+              : actionColorCls(v?.action ?? ""),
+          )}
+        >
+          {l0.text}
+        </p>
+        <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+          {l0.tierCn && (
+            <span
               className={clsx(
-                "text-2xl font-bold leading-none",
-                actionColorCls(v.action),
+                "text-[10px] px-1.5 py-0.5 rounded border",
+                l0.tierCn === "证据充分"
+                  ? "border-jarvis-green/50 text-jarvis-green"
+                  : l0.tierCn === "证据一般"
+                    ? "border-jarvis-yellow/50 text-jarvis-yellow"
+                    : "border-jarvis-border text-jarvis-text-secondary",
               )}
+              title="置信度按窗口样本量与证据结构分档（后端契约就绪后以引擎输出为准）"
             >
-              {v.action}
-            </p>
-            {v.note && (
-              <p className="text-[11px] text-jarvis-text-secondary mt-1.5 leading-snug">
-                {v.note}
-              </p>
-            )}
-          </div>
+              {l0.tierCn}
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={onAskMentor}
+            className="flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border border-jarvis-blue/50 text-jarvis-blue hover:bg-jarvis-blue/10 transition-colors"
+            title="把这个信号带去导师页写计划——方向与开单建议由导师裁决，不在本卡给出"
+          >
+            <GraduationCap size={11} />
+            问导师这单能不能做
+          </button>
+        </div>
+      </div>
 
+      {/* L1 人话证据 ≤3 条 */}
+      {evidence.length > 0 && (
+        <div className="space-y-1.5">
+          {evidence.map((e, i) => (
+            <div
+              key={i}
+              className="flex items-start gap-1.5 rounded-lg bg-jarvis-bg/60 border border-jarvis-border/40 px-2.5 py-1.5"
+            >
+              <EvidenceIcon level={e.level} />
+              <p className="text-[11px] text-jarvis-text leading-snug">{e.text}</p>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {v && !l0.insufficient && (
+        <>
           {/* 非散户参与占比进度条 */}
           <div>
             <div className="flex items-center justify-between text-[10px] text-jarvis-text-secondary mb-1">
@@ -523,25 +721,33 @@ function VerdictCard({ tape }: { tape: TapeFlowResponse }) {
             </div>
           )}
         </>
-      ) : (
-        <p className="text-xs text-jarvis-text-secondary py-2">
-          窗口内数据不足，暂无法判定
-        </p>
       )}
 
-      {/* 四主体占比横向堆叠条 + 图例（各自净额正绿负红） */}
+      {/* 四主体占比条 + 图例：A1 样本门禁——n<10 的桶灰化，不给精确数与方向色。
+          A2 身份词降格：副标题标注推断口径（后端「单笔规模分布」字段就绪后切换主标签） */}
       {actors && (
         <div>
+          <p className="text-[10px] text-jarvis-text-secondary mb-1">
+            单笔规模分布
+            <span className="ml-1 text-jarvis-text-secondary/60">
+              （身份按单笔金额推断，非真实身份）
+            </span>
+          </p>
           <div className="h-2.5 rounded-full overflow-hidden flex bg-jarvis-bg">
             {ACTOR_ORDER.map((a) => {
               const s = actors[a];
               if (!s || s.pct <= 0) return null;
+              const insufficient = (s.n ?? 0) < ACTOR_MIN_TRADES;
               return (
                 <div
                   key={a}
-                  className={ACTOR_STYLE[a].bar}
+                  className={insufficient ? "bg-jarvis-border/60" : ACTOR_STYLE[a].bar}
                   style={{ width: `${s.pct}%` }}
-                  title={`${s.actor_cn} ${s.pct.toFixed(1)}% · 净额 ${fmtSignedUsd(s.net_usd)}`}
+                  title={
+                    insufficient
+                      ? `${s.actor_cn}：样本不足（${s.n} 笔 < ${ACTOR_MIN_TRADES}），不给精确占比`
+                      : `${s.actor_cn} ${s.pct.toFixed(1)}% · 净额 ${fmtSignedUsd(s.net_usd)}`
+                  }
                 />
               );
             })}
@@ -550,26 +756,38 @@ function VerdictCard({ tape }: { tape: TapeFlowResponse }) {
             {ACTOR_ORDER.map((a) => {
               const s = actors[a];
               if (!s) return null;
+              const insufficient = (s.n ?? 0) < ACTOR_MIN_TRADES;
               return (
                 <div key={a} className="flex items-center gap-1.5 text-[10px]">
                   <span
                     className={clsx(
                       "w-2 h-2 rounded-sm flex-shrink-0",
-                      ACTOR_STYLE[a].bar,
+                      insufficient ? "bg-jarvis-border/60" : ACTOR_STYLE[a].bar,
                     )}
                   />
                   <span className="text-jarvis-text-secondary">{s.actor_cn}</span>
-                  <span className="font-mono text-jarvis-text">
-                    {s.pct.toFixed(1)}%
-                  </span>
-                  <span
-                    className={clsx(
-                      "font-mono ml-auto",
-                      s.net_usd >= 0 ? "text-jarvis-green" : "text-jarvis-red",
-                    )}
-                  >
-                    {fmtSignedUsd(s.net_usd)}
-                  </span>
+                  {insufficient ? (
+                    <span
+                      className="font-mono ml-auto text-jarvis-text-secondary/60"
+                      title={`仅 ${s.n} 笔成交，样本不足不给精确占比与净额方向`}
+                    >
+                      样本不足
+                    </span>
+                  ) : (
+                    <>
+                      <span className="font-mono text-jarvis-text">
+                        {s.pct.toFixed(1)}%
+                      </span>
+                      <span
+                        className={clsx(
+                          "font-mono ml-auto",
+                          s.net_usd >= 0 ? "text-jarvis-green" : "text-jarvis-red",
+                        )}
+                      >
+                        {fmtSignedUsd(s.net_usd)}
+                      </span>
+                    </>
+                  )}
                 </div>
               );
             })}
@@ -1516,6 +1734,11 @@ export default function DepthView() {
     readStored(TAPE_VIEW_KEY, ["footprint", "list"] as const, "footprint"),
   );
 
+  // ④-D2 L2 原始数据折叠：拆单表/逐笔流默认不进视野（方案 A3/A4——
+  // 3s 刷新逐笔流对情绪化交易者是追单诱发器）；每次进页重置为折叠（有意不持久）
+  const [showRaw, setShowRaw] = useState(false);
+  const navigate = useNavigate();
+
   // ② MACD 副图开关（12/26/9，主图下方可折叠），localStorage 持久
   const [showMacd, setShowMacd] = useState(
     () => readStored(MACD_KEY, ["on", "off"] as const, "off") === "on",
@@ -1917,10 +2140,31 @@ export default function DepthView() {
             </p>
           </div>
         ) : (
-          <div className="grid grid-cols-1 xl:grid-cols-[3fr_4fr_3fr] gap-4">
-            <VerdictCard tape={tape} />
-            <FingerprintTable fps={tape.fingerprints ?? []} />
-            <RecentTradeList trades={recentDesc} />
+          <div className="space-y-4">
+            {/* D2 L0/L1：结论卡第一公民（问导师入口→导师页，币种走全局 useSymbol 预填） */}
+            <VerdictCard
+              tape={tape as TapeFlowExt}
+              windowMin={windowMin}
+              onAskMentor={() => navigate("/mentor")}
+            />
+            {/* D2 L2：原始数据默认折叠（拆单表 + 逐笔成交流） */}
+            <button
+              type="button"
+              onClick={() => setShowRaw((s) => !s)}
+              className="flex items-center gap-1.5 text-xs text-jarvis-text-secondary hover:text-jarvis-text transition-colors"
+            >
+              {showRaw ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+              看原始数据（拆单识别表 · 逐笔成交流）
+              <span className="text-[10px] text-jarvis-text-secondary/60">
+                进阶用户下钻用；结论与证据已在上方卡片
+              </span>
+            </button>
+            {showRaw && (
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                <FingerprintTable fps={tape.fingerprints ?? []} />
+                <RecentTradeList trades={recentDesc} />
+              </div>
+            )}
           </div>
         ))}
 
