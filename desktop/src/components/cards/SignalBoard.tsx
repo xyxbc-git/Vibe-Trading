@@ -28,6 +28,7 @@ import {
   type SignalDirection,
   type SignalGradeStats,
   type SignalTradePlan,
+  type SignalTriggerLevel,
   type SignalWinrateStats,
   type TwelveSignal,
   type TwelveTf,
@@ -231,6 +232,70 @@ function TriggerStateBadge({
     >
       等待触发 · 距入场 {Math.abs(state.distPct).toFixed(2)}%
     </span>
+  );
+}
+
+/** [S3 蓄势雷达] 触发位一行话：「涨到 1,937.67 转看涨 · 距 2.34%」（纯函数可测） */
+export function triggerLine(t: SignalTriggerLevel): string {
+  const move = t.side === "bullish" ? "涨到" : "跌到";
+  const turn = t.side === "bullish" ? "转看涨" : "转看跌";
+  const d = Number(t.dist_pct);
+  const dist = t.dist_pct != null && Number.isFinite(d) ? ` · 距 ${d.toFixed(2)}%` : "";
+  return `${move} ${formatPrice(t.price)} ${turn}${dist}`;
+}
+
+/**
+ * [S3 蓄势雷达] 中性信号的触发位标注：中性≠没信息——震荡市也让用户知道
+ * 「盯哪几个价位、到了会发生什么」。折叠态显示紧凑价位行（按距离升序，
+ * 后端已排好）；展开态追加每条的完整说明。
+ */
+function TriggerRadar({
+  triggers,
+  expanded,
+}: {
+  triggers: SignalTriggerLevel[];
+  expanded: boolean;
+}) {
+  if (triggers.length === 0) return null;
+  return (
+    <div className="mt-1.5 rounded bg-jarvis-bg/60 px-1.5 py-1 space-y-0.5">
+      <p
+        className="text-[9px] text-jarvis-text-secondary/80 cursor-help"
+        title="蓄势雷达：该系统当前中性，但它的触发条件是明确的——价格走到这些位置时信号会翻转。按距离由近到远排列"
+      >
+        蓄势雷达 · 盯这些价位
+      </p>
+      {triggers.map((t, i) => (
+        <p
+          key={`${t.side}-${i}`}
+          title={expanded ? undefined : t.desc}
+          className={clsx(
+            "text-[10px] font-mono flex items-center gap-1",
+            t.side === "bullish" ? "text-jarvis-green" : "text-jarvis-red",
+            !expanded && "cursor-help",
+          )}
+        >
+          {t.side === "bullish" ? (
+            <TrendingUp size={9} className="shrink-0" />
+          ) : (
+            <TrendingDown size={9} className="shrink-0" />
+          )}
+          <span>{triggerLine(t)}</span>
+        </p>
+      ))}
+      {expanded && (
+        <div className="pt-0.5 space-y-0.5">
+          {triggers.map((t, i) => (
+            <p
+              key={`desc-${t.side}-${i}`}
+              className="text-[10px] text-jarvis-text-secondary leading-relaxed"
+            >
+              {t.desc}
+            </p>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -909,6 +974,11 @@ function SignalCell({
 
       {/* 更新/变更时间徽章（需求 1：每个信号的最新更新时间 + 上次变更时间） */}
       <SignalTimeLine updatedAt={signal.updated_at} changedAt={signal.last_change_at} />
+
+      {/* [S3 蓄势雷达] 中性卡亮出触发位：盯哪个价、到了会发生什么（严格中性才显示） */}
+      {dir === "neutral" && (signal.trigger_levels?.length ?? 0) > 0 && (
+        <TriggerRadar triggers={signal.trigger_levels!} expanded={open} />
+      )}
 
       {/* 历史胜率：方向信号 + 已有回测缓存时展示「近 N 次胜率 x%」+ 盈损点入口 */}
       {grade !== undefined && (

@@ -1960,6 +1960,16 @@ export interface SignalExplain {
   lag: string;
 }
 
+/** [S3 蓄势雷达] 中性信号触发位：盯哪个价、到了会发生什么（后端按距离升序） */
+export interface SignalTriggerLevel {
+  /** 触发后的方向 */
+  side: "bullish" | "bearish";
+  price: number;
+  /** 现价到触发价的距离 %（后端算好；异常为 null） */
+  dist_pct: number | null;
+  desc: string;
+}
+
 export interface TwelveSignal {
   system: string;
   name_cn: string;
@@ -1969,6 +1979,8 @@ export interface TwelveSignal {
   key_levels?: KeyLevel[];
   /** 单信号交易计划；无可执行计划时为 null */
   trade_plan?: SignalTradePlan | null;
+  /** [S3 蓄势雷达] 中性信号的触发位标注；方向信号/无可计算触发位为 null（旧后端缺失） */
+  trigger_levels?: SignalTriggerLevel[] | null;
   /** 静态画像；旧缓存响应可能缺失 */
   explain?: SignalExplain | null;
   /** 该信号最近一次计算时间（unix 秒；旧后端缺失） */

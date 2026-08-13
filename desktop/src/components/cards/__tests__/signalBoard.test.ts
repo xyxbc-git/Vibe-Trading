@@ -45,3 +45,35 @@ describe("planTriggerState 计划触发状态", () => {
     expect(planTriggerState({ entry: 1888 }, "long", 1888.5)?.kind).toBe("near");
   });
 });
+
+// [S3 蓄势雷达] 中性卡触发位一行话（用户场景：ETHUSDT 4h 全中性，
+// 卡片必须亮出「涨破 1937.67 转看涨 · 距 2.3%」这类可盯价位）
+import { triggerLine } from "../SignalBoard";
+
+describe("triggerLine 蓄势雷达触发位文案", () => {
+  it("看涨触发：涨到 + 转看涨 + 距离百分比", () => {
+    const s = triggerLine({
+      side: "bullish", price: 1937.67, dist_pct: 2.34,
+      desc: "突破20日高 1937.67 转看涨（顺势做多入场）",
+    });
+    expect(s).toContain("涨到");
+    expect(s).toContain("转看涨");
+    expect(s).toContain("距 2.34%");
+  });
+
+  it("看跌触发：跌到 + 转看跌", () => {
+    const s = triggerLine({
+      side: "bearish", price: 1853.22, dist_pct: 1.5,
+      desc: "跌破20日低 1853.22 转看跌（顺势做空入场）",
+    });
+    expect(s).toContain("跌到");
+    expect(s).toContain("转看跌");
+    expect(s).toContain("距 1.50%");
+  });
+
+  it("dist_pct 缺失时省略距离段，不砸渲染", () => {
+    const s = triggerLine({ side: "bullish", price: 100, dist_pct: null, desc: "x" });
+    expect(s).toContain("转看涨");
+    expect(s).not.toContain("距");
+  });
+});
