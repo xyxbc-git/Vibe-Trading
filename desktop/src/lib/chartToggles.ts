@@ -37,6 +37,8 @@ export interface ChartToggles {
   bosOn?: boolean;
   /** K 线页：折溢价区参考线（R9 独立开关，默认关） */
   pdOn?: boolean;
+  /** K 线页：盘上合流仪表 HUD（C2，默认开——主控 D1 裁决） */
+  confluenceOn?: boolean;
   /** K 线页：手动画线模式集合（DrawMode 名） */
   draws?: string[];
   /** K 线页：周期档 */

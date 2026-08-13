@@ -98,6 +98,7 @@ import DeltaPane from "@/components/charts/DeltaPane";
 import MacdPane from "@/components/charts/MacdPane";
 import DeltaAiExplainCard from "@/components/cards/DeltaAiExplainCard";
 import TrapReasonCard from "@/components/cards/TrapReasonCard";
+import ConfluenceHud from "@/components/cards/ConfluenceHud";
 import PatternExplainCard from "@/components/charts/PatternExplainCard";
 import { AlertTriangle, CandlestickChart, Cloudy, HelpCircle, Layers, Target, Waypoints, X } from "lucide-react";
 import { planSide } from "@/components/cards/SignalBoard";
@@ -281,6 +282,12 @@ export default function Chart() {
   const [autoTune, setAutoTune] = useState(toggleOr(persistedToggles, "autoTune", true));
   const [twelve, setTwelve] = useState(toggleOr(persistedToggles, "twelve", false));
   const [plan, setPlan] = useState(toggleOr(persistedToggles, "plan", true));
+  // [C2] 盘上合流仪表（环境合流分 HUD）：默认开（主控 D1 裁决——用户点名主打，
+  // 折叠态单行视觉预算极小；「新层默认关」惯例适用于会洗图的叠加层，不适用于此）
+  const [confluenceOn, setConfluenceOn] = useState(toggleOr(persistedToggles, "confluenceOn", true));
+  // [C2] 反转四条件面板已收编进合流仪表展开态（D2 裁决）；图下原面板默认收起
+  // 保留回退，点开才挂载（避免收起状态下的后台轮询）
+  const [reversalOpen, setReversalOpen] = useState(false);
   // 走势预测层（概率锥/路径/研判卡片）独立开关；默认关，避免干扰常规看盘
   const [predictOn, setPredictOn] = useState(toggleOr(persistedToggles, "predictOn", false));
   // 云图（一目均衡表）开关：localStorage 记住偏好，默认关
@@ -1340,6 +1347,7 @@ export default function Chart() {
       autoTune,
       twelve,
       plan,
+      confluenceOn,
       predictOn,
       patternOn,
       liqOn,
@@ -1351,7 +1359,7 @@ export default function Chart() {
       draws: [...draws],
       tf,
     });
-  }, [smart, autoTune, twelve, plan, predictOn, patternOn, liqOn, macdOn, deltaOn, fvgOn, bosOn, pdOn, draws, tf]);
+  }, [smart, autoTune, twelve, plan, confluenceOn, predictOn, patternOn, liqOn, macdOn, deltaOn, fvgOn, bosOn, pdOn, draws, tf]);
   const [deltaResp, setDeltaResp] = useState<DeltaResponse | null>(null);
   const [deltaLoading, setDeltaLoading] = useState(false);
   const [deltaError, setDeltaError] = useState<string | null>(null);
@@ -1602,6 +1610,15 @@ export default function Chart() {
             </button>
           ))}
         </div>
+
+        {/* [C2] 盘上合流仪表：环境合流分 HUD（图内左上角折叠单行，点开看逐条证据） */}
+        <button
+          onClick={() => setConfluenceOn((v) => !v)}
+          title="盘上合流仪表：图内左上角常驻环境合流分（多周期一致/结构突破/流动性扫单/FVG 折溢价四项微勾 + 0-100 分），点开看四组逐条证据与「按当前合流开计划」入口。分数是环境分不是下单信号；数据缺失诚实灰显不硬造"
+          className={pillCls(confluenceOn)}
+        >
+          合流{confluenceOn ? "·开" : "·关"}
+        </button>
 
         {/* 预测层：概率锥 + 路径虚线画在 K 线右侧未来区域 + 图上方研判卡片 */}
         <button
@@ -2318,6 +2335,8 @@ export default function Chart() {
               onNearLeftEdge={loadOlder}
               loadingOlder={loadingOlder}
             />
+            {/* [C2] 合流仪表 HUD：左上角常驻折叠单行（z-10 < TrapReasonCard z-20） */}
+            {confluenceOn && <ConfluenceHud symbol={symbol} tf={tf} />}
             {/* 陷阱原因卡片：固定右上角浮层，不遮点击处的 K 线形态 */}
             {selectedTrap && (
               <TrapReasonCard mark={selectedTrap} onClose={() => setSelectedTrap(null)} />
@@ -2371,8 +2390,27 @@ export default function Chart() {
         </>
       )}
 
-      {/* ── 高胜率反转四条件叠加：Delta 背离 + 多分布 + 三连确认 + 止损扫单 ── */}
-      <ReversalScorePanel symbol={symbol} timeframe={tf} />
+      {/* ── 高胜率反转四条件：已收编进合流仪表展开态「微观确认」组（D2 裁决）；
+          原面板默认收起保留回退，点开才挂载（收起状态零轮询） ── */}
+      {reversalOpen ? (
+        <div>
+          <button
+            onClick={() => setReversalOpen(false)}
+            className="mb-1 text-xs text-jarvis-text-secondary hover:text-jarvis-text transition-colors"
+          >
+            ▾ 收起反转四条件原面板
+          </button>
+          <ReversalScorePanel symbol={symbol} timeframe={tf} />
+        </div>
+      ) : (
+        <button
+          onClick={() => setReversalOpen(true)}
+          title="四条件（Delta 背离/过程多分布/三连确认/止损扫单）已并入图上合流仪表展开态；点开回看原独立面板"
+          className="text-left text-xs text-jarvis-text-secondary hover:text-jarvis-text transition-colors"
+        >
+          ▸ 高胜率反转 · 四条件（已并入合流仪表，点开回看原面板）
+        </button>
+      )}
 
       {/* ── 主力底牌（威科夫×订单流量价核对）：吸筹/派发裁决 + 突破真伪核验 ── */}
       <SupplyDemandCard symbol={symbol} interval={tf} />

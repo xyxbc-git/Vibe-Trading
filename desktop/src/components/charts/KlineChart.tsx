@@ -972,8 +972,9 @@ export default function KlineChart({
   return (
     <div className="relative">
       <div ref={containerRef} className="w-full rounded-lg overflow-hidden" />
+      {/* [C2] 左上角让位给合流仪表 HUD；本提示语义在左缘老 K 线处，左下更合 */}
       {loadingOlder && (
-        <div className="pointer-events-none absolute top-2 left-2 z-10 flex items-center gap-1.5 px-2 py-1 rounded border border-jarvis-border bg-jarvis-card/90 text-xs text-jarvis-text-secondary">
+        <div className="pointer-events-none absolute bottom-8 left-2 z-10 flex items-center gap-1.5 px-2 py-1 rounded border border-jarvis-border bg-jarvis-card/90 text-xs text-jarvis-text-secondary">
           <span className="inline-block w-3 h-3 border-2 border-jarvis-blue border-t-transparent rounded-full animate-spin" />
           加载更早 K 线…
         </div>
