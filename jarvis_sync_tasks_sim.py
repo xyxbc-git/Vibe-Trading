@@ -795,7 +795,17 @@ def sync_sim_signal_log(ctx: SyncContext) -> TaskResult:
 # ══════════════════════════════════ 配置回读（MySQL → 本地，全链路唯一豁免）
 
 
+# 任务L（2026-08-13）：MySQL 侧新增周期纪律 5 可空列（tp_mode/tp_rr_ratio/
+# tp_pct_factor/sl_mode/sl_atr_mult，NULL=跟随信号现行为）；回读 SELECT 带上，
+# 老库未 ALTER 时经 _is_missing_column 回退 LEGACY 列清单（纪律字段按全 NULL）。
 _SQL_CONFIG_PULL = (
+    "SELECT id, symbol, scope_tf, scope_system, principal, leverage, "
+    "position_pct, stop_loss_pct, take_profit_pct, enabled, "
+    "tp_mode, tp_rr_ratio, tp_pct_factor, sl_mode, sl_atr_mult "
+    f"FROM {CONFIG_TABLE}"
+)
+
+_SQL_CONFIG_PULL_LEGACY = (
     "SELECT id, symbol, scope_tf, scope_system, principal, leverage, "
     "position_pct, stop_loss_pct, take_profit_pct, enabled "
     f"FROM {CONFIG_TABLE}"
@@ -815,14 +825,29 @@ CREATE TABLE IF NOT EXISTS {LOCAL_CONFIG_TABLE} (
     stop_loss_pct   REAL,
     take_profit_pct REAL,
     enabled         INTEGER NOT NULL DEFAULT 1,
+    tp_mode         TEXT,
+    tp_rr_ratio     REAL,
+    tp_pct_factor   REAL,
+    sl_mode         TEXT,
+    sl_atr_mult     REAL,
     UNIQUE (symbol, scope_tf, scope_system)
 )
 """
 
+# 本地老库（trader 尚未升级加列）幂等 ALTER：重复加列抛错=已升级，逐条吞
+_SQL_CONFIG_LOCAL_UPGRADES = (
+    f"ALTER TABLE {LOCAL_CONFIG_TABLE} ADD COLUMN tp_mode TEXT",
+    f"ALTER TABLE {LOCAL_CONFIG_TABLE} ADD COLUMN tp_rr_ratio REAL",
+    f"ALTER TABLE {LOCAL_CONFIG_TABLE} ADD COLUMN tp_pct_factor REAL",
+    f"ALTER TABLE {LOCAL_CONFIG_TABLE} ADD COLUMN sl_mode TEXT",
+    f"ALTER TABLE {LOCAL_CONFIG_TABLE} ADD COLUMN sl_atr_mult REAL",
+)
+
 # 业务键匹配用 COALESCE 归一 NULL（SQLite/PG 双兼容，避免 IS NOT DISTINCT FROM 方言差异）
 _SQL_CONFIG_LOCAL_UPDATE = (
     f"UPDATE {LOCAL_CONFIG_TABLE} SET principal=?, leverage=?, position_pct=?, "
-    "stop_loss_pct=?, take_profit_pct=?, enabled=? "
+    "stop_loss_pct=?, take_profit_pct=?, enabled=?, "
+    "tp_mode=?, tp_rr_ratio=?, tp_pct_factor=?, sl_mode=?, sl_atr_mult=? "
     "WHERE symbol=? AND COALESCE(scope_tf,'')=COALESCE(?,'') "
     "AND COALESCE(scope_system,'')=COALESCE(?,'')"
 )
@@ -830,8 +855,9 @@ _SQL_CONFIG_LOCAL_UPDATE = (
 _SQL_CONFIG_LOCAL_INSERT = (
     f"INSERT INTO {LOCAL_CONFIG_TABLE} "
     "(symbol, scope_tf, scope_system, principal, leverage, position_pct, "
-    " stop_loss_pct, take_profit_pct, enabled) "
-    "VALUES (?,?,?,?,?,?,?,?,?)"
+    " stop_loss_pct, take_profit_pct, enabled, "
+    " tp_mode, tp_rr_ratio, tp_pct_factor, sl_mode, sl_atr_mult) "
+    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 )
 
 
@@ -853,14 +879,32 @@ def _enabled_int(v) -> int:
         return 1
 
 
+def _str_or_none(v) -> Optional[str]:
+    """纪律 mode 列（VARCHAR）→ 本地 TEXT：空串/空白归 NULL（=跟随信号）。"""
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def _is_missing_column(err: Exception) -> bool:
+    """远端/本地缺列（老库未 ALTER 纪律字段）的跨后端判定（MySQL 1054 等）。"""
+    msg = str(err).lower()
+    return "unknown column" in msg or "no such column" in msg
+
+
 @register_task(group="mid", table=CONFIG_TABLE)
 def sync_sim_config_pull(ctx: SyncContext) -> TaskResult:
     """反向配置回读：MySQL jarvis_sim_config 全量 → upsert 本地 twelve_sim_config。
 
     全链路唯一豁免的回读写（仅限该表）。MySQL 不可达 / 远端表未建时**静默**
     保留本地旧配置不报错（配置宁可陈旧不可断供）；本地表不存在则按 trader
-    同款 DDL 懒建。upsert 键为业务键 (symbol, scope_tf, scope_system)，
-    不回写 id（本地自增序列与 trader 自插行互不干扰）。
+    同款 DDL 懒建（表已存在的老库经幂等 ALTER 补纪律列）。upsert 键为业务键
+    (symbol, scope_tf, scope_system)，不回写 id（本地自增序列与 trader
+    自插行互不干扰）。
+    任务L：回读含周期纪律 5 列；MySQL 侧未 ALTER（unknown column）回退
+    LEGACY 列清单，纪律字段按全 NULL 落地（=跟随信号，行为不变）。
+    行解包按长度自适应（新 15 列 / 回退 10 列均兼容）。
     """
     mysql_conn = ctx.mysql.get()
     if mysql_conn is None:
@@ -868,9 +912,20 @@ def sync_sim_config_pull(ctx: SyncContext) -> TaskResult:
         return TaskResult(rows=0, cursor_value="mysql_down_keep_local")
 
     try:
-        with mysql_conn.cursor() as cur:
-            cur.execute(_SQL_CONFIG_PULL)
-            remote_rows = cur.fetchall()
+        try:
+            with mysql_conn.cursor() as cur:
+                cur.execute(_SQL_CONFIG_PULL)
+                remote_rows = cur.fetchall()
+        except Exception as e:  # noqa: BLE001 — 远端未 ALTER 纪律列：回退旧清单
+            if not _is_missing_column(e):
+                raise
+            if f"{CONFIG_TABLE}.cols" not in _missing_warned:
+                log.warning("[%s] MySQL 侧缺周期纪律列（%s），按旧列清单回读",
+                            CONFIG_TABLE, e)
+                _missing_warned.add(f"{CONFIG_TABLE}.cols")
+            with mysql_conn.cursor() as cur:
+                cur.execute(_SQL_CONFIG_PULL_LEGACY)
+                remote_rows = cur.fetchall()
     except Exception as e:  # noqa: BLE001 — 远端表未建（DDL 未执行）同样静默容忍
         if _is_missing_table(e):
             if CONFIG_TABLE not in _missing_warned:
@@ -883,15 +938,26 @@ def sync_sim_config_pull(ctx: SyncContext) -> TaskResult:
 
     with _local_db() as db:
         db.execute(_SQL_CONFIG_LOCAL_DDL)
+        for _ddl in _SQL_CONFIG_LOCAL_UPGRADES:
+            try:
+                db.execute(_ddl)
+            except Exception:  # noqa: BLE001 — duplicate column = 已升级过
+                pass
         upserted = 0
         for row in remote_rows:
-            # 列序与 _SQL_CONFIG_PULL 一致：id 仅占位不回写
+            # 列序与 _SQL_CONFIG_PULL(_LEGACY) 一致：id 仅占位不回写；
+            # 前 10 列为基础字段，10 之后为纪律列（回退档缺失按 None 补齐）
             (_rid, symbol, scope_tf, scope_system, principal, leverage,
-             position_pct, stop_loss_pct, take_profit_pct, enabled) = row
+             position_pct, stop_loss_pct, take_profit_pct, enabled) = row[:10]
+            (tp_mode, tp_rr_ratio, tp_pct_factor, sl_mode, sl_atr_mult
+             ) = (tuple(row[10:]) + (None,) * 5)[:5]
             vals = (
                 _num_or_none(principal), _num_or_none(leverage),
                 _num_or_none(position_pct), _num_or_none(stop_loss_pct),
                 _num_or_none(take_profit_pct), _enabled_int(enabled),
+                _str_or_none(tp_mode), _num_or_none(tp_rr_ratio),
+                _num_or_none(tp_pct_factor), _str_or_none(sl_mode),
+                _num_or_none(sl_atr_mult),
             )
             cur = db.execute(
                 _SQL_CONFIG_LOCAL_UPDATE, vals + (symbol, scope_tf, scope_system)

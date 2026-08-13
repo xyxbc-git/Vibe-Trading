@@ -521,9 +521,10 @@ print("\n── 用例6 配置回读：懒建/业务键 upsert/幂等/断供静�
 
 
 class _PullCursor:
-    def __init__(self, rows, missing=False):
+    def __init__(self, rows, missing=False, legacy_only=False):
         self.rows = rows
         self.missing = missing
+        self.legacy_only = legacy_only
 
     def __enter__(self):
         return self
@@ -534,23 +535,27 @@ class _PullCursor:
     def execute(self, sql, params=None):
         if self.missing:
             raise RuntimeError(f"(1146, \"Table 'jiaweisi.{ts.CONFIG_TABLE}' doesn't exist\")")
+        # 任务L：模拟 MySQL 侧未 ALTER 纪律列的老库（新列清单报 1054）
+        if self.legacy_only and "tp_mode" in sql:
+            raise RuntimeError("(1054, \"Unknown column 'tp_mode' in 'field list'\")")
 
     def fetchall(self):
         return self.rows
 
 
 class _PullConn:
-    def __init__(self, rows, missing=False):
+    def __init__(self, rows, missing=False, legacy_only=False):
         self.rows = rows
         self.missing = missing
+        self.legacy_only = legacy_only
 
     def cursor(self):
-        return _PullCursor(self.rows, self.missing)
+        return _PullCursor(self.rows, self.missing, self.legacy_only)
 
 
 class _PullMySQL:
-    def __init__(self, rows, missing=False):
-        self.conn = _PullConn(rows, missing)
+    def __init__(self, rows, missing=False, legacy_only=False):
+        self.conn = _PullConn(rows, missing, legacy_only)
 
     def get(self):
         return self.conn
@@ -633,6 +638,52 @@ n_lazy = rc.execute(f"SELECT COUNT(*) FROM {ts.LOCAL_CONFIG_TABLE}").fetchone()[
 rc.close()
 check("6.本地表懒建 + 首轮全插", res6e.rows == 2 and n_lazy == 2)
 os.remove(lazy_db)
+
+# ══════════ 6L) 任务L 周期纪律 5 列回读 ══════════
+print("\n── 用例6L 纪律列回读：15列落地/空串归NULL/老库缺列回退/旧表补列 ──")
+_patch_local(cfg_db)   # 回到 6.x 的旧结构预置库：验证幂等 ALTER 对老表补列
+
+# f) 15 元组新行：纪律列落地（tp_mode/tp_rr_ratio/sl_mode/sl_atr_mult），
+#    空白 mode 归 NULL（第二行 tp_mode='  ' / sl_mode=''）
+remote3 = [
+    (11, "BTCUSDT", None, None, 100.0, 10.0, 10.0, 2.0, 4.0, "1",
+     "fixed_rr", 2.5, None, "atr_buffer", 1.5),
+    (12, "BTCUSDT", "1h", "turtle", 200.0, 5.0, 15.0, 1.5, 3.0, "1",
+     "  ", None, 0.5, "", None),
+]
+res6f = ts.sync_sim_config_pull(_Ctx(mysql=_PullMySQL(remote3)))
+rc = sqlite3.connect(cfg_db)
+rc.row_factory = sqlite3.Row
+got6f = rc.execute(f"SELECT * FROM {ts.LOCAL_CONFIG_TABLE} ORDER BY id").fetchall()
+rc.close()
+glob6f = next((r for r in got6f if r["scope_system"] is None), None)
+hit6f = next((r for r in got6f if r["scope_system"] == "turtle"), None)
+check("6L.旧结构本地表被幂等补列 + 纪律字段落地（fixed_rr/2.5/atr_buffer/1.5）",
+      res6f.rows == 2 and bool(glob6f)
+      and glob6f["tp_mode"] == "fixed_rr" and float(glob6f["tp_rr_ratio"]) == 2.5
+      and glob6f["tp_pct_factor"] is None
+      and glob6f["sl_mode"] == "atr_buffer" and float(glob6f["sl_atr_mult"]) == 1.5,
+      str(dict(glob6f)) if glob6f else str(res6f))
+check("6L.空串/空白 mode 归 NULL（=跟随信号），数值列独立落地（pct_factor=0.5）",
+      bool(hit6f) and hit6f["tp_mode"] is None and hit6f["sl_mode"] is None
+      and float(hit6f["tp_pct_factor"]) == 0.5,
+      str(dict(hit6f)) if hit6f else "")
+
+# g) MySQL 侧未 ALTER（unknown column 1054）→ 回退旧列清单，纪律字段刷 NULL 镜像源
+ts._missing_warned.clear()
+res6g = ts.sync_sim_config_pull(_Ctx(mysql=_PullMySQL(remote2, legacy_only=True)))
+rc = sqlite3.connect(cfg_db)
+rc.row_factory = sqlite3.Row
+hit6g = next((r for r in rc.execute(
+    f"SELECT * FROM {ts.LOCAL_CONFIG_TABLE} ORDER BY id").fetchall()
+    if r["scope_system"] == "turtle"), None)
+rc.close()
+check("6L.远端缺纪律列 → 回退旧清单照常回读（rows=2 无 error）",
+      res6g.rows == 2 and res6g.error is None, f"cursor={res6g.cursor_value}")
+check("6L.回退档纪律字段刷 NULL（镜像照源：远端无纪律配置）",
+      bool(hit6g) and hit6g["tp_mode"] is None and hit6g["tp_rr_ratio"] is None
+      and hit6g["sl_mode"] is None and float(hit6g["principal"]) == 500.0,
+      str(dict(hit6g)) if hit6g else "")
 
 ts._local_db = _ORIG_LOCAL_DB
 os.remove(src_db)
