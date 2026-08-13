@@ -8389,7 +8389,9 @@ def api_fvg(symbol: str = "BTCUSDT", tf: str = "15m", max_zones: int = 10):
                 "price": out.get("price"), "atr": out.get("atr"),
                 "zones": _fvg_zones_with_ts(df, out.get("zones") or []),
                 "structure_events": structure_events,
-                "structure_direction": structure_dir}
+                "structure_direction": structure_dir,
+                # [N2] 折价溢价区（agent-3 契约透传：均衡线+区域着色数据源）
+                "premium_discount": out.get("premium_discount")}
 
     return JSONResponse(_cached(f"fvg:{sym}:{iv}:{mz}", 60, _calc))
 

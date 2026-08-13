@@ -29,7 +29,7 @@ import { PositionZonePrimitive } from "./PositionZonePrimitive";
 import { IchimokuCloudPrimitive } from "./IchimokuCloudPrimitive";
 import { TrapSignalsPrimitive } from "./TrapSignalsPrimitive";
 import { WyckoffPrimitive } from "./WyckoffPrimitive";
-import { FvgPrimitive, type FvgZoneView } from "./FvgPrimitive";
+import { FvgPrimitive, type FvgZoneView, type PremiumDiscountView } from "./FvgPrimitive";
 import { SmcStructurePrimitive, type StructureEventView } from "./SmcStructurePrimitive";
 
 /** 云图叠加载荷：三条线走 LineSeries，云带（含未来段）走 primitive */
@@ -115,6 +115,8 @@ interface KlineChartProps {
    * null/undefined 不渲染。
    */
   fvgZones?: FvgZoneView[] | null;
+  /** [N2] 折价溢价区：横贯整图淡色带+均衡虚线（FVG 同开关）；null 不渲染。 */
+  fvgPremiumDiscount?: PremiumDiscountView | null;
   /**
    * SMC 结构事件线（R8 追加）：BOS/CHoCH 素雅细线从被突破 swing 点延伸到
    * 突破蜡烛+小字标签（看涨绿/看跌红/CHoCH 琥珀虚线）；hover 出事件摘要。
@@ -183,6 +185,7 @@ export default function KlineChart({
   onTrapClick,
   wyckoff,
   fvgZones,
+  fvgPremiumDiscount,
   smcEvents,
   datasetKey,
   onNearLeftEdge,
@@ -621,6 +624,16 @@ export default function KlineChart({
       // chart may have been disposed between render and effect
     }
   }, [fvgZones, initVersion]);
+
+  // [N2] 折价溢价区：均衡线+区域着色（FVG 同 primitive 承载）
+  useEffect(() => {
+    if (disposedRef.current) return;
+    try {
+      fvgPrimitiveRef.current?.setPremiumDiscount(fvgPremiumDiscount ?? null);
+    } catch {
+      // chart may have been disposed between render and effect
+    }
+  }, [fvgPremiumDiscount, initVersion]);
 
   // SMC 结构事件线（R8 追加）：prop 变化整组重设，传空/未传即清空。
   useEffect(() => {

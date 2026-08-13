@@ -34,6 +34,17 @@ export interface FvgZoneView {
   tooltip: string;
 }
 
+/** [N2] 折价溢价区（dealing range 分位）：均衡线 + 溢价/折价淡色带 */
+export interface PremiumDiscountView {
+  rangeHigh: number;
+  rangeLow: number;
+  equilibrium: number;
+  zone: "premium" | "discount" | "equilibrium";
+  /** 现价在区间分位 0~100 */
+  posPct: number;
+  tooltip: string;
+}
+
 const COLOR_BULL = "#3fb950";
 const COLOR_BEAR = "#f85149";
 const FILL_ALPHA = 0.1;
@@ -47,6 +58,13 @@ interface ZoneLayout {
   view: FvgZoneView;
 }
 
+interface PdLayout {
+  yHigh: number;
+  yEq: number;
+  yLow: number;
+  view: PremiumDiscountView;
+}
+
 function rgba(hex: string, alpha: number): string {
   const m = /^#([0-9a-fA-F]{6})$/.exec(hex);
   if (!m) return hex;
@@ -55,12 +73,54 @@ function rgba(hex: string, alpha: number): string {
 }
 
 class FvgRenderer implements ISeriesPrimitivePaneRenderer {
-  constructor(private readonly _layouts: readonly ZoneLayout[]) {}
+  constructor(
+    private readonly _layouts: readonly ZoneLayout[],
+    private readonly _pd: PdLayout | null,
+  ) {}
 
   draw(target: RenderTarget): void {
     target.useMediaCoordinateSpace(({ context: ctx, mediaSize }) => {
       const { width, height } = mediaSize;
       ctx.font = "9px -apple-system, BlinkMacSystemFont, PingFang SC, sans-serif";
+
+      // [N2] 折价溢价区（横贯整图的淡色背景层，先画垫底）：
+      // 溢价带（range_high~均衡）淡红=宜卖区，折价带（均衡~range_low）淡绿=宜买区
+      const pd = this._pd;
+      if (pd) {
+        const drawBand = (y1: number, y2: number, color: string) => {
+          const top = Math.min(y1, y2);
+          const h = Math.abs(y2 - y1);
+          if (h <= 0 || top > height || top + h < 0) return;
+          ctx.fillStyle = color;
+          ctx.fillRect(0, top, width, h);
+        };
+        drawBand(pd.yHigh, pd.yEq, "rgba(248,81,73,0.045)");
+        drawBand(pd.yEq, pd.yLow, "rgba(63,185,80,0.045)");
+        // 均衡线（0.5 中点）虚线 + 右缘标注
+        if (pd.yEq >= 0 && pd.yEq <= height) {
+          ctx.strokeStyle = "rgba(201,209,217,0.5)";
+          ctx.lineWidth = 1;
+          ctx.setLineDash([6, 4]);
+          ctx.beginPath();
+          ctx.moveTo(0, pd.yEq + 0.5);
+          ctx.lineTo(width, pd.yEq + 0.5);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.fillStyle = "rgba(201,209,217,0.85)";
+          ctx.textBaseline = "bottom";
+          ctx.fillText("均衡 0.5", width - 52, pd.yEq - 2);
+        }
+        // 区域小字（右缘，带太矮跳过）
+        ctx.textBaseline = "middle";
+        if (Math.abs(pd.yEq - pd.yHigh) >= 24) {
+          ctx.fillStyle = rgba(COLOR_BEAR, 0.55);
+          ctx.fillText("溢价区", width - 44, (Math.max(pd.yHigh, 0) + pd.yEq) / 2);
+        }
+        if (Math.abs(pd.yLow - pd.yEq) >= 24) {
+          ctx.fillStyle = rgba(COLOR_BULL, 0.55);
+          ctx.fillText("折价区", width - 44, (pd.yEq + Math.min(pd.yLow, height)) / 2);
+        }
+      }
       for (const L of this._layouts) {
         if (L.xLeft > width) continue;
         const top = Math.min(L.yTop, L.yBottom);
@@ -118,13 +178,16 @@ class FvgPaneView implements ISeriesPrimitivePaneView {
 
   renderer(): ISeriesPrimitivePaneRenderer | null {
     const layouts = this._source.layouts();
-    return layouts.length > 0 ? new FvgRenderer(layouts) : null;
+    const pd = this._source.pdLayout();
+    return layouts.length > 0 || pd ? new FvgRenderer(layouts, pd) : null;
   }
 }
 
 export class FvgPrimitive implements ISeriesPrimitive<Time> {
   private _zones: FvgZoneView[] = [];
   private _layouts: ZoneLayout[] = [];
+  private _pd: PremiumDiscountView | null = null;
+  private _pdLayout: PdLayout | null = null;
   private readonly _views: readonly ISeriesPrimitivePaneView[];
   private _series: ISeriesApi<SeriesType, Time> | null = null;
   private _chart: AttachedChart | null = null;
@@ -152,12 +215,24 @@ export class FvgPrimitive implements ISeriesPrimitive<Time> {
     this._requestUpdate?.();
   }
 
+  /** [N2] 设置/清除折价溢价区（null 即清除） */
+  setPremiumDiscount(pd: PremiumDiscountView | null): void {
+    this._pd = pd;
+    this._requestUpdate?.();
+  }
+
   layouts(): readonly ZoneLayout[] {
     return this._layouts;
   }
 
-  /** hover 命中：返回命中 zone 的 tooltip（多带重叠取最新形成的=数组靠前者） */
+  pdLayout(): PdLayout | null {
+    return this._pdLayout;
+  }
+
+  /** hover 命中：均衡线（±4px 精确元素）优先，其后 FVG 带（多带重叠取最新） */
   zoneAt(x: number, y: number): string | null {
+    const pd = this._pdLayout;
+    if (pd && Math.abs(y - pd.yEq) <= 4) return pd.view.tooltip;
     for (const L of this._layouts) {
       const top = Math.min(L.yTop, L.yBottom);
       const bottom = Math.max(L.yTop, L.yBottom);
@@ -169,9 +244,10 @@ export class FvgPrimitive implements ISeriesPrimitive<Time> {
   // 缩放/平移/新数据由库回调重投影：time → x（时间锚点），price → y
   updateAllViews(): void {
     this._layouts = [];
+    this._pdLayout = null;
     const series = this._series;
     const chart = this._chart;
-    if (!series || !chart || this._zones.length === 0) return;
+    if (!series || !chart) return;
     const timeScale = chart.timeScale();
     for (const z of this._zones) {
       const x = timeScale.timeToCoordinate(z.timeSec as Time);
@@ -180,6 +256,15 @@ export class FvgPrimitive implements ISeriesPrimitive<Time> {
       // 形成 bar 已滚出已加载数据左缘时 x=null：带从图左缘起画（缺口仍有效）
       if (yTop === null || yBottom === null) continue;
       this._layouts.push({ xLeft: x ?? 0, yTop, yBottom, view: z });
+    }
+    const pd = this._pd;
+    if (pd) {
+      const yHigh = series.priceToCoordinate(pd.rangeHigh);
+      const yEq = series.priceToCoordinate(pd.equilibrium);
+      const yLow = series.priceToCoordinate(pd.rangeLow);
+      if (yHigh !== null && yEq !== null && yLow !== null) {
+        this._pdLayout = { yHigh, yEq, yLow, view: pd };
+      }
     }
   }
 

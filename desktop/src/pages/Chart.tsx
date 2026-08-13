@@ -7,7 +7,7 @@ import { useSymbol } from "@/hooks/useSymbol";
 import { useLivePrice } from "@/hooks/usePrice";
 import { api, formatPrice, type TwelveSignal, type ConsensusTradePlan, type KeyLevel, type LiqMapResponse, type SignalDirection } from "@/api/client";
 import KlineChart from "@/components/charts/KlineChart";
-import type { FvgZoneView } from "@/components/charts/FvgPrimitive";
+import type { FvgZoneView, PremiumDiscountView } from "@/components/charts/FvgPrimitive";
 import type { StructureEventView } from "@/components/charts/SmcStructurePrimitive";
 import { EventRibbon } from "@/components/cards/EventCalendarCard";
 import { tradesToMarks } from "@/lib/signalTrades";
@@ -1256,6 +1256,34 @@ export default function Chart() {
     return out;
   }, [fvgOn, fvgResp, symbol, tfSettled]);
 
+  // [N2] 折价溢价区 → 均衡线+区域着色（FVG 同开关同数据源；检测失败/旧后端缺字段不渲染）
+  const fvgPdView = useMemo<PremiumDiscountView | null>(() => {
+    if (!fvgOn || !fvgResp?.ok) return null;
+    if (isStaleEcho(symbol, fvgResp.symbol) || (fvgResp.tf != null && fvgResp.tf !== tfSettled)) {
+      return null;
+    }
+    const pd = fvgResp.premium_discount;
+    if (!pd?.ok || pd.range_high == null || pd.range_low == null || pd.equilibrium == null) {
+      return null;
+    }
+    const zoneCn =
+      pd.zone === "premium" ? "溢价区（宜卖不宜追多）"
+      : pd.zone === "discount" ? "折价区（宜买不宜杀跌）"
+      : "均衡带（无分位优势）";
+    return {
+      rangeHigh: pd.range_high,
+      rangeLow: pd.range_low,
+      equilibrium: pd.equilibrium,
+      zone: pd.zone ?? "equilibrium",
+      posPct: pd.pos_pct ?? 50,
+      tooltip:
+        `折价/溢价区（近 ${pd.lookback_bars ?? 120} 根 dealing range）\n` +
+        `区间 ${pd.range_low.toLocaleString()} ~ ${pd.range_high.toLocaleString()} · 均衡 ${pd.equilibrium.toLocaleString()}\n` +
+        `现价分位 ${Math.round(pd.pos_pct ?? 50)}% → ${zoneCn}\n` +
+        `SMC 口径：折价区找做多、溢价区找做空，均衡线上下各留 5% 缓冲`,
+    };
+  }, [fvgOn, fvgResp, symbol, tfSettled]);
+
   // SMC 结构事件 → 线段视图（BOS 实线 / CHoCH 琥珀虚线，被突破 swing 点→突破蜡烛）
   const smcEventViews = useMemo<StructureEventView[] | null>(() => {
     if (!bosOn || !fvgResp?.ok) return null;
@@ -2252,6 +2280,7 @@ export default function Chart() {
               ichimoku={ichimokuData?.overlay ?? null}
               trapMarks={trapMarks}
               fvgZones={fvgZoneViews}
+              fvgPremiumDiscount={fvgPdView}
               smcEvents={smcEventViews}
               onTrapClick={(mark) => setSelectedTrap(mark)}
               wyckoff={wyckoffOverlay}

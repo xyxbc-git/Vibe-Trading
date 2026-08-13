@@ -2452,6 +2452,19 @@ export interface SmcStructureEvent {
   break_ts?: number | null;
 }
 
+/** [N2] 折价溢价区（dealing range 分位；ok:false 时其余键为 null） */
+export interface PremiumDiscount {
+  ok: boolean;
+  reason?: string | null;
+  range_high: number | null;
+  range_low: number | null;
+  equilibrium: number | null;
+  price?: number | null;
+  pos_pct: number | null;
+  zone: "premium" | "discount" | "equilibrium" | null;
+  lookback_bars?: number | null;
+}
+
 export interface FvgResponse {
   ok: boolean;
   reason?: string | null;
@@ -2464,6 +2477,8 @@ export interface FvgResponse {
   /** SMC 结构事件（R8 追加；旧后端无此字段） */
   structure_events?: SmcStructureEvent[];
   structure_direction?: "up" | "down" | null;
+  /** [N2] 折价溢价区（旧后端无此字段） */
+  premium_discount?: PremiumDiscount | null;
   error?: string;
 }
 
