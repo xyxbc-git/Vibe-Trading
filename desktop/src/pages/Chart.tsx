@@ -6,6 +6,7 @@ import { useSymbol } from "@/hooks/useSymbol";
 import { useLivePrice } from "@/hooks/usePrice";
 import { api, formatPrice, type TwelveSignal, type ConsensusTradePlan, type KeyLevel, type LiqMapResponse, type SignalDirection } from "@/api/client";
 import KlineChart from "@/components/charts/KlineChart";
+import { EventRibbon } from "@/components/cards/EventCalendarCard";
 import { tradesToMarks } from "@/lib/signalTrades";
 import {
   computeDrawings,
@@ -1362,6 +1363,8 @@ export default function Chart() {
 
   return (
     <div className="space-y-4">
+      {/* 任务 U：未来 24h 高影响财经事件标记条（风险窗口内变红；未配置/无事件不占位） */}
+      <EventRibbon />
       <div className="flex items-center justify-between">
         <h1 className="page-title flex items-center gap-2 mb-0">
           <CandlestickChart size={22} />

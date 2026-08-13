@@ -8,6 +8,7 @@ import ConsensusGauge from "@/components/cards/ConsensusGauge";
 import SignalBoard from "@/components/cards/SignalBoard";
 import PositionAdvisor from "@/components/cards/PositionAdvisor";
 import InsightFeed from "@/components/cards/InsightFeed";
+import TodayEventsCard from "@/components/cards/EventCalendarCard";
 import TradeHistory from "@/components/cards/TradeHistory";
 import SignalWinRate from "@/components/cards/SignalWinRate";
 import {
@@ -209,9 +210,13 @@ export default function Dashboard() {
       {/* ── 第二行半 · 能开多少：仓位与风控建议（信号计划 × 本金/杠杆/风险%）── */}
       <PositionAdvisor symbol={symbol} tf={consensusTf} />
 
-      {/* ── 第三行 · 主动汇报：洞察流 | 净值曲线 ── */}
+      {/* ── 第三行 · 主动汇报：今日大事+洞察流 | 净值曲线 ── */}
       <div className="grid grid-cols-3 gap-4">
-        <InsightFeed limit={20} />
+        <div className="space-y-4">
+          {/* 任务 U：金十事件日历（未配置 key 时显示注册引导） */}
+          <TodayEventsCard />
+          <InsightFeed limit={20} />
+        </div>
 
         <div className="card col-span-2">
           <p className="stat-label mb-4">收益曲线（7天）</p>

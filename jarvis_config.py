@@ -334,6 +334,13 @@ DEFAULTS: dict = {
     # 作 D7 反向影子验证的输入；仅统计筛选，不影响交易引擎。
     "twelve_diag_min_samples": 20,    # 稳定亏候选最小样本数（笔）
     "twelve_diag_max_winrate": 30.0,  # 稳定亏候选胜率上限%
+    # ── 任务 U：金十事件日历·风险窗口阈值（jarvis_event_calendar）──────────────
+    # 高影响宏观数据（CPI/非农/FOMC）公布瞬间常见插针——事件前 pre / 后 post
+    # 分钟内算风险窗口，导师证据链 event_risk 路在窗口内出 warn 提示。
+    # 数据源金十开放平台（secret-key 放 ~/.vibe-trading/jin10.json，不进 git）。
+    "event_risk_min_star": 3,        # ≥该星级(1-3)才算高影响事件
+    "event_risk_pre_min": 30,        # 事件公布前 N 分钟进入风险窗口
+    "event_risk_post_min": 15,       # 事件公布后 N 分钟仍在风险窗口
     # ── T1 止损结算口径纠偏（2026-08-11 正期望重建：轮询粒度 → 挂单语义）────────
     # 取证：模拟盘止损结算单边悲观伪影 51.35U（82% 为代码伪影非真滑点）。
     # bar=按触发 bar 结算：常规触发=触发位+常数滑点（方向恒不利），真跳空
@@ -526,6 +533,10 @@ GROUPS: dict[str, str] = {
     "twelve_max_toll_ratio": "risk",
     # T7 零成交体系处置：12 套体系启停显式标记（dict 键，BOUNDS 不适用）
     "twelve_system_enabled": "signal",
+    # 任务 U：金十事件日历·风险窗口阈值
+    "event_risk_min_star": "risk",
+    "event_risk_pre_min": "risk",
+    "event_risk_post_min": "risk",
 }
 
 # 组内注释（init 模板用；也是 Settings 页分组展示的口径说明）。
@@ -630,6 +641,9 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "twelve_cb_deweight": (0.05, 1.0),
     "twelve_tf_deweight": (0.05, 1.0),
     "twelve_sl_slippage_pct": (0.0, 0.5),      # 止损常数滑点%（真实滑点 0.01~0.03）
+    "event_risk_min_star": (1, 3),             # 高影响事件星级门槛
+    "event_risk_pre_min": (0, 240),            # 事件前风险窗口（分钟）
+    "event_risk_post_min": (0, 240),           # 事件后风险窗口（分钟）
     "twelve_sl_deweight": (0.05, 1.0),         # 降权下限 0.05：绝不降到 0 断样本
     "twelve_max_toll_ratio": (0.0, 999.0),     # 过路费/风险上限（0=关，999=事实关闭）
 }

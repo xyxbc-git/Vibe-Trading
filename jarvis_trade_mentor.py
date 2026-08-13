@@ -254,6 +254,27 @@ def _fvg_evidence(symbol: str, tf: str) -> dict:
         return _ev(False, reason=repr(exc)[:120])
 
 
+def _event_risk_evidence(symbol: str) -> dict:
+    """事件风险窗口（任务 U）：jarvis_event_calendar.mentor_item 动态 import。
+
+    未配置金十 key / 模块未就绪 → available=False（unavailable 不计分母，
+    照 FVG 路接法）；不把「没数据」误读成「没风险」。
+    """
+    try:
+        import jarvis_event_calendar as jec
+    except Exception:
+        return _ev(False, reason="jarvis_event_calendar 未就绪，已降级")
+    try:
+        item = jec.mentor_item(symbol)
+        if not item.get("available"):
+            return _ev(False, reason=item.get("note") or "事件日历未配置")
+        return _ev(True, in_window=bool(item.get("in_window")),
+                   note=item.get("note"), event=item.get("event"),
+                   minutes_to=item.get("minutes_to"))
+    except Exception as exc:  # noqa: BLE001 — 证据缺失降级，不拖垮裁决
+        return _ev(False, reason=repr(exc)[:120])
+
+
 def build_evidence(symbol: str, direction: str, entry: float, sl: float, tp: float,
                    *, tf: str = "30m", consensus_provider=None) -> dict:
     """组装一份证据包（全只读；每路独立容错，缺失诚实标 available=False）。
@@ -277,6 +298,7 @@ def build_evidence(symbol: str, direction: str, entry: float, sl: float, tp: flo
         "micro": _micro_evidence(symbol, tf, direction),
         "history": _history_evidence(symbol.upper(), tf),
         "fvg": _fvg_evidence(symbol, tf),
+        "event_risk": _event_risk_evidence(symbol),
     }
 
 
@@ -525,6 +547,22 @@ def _judge_micro(ev: dict, plan: dict) -> dict:
     return _item("micro", worst, "；".join(parts))
 
 
+def _judge_event_risk(ev: dict) -> dict:
+    """事件风险窗口（任务 U·第八路）：不在 WEIGHTS 内 → weight=0 不参与加权，
+    只作明细警示——风险窗口内 warn，窗口外 pass，未配置 unavailable 不计分母。"""
+    er = ev.get("event_risk") or {}
+    if not er.get("available"):
+        return _item("event_risk", "unavailable",
+                     f"事件日历不可用（{er.get('reason', '未配置金十 key')}）")
+    if er.get("in_window"):
+        return _item("event_risk", "warn",
+                     er.get("note") or "高影响宏观数据风险窗口内，数据瞬间插针风险高",
+                     raw={"event": er.get("event"), "minutes_to": er.get("minutes_to")})
+    return _item("event_risk", "pass",
+                 er.get("note") or "未来无临近高影响宏观事件",
+                 raw={"event": er.get("event"), "minutes_to": er.get("minutes_to")})
+
+
 def verdict(evidence: dict, plan: dict) -> dict:
     """确定性裁决（纯函数）。plan 需含 direction/entry/stop_loss/take_profit，
     可选 emotion_score(1-5)/reason。输出契约见任务书：
@@ -539,6 +577,7 @@ def verdict(evidence: dict, plan: dict) -> dict:
         _judge_levels(evidence, plan),
         _judge_structure(evidence, plan_dir),
         _judge_micro(evidence, plan),
+        _judge_event_risk(evidence),   # 任务 U：weight=0 仅明细警示，不动预登记权重
     ]
 
     # 加权计分：unavailable 不计分母（证据不全不硬造分数，对齐 supply_demand 哲学）

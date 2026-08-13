@@ -8256,6 +8256,42 @@ async def api_datasource_switch(request: Request):
         return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
 
 
+# ─────────────────── 金十事件日历 API（任务 U · 事件风险窗口）───────────────────
+# 数据层 jarvis_event_calendar：1h TTL + 磁盘缓存，出网只打金十域名；
+# 未配置 secret-key 时诚实 not_configured（绝不伪造日历），前端按此引导配置。
+
+@app.get("/api/events/upcoming")
+def api_events_upcoming(hours: float = 24.0, min_star: int = 1):
+    """未来 N 小时财经事件（含风险窗口判定）。
+
+    响应：{ok, configured, events:[{ts,country,title,importance,previous,
+    forecast,actual,minutes_to}], risk:{in_window,event,minutes_to,note},
+    stale, note}；未配置 key → ok:true + configured:false + events:[]（诚实空）。
+    """
+    try:
+        import jarvis_event_calendar as jec
+        h = max(0.5, min(24.0 * 14, float(hours)))
+        ms = max(1, min(3, int(min_star)))
+        box = jec.upcoming_events(h * 60.0, ms)
+        return JSONResponse({
+            "ok": True, "configured": box["configured"],
+            "events": box["events"], "risk": jec.risk_window(),
+            "stale": box.get("stale", False), "note": box.get("note"),
+        })
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
+
+
+@app.get("/api/events/status")
+def api_events_status():
+    """事件日历配置/缓存健康态（含未配置时的 key 获取与落盘路径提示）。"""
+    try:
+        import jarvis_event_calendar as jec
+        return JSONResponse({"ok": True, **jec.status()})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="贾维斯可视化仪表盘")
     # [Sprint0] 监听地址/端口默认从配置中心读（dashboard_host/dashboard_port，
