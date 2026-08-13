@@ -8184,6 +8184,33 @@ def api_mentor_rules_upsert(req: MentorRuleReq):
         return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
 
 
+# ─────────────── 盘上实时合流仪表 API（方案 20260813 C-2，环境合流分） ───────────────
+# 说明：评分核心在 jarvis_confluence（预登记权重，纯函数可冒烟）；本端点只做
+# 缓存接线——共识路复用本进程 /api/twelve/consensus 缓存桶（同 mentor 模式），
+# 其余各路走各模块自带缓存/降级，零新增出网。行为/成本不进分（D3/D4 裁决）。
+
+import jarvis_confluence as jcfl
+
+
+@app.get("/api/confluence")
+def api_confluence(symbol: str = "ETHUSDT", tf: str = "30m"):
+    """环境合流分（事前扫描 HUD）：{score, direction, groups, cp1_align,
+    action_gate, cost_flag, freshness}。60s 缓存；skipped 不计分母。"""
+    sym = symbol.upper().replace("-", "").replace("/", "")
+    if not sym.endswith(("USDT", "USDC")):
+        sym += "USDT"
+    iv = tf if tf in {"5m", "15m", "30m", "1h", "4h", "1d"} else "30m"
+
+    def _calc():
+        return jcfl.assess(sym, iv,
+                           consensus_provider=_mentor_consensus_provider(sym))
+
+    try:
+        return JSONResponse(_cached(f"confluence:{sym}:{iv}", 60, _calc))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
+
+
 # ─────────────── 交易导师·AI 解释层（小白话 SSE，任务 N agent-3 区段） ───────────────
 # 在 jarvis_trade_mentor 的确定性 verdict 之上做小白话润色：灯色/分数以规则引擎
 # 为准，AI 只解释不改判。证据包经 jarvis_mentor_explain.fetch_plan_bundle
