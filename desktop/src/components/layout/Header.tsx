@@ -7,6 +7,7 @@ import SymbolPicker from "./SymbolPicker";
 import AddSymbolDialog from "./AddSymbolDialog";
 import RegimeBadge from "./RegimeBadge";
 import RefreshCountdown from "./RefreshCountdown";
+import DataSourceCapsule from "./DataSourceCapsule";
 import {
   Activity,
   Clock,
@@ -102,6 +103,8 @@ export default function Header() {
         </div>
 
         <RegimeBadge />
+
+        <DataSourceCapsule />
 
         <SymbolPicker />
 
