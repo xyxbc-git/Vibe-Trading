@@ -123,6 +123,18 @@ removed = jsh.prune(max_rows=10)
 check("裁剪-删除数", removed == 29 + 1 - 10 or removed > 0, f"removed={removed}")
 check("裁剪-上限内", jsh.history("SOLUSDT")["total"] <= 10)
 
+# ── 11) [T10] 裁剪上限可配：默认参数走配置解析，显式传参行为不变 ────
+check("上限-配置解析为整数且≥1000", isinstance(jsh._max_change_rows(), int)
+      and jsh._max_change_rows() >= 1000, f"={jsh._max_change_rows()}")
+check("裁剪-无参调用不删（远低于上限）", jsh.prune() == 0)
+_orig_mcr = jsh._max_change_rows
+jsh._max_change_rows = lambda: 3
+try:
+    check("裁剪-无参调用吃配置上限", jsh.prune() > 0
+          and jsh.history("SOLUSDT")["total"] <= 3)
+finally:
+    jsh._max_change_rows = _orig_mcr
+
 print()
 if _FAILED:
     print(f"FAILED: {len(_FAILED)} → {_FAILED}")

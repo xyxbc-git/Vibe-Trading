@@ -179,6 +179,21 @@ DEFAULTS: dict = {
     # 单进程对单主机每分钟实际出网请求上限（含重试）；超限走缓存/短错。
     # 4 个常驻进程 × 该值 ≈ 全系统上限，默认 180×4=720 远低于币安 2400 权重/分。
     "rest_max_per_min": 180,
+    # ── T10 常驻信号采集器（jarvis_signal_collector：WS 收盘 bar 事件驱动落带）──
+    # 背景：twelve_signal_changes 此前只被 dashboard API 重算路径写入（面板/轮询
+    # 驱动），真 bar 可用率按 UTC 小时 30%~86.5%（偏斜 2.9×）。采集器为独立常驻
+    # 进程：只认已收盘 bar → 12 系统信号计算 → record_batch 落库，与面板无关。
+    "sigcol_enabled": True,           # 采集器总开关（进程启动时读取；关=启动即退出）
+    "sigcol_tfs": "5m,15m,30m,1h,4h",  # 采集 TF 集（逗号分隔，与 12 系统共识 TF 对齐）
+    "sigcol_backfill_bars": 288,      # WS 断线缺口单 (币,TF) 最大回补 bar 数（0=关回补）
+    "sigcol_queue_max": 4096,         # 收盘事件队列容量（满则丢新事件并计数，绝不阻塞 WS）
+    "sigcol_ledger_retention_days": 45,  # 采集台账 signal_collect_log 保留天数
+    "sigcol_tape": True,              # 采集器同进程挂 aggTrade→tape 分钟 bar 落库链（真 bar 覆盖）
+    "sigcol_basis": True,             # 拉期现基差供套利系统（~2 请求/币/5min 经共享预算；关=剔除 arbitrage 不硬造中性）
+    # ── T10 信号变更流水保留上限（jarvis_signal_history.prune 消费）─────────────
+    # 旧硬编码 50k 已被打满（T9 实测 50,005 条=贴上限，裁剪正在吃掉历史尾部）；
+    # 常驻采集下 50k 仅够数天，T9 按日聚类需按月累积。调大留意磁盘（~1KB/条）。
+    "signal_history_max_rows": 500_000,
     # ── order-flow phase-1 本地订单簿引擎（jarvis_orderbook）───────────────────
     "book_enabled": True,             # 总开关：dashboard 启动时挂载订单簿引擎
     "book_snapshot_interval_s": 5.0,  # 内存深度切片周期（秒）
@@ -424,6 +439,13 @@ GROUPS: dict[str, str] = {
     "ws_reconnect_max_s": "data",
     "ws_force_order_persist": "data",
     "rest_max_per_min": "data",
+    "sigcol_tfs": "data",
+    "sigcol_backfill_bars": "data",
+    "sigcol_queue_max": "data",
+    "sigcol_ledger_retention_days": "data",
+    "sigcol_tape": "data",
+    "sigcol_basis": "data",
+    "signal_history_max_rows": "data",
     "book_snapshot_interval_s": "data",
     "book_retention_days": "data",
     "book_levels": "data",
@@ -436,6 +458,7 @@ GROUPS: dict[str, str] = {
     "dashboard_port": "system",
     "ws_enabled": "system",
     "book_enabled": "system",
+    "sigcol_enabled": "system",
     # sim——twelve 模拟盘结算口径（T1 正期望重建）
     "twelve_sl_slippage_pct": "sim",
     "twelve_sl_fill_mode": "sim",
@@ -508,6 +531,10 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "ws_reconnect_base_s": (0.5, 30.0),
     "ws_reconnect_max_s": (5.0, 600.0),
     "rest_max_per_min": (30, 2000),
+    "sigcol_backfill_bars": (0, 480),         # 上限 < fetch_klines 单次 500 根天花板
+    "sigcol_queue_max": (256, 65_536),
+    "sigcol_ledger_retention_days": (7, 365),  # 下限 7 天：短于验收窗口的台账无意义
+    "signal_history_max_rows": (50_000, 5_000_000),  # 下限=旧硬编码值，防误设丢样本
     "book_snapshot_interval_s": (1.0, 60.0),
     "book_retention_days": (1, 365),
     "book_levels": (10, 200),
@@ -539,6 +566,7 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "twelve_cb_deweight": (0.05, 1.0),
     "twelve_tf_deweight": (0.05, 1.0),
     "twelve_sl_slippage_pct": (0.0, 0.5),      # 止损常数滑点%（真实滑点 0.01~0.03）
+    "twelve_sl_deweight": (0.05, 1.0),         # 降权下限 0.05：绝不降到 0 断样本
 }
 
 # 允许的枚举键。
@@ -551,6 +579,7 @@ ENUMS: dict[str, tuple[str, ...]] = {
     "twelve_cb_mode": ("reject", "deweight"),
     "twelve_tf_gate_mode": ("reject", "deweight"),
     "twelve_sl_fill_mode": ("bar", "poll"),
+    "twelve_sl_gate_mode": ("rewrite", "deweight", "reject"),
 }
 
 

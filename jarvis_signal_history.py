@@ -36,7 +36,10 @@ STRENGTH_EPS = 0.15          # 强度绝对变化
 PLAN_PRICE_EPS_PCT = 0.2     # 计划价相对变化 %
 LEVEL_PRICE_EPS_PCT = 0.5    # 关键位价相对变化 %
 
-# 流水保留上限（自动裁剪，防无界增长）
+# 流水保留上限（自动裁剪，防无界增长）。
+# [T10] 生效值优先读配置 signal_history_max_rows（默认 50 万）：旧硬编码 5 万
+# 已被打满（表长期贴上限=裁剪在吃历史尾部），T9 按日聚类需按月累积样本。
+# 本常量仅作配置层不可用时的兜底。
 MAX_CHANGE_ROWS = 50_000
 # 自动裁剪节流：每小时最多跑一次
 _PRUNE_INTERVAL_S = 3600.0
@@ -337,9 +340,25 @@ def record_batch(symbol: str, tf: str, signals: list[dict],
         return {}
 
 
-def prune(max_rows: int = MAX_CHANGE_ROWS) -> int:
-    """裁剪最老流水到上限内；返回删除行数。失败返回 0。"""
+def _max_change_rows() -> int:
+    """流水保留上限：配置 signal_history_max_rows，配置层不可用回退旧硬编码。"""
     try:
+        import jarvis_config as jc
+        v = int(float(jc.get("signal_history_max_rows") or 0))
+        return v if v >= 1000 else MAX_CHANGE_ROWS
+    except Exception:  # noqa: BLE001 — 配置层异常不拖垮裁剪，退回内置默认
+        return MAX_CHANGE_ROWS
+
+
+def prune(max_rows: int | None = None) -> int:
+    """裁剪最老流水到上限内；返回删除行数。失败返回 0。
+
+    max_rows=None（record_batch 小时级自动裁剪的口径）时读配置
+    signal_history_max_rows；显式传参（测试/手动清理）行为不变。
+    """
+    try:
+        if max_rows is None:
+            max_rows = _max_change_rows()
         _ensure_init()
         with _conn() as conn:
             row = conn.execute(
