@@ -406,6 +406,19 @@ def sync_market_snapshot(ctx: SyncContext) -> TaskResult:
         return _round_fail(SNAP_TABLE, "market-intel 失败")
     _consec_fail[SNAP_TABLE] = 0
 
+    # [任务J3] 降级缓存诚实性：源数据任一 part 来自降级缓存（封禁/失败回旧值）
+    # 时跳过本轮——snap_time 是本轮系统时刻，冻结数据配新时刻=向镜像/若依
+    # 制造「假新鲜」行（agent-9 H2 实锤的选源欺骗链）。跳过留缺口是诚实语义；
+    # 旧版 dashboard（未重启无 stale_parts 字段）不受影响走原路径。
+    _stale_src = intel.get("stale_parts") or []
+    if _stale_src:
+        log.info("[%s] 源数据降级（stale: %s），本轮跳过不制造假新鲜快照行",
+                 SNAP_TABLE, ",".join(str(x) for x in _stale_src))
+        return TaskResult(
+            rows=0,
+            cursor_value=f"stale-skip@{_now_gmt8().strftime('%H:%M:%S')}",
+        )
+
     now = _now_gmt8()
     snap_time = now.replace(second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
 

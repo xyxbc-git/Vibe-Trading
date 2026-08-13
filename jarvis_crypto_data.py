@@ -105,6 +105,40 @@ def _cache_read(key: str) -> Optional[dict]:
         return None
 
 
+# ── 降级缓存诚实性（任务 J3，2026-08-13）────────────────────────────────────
+# 背景（agent-9 H2 取证）：封禁期 _get 回旧缓存不带任何标记 → market_intel 把
+# 冻结价格当新数据刷新 ts → 快照同步写「假新鲜」行 → 若依按时间戳选源被骗。
+# 修复：缓存降级出口给 dict 响应附加 _stale/_stale_age_s；list 响应（klines/
+# ticker 全量等）无法内嵌标记，走 last_get_meta() 线程旁路。正常路径零变化。
+_GET_META = threading.local()
+
+
+def _note_degrade_meta(stale: bool, age_s: Optional[int] = None) -> None:
+    _GET_META.stale = bool(stale)
+    _GET_META.age_s = age_s
+
+
+def last_get_meta() -> dict:
+    """本线程最近一次 _get 的降级元信息：{'stale': bool, 'age_s': int|None}。
+
+    list 响应无法内嵌 _stale 标记，消费方（如 jarvis_market_intel）在 _get
+    返回后立即读本旁路判断是否降级缓存，避免把冻结数据当新鲜刷时间戳。
+    """
+    return {"stale": bool(getattr(_GET_META, "stale", False)),
+            "age_s": getattr(_GET_META, "age_s", None)}
+
+
+def _stale_cached(cached: dict) -> Any:
+    """缓存降级统一出口：登记旁路元信息；dict 响应浅拷贝附加 _stale 标记
+    （绝不原地污染磁盘缓存对象），list 等非 dict 响应原样返回。"""
+    age = int(time.time() - float(cached.get("ts", 0) or 0))
+    _note_degrade_meta(True, age)
+    data = cached.get("data")
+    if isinstance(data, dict):
+        return {**data, "_stale": True, "_stale_age_s": age}
+    return data
+
+
 def _degrade_log(msg: str) -> None:
     try:
         os.makedirs(os.path.dirname(DEGRADE_LOG), exist_ok=True)
@@ -286,16 +320,17 @@ def _get(url: str, params: Optional[dict] = None, retries: Optional[int] = None,
       3. 分钟预算：单进程对单主机出网次数/分钟 ≤ rest_max_per_min（含重试）。
     """
     key = _cache_key(url, params)
+    _note_degrade_meta(False)   # [J3] 每次调用重置旁路元信息，只有降级出口置真
     eff_ttl = _endpoint_ttl(url) if ttl is None else float(ttl)
     if eff_ttl > 0:
         cached = _cache_read(key)
         if cached is not None and time.time() - float(cached.get("ts", 0)) < eff_ttl:
-            return cached.get("data")
+            return cached.get("data")   # TTL 内=按约定新鲜，不算降级
     ban_ts = jarvis_net.banned_until(url)
     if ban_ts:
         cached = _cache_read(key)
         if cached is not None:
-            return cached.get("data")
+            return _stale_cached(cached)   # [J3] 封禁短路回缓存：如实打 stale
         return {"_error": "IP rate-limit banned until "
                           + time.strftime("%H:%M:%S", time.localtime(ban_ts))}
     if retries is None:
@@ -371,7 +406,7 @@ def _get(url: str, params: Optional[dict] = None, retries: Optional[int] = None,
     if cached is not None:
         age = int(time.time() - cached.get("ts", 0))
         _degrade_log(f"GET 降级用缓存 url={url} age={age}s err={last_err}")
-        return cached.get("data")
+        return _stale_cached(cached)   # [J3] 失败降级回缓存：如实打 stale
     return {"_error": last_err}
 
 

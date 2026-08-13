@@ -42,6 +42,11 @@ _REFRESHING = False
 _STORE: dict[str, dict] = {}
 
 
+# [任务J3] 降级感知：同一 fetcher 线程内任一请求命中降级缓存 → 该 part 视为
+# stale（list 响应无法内嵌 _stale 标记，靠 jcd.last_get_meta() 旁路感知）
+_FETCH_CTX = threading.local()
+
+
 def _get_json(url: str, params: dict | None = None):
     """经 jcd._get 三道闸出网（TTL 直出 / 封禁短路 / 权重预算）。
 
@@ -50,11 +55,23 @@ def _get_json(url: str, params: dict | None = None):
     是撞爆 IP 权重额度的未记账大户。改走 jcd._get 后自动获得端点 TTL 缓存、
     封禁/冷却短路、权重计费与降级旧缓存；失败语义保持 raise（调用方已有
     per-项容错）。
+    [任务J3] 每次调用后读 jcd.last_get_meta() 累计本线程 stale 记号，供
+    _refresh 决定「不刷新 ts」——冻结数据不再伪装新鲜。
     """
     import jarvis_crypto_data as jcd
     data = jcd._get(url, params, fast=True)
     if isinstance(data, dict) and "_error" in data:
         raise RuntimeError(f"fetch failed: {data.get('_error')}")
+    try:
+        meta = getattr(jcd, "last_get_meta", lambda: {})() or {}
+        if meta.get("stale"):
+            _FETCH_CTX.stale = True
+            age = meta.get("age_s")
+            if age is not None:
+                prev = getattr(_FETCH_CTX, "age_s", None)
+                _FETCH_CTX.age_s = max(int(age), int(prev)) if prev is not None else int(age)
+    except Exception:  # noqa: BLE001 — 旁路感知失败不影响取数主链路
+        pass
     return data
 
 
@@ -177,12 +194,27 @@ _FETCHERS = {"funding": _fetch_funding, "oi": _fetch_oi,
 
 
 def _refresh(parts: list[str]) -> None:
-    """并行拉取指定 parts；成功写缓存，失败保留旧值并记录错误。"""
+    """并行拉取指定 parts；成功写缓存，失败保留旧值并记录错误。
+
+    [任务J3] 降级缓存诚实性：本轮任一请求命中降级缓存（封禁短路/失败回缓存）
+    → 数据照常可用但**不刷新 ts**（保留旧 ts）并打 stale 标——下游按时间戳
+    判断新鲜度的逻辑（快照同步/若依选源）自然正确，冻结数据不再伪装新鲜。
+    """
     def _one(name: str) -> None:
         try:
+            _FETCH_CTX.stale = False
+            _FETCH_CTX.age_s = None
             data = _FETCHERS[name]()
+            is_stale = bool(getattr(_FETCH_CTX, "stale", False))
+            stale_age = getattr(_FETCH_CTX, "age_s", None)
             with _LOCK:
-                _STORE[name] = {"ts": time.time(), "data": data, "error": None}
+                if is_stale:
+                    old = _STORE.get(name) or {"ts": 0.0, "data": None}
+                    _STORE[name] = {"ts": old.get("ts") or 0.0, "data": data,
+                                    "error": None, "stale": True,
+                                    "stale_age_s": stale_age}
+                else:
+                    _STORE[name] = {"ts": time.time(), "data": data, "error": None}
         except Exception as exc:  # noqa: BLE001 — 单源失败不拖垮整页
             with _LOCK:
                 old = _STORE.get(name) or {"ts": 0.0, "data": None}
@@ -248,16 +280,30 @@ def get_intel() -> dict:
 
     parts_ts = [t for t in (_ts(n) for n in _FETCHERS) if t]
     errors = {name: snap[name]["error"] for name in _FETCHERS if snap[name]["error"]}
+    # [任务J3] 逐 part 降级标注：数据来自降级缓存时 part 内附 stale/stale_age_s，
+    # 顶层 stale_parts 汇总（快照同步据此拒绝制造假新鲜行）
+    stale_parts = [n for n in _FETCHERS if snap[n].get("stale")]
+
+    def _mark(name: str, part: dict | None) -> dict | None:
+        if part is None or not snap[name].get("stale"):
+            return part
+        out = {**part, "stale": True}
+        if snap[name].get("stale_age_s") is not None:
+            out["stale_age_s"] = snap[name]["stale_age_s"]
+        return out
 
     return {
         "ok": any(x is not None for x in (funding, oi, ls, fng)),
         "updated_at": max(parts_ts) if parts_ts else None,
-        "fng": ({**fng, "ts": _ts("fng")} if fng else None),
+        "stale_parts": stale_parts or None,
+        "fng": _mark("fng", {**fng, "ts": _ts("fng")} if fng else None),
         "funding_rate": (funding or {}).get("rates") or None,
         "funding_ts": _ts("funding") if funding else None,
-        "oi": ({**oi, "ts": _ts("oi")} if oi else None),
-        "long_short": ({**ls, "ts": _ts("long_short")} if ls else None),
-        "price_24h": ({**price24, "ts": _ts("price_24h")} if price24 else None),
+        "funding_stale": True if snap["funding"].get("stale") else None,
+        "oi": _mark("oi", {**oi, "ts": _ts("oi")} if oi else None),
+        "long_short": _mark("long_short", {**ls, "ts": _ts("long_short")} if ls else None),
+        "price_24h": _mark("price_24h",
+                           {**price24, "ts": _ts("price_24h")} if price24 else None),
         # 未接入源：明确原因，前端据此渲染「未接入」占位态，禁止演示假数据
         "liquidations": None,
         "onchain": None,
