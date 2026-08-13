@@ -139,11 +139,16 @@ def _stale_cached(cached: dict) -> Any:
     return data
 
 
+# [任务N1] 降级日志进程标记：多进程共写一个降级日志，此前无法回答「谁在敲」
+# ——每行前缀 进程名:pid，封禁期取证直接定位调用方。
+_PROC_TAG = f"{os.path.basename(sys.argv[0] or 'python')}:{os.getpid()}"
+
+
 def _degrade_log(msg: str) -> None:
     try:
         os.makedirs(os.path.dirname(DEGRADE_LOG), exist_ok=True)
         with open(DEGRADE_LOG, "a", encoding="utf-8") as f:
-            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][{_PROC_TAG}] {msg}\n")
     except Exception:  # noqa: BLE001
         pass
 
@@ -304,6 +309,14 @@ def _note_ban(url: str, msg: str) -> bool:
     return True
 
 
+# [任务N1] 同参 single-flight：同一进程内并发的同 (url,params) 请求只放一支
+# 真实出网，其余线程等领跑者写缓存后直接吃缓存——dashboard 多面板同秒齐拉
+# 同一根 K 线（实测封禁到期瞬间 6+ 条相同 klines 并发）不再放大出网量。
+_INFLIGHT: dict = {}
+_INFLIGHT_LOCK = threading.Lock()
+_INFLIGHT_WAIT_S = 12.0
+
+
 def _get(url: str, params: Optional[dict] = None, retries: Optional[int] = None,
          *, fast: bool = False, ttl: Optional[float] = None) -> Any:
     """带指数退避的 GET，优雅处理 binance 限流(-1003/418/429)，主源失败回退缓存。
@@ -318,14 +331,47 @@ def _get(url: str, params: Optional[dict] = None, retries: Optional[int] = None,
       2. 封禁短路：主机在登记封禁期内不出网（缓存/报错），响应解析到
          "banned until" 时登记封禁并立即停止重试；
       3. 分钟预算：单进程对单主机出网次数/分钟 ≤ rest_max_per_min（含重试）。
+
+    [任务N1] 第四道闸——同参 single-flight（仅 eff_ttl>0 的端点）：并发同参
+    请求由领跑者独跑，其余等其写缓存后直出；领跑者失败/超时则各自走完整
+    链路（封禁短路与分钟预算仍兜底，不会退化成雪崩）。
     """
     key = _cache_key(url, params)
     _note_degrade_meta(False)   # [J3] 每次调用重置旁路元信息，只有降级出口置真
     eff_ttl = _endpoint_ttl(url) if ttl is None else float(ttl)
-    if eff_ttl > 0:
+    if eff_ttl <= 0:
+        return _get_body(url, params, retries, fast=fast, key=key)
+    cached = _cache_read(key)
+    if cached is not None and time.time() - float(cached.get("ts", 0)) < eff_ttl:
+        return cached.get("data")   # TTL 内=按约定新鲜，不算降级
+    leader = False
+    with _INFLIGHT_LOCK:
+        ev = _INFLIGHT.get(key)
+        if ev is None:
+            ev = threading.Event()
+            _INFLIGHT[key] = ev
+            leader = True
+    if not leader:
+        ev.wait(_INFLIGHT_WAIT_S)
         cached = _cache_read(key)
-        if cached is not None and time.time() - float(cached.get("ts", 0)) < eff_ttl:
-            return cached.get("data")   # TTL 内=按约定新鲜，不算降级
+        if cached is not None and time.time() - float(cached.get("ts", 0)) < max(eff_ttl, 5.0):
+            return cached.get("data")   # 领跑者刚写的新鲜缓存
+        # 领跑者失败/超时（无新鲜缓存可吃）：自行走完整链路，三道闸兜底
+        return _get_body(url, params, retries, fast=fast, key=key)
+    try:
+        return _get_body(url, params, retries, fast=fast, key=key)
+    finally:
+        with _INFLIGHT_LOCK:
+            _INFLIGHT.pop(key, None)
+        ev.set()
+
+
+def _get_body(url: str, params: Optional[dict] = None,
+              retries: Optional[int] = None, *, fast: bool = False,
+              key: Optional[str] = None) -> Any:
+    """_get 的封禁/预算/网络主体（single-flight 协调层之下，语义与旧版一致）。"""
+    if key is None:
+        key = _cache_key(url, params)
     ban_ts = jarvis_net.banned_until(url)
     if ban_ts:
         cached = _cache_read(key)

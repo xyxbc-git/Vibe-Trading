@@ -490,6 +490,70 @@ def weight_headroom(url_or_host: str, threshold: float) -> bool:
     return True
 
 
+# ── 出网观测只读器（任务 N1：/api/net/weight 数据源，零锁快照口径）─────────────
+
+
+def weight_records() -> dict:
+    """net_weight.json 原样读出：host → {w: 响应头回报的 IP 已用权重, ts}。
+
+    这是「自家流量 vs 共享 IP 被连坐」定性实验的仪表：自家预算只有几十
+    权重/分而此处 ≥ 上千，即实锤第三方流量打满出口 IP。异常返回 {}。
+    """
+    try:
+        with open(_WEIGHT_PATH, encoding="utf-8") as f:
+            raw = json.load(f)
+        return raw if isinstance(raw, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def budget_usage() -> dict:
+    """net_budget.json 60s 滑窗内各 host 自家已用权重合计（读侧快照，不加锁）。
+
+    与 weight_records 对照即可回答「谁在敲」：本值≈自家真实出网量。
+    """
+    out: dict = {}
+    try:
+        with open(_BUDGET_PATH, encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            return {}
+        now = time.time()
+        for host, win in raw.items():
+            try:
+                used = sum(c for t, c in
+                           (e for e in (_win_entry(x) for x in (win or []))
+                            if e is not None)
+                           if now - t < _BUDGET_WINDOW_S)
+                if used > 0:
+                    out[str(host)] = round(used, 1)
+            except Exception:  # noqa: BLE001 — 单 host 结构异常跳过
+                continue
+    except Exception:  # noqa: BLE001
+        return {}
+    return out
+
+
+def ban_records() -> dict:
+    """当前有效封禁登记：host → until（秒级 epoch）。含策略层前的原始登记。"""
+    try:
+        now = time.time()
+        _ban_load(now)
+        return {h: t for h, t in _ban_cache.items() if t > now}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def probe_state() -> dict:
+    """软着陆探针状态快照（net_probe.json 原样）；异常返回 {}。"""
+    try:
+        with open(_PROBE_PATH, encoding="utf-8") as f:
+            raw = json.load(f)
+        return raw if isinstance(raw, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def report_cooldown(url_or_host: str, seconds: float) -> None:
     """登记短时冷却（429 未附封禁时间时用）——复用封禁登记表跨进程短路。
 

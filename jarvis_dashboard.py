@@ -8317,6 +8317,41 @@ async def api_datasource_switch(request: Request):
         return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
 
 
+@app.get("/api/net/weight")
+def api_net_weight():
+    """[任务N1] 出网权重观测（纯读本地状态零出网）。
+
+    自家 60s 已用权重（net_budget） vs 交易所响应头回报的 IP 已用权重
+    （X-MBX-USED-WEIGHT-1M，net_weight）——两者相差数量级即实锤共享 IP 被
+    第三方打满；另附封禁登记/软着陆探针/数据源策略与限额配置一站式视图。
+    """
+    try:
+        import jarvis_net as _jn
+        try:
+            import jarvis_config as _jc
+            self_budget = int(_jc.get("rest_max_per_min") or 180)
+            brake = float(_jc.get("rest_weight_brake") or 1200)
+        except Exception:  # noqa: BLE001
+            self_budget, brake = 180, 1200.0
+        bans = {h: {"until": t,
+                    "until_hms": time.strftime("%H:%M:%S", time.localtime(t))}
+                for h, t in (_jn.ban_records() or {}).items()}
+        return JSONResponse({
+            "ok": True,
+            "limits": {"binance_official_per_min": 2400,
+                       "self_budget_per_min": self_budget,
+                       "weight_brake": brake},
+            "self_used_1m": _jn.budget_usage(),
+            "ip_reported_1m": _jn.weight_records(),
+            "bans": bans,
+            "postban_probe": _jn.probe_state(),
+            "datasource_policy": _jn.source_policy(),
+            "ts": time.time(),
+        })
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
+
+
 # ─────────────────── 金十事件日历 API（任务 U · 事件风险窗口）───────────────────
 # 数据层 jarvis_event_calendar：1h TTL + 磁盘缓存，出网只打金十域名；
 # 未配置 secret-key 时诚实 not_configured（绝不伪造日历），前端按此引导配置。
