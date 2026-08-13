@@ -273,9 +273,166 @@ finally:
     import shutil as _sh
     _sh.rmtree(_tmp2, ignore_errors=True)
 
+# ══════════════ V1 · 个人军规引擎 + 行为统计 ══════════════
+
+RULES = [{"rule_id": rid, "title": t, "rtype": rt, "params": p, "enabled": 1}
+         for rid, t, rt, p in jtm.DEFAULT_RULES]
+
+
+def rules_map(vd):
+    return {r["rule_id"]: r for r in vd.get("rules", [])}
+
+
+# ── 26. 顺风局 + 干净上下文：军规全 pass（R07/R08 数据缺 → skipped）──
+ev26 = ev_base()   # RR=3、toll=5%、30m 同向（tfs 只有 5m→构造补 30m/1h/4h）
+ev26["trend"]["consensus"]["tfs"].update(
+    {"30m": {"direction": "bullish", "confidence": 0.6},
+     "1h": {"direction": "bullish", "confidence": 0.6},
+     "4h": {"direction": "neutral", "confidence": 0.3}})
+ctx_clean = {"today_submitted": 0, "loss_streak_today": 0, "last_red_age_min": None}
+vd26 = jtm.verdict(ev26, plan_of(ev26), rules=RULES, rules_ctx=ctx_clean)
+rm = rules_map(vd26)
+check("V1 军规区段齐 8 条", len(rm) == 8, str(list(rm)))
+check("V1 顺风局 R01-R06 全 pass",
+      all(rm[k]["status"] == "pass" for k in ("R01", "R02", "R03", "R04", "R05", "R06")),
+      str({k: rm[k]["status"] for k in ("R01", "R02", "R03", "R04", "R05", "R06")}))
+check("V1 R07 事件缺失 skipped", rm["R07"]["status"] == "skipped")
+check("V1 R08 无本金 skipped", rm["R08"]["status"] == "skipped")
+check("V1 军规不违反不降灯", vd26["light"] == "green", vd26["light"])
+check("V1 军规展示字段均 str",
+      all(isinstance(r["evidence"], str) and isinstance(r["title"], str)
+          for r in vd26["rules"]))
+
+# ── 27. R03 RR<2 违反 → fail + 降灯（绿→黄）──
+ev27 = ev_base(entry=100, sl=98, tp=103.2)   # RR=1.6（过 R1 红线但违 R03 军规）
+ev27["trend"]["consensus"]["tfs"].update(
+    {"30m": {"direction": "bullish", "confidence": 0.6},
+     "1h": {"direction": "bullish", "confidence": 0.6}})
+vd27 = jtm.verdict(ev27, plan_of(ev27), rules=RULES, rules_ctx=ctx_clean)
+check("V1 R03 违反 fail", rules_map(vd27)["R03"]["status"] == "fail")
+check("V1 R03 降灯（≤黄）", vd27["light"] in ("yellow", "red"), vd27["light"])
+check("V1 rules_note 记录降灯", vd27["rules_note"] and "R03" in vd27["rules_note"])
+
+# ── 28. R02 toll>0.2 → fail + 引取证 ──
+ev28 = ev_base(entry=100, sl=99.7, tp=100.9)   # sl 0.3% → toll≈33%（RR=3 不触 R1/R3）
+vd28 = jtm.verdict(ev28, plan_of(ev28), rules=RULES, rules_ctx=ctx_clean)
+check("V1 R02 违反引 9.5% 取证", rules_map(vd28)["R02"]["status"] == "fail"
+      and "9.5%" in rules_map(vd28)["R02"]["evidence"])
+
+# ── 29. R04 多周期不同向 → fail（warn 叠加不降灯）──
+ev29 = ev_base()
+ev29["trend"]["consensus"]["tfs"].update(
+    {"30m": {"direction": "bearish", "confidence": 0.6},
+     "1h": {"direction": "neutral", "confidence": 0.3},
+     "4h": {"direction": "bearish", "confidence": 0.5}})
+vd29 = jtm.verdict(ev29, plan_of(ev29), rules=RULES, rules_ctx=ctx_clean)
+check("V1 R04 违反 fail", rules_map(vd29)["R04"]["status"] == "fail")
+check("V1 R04 不在降灯清单（灯不因它变红）", vd29["light"] != "red", vd29["light"])
+
+# ── 30. R05 当日 ≥3 单 → fail；R01 红灯冷静期未过 → fail ──
+ctx_busy = {"today_submitted": 3, "loss_streak_today": 0, "last_red_age_min": 10.0}
+vd30 = jtm.verdict(ev26, plan_of(ev26), rules=RULES, rules_ctx=ctx_busy)
+rm30 = rules_map(vd30)
+check("V1 R05 过度交易 fail", rm30["R05"]["status"] == "fail", rm30["R05"]["evidence"][:40])
+check("V1 R01 冷静期未过 fail", rm30["R01"]["status"] == "fail")
+
+# ── 31. R06 连亏 2 单 → fail + 降灯 + 冷静期加长 60 ──
+ctx_tilt = {"today_submitted": 2, "loss_streak_today": 2, "last_red_age_min": None}
+vd31 = jtm.verdict(ev26, plan_of(ev26), rules=RULES, rules_ctx=ctx_tilt)
+check("V1 R06 连亏 fail + 降灯", rules_map(vd31)["R06"]["status"] == "fail"
+      and vd31["light"] in ("yellow", "red"), vd31["light"])
+check("V1 R06 冷静期加长 60", vd31["cooldown_min"] == 60, str(vd31["cooldown_min"]))
+
+# ── 32. R07 事件窗口内 → warn；R08 预亏 2% > 1% → warn ──
+ev32 = ev_base()
+ev32["trend"]["consensus"]["tfs"].update(
+    {"30m": {"direction": "bullish", "confidence": 0.6},
+     "1h": {"direction": "bullish", "confidence": 0.6}})
+ev32["event_risk"] = {"available": True, "in_window": True,
+                      "note": "美国CPI（★★★）还有 20 分钟公布", "minutes_to": 20.0}
+p32 = {**plan_of(ev32), "principal": 1000.0, "leverage": 1.0}   # 预亏 = 2% 本金
+vd32 = jtm.verdict(ev32, p32, rules=RULES, rules_ctx=ctx_clean)
+rm32 = rules_map(vd32)
+check("V1 R07 事件窗口 warn", rm32["R07"]["status"] == "warn"
+      and "CPI" in rm32["R07"]["evidence"])
+check("V1 R08 预亏超日常档 warn", rm32["R08"]["status"] == "warn",
+      rm32["R08"]["evidence"][:50])
+check("V1 warn 军规不降灯", vd32["light"] == "green", vd32["light"])
+
+# ── 33. 军规停用即跳过；custom 规则展示不判定 ──
+rules33 = [dict(r) for r in RULES]
+for r in rules33:
+    if r["rule_id"] == "R03":
+        r["enabled"] = 0
+rules33.append({"rule_id": "U-1", "title": "只在自己熟悉的形态下单",
+                "rtype": "custom", "params": {}, "enabled": 1})
+vd33 = jtm.verdict(ev27, plan_of(ev27), rules=rules33, rules_ctx=ctx_clean)
+rm33 = rules_map(vd33)
+check("V1 停用军规不出现", "R03" not in rm33)
+check("V1 custom 军规展示自查", rm33["U-1"]["status"] == "pass"
+      and "自定义" in rm33["U-1"]["evidence"])
+
+# ── 34. 不传 rules 完全向后兼容 ──
+vd34 = jtm.verdict(ev26, plan_of(ev26))
+check("V1 不传 rules 输出空区段", vd34["rules"] == [] and vd34["rules_note"] is None)
+
+# ── 35. 军规表 CRUD + 上下文 + stats 行为扩展（临时库）──
+_tmp3 = tempfile.mkdtemp(prefix="mentor_smoke3_")
+_orig_db3 = jj.DB_PATH
+try:
+    jj.DB_PATH = os.path.join(_tmp3, "t.db")
+    jtm.ensure_schema()
+    jtm.ensure_schema()   # seed 幂等
+    rules_db = jtm.load_rules()
+    check("V1 seed 默认 8 条", len(rules_db) == 8
+          and rules_db[0]["params"].get("cooldown_min") == 30, str(len(rules_db)))
+
+    up = jtm.upsert_rule("R03", params={"min_rr": 2.5}, enabled=True)
+    check("V1 内置军规调参", up["ok"] and not up["created"]
+          and jtm.load_rules()[2]["params"]["min_rr"] == 2.5)
+    up2 = jtm.upsert_rule("R03", rtype="custom")
+    check("V1 内置 rtype 锁定", any(r["rtype"] == "rr_gate"
+                                    for r in jtm.load_rules() if r["rule_id"] == "R03"))
+    up3 = jtm.upsert_rule(None, title="自定义军规A", enabled=True)
+    check("V1 新增自定义军规", up3["ok"] and up3["created"]
+          and up3["rule_id"].startswith("U-"))
+    jtm.upsert_rule("R05", enabled=False)
+    check("V1 停用后 enabled_only 不含", all(r["rule_id"] != "R05"
+                                             for r in jtm.load_rules(enabled_only=True)))
+
+    # 台账上下文：造 1 红灯 + 2 连亏
+    evx = ev_base(entry=100, sl=98, tp=102)   # 红灯（R1）
+    vdx = jtm.verdict(evx, plan_of(evx))
+    jtm.save_plan(plan_of(evx), vdx)
+    for i in range(2):
+        pid_l = jtm.save_plan(plan_of(ev_base(), emotion=5), vd26)
+        jtm.set_outcome(pid_l, result="loss", pnl_pct=-2.0, followed=False)
+    ctx = jtm._rules_context("TESTUSDT")
+    check("V1 ctx 当日提交数=3", ctx["today_submitted"] == 3, str(ctx))
+    check("V1 ctx 连亏=2", ctx["loss_streak_today"] == 2)
+    check("V1 ctx 红灯年龄有值", ctx["last_red_age_min"] is not None
+          and ctx["last_red_age_min"] < 5)
+
+    st = jtm.stats(30)
+    check("V1 stats.today", st["today"]["submitted"] == 3
+          and st["today"]["executed"] == 2 and st["today"]["loss_streak"] == 2,
+          str(st["today"]))
+    check("V1 stats 时段桶齐 4 段", len(st["by_session"]) == 4)
+    check("V1 时段样本不足标不可判定",
+          all(b.get("insufficient") for b in st["by_session"].values()
+              if b["n"] > 0), json.dumps(st["by_session"], ensure_ascii=False)[:120])
+    check("V1 情绪对比桶存在", "hot_ge4" in st["by_emotion"]
+          and "calm_le3" in st["by_emotion"])
+    check("V1 情绪桶样本不足不给数字",
+          st["by_emotion"]["hot_ge4"]["win_rate"] is None)
+finally:
+    jj.DB_PATH = _orig_db3
+    import shutil as _sh3
+    _sh3.rmtree(_tmp3, ignore_errors=True)
+
 # ── 汇总 ──
 print()
 if fails:
     print(f"FAILED {len(fails)}: {fails}")
     raise SystemExit(1)
-print("ALL PASS（25 组 / 覆盖红线、权重、情绪、关键位、台账、信任回路、R2 字符串契约+principal）")
+print("ALL PASS（35 组 / 红线、权重、情绪、关键位、台账、信任回路、R2 契约、V1 军规+行为统计）")

@@ -8095,7 +8095,12 @@ def api_mentor_plan(req: MentorPlanReq):
         ev = jtm.build_evidence(sym, req.direction, req.entry, req.stop_loss,
                                 req.take_profit, tf=req.tf,
                                 consensus_provider=_mentor_consensus_provider(sym))
-        vd = jtm.verdict(ev, plan)
+        # V1：加载启用的个人军规 + 台账上下文（当日提交/连亏/最近红灯）一起裁决
+        try:
+            rules, rctx = jtm.load_rules(), jtm._rules_context(sym)
+        except Exception:  # noqa: BLE001 — 军规层异常不阻塞主裁决
+            rules, rctx = None, None
+        vd = jtm.verdict(ev, plan, rules=rules, rules_ctx=rctx)
         pid = jtm.save_plan(plan, vd)
         return JSONResponse({"ok": True, "plan_id": pid, "verdict": vd})
     except Exception as e:  # noqa: BLE001
@@ -8143,9 +8148,38 @@ def api_mentor_outcome(plan_id: int, req: MentorOutcomeReq):
 
 @app.get("/api/mentor/stats")
 def api_mentor_stats(days: int = 90):
-    """信任回路统计：红/黄/绿灯各自胜率 + 听劝 vs 不听劝盈亏对比。"""
+    """信任回路统计：红/黄/绿灯胜率 + 听劝对比 + V1 行为维度（当日/时段/情绪）。"""
     try:
         return JSONResponse({"ok": True, **jtm.stats(days)})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
+
+
+class MentorRuleReq(BaseModel):
+    rule_id: str | None = None          # 有且存在 → 更新；否则新增（缺省自动生成 U-<ts>）
+    title: str | None = None
+    rtype: str | None = None            # 内置军规（R01-R08）的 rtype 锁定不可改
+    params: dict | None = None          # 参数 JSON（如 {"min_rr": 2.0}）
+    enabled: bool | None = None         # 启停开关
+
+
+@app.get("/api/mentor/rules")
+def api_mentor_rules(all: int = 1):
+    """个人军规清单（V1）。all=1 含停用项（管理页），all=0 只看启用项。"""
+    try:
+        return JSONResponse({"ok": True,
+                             "rules": jtm.load_rules(enabled_only=not int(all))})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
+
+
+@app.post("/api/mentor/rules")
+def api_mentor_rules_upsert(req: MentorRuleReq):
+    """军规增改启停（V1）：内置 8 条可调参/停用；自定义条目自由增改。"""
+    try:
+        out = jtm.upsert_rule(req.rule_id, title=req.title, rtype=req.rtype,
+                              params=req.params, enabled=req.enabled)
+        return JSONResponse(out, status_code=200 if out.get("ok") else 422)
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
 

@@ -38,7 +38,23 @@
   4. 其余 → yellow
   5. 可用证据权重 < 50/100 → 最高只能黄灯（证据不足不给绿灯——缺证据
      不是证据没问题；对齐 supply_demand 的 coverage 降置信哲学）
-  6. E1 命中且结果优于黄 → 降为 yellow
+  6. 个人军规（V1）：R02/R03/R06 任一被违反 → 最高只能黄灯；
+     R06 违反同时把冷静期加长到 extended_cooldown_min（默认 60）；
+     其余军规违反只作 warn 叠加展示，不降灯
+  7. E1 命中且结果优于黄 → 降为 yellow
+
+个人军规引擎（V1 预登记；默认 8 条参数化、可关，用户可增删改）：
+  R01 cooldown_red   上一条红灯裁决 < cooldown_min(30) 分钟 → fail（报复性交易信号）
+  R02 toll_gate      toll_ratio > max_toll(0.20) → fail + 降灯（引 9.5% 胜率取证）
+  R03 rr_gate        RR < min_rr(2.0) → fail + 降灯
+  R04 mtf_align      30m/1h/4h 中与计划同向的 < min_agree(2) 个 → fail（5m 只做时机）
+  R05 daily_cap      当日已提交 ≥ max_per_day(3) 单 → fail（过度交易提醒）
+  R06 loss_streak    当日已连亏 ≥ streak(2) 单再提交 → fail + 降灯 + 冷静期 60min
+  R07 event_window   高影响事件风险窗口内 → warn（事件日历未配置 → skipped）
+  R08 risk_pct_cap   预亏 > 本金 × max_loss_pct(1.0)% → warn（未给本金 → skipped）
+  状态集合：pass=遵守 / warn=边缘触碰 / fail=违反 / skipped=数据缺失不判定；
+  台账上下文（当日提交数/连亏 streak/最近红灯）由 _rules_context 查库，
+  evaluate_rules 本身为纯函数（离线冒烟可构造）。
 ──────────────────────────────────────────────────────────────────────
 
 数据纪律：pg/SQLite 只经 jarvis_journal._conn()（jarvis_db 兼容层）；
@@ -70,6 +86,21 @@ MAGNET_MIN_STRENGTH = 0.5   # 强磁吸位强度门槛（对齐 jarvis_liq_map.m
 
 TOLL_QUOTE = ("取证：止损距离<0.1% 的 95 笔，光过路费就是风险预算的 2 倍，"
               "实测胜率仅 9.5%——下单那一刻就已注定亏损")
+
+# V1 个人军规：内置默认 8 条（参数化、可关；用户可经 /api/mentor/rules 增改启停）
+RULE_HARD_FAIL = ("R02", "R03", "R06")   # 违反即降灯（最高黄）的军规
+DEFAULT_RULES = (
+    ("R01", "红灯单必须过冷静期再提交", "cooldown_red", {"cooldown_min": 30}),
+    ("R02", "过路费占风险预算超 20% 不开单", "toll_gate", {"max_toll": 0.20}),
+    ("R03", "盈亏比低于 2 不开单", "rr_gate", {"min_rr": 2.0}),
+    ("R04", "方向必须顺 30m/1h/4h 中至少 2 个周期（5m 只做入场时机）",
+     "mtf_align", {"tfs": ["30m", "1h", "4h"], "min_agree": 2}),
+    ("R05", "当日提交超过 3 单触发过度交易提醒", "daily_cap", {"max_per_day": 3}),
+    ("R06", "当日连亏 2 单后再提交强制黄灯并加长冷静期", "loss_streak",
+     {"streak": 2, "extended_cooldown_min": 60}),
+    ("R07", "高影响事件风险窗口内不开新仓", "event_window", {}),
+    ("R08", "单笔预亏不超过本金 1%", "risk_pct_cap", {"max_loss_pct": 1.0}),
+)
 
 _DIR_CN = {"long": "多单", "short": "空单"}
 _CONS_OF_PLAN = {"long": "bullish", "short": "bearish"}
@@ -563,10 +594,147 @@ def _judge_event_risk(ev: dict) -> dict:
                  raw={"event": er.get("event"), "minutes_to": er.get("minutes_to")})
 
 
-def verdict(evidence: dict, plan: dict) -> dict:
+# ═══════════════════════════ 个人军规引擎（V1，纯函数） ═══════════════════════════
+
+def _rule_params(rule: dict) -> dict:
+    p = rule.get("params")
+    if isinstance(p, str):
+        try:
+            p = json.loads(p or "{}")
+        except Exception:  # noqa: BLE001
+            p = {}
+    return p if isinstance(p, dict) else {}
+
+
+def evaluate_rules(evidence: dict, plan: dict, rules: list[dict],
+                   ctx: dict | None = None) -> list[dict]:
+    """逐条核对个人军规（纯函数，预登记见模块头）。
+
+    ctx = _rules_context() 的台账上下文：{today_submitted, loss_streak_today,
+    last_red_age_min}；离线冒烟可直接构造。
+    返回 [{rule_id, title, status: pass|warn|fail|skipped, evidence}]。
+    """
+    ctx = ctx or {}
+    out: list[dict] = []
+    risk = evidence.get("risk") or {}
+    plan_dir = plan.get("direction", "long")
+    for rule in rules:
+        if not rule.get("enabled", 1):
+            continue
+        rid, rtype = rule.get("rule_id", "?"), rule.get("rtype", "custom")
+        title = rule.get("title", rid)
+        p = _rule_params(rule)
+        status, ev_txt = "pass", ""
+        if rtype == "cooldown_red":
+            cd = float(p.get("cooldown_min", 30))
+            age = ctx.get("last_red_age_min")
+            if age is None:
+                ev_txt = "近期无红灯裁决，无需冷静期"
+            elif age < cd:
+                status = "fail"
+                ev_txt = (f"上一条红灯裁决仅 {age:.0f} 分钟前（<{cd:.0f}），冷静期未过——"
+                          "红灯后急着再提交，往往是报复性交易")
+            else:
+                ev_txt = f"上一条红灯已过 {age:.0f} 分钟（≥{cd:.0f}），冷静期已满"
+        elif rtype == "toll_gate":
+            mx = float(p.get("max_toll", 0.20))
+            toll = float(risk.get("toll_ratio") or 0)
+            if toll > mx:
+                status = "fail"
+                ev_txt = f"过路费占风险预算 {toll:.1%} > {mx:.0%}。" + TOLL_QUOTE
+            else:
+                ev_txt = f"过路费占比 {toll:.1%} ≤ {mx:.0%}，成本结构可接受"
+        elif rtype == "rr_gate":
+            mn = float(p.get("min_rr", 2.0))
+            rr = float(risk.get("rr") or 0)
+            if rr < mn:
+                status = "fail"
+                ev_txt = f"RR={rr:.2f} < {mn:g}——按你的军规这单赔率不够，不开"
+            else:
+                ev_txt = f"RR={rr:.2f} ≥ {mn:g}，赔率达标"
+        elif rtype == "mtf_align":
+            t = evidence.get("trend") or {}
+            tfs = (t.get("consensus") or {}).get("tfs") or {} if t.get("available") else {}
+            want_tfs = list(p.get("tfs", ["30m", "1h", "4h"]))
+            need = int(p.get("min_agree", 2))
+            want_dir = _CONS_OF_PLAN[plan_dir]
+            visible = [tf for tf in want_tfs if tf in tfs]
+            if not visible:
+                status = "skipped"
+                ev_txt = "30m/1h/4h 共识不可用（取数降级中），本条不判定"
+            else:
+                agree = [tf for tf in visible
+                         if (tfs[tf] or {}).get("direction") == want_dir]
+                if len(agree) >= need:
+                    status = "pass"
+                    ev_txt = (f"{'/'.join(agree)} 与计划同向（{len(agree)}/{len(visible)}"
+                              f" ≥ {need}），5m 仅作入场时机")
+                else:
+                    status = "fail"
+                    ev_txt = (f"{'/'.join(want_tfs)} 中仅 {len(agree)} 个周期与计划同向"
+                              f"（需 ≥{need}）——方向没有多周期背书")
+        elif rtype == "daily_cap":
+            cap = int(p.get("max_per_day", 3))
+            n = int(ctx.get("today_submitted") or 0)
+            if n >= cap:
+                status = "fail"
+                ev_txt = (f"今天已提交 {n} 单（≥{cap}）——交易越多手续费越厚、"
+                          "决策质量越差，这是过度交易信号")
+            else:
+                ev_txt = f"今天第 {n + 1} 单（军规上限 {cap}），频次健康"
+        elif rtype == "loss_streak":
+            need = int(p.get("streak", 2))
+            got_streak = int(ctx.get("loss_streak_today") or 0)
+            if got_streak >= need:
+                status = "fail"
+                ev_txt = (f"今天已连亏 {got_streak} 单（≥{need}）——连亏后最容易上头翻本，"
+                          f"强制黄灯并把冷静期加长到 "
+                          f"{int(p.get('extended_cooldown_min', 60))} 分钟")
+            else:
+                ev_txt = f"当日连亏 {got_streak} 单（<{need}），未触发翻本保护"
+        elif rtype == "event_window":
+            er = evidence.get("event_risk") or {}
+            if not er.get("available"):
+                status = "skipped"
+                ev_txt = f"事件日历不可用（{er.get('reason', '未配置')}），本条不判定"
+            elif er.get("in_window"):
+                status = "warn"
+                ev_txt = str(er.get("note") or "高影响事件风险窗口内，插针风险高")
+            else:
+                ev_txt = str(er.get("note") or "当前不在高影响事件窗口")
+        elif rtype == "risk_pct_cap":
+            principal = float(plan.get("principal") or 0)
+            leverage = float(plan.get("leverage") or 0)
+            if principal <= 0 or leverage <= 0:
+                status = "skipped"
+                ev_txt = "未提供本金/杠杆，本条不判定（在计划里填 principal+leverage 可启用）"
+            else:
+                mx = float(p.get("max_loss_pct", 1.0))
+                loss_pct = leverage * float(risk.get("sl_dist_pct") or 0)
+                if loss_pct > mx:
+                    status = "warn"
+                    ev_txt = (f"打到止损预计亏本金的 {loss_pct:.1f}%（军规日常档 ≤{mx:g}%）"
+                              f"——{'已属重仓豪赌' if loss_pct > 50 else '超出你的日常风险档'}，建议缩仓")
+                else:
+                    ev_txt = f"预亏占本金 {loss_pct:.2f}% ≤ {mx:g}%，仓位在日常风险档内"
+        else:
+            # 用户自定义文案军规：无自动判定逻辑，只展示提醒自查
+            status = "pass"
+            ev_txt = "自定义军规（不参与自动判定），提交前自行核对"
+        out.append({"rule_id": rid, "title": title, "status": status,
+                    "evidence": ev_txt})
+    return out
+
+
+def verdict(evidence: dict, plan: dict, rules: list[dict] | None = None,
+            rules_ctx: dict | None = None) -> dict:
     """确定性裁决（纯函数）。plan 需含 direction/entry/stop_loss/take_profit，
-    可选 emotion_score(1-5)/reason。输出契约见任务书：
-    {light, score, items, summary, cooldown_min}。"""
+    可选 emotion_score(1-5)/reason/principal/leverage。输出契约：
+    {light, score, items, rules, summary, cooldown_min}。
+
+    rules/rules_ctx（V1）：调用方加载启用的军规与台账上下文传入；
+    None = 不评军规（向后兼容旧调用）。
+    """
     plan_dir = plan.get("direction", "long")
     emotion = int(plan.get("emotion_score") or 3)
 
@@ -603,15 +771,34 @@ def verdict(evidence: dict, plan: dict) -> dict:
         coverage_note = (f"可用证据权重仅 {denom}/100（多数引擎不可用）——"
                          "缺证据不等于没问题，最高只给黄灯")
 
-    # E1 情绪强制降档
+    # V1 个人军规：R02/R03/R06 违反 → 最高黄灯；R06 另加长冷静期；其余违反仅展示
     cooldown_min = 0
+    rules_out = evaluate_rules(evidence, plan, rules, rules_ctx) if rules else []
+    rule_fails = [r for r in rules_out if r["status"] == "fail"]
+    rules_note = None
+    hard_hits = [r for r in rule_fails if r["rule_id"] in RULE_HARD_FAIL]
+    if hard_hits and light == "green":
+        light = "yellow"
+    if rule_fails:
+        rules_note = ("违反个人军规 " + "、".join(r["rule_id"] for r in rule_fails)
+                      + (f"（{'、'.join(r['rule_id'] for r in hard_hits)} 触发降灯）"
+                         if hard_hits else ""))
+    for r in rule_fails:
+        if r["rule_id"] == "R06":
+            ext = 60
+            for src in (rules or []):
+                if src.get("rule_id") == "R06":
+                    ext = int(_rule_params(src).get("extended_cooldown_min", 60))
+            cooldown_min = max(cooldown_min, ext)
+
+    # E1 情绪强制降档
     emotion_note = None
     t = evidence.get("trend") or {}
     cons_dir = (t.get("consensus") or {}).get("direction") if t.get("available") else None
     if emotion >= EMOTION_HOT and cons_dir == _OPP_OF_PLAN[plan_dir]:
-        cooldown_min = COOLDOWN_MIN
+        cooldown_min = max(cooldown_min, COOLDOWN_MIN)   # 不覆盖军规加长的冷静期
         emotion_note = (f"情绪自评 {emotion}/5 且计划与共识反向——上头时最容易做的就是"
-                        f"逆势重仓。强制降档，建议冷静 {COOLDOWN_MIN} 分钟后重新提交裁决")
+                        f"逆势重仓。强制降档，建议冷静 {cooldown_min} 分钟后重新提交裁决")
         if light == "green":
             light = "yellow"
 
@@ -628,20 +815,24 @@ def verdict(evidence: dict, plan: dict) -> dict:
         reasons.append("✗✗ " + v)
     if not reasons:
         reasons = ["✓ " + it["evidence"] for it in items if it["level"] == "pass"][:2]
+    if rules_note:
+        reasons.append("⚠ " + rules_note)
     if coverage_note:
         reasons.append("⚠ " + coverage_note)
     if emotion_note:
         reasons.append("⚠ " + emotion_note)
-    summary = head + "。" + "；".join(reasons[:4])
+    summary = head + "。" + "；".join(reasons[:5])
 
-    return {"light": light, "score": score, "items": items, "summary": summary,
+    return {"light": light, "score": score, "items": items, "rules": rules_out,
+            "summary": summary,
             "cooldown_min": cooldown_min, "vetoes": vetoes,
-            "coverage_note": coverage_note,
+            "coverage_note": coverage_note, "rules_note": rules_note,
             "emotion_note": emotion_note, "as_of": time.time(),
             "prereg": {"weights": WEIGHTS, "rr_hard_min": RR_HARD_MIN,
                        "toll_hard_max": TOLL_HARD_MAX, "emotion_hot": EMOTION_HOT,
                        "cooldown_min": COOLDOWN_MIN,
-                       "reversal_min_score": REVERSAL_MIN_SCORE}}
+                       "reversal_min_score": REVERSAL_MIN_SCORE,
+                       "rule_hard_fail": list(RULE_HARD_FAIL)}}
 
 
 # ═══════════════════════════ 计划台账（mentor_plan） ═══════════════════════════
@@ -693,6 +884,121 @@ def ensure_schema() -> None:
                 conn.execute(_ddl)
             except Exception:  # noqa: BLE001 — duplicate column = 已升级过
                 pass
+        # V1 个人军规表 + 默认 8 条 seed（不覆盖用户已改动的行，幂等）
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mentor_rules (
+                rule_id    TEXT PRIMARY KEY,
+                title      TEXT NOT NULL,
+                rtype      TEXT NOT NULL,
+                params     TEXT,
+                enabled    INTEGER NOT NULL DEFAULT 1,
+                updated_ts REAL
+            )
+            """
+        )
+        for rid, title, rtype, params in DEFAULT_RULES:
+            row = conn.execute("SELECT rule_id FROM mentor_rules WHERE rule_id = ?",
+                               (rid,)).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO mentor_rules (rule_id, title, rtype, params, "
+                    "enabled, updated_ts) VALUES (?,?,?,?,1,?)",
+                    (rid, title, rtype, json.dumps(params, ensure_ascii=False),
+                     time.time()))
+
+
+def load_rules(enabled_only: bool = True) -> list[dict]:
+    """读军规清单（params 反序列化为 dict）。"""
+    ensure_schema()
+    sql = "SELECT rule_id, title, rtype, params, enabled, updated_ts FROM mentor_rules"
+    if enabled_only:
+        sql += " WHERE enabled = 1"
+    sql += " ORDER BY rule_id"
+    with _conn() as conn:
+        rows = [dict(r) for r in conn.execute(sql).fetchall()]
+    for r in rows:
+        r["params"] = _rule_params(r)
+        r["enabled"] = int(r.get("enabled") or 0)
+    return rows
+
+
+def upsert_rule(rule_id: str | None, *, title: str | None = None,
+                rtype: str | None = None, params: dict | None = None,
+                enabled: bool | None = None) -> dict:
+    """增改军规：有 rule_id 且存在 → 局部更新；否则新增（缺 rule_id 自动生成 U-<ts>）。
+
+    内置军规（R01-R08）只允许改 title/params/enabled，不允许改 rtype——
+    判定语义由 rtype 锁定，改语义请新建自定义规则。
+    """
+    ensure_schema()
+    now = time.time()
+    with _conn() as conn:
+        row = (conn.execute("SELECT rule_id, rtype FROM mentor_rules WHERE rule_id = ?",
+                            (rule_id,)).fetchone() if rule_id else None)
+        if row is not None:
+            builtin = str(row["rule_id"]).startswith("R0")
+            sets, vals = [], []
+            if title is not None:
+                sets.append("title = ?")
+                vals.append(title)
+            if params is not None:
+                sets.append("params = ?")
+                vals.append(json.dumps(params, ensure_ascii=False))
+            if enabled is not None:
+                sets.append("enabled = ?")
+                vals.append(int(enabled))
+            if rtype is not None and not builtin:
+                sets.append("rtype = ?")
+                vals.append(rtype)
+            if not sets:
+                return {"ok": False, "error": "没有可更新的字段"}
+            sets.append("updated_ts = ?")
+            vals.append(now)
+            vals.append(rule_id)
+            conn.execute(f"UPDATE mentor_rules SET {', '.join(sets)} WHERE rule_id = ?",
+                         tuple(vals))
+            return {"ok": True, "rule_id": rule_id, "created": False}
+        rid = rule_id or f"U-{int(now)}"
+        conn.execute(
+            "INSERT INTO mentor_rules (rule_id, title, rtype, params, enabled, updated_ts) "
+            "VALUES (?,?,?,?,?,?)",
+            (rid, title or rid, rtype or "custom",
+             json.dumps(params or {}, ensure_ascii=False),
+             1 if enabled is None else int(enabled), now))
+        return {"ok": True, "rule_id": rid, "created": True}
+
+
+def _day_start_utc8(now: float | None = None) -> float:
+    """当日（UTC+8 自然日）零点的 epoch 秒。"""
+    now = time.time() if now is None else now
+    return (int((now + 8 * 3600) // 86400)) * 86400.0 - 8 * 3600.0
+
+
+def _rules_context(symbol: str, now: float | None = None) -> dict:
+    """军规判定所需的台账上下文（R01/R05/R06）。"""
+    ensure_schema()
+    now = time.time() if now is None else now
+    day0 = _day_start_utc8(now)
+    with _conn() as conn:
+        today = [dict(r) for r in conn.execute(
+            "SELECT status, result, closed_ts FROM mentor_plan "
+            "WHERE symbol = ? AND created_ts >= ?", (symbol.upper(), day0)).fetchall()]
+        last_red = conn.execute(
+            "SELECT created_ts FROM mentor_plan WHERE symbol = ? AND light = 'red' "
+            "ORDER BY created_ts DESC LIMIT 1", (symbol.upper(),)).fetchone()
+    graded = sorted((r for r in today if r["status"] == "closed"
+                     and r.get("result") in ("win", "loss", "breakeven")),
+                    key=lambda r: float(r.get("closed_ts") or 0))
+    streak = 0
+    for r in reversed(graded):
+        if r["result"] == "loss":
+            streak += 1
+        else:
+            break
+    return {"today_submitted": len(today), "loss_streak_today": streak,
+            "last_red_age_min": ((now - float(last_red["created_ts"])) / 60.0
+                                 if last_red else None)}
 
 
 def save_plan(plan: dict, vd: dict) -> int:
@@ -770,23 +1076,43 @@ def set_outcome(plan_id: int, *, result: str, pnl_pct: float | None = None,
         return bool(cur.rowcount)
 
 
+MIN_STAT_N = 5   # V1：行为统计的样本充分性门槛（n<5 标不可判定）
+
+
 def stats(days: int = 90) -> dict:
-    """信任回路统计：红/黄/绿各自胜率 + 听劝 vs 不听劝盈亏对比。"""
+    """信任回路统计：红/黄/绿各自胜率 + 听劝 vs 不听劝盈亏对比。
+
+    V1 行为维度扩展：
+    - today：当日（UTC+8）提交数 / 执行数（closed 且有胜负）/ 当前连亏 streak
+    - by_session：UTC+8 四时段（凌晨 00-06 / 早 06-12 / 午 12-18 / 晚 18-24）胜率
+    - by_emotion：情绪自评 ≥4（上头单）vs ≤3（冷静单）盈亏对比
+    样本 < MIN_STAT_N 的桶标 insufficient=true（不可判定，win_rate/avg 不给数字）。
+    """
     ensure_schema()
-    since = time.time() - days * 86400.0
+    now = time.time()
+    since = now - days * 86400.0
     with _conn() as conn:
         rows = [dict(r) for r in conn.execute(
-            "SELECT light, status, followed, result, pnl_pct FROM mentor_plan "
+            "SELECT light, status, followed, result, pnl_pct, created_ts, "
+            "closed_ts, emotion_score FROM mentor_plan "
             "WHERE created_ts >= ?", (since,)).fetchall()]
 
-    def _bucket(sel: list[dict]) -> dict:
+    def _graded(sel: list[dict]) -> list[dict]:
+        return [r for r in sel if r["status"] == "closed"
+                and r.get("result") in ("win", "loss", "breakeven")]
+
+    def _bucket(sel: list[dict], *, min_n: int = 0) -> dict:
         closed = [r for r in sel if r["status"] == "closed" and r.get("result")]
-        graded = [r for r in closed if r["result"] in ("win", "loss", "breakeven")]
+        graded = _graded(sel)
         wins = sum(1 for r in graded if r["result"] == "win")
         pnls = [float(r["pnl_pct"]) for r in graded if r.get("pnl_pct") is not None]
-        return {"n": len(sel), "closed": len(closed),
-                "win_rate": round(wins / len(graded), 4) if graded else None,
-                "avg_pnl_pct": round(sum(pnls) / len(pnls), 4) if pnls else None}
+        out = {"n": len(sel), "closed": len(closed),
+               "win_rate": round(wins / len(graded), 4) if graded else None,
+               "avg_pnl_pct": round(sum(pnls) / len(pnls), 4) if pnls else None}
+        if min_n and len(graded) < min_n:
+            out.update({"insufficient": True, "win_rate": None, "avg_pnl_pct": None,
+                        "note": f"样本不足（已定胜负 {len(graded)} < {min_n}），不可判定"})
+        return out
 
     by_light = {lt: _bucket([r for r in rows if r["light"] == lt])
                 for lt in ("green", "yellow", "red")}
@@ -798,8 +1124,47 @@ def stats(days: int = 90) -> dict:
         note = (f"听劝平均 {f_avg:+.2f}% vs 不听劝 {i_avg:+.2f}%——"
                 + ("导师建议在你自己的台账上是赚钱的" if f_avg > i_avg
                    else "样本尚未体现优势，继续积累"))
+
+    # V1 · 当日行为（UTC+8）
+    day0 = _day_start_utc8(now)
+    today_rows = [r for r in rows if float(r["created_ts"]) >= day0]
+    today_graded = sorted(_graded(today_rows),
+                          key=lambda r: float(r.get("closed_ts") or 0))
+    streak = 0
+    for r in reversed(today_graded):
+        if r["result"] == "loss":
+            streak += 1
+        else:
+            break
+    today = {"submitted": len(today_rows), "executed": len(today_graded),
+             "loss_streak": streak}
+
+    # V1 · 分时段胜率（UTC+8 四段——看清自己哪个时段最容易亏）
+    session_def = (("凌晨(00-06)", 0, 6), ("早盘(06-12)", 6, 12),
+                   ("午后(12-18)", 12, 18), ("晚间(18-24)", 18, 24))
+    by_session = {}
+    for name, lo, hi in session_def:
+        sel = [r for r in rows
+               if lo <= int(((float(r["created_ts"]) + 8 * 3600) % 86400) // 3600) < hi]
+        by_session[name] = _bucket(sel, min_n=MIN_STAT_N)
+
+    # V1 · 情绪对比（≥4 上头单 vs ≤3 冷静单）
+    hot = [r for r in rows if int(r.get("emotion_score") or 3) >= EMOTION_HOT]
+    calm = [r for r in rows if int(r.get("emotion_score") or 3) < EMOTION_HOT]
+    by_emotion = {"hot_ge4": _bucket(hot, min_n=MIN_STAT_N),
+                  "calm_le3": _bucket(calm, min_n=MIN_STAT_N)}
+    h_avg = by_emotion["hot_ge4"].get("avg_pnl_pct")
+    c_avg = by_emotion["calm_le3"].get("avg_pnl_pct")
+    emotion_note = None
+    if h_avg is not None and c_avg is not None:
+        emotion_note = (f"上头单（情绪≥4）平均 {h_avg:+.2f}% vs 冷静单 {c_avg:+.2f}%——"
+                        + ("数据证明你上头时更亏，冷静期规则值得遵守"
+                           if h_avg < c_avg else "当前样本未见情绪劣化，继续观察"))
+
     return {"days": days, "total": len(rows), "by_light": by_light,
-            "followed": followed, "ignored": ignored, "note": note}
+            "followed": followed, "ignored": ignored, "note": note,
+            "today": today, "by_session": by_session, "by_emotion": by_emotion,
+            "emotion_note": emotion_note, "min_stat_n": MIN_STAT_N}
 
 
 # ═══════════════════════════ CLI ═══════════════════════════
@@ -828,11 +1193,17 @@ def main() -> int:
                 "principal": args.principal, "leverage": args.leverage}
         ev = build_evidence(args.symbol.upper(), args.direction, args.entry,
                             args.sl, args.tp, tf=args.tf)
-        vd = verdict(ev, plan)
+        try:
+            rules, ctx = load_rules(), _rules_context(args.symbol.upper())
+        except Exception:  # noqa: BLE001 — 台账不可用时退回无军规裁决
+            rules, ctx = None, None
+        vd = verdict(ev, plan, rules=rules, rules_ctx=ctx)
         print(json.dumps({k: vd[k] for k in ("light", "score", "summary", "cooldown_min")},
                          ensure_ascii=False, indent=2))
         for it in vd["items"]:
             print(f"  [{it['level']:>11}] {it['key']:<9} w={it['weight']:>2}  {it['evidence']}")
+        for r in vd.get("rules", []):
+            print(f"  [{r['status']:>11}] {r['rule_id']:<9} 军规  {r['title']}：{r['evidence']}")
         if args.save:
             pid = save_plan(plan, vd)
             print(f"已落台账 mentor_plan id={pid}")
