@@ -184,6 +184,13 @@ DEFAULTS: dict = {
     # 单进程对单主机每分钟实际出网请求上限（含重试）；超限走缓存/短错。
     # 4 个常驻进程 × 该值 ≈ 全系统上限，默认 180×4=720 远低于币安 2400 权重/分。
     "rest_max_per_min": 180,
+    # ── [任务J2] 数据源手动切换（jarvis_net 策略层 + dashboard /api/datasource/*）──
+    # auto=现状（币安主源，故障自动回退 OKX）；binance=锁定币安（策略屏蔽 OKX
+    # 备源，不自动切）；okx=OKX 有等价数据的币安端点（费率/OI/最新价）被策略
+    # 屏蔽优先走 OKX，K线等 OKX 无等价数据的类型仍走币安（status 接口如实标注）。
+    # 切换经 POST /api/datasource/switch「先探测后生效」；运行态存
+    # ~/.vibe-trading/datasource_mode.json（跨进程热生效），本键仅为初始默认。
+    "data_source_mode": "auto",
     # ── T10 常驻信号采集器（jarvis_signal_collector：WS 收盘 bar 事件驱动落带）──
     # 背景：twelve_signal_changes 此前只被 dashboard API 重算路径写入（面板/轮询
     # 驱动），真 bar 可用率按 UTC 小时 30%~86.5%（偏斜 2.9×）。采集器为独立常驻
@@ -488,6 +495,7 @@ GROUPS: dict[str, str] = {
     "ws_reconnect_max_s": "data",
     "ws_force_order_persist": "data",
     "rest_max_per_min": "data",
+    "data_source_mode": "data",
     "sigcol_symbols": "data",
     "sigcol_tfs": "data",
     "sigcol_backfill_bars": "data",
@@ -637,6 +645,7 @@ ENUMS: dict[str, tuple[str, ...]] = {
     "twelve_tf_gate_mode": ("reject", "deweight"),
     "twelve_sl_fill_mode": ("bar", "poll"),
     "twelve_sl_gate_mode": ("rewrite", "deweight", "reject"),
+    "data_source_mode": ("auto", "binance", "okx"),
 }
 
 

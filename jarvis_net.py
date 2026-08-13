@@ -181,17 +181,21 @@ def banned_until(url_or_host: str) -> float:
     [2026-08-13 软着陆] 硬封禁到期后不再立即全量放行：若该主机有近期封禁史
     （net_probe.json 有 streak 记录），只放一支「探针」先试路，其余调用方拿到
     合成截止时间继续走缓存；探针存活满确认窗才恢复常态（见 _probe_check）。
-    无封禁史 / 探针层任何异常 → 行为与旧版完全一致。
+    [2026-08-13 任务J2] 数据源手动锁源：被 data_source_mode 策略屏蔽的
+    源/端点返回滚动合成截止（见 _policy_until），复用调用方封禁短路路径。
+    无封禁史且无策略屏蔽 / 任何异常 → 行为与旧版完全一致。
     """
     try:
         now = time.time()
         _ban_load(now)
         host = _ban_key(url_or_host)
+        pol = _policy_until(url_or_host)
         t = _ban_cache.get(host, 0.0)
         if t > now:
-            return t
+            return max(t, pol)
         pt = _probe_check(host)
-        return pt if pt > now else 0.0
+        eff = pt if pt > now else 0.0
+        return max(eff, pol)
     except Exception:  # noqa: BLE001
         return 0.0
 
@@ -497,6 +501,117 @@ def report_cooldown(url_or_host: str, seconds: float) -> None:
         report_ban(url_or_host, time.time() + max(1.0, float(seconds)))
     except Exception:  # noqa: BLE001
         pass
+
+
+# ── 数据源手动切换策略层（任务 J2，2026-08-13）────────────────────────────────
+# 语义（配置键 data_source_mode，运行态 ~/.vibe-trading/datasource_mode.json）：
+#   auto     现状零变化：币安主源，故障时 crypto_data T-06 链自动回退 OKX；
+#   binance  锁定币安：OKX 备源被策略屏蔽（不自动切），币安不可用走缓存降级；
+#   okx      OKX 有等价数据的币安端点（费率/OI/最新价 ticker）被策略屏蔽 →
+#            crypto_data 既有回退链自然切 OKX；K线/深度/多空比等 OKX 无等价
+#            数据的端点不屏蔽仍走币安（与 /api/datasource/status 标注一致）。
+# 实现方式：banned_until() 对被屏蔽端点返回滚动合成截止（60s 窗，模式文件
+# 热更后 ≤5s 生效）——复用调用方既有的封禁短路路径，零调用方改造。探测端点
+# （server time）豁免屏蔽，保证「切换前探测目标源」永远可达（真实封禁仍短路）。
+# 任何异常回退 auto（不屏蔽），绝不因策略层故障阻断出网。
+_SOURCE_MODE_PATH = os.path.expanduser("~/.vibe-trading/datasource_mode.json")
+_SOURCE_MODES = ("auto", "binance", "okx")
+_MODE_RELOAD_S = 5.0
+_POLICY_WIN_S = 60.0
+
+# okx 模式下屏蔽的币安端点前缀（仅 OKX 有等价数据的类型；见 jarvis_datasource
+# CAPABILITY 矩阵）。注意 /fapi/v1/klines 不在列——OKX 仅日线 candles 有回退，
+# 多周期 K 线主链路仍归币安。
+_OKX_COVERED_BINANCE_PATHS = (
+    "/fapi/v1/premiumIndex", "/fapi/v1/fundingRate", "/fapi/v1/openInterest",
+    "/fapi/v1/ticker/price", "/api/v3/ticker/price",
+)
+# 探测端点豁免：切换前的目标源探测必须可达（真实封禁/冷却仍会短路）
+_POLICY_EXEMPT_PATHS = ("/fapi/v1/time", "/api/v5/public/time")
+
+_mode_cache: dict = {"mode": None, "read_at": 0.0}
+
+
+def get_source_mode() -> str:
+    """当前数据源模式：运行态文件 > jarvis_config 默认 > auto。5s 节流热读。"""
+    now = time.time()
+    if _mode_cache["mode"] is not None and now - _mode_cache["read_at"] < _MODE_RELOAD_S:
+        return _mode_cache["mode"]
+    mode = None
+    try:
+        with open(_SOURCE_MODE_PATH, encoding="utf-8") as f:
+            raw = json.load(f)
+        m = str((raw or {}).get("mode", "")).lower()
+        if m in _SOURCE_MODES:
+            mode = m
+    except Exception:  # noqa: BLE001 — 文件缺失/损坏走配置默认
+        pass
+    if mode is None:
+        try:
+            import jarvis_config as _jc
+            m = str(_jc.get("data_source_mode") or "auto").lower()
+            mode = m if m in _SOURCE_MODES else "auto"
+        except Exception:  # noqa: BLE001
+            mode = "auto"
+    _mode_cache["mode"] = mode
+    _mode_cache["read_at"] = now
+    return mode
+
+
+def set_source_mode(mode: str, by: str = "api") -> dict:
+    """写入数据源模式（原子落盘，跨进程 ≤5s 热生效）。非法模式抛 ValueError。"""
+    m = str(mode or "").lower()
+    if m not in _SOURCE_MODES:
+        raise ValueError(f"未知数据源模式 {mode!r}，可选: {_SOURCE_MODES}")
+    state = {"mode": m, "ts": time.time(), "by": str(by)[:64]}
+    os.makedirs(os.path.dirname(_SOURCE_MODE_PATH), exist_ok=True)
+    tmp = _SOURCE_MODE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    os.replace(tmp, _SOURCE_MODE_PATH)
+    _mode_cache["mode"] = m
+    _mode_cache["read_at"] = time.time()
+    return state
+
+
+def source_policy() -> dict:
+    """当前策略视图（/api/datasource/status 数据源）：模式 + 被屏蔽范围。"""
+    mode = get_source_mode()
+    if mode == "binance":
+        blocked: list = ["www.okx.com（全部端点，锁定币安不自动回退）"]
+    elif mode == "okx":
+        blocked = list(_OKX_COVERED_BINANCE_PATHS)
+    else:
+        blocked = []
+    return {"mode": mode, "policy_blocked": blocked,
+            "exempt_paths": list(_POLICY_EXEMPT_PATHS)}
+
+
+def _policy_until(url_or_host: str) -> float:
+    """策略屏蔽合成截止：0=不屏蔽；>0=屏蔽（60s 滚动窗，模式变更热解除）。"""
+    try:
+        mode = get_source_mode()
+        if mode == "auto":
+            return 0.0
+        u = url_or_host or ""
+        path = ""
+        if "://" in u:
+            after = u.split("://", 1)[1]
+            path = "/" + after.split("/", 1)[1] if "/" in after else ""
+        for p in _POLICY_EXEMPT_PATHS:
+            if path.startswith(p):
+                return 0.0
+        host = _ban_key(u)
+        if mode == "binance":
+            return time.time() + _POLICY_WIN_S if host.endswith("okx.com") else 0.0
+        # mode == "okx"：仅屏蔽有 OKX 等价数据的币安端点；裸 host（无路径）不屏蔽
+        if host.endswith("binance.com") and path:
+            for p in _OKX_COVERED_BINANCE_PATHS:
+                if path.startswith(p):
+                    return time.time() + _POLICY_WIN_S
+        return 0.0
+    except Exception:  # noqa: BLE001 — 策略层故障回退 auto 行为
+        return 0.0
 
 
 if __name__ == "__main__":
