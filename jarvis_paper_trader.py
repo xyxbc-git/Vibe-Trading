@@ -569,6 +569,31 @@ _TWELVE_NAME_CN = {
 _TWELVE_CACHE: dict = {}
 _TWELVE_CACHE_TTL = 120.0
 
+# 基差序列缓存（symbol → (ts, data|None)）；None 也缓存，避免失败时每轮重拉
+_BASIS_CACHE: dict = {}
+_BASIS_CACHE_TTL = 300.0
+
+
+def _twelve_basis(symbol: str):
+    """套利系统双腿数据：spot-perp 基差序列（5min 缓存；失败返回 None 降级中性）。
+
+    [信号篇 P2-4] 与 dashboard 展示链同口径给 analyze 传 basis_data，消除
+    「面板套利系统有票、跟盘侧恒为数据不足中性」的口径分裂。逻辑对齐
+    jarvis_dashboard._twelve_basis，但不 import dashboard（避免循环依赖）。
+    """
+    sym = (symbol if symbol.endswith("USDT") else symbol + "USDT").upper()
+    hit = _BASIS_CACHE.get(sym)
+    if hit and time.time() - hit[0] < _BASIS_CACHE_TTL:
+        return hit[1]
+    data = None
+    try:
+        import jarvis_crypto_data as jcd
+        data = jcd.fetch_basis_series(sym) or None
+    except Exception:  # noqa: BLE001 — 基差取数失败不拖垮共识（套利系统降级中性）
+        data = None
+    _BASIS_CACHE[sym] = (time.time(), data)
+    return data
+
 # 市场状态（regime）缓存（symbol → (ts, regime)）；分类要拉 3 个 TF 的 K 线，短期内复用
 _REGIME_CACHE: dict = {}
 _REGIME_CACHE_TTL = 300.0
@@ -605,11 +630,12 @@ def _twelve_consensus(symbol: str) -> dict | None:
     try:
         import jarvis_twelve_systems as jts
         tf_cons: dict = {}
+        basis = _twelve_basis(sym)   # 基差与 TF 无关，整轮共用一份（P2-4 对齐展示链）
         for tf in ("15m", "1h", "4h"):
             df = jts.fetch_klines_df(sym, tf, 300)
             if df is None or len(df) < 30:
                 continue
-            tf_cons[tf] = jts.analyze(df)["consensus"]
+            tf_cons[tf] = jts.analyze(df, basis_data=basis)["consensus"]
         if not tf_cons:
             return None
         merged = jts.consensus_multi_tf(tf_cons)
