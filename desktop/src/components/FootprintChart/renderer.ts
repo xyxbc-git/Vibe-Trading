@@ -1,4 +1,5 @@
 import type { FootprintBar, PriceLevel } from "@/types/footprint";
+import { TIMEFRAME_MS } from "@/lib/footprint/aggregator";
 import type { FpSignal } from "./insight/signals";
 import type { VolumeProfile } from "./profile";
 
@@ -190,6 +191,85 @@ export function fmtTime(t: number): string {
   const ms = t < 1e12 ? t * 1000 : t;
   const d = new Date(ms);
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+/** 本地日期（MM-DD），时间条跨天标签用 */
+export function fmtDay(t: number): string {
+  const ms = t < 1e12 ? t * 1000 : t;
+  const d = new Date(ms);
+  return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+export interface TimeAxisLabel {
+  /** 柱索引 */
+  i: number;
+  text: string;
+  /** 末柱高亮 */
+  emphasized: boolean;
+  /** 该柱与前一柱之间存在数据断档（间隔 > 1.5 周期） */
+  gap: boolean;
+}
+
+/**
+ * [R5] 时间条标签序列（纯函数，drawFrame 与单测共用）。
+ * 修复「时间轴乱序」错觉的两个来源：
+ * ① 多天数据只显示 HH:MM——19:00 后出现 16:30 看似倒退，实际是次日柱。
+ *    跨天首个标签带 MM-DD 日期前缀；可见范围跨天时首标签也带日期锚定。
+ * ② 封禁期断档被无缝拼接——间隔 > 1.5 周期的柱无论采样与否强制打标并
+ *    标记 gap（绘制层画断档虚线），诚实展示数据断层而不是装连续。
+ */
+export function timeAxisLabels(
+  bars: readonly FootprintBar[],
+  visStart: number,
+  visEnd: number,
+  barW: number,
+): TimeAxisLabel[] {
+  const n = bars.length;
+  const lo = Math.max(0, visStart);
+  const hi = Math.min(visEnd, n);
+  if (lo >= hi) return [];
+  const m = Math.max(1, Math.ceil(56 / barW));
+  const tfMs = TIMEFRAME_MS[bars[0].timeframe] ?? 0;
+
+  const multiDay = fmtDay(bars[lo].time) !== fmtDay(bars[hi - 1].time);
+  // 单日视窗：首标签不必带日期；跨天视窗：首标签即带日期锚定
+  let prevDay = multiDay ? "" : fmtDay(bars[lo].time);
+
+  const out: TimeAxisLabel[] = [];
+  for (let i = lo; i < hi; i++) {
+    const isLast = i === n - 1;
+    const gap = i > 0 && tfMs > 0 && bars[i].time - bars[i - 1].time > tfMs * 1.5;
+    if (!gap && i % m !== 0 && !(isLast && barW >= 34)) continue;
+    const day = fmtDay(bars[i].time);
+    const withDate = gap || day !== prevDay;
+    out.push({
+      i,
+      text: withDate ? `${day} ${fmtTime(bars[i].time)}` : fmtTime(bars[i].time),
+      emphasized: isLast,
+      gap,
+    });
+    prevDay = day;
+  }
+  return out;
+}
+
+/**
+ * [R5] 渲染数据最后防线：强制 time 严格升序 + 同 time 去重（保留后写入）。
+ * 正常链路（getBars 排序 / applyLive 守序 / mergeOlderBars 有序）本应恒有序；
+ * 检测到异常时自愈修正并由调用方记日志取证，绝不把乱序序列交给渲染。
+ */
+export function sanitizeBars(bars: FootprintBar[]): { bars: FootprintBar[]; fixed: boolean } {
+  let ordered = true;
+  for (let i = 1; i < bars.length; i++) {
+    if (bars[i].time <= bars[i - 1].time) {
+      ordered = false;
+      break;
+    }
+  }
+  if (ordered) return { bars, fixed: false };
+  const byTime = new Map<number, FootprintBar>();
+  for (const b of bars) byTime.set(b.time, b);
+  return { bars: [...byTime.values()].sort((a, b) => a.time - b.time), fixed: true };
 }
 
 /** 从数据推导最小价格步长（tick），用于对齐价格网格 */
@@ -924,17 +1004,27 @@ export function drawFrame(
   ctx.lineTo(l.width, l.plotH + 0.5);
   ctx.stroke();
 
-  const m = Math.max(1, Math.ceil(56 / l.barW));
   ctx.font = `10px ${FONT_MONO}`;
   ctx.textAlign = "center";
   const tyMid = l.plotH + TIME_H / 2 + 1;
-  for (let i = l.visStart; i < l.visEnd; i++) {
-    const isLast = i === n - 1;
-    if (i % m !== 0 && !(isLast && l.barW >= 34)) continue;
-    const x = xOfBar(l, i) + l.barW / 2;
+  for (const lb of timeAxisLabels(bars, l.visStart, l.visEnd, l.barW)) {
+    const x = xOfBar(l, lb.i) + l.barW / 2;
     if (x < 0 || x > l.chartW) continue;
-    ctx.fillStyle = isLast ? COLORS.upText : COLORS.dim;
-    ctx.fillText(fmtTime(bars[i].time), x, tyMid);
+    if (lb.gap) {
+      // [R5] 数据断档（封禁期断段等）：断口处淡黄虚线贯穿图区+时间条，
+      // 诚实提示「这里不连续」，多天断段不再被无缝拼成一片
+      const gx = Math.round(xOfBar(l, lb.i)) + 0.5;
+      ctx.strokeStyle = "rgba(234,179,8,0.35)";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([2, 4]);
+      ctx.beginPath();
+      ctx.moveTo(gx, 0);
+      ctx.lineTo(gx, l.plotH + TIME_H);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    ctx.fillStyle = lb.emphasized ? COLORS.upText : lb.gap ? COLORS.poc : COLORS.dim;
+    ctx.fillText(lb.text, x, tyMid);
   }
 
   // 底部统计

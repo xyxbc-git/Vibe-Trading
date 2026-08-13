@@ -32,6 +32,7 @@ import {
   fmtPrice,
   hitTest,
   hoverEq,
+  sanitizeBars,
 } from "./renderer";
 import { stepViewport, useViewport } from "./useViewport";
 import { buildInsights, type Insight } from "./insight/rules";
@@ -308,7 +309,14 @@ export default function FootprintChart() {
           ? await fetchFootprintRange(symbol, tf, fromMs, toMs)
           : await fetchOhlcRange(symbol, tf, fromMs, toMs);
         if (backfillRef.current.gen !== gen) return; // 切币/切周期后过期响应作废
-        const { bars: merged, prepended } = mergeOlderBars(barsRef.current, older);
+        const { bars: mergedRaw, prepended } = mergeOlderBars(barsRef.current, older);
+        // [R5] 渲染数据最后防线：乱序/重复自愈 + 取证日志
+        const { bars: merged, fixed } = sanitizeBars(mergedRaw);
+        if (fixed) {
+          console.warn(
+            `[footprint] ${symbol} ${tf} 回补合并后序列乱序/重复，已自愈排序——请附此日志排查数据源`,
+          );
+        }
         if (prepended === 0) {
           // 区间内无更早数据：到达本地落库起点，优雅停止并轻提示
           st.exhausted = true;
@@ -462,8 +470,15 @@ export default function FootprintChart() {
           const { fromMs, toMs } = dayRangeMs(histDate);
           const bars = await fetchHistoryBars(symbol, tfEff, fromMs, toMs);
           if (disposed) return;
-          barsRef.current = bars;
-          tickRef.current = estimateTick(bars);
+          // [R5] 渲染数据最后防线：乱序/重复自愈（历史落库同样不豁免）
+          const { bars: clean, fixed } = sanitizeBars([...bars]);
+          if (fixed) {
+            console.warn(
+              `[footprint] ${symbol} ${tfEff} ${histDate} 历史序列乱序/重复，已自愈`,
+            );
+          }
+          barsRef.current = clean;
+          tickRef.current = estimateTick(clean);
           if (bars.length === 0) {
             setLoadError(
               `${histDate} 后端库内暂无 ${symbol} 足迹数据——` +
@@ -546,7 +561,14 @@ export default function FootprintChart() {
           now,
         );
         if (disposed) return;
-        barsRef.current = [...bars].sort((a, b) => a.time - b.time);
+        // [R5] 渲染数据最后防线：升序+去重（同 time 重复保后写入）+ 取证日志
+        const { bars: clean, fixed } = sanitizeBars([...bars].sort((a, b) => a.time - b.time));
+        if (fixed) {
+          console.warn(
+            `[footprint] ${symbol} ${tf} 历史铺底序列含重复 time，已自愈——请附此日志排查数据源`,
+          );
+        }
+        barsRef.current = clean;
         tickRef.current = estimateTick(barsRef.current);
         if (barsRef.current.length > 0) setLoadError(null);
       } catch (e) {
