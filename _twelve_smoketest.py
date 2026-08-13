@@ -707,5 +707,38 @@ check("P2-5 变盘敏感强度保留 0.4", g_hit["strength"] == 0.4, str(g_hit["
 check("P2-5 倾向说明保留（人工参考）", "倾向" in g_hit["reasoning"],
       g_hit["reasoning"][:150])
 
+# ── 15. [信号篇 P2-1] layer4 恒中性成员稀释修复 ─────────────────────
+
+
+def _synth_sigs(dir_by_system: dict) -> list:
+    """按 {system: (direction, strength)} 生成 12 套合成信号（缺省 neutral 0.0）。"""
+    out = []
+    for sk in _SYS_ORDER:
+        d, s = dir_by_system.get(sk, ("neutral", 0.0))
+        out.append(_mk_sig(sk, sk, d, s))
+    return out
+
+
+# 仅 oscillator 有方向（0.8），layer4 其余 4 成员恒中性 → 层得分应为 0.8 而非 0.16
+_c_dilute = jts.consensus(_synth_sigs({"oscillator": ("bullish", 0.8)}))
+check("P2-1 layer4 只计方向性成员（0.8 不被稀释为 0.16）",
+      abs(_c_dilute["layers"]["layer4_adaptive"]["score"] - 0.8) < 1e-9,
+      str(_c_dilute["layers"]["layer4_adaptive"]["score"]))
+check("P2-1 无方向成员的层得分为 0",
+      _c_dilute["layers"]["layer3_resonance"]["score"] == 0.0
+      and _c_dilute["layers"]["layer2_main"]["score"] == 0.0,
+      str({k: v["score"] for k, v in _c_dilute["layers"].items()}))
+# 层内两个方向性成员对冲：均值只除以 2（不是 5）
+_c_mix = jts.consensus(_synth_sigs({"oscillator": ("bullish", 0.8),
+                                    "gap": ("bearish", 0.4)}))
+check("P2-1 方向性成员间均值口径（(0.8-0.4)/2=0.2）",
+      abs(_c_mix["layers"]["layer4_adaptive"]["score"] - 0.2) < 1e-9,
+      str(_c_mix["layers"]["layer4_adaptive"]["score"]))
+check("P2-1 members 明细仍含全部成员（含中性）",
+      len(_c_dilute["layers"]["layer4_adaptive"]["members"]) == 5,
+      str(len(_c_dilute["layers"]["layer4_adaptive"]["members"])))
+check("P2-1 共识 score 仍∈[-1,1] 且结构完整",
+      -1.0 <= _c_dilute["score"] <= 1.0 and CONS_FIELDS.issubset(_c_dilute.keys()))
+
 print(f"\n{'=' * 40}\n通过 {PASS} / 失败 {FAIL}")
 raise SystemExit(1 if FAIL else 0)

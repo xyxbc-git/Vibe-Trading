@@ -1313,7 +1313,10 @@ def consensus(signals: list[dict], atr: float | None = None,
     """分层共识融合。
 
     口径：
-      - 每层内取各信号 direction(±1/0) × strength 的均值 → 层得分 ∈ [-1, 1]
+      - 每层内取**方向性成员**（direction≠neutral）的 direction(±1) × strength
+        均值 → 层得分 ∈ [-1, 1]；全层无方向性成员 → 层得分 0
+        （[P2-1] 恒中性成员如 volatility/martingale/arbitrage 不再稀释同层
+        oscillator/gap 等真实方向信号）
       - 总分 = Σ 层得分 × 层权重（道氏顶层过滤：与道氏相反的层贡献减半）
       - direction：|score| ≥ 0.12 → bullish/bearish，否则 neutral
       - confidence：|score| 与投票一致率的融合，∈ [0, 1]
@@ -1339,7 +1342,11 @@ def consensus(signals: list[dict], atr: float | None = None,
             v = _DIR_VAL.get(sig["direction"], 0.0) * float(sig["strength"])
             members.append({"system": skey, "name_cn": sig["name_cn"],
                             "direction": sig["direction"], "strength": sig["strength"]})
-            contribs.append(v)
+            # [P2-1] 层均值只计方向性成员：恒中性成员（volatility/martingale/
+            # arbitrage 及数据不足降级者）不进分母，不再把同层真实方向信号
+            # 稀释掉（原 layer4 有向信号被 5 成员均值摊薄到 2/5）
+            if sig["direction"] in ("bullish", "bearish"):
+                contribs.append(v)
         layer_score = float(np.mean(contribs)) if contribs else 0.0
         # 道氏顶层过滤：下层若与主趋势相反，贡献减半（仅顺趋势开仓的软化版）
         effective = layer_score
