@@ -573,5 +573,67 @@ with tempfile.TemporaryDirectory() as tmpd:
     finally:
         jr.DB_PATH = _orig_db
 
+# ── 12. [信号篇 P1-3] 摆动系逆势门控 ────────────────────────────────
+
+# 门控纯函数：逆势打折撤计划、顺势/震荡原样放行
+_g_s, _g_p, _g_note = jts._apply_counter_trend_gate("bullish", 0.8, {"x": 1}, "down")
+check("P1-3 门控：下跌市逆势多单 强度×0.4+撤计划",
+      abs(_g_s - 0.32) < 1e-9 and _g_p is None and "已降级" in _g_note,
+      f"s={_g_s} p={_g_p} note={_g_note}")
+_g_s, _g_p, _g_note = jts._apply_counter_trend_gate("bearish", 0.8, {"x": 1}, "up")
+check("P1-3 门控：上涨市逆势空单 强度×0.4+撤计划",
+      abs(_g_s - 0.32) < 1e-9 and _g_p is None, f"s={_g_s} p={_g_p}")
+_g_s, _g_p, _g_note = jts._apply_counter_trend_gate("bullish", 0.8, {"x": 1}, "up")
+check("P1-3 门控：顺势原样放行", _g_s == 0.8 and _g_p == {"x": 1} and _g_note == "")
+_g_s, _g_p, _g_note = jts._apply_counter_trend_gate("bearish", 0.8, {"x": 1}, "range")
+check("P1-3 门控：震荡市不门控", _g_s == 0.8 and _g_p == {"x": 1} and _g_note == "")
+
+
+def _mono_df(step: float, n: int = 90, start: float = 200.0) -> pd.DataFrame:
+    """单边趋势合成盘（无 swing 摆动点，走 MA50 斜率兜底路径）。"""
+    rows, p = [], start
+    for _ in range(n):
+        o, c = p, p + step
+        rows.append({"open": o, "high": max(o, c) + 0.2, "low": min(o, c) - 0.2,
+                     "close": c, "volume": 1000.0})
+        p = c
+    return pd.DataFrame(rows)
+
+
+df_mono_dn = _mono_df(-0.5)
+df_mono_up = _mono_df(+0.5)
+check("P1-3 单边下跌 regime=down", jts._trend_regime(df_mono_dn) == "down",
+      jts._trend_regime(df_mono_dn))
+check("P1-3 单边上涨 regime=up", jts._trend_regime(df_mono_up) == "up",
+      jts._trend_regime(df_mono_up))
+
+def _tri_df(n: int = 96, period: int = 12, amp: float = 3.0) -> pd.DataFrame:
+    """对称三角波震荡盘（swing 高低点等高等低、MA50 斜率≈0）：受控 range 输入。"""
+    rows = []
+    for i in range(n):
+        phase = i % period
+        half = period // 2
+        c = 100.0 + amp * (phase if phase <= half else period - phase) / half
+        rows.append({"open": c, "high": c + 0.2, "low": c - 0.2,
+                     "close": c, "volume": 1000.0})
+    return pd.DataFrame(rows)
+
+
+check("P1-3 震荡盘 regime=range", jts._trend_regime(_tri_df()) == "range",
+      jts._trend_regime(_tri_df()))
+
+osc_dn = jts.signal_oscillator(df_mono_dn)
+check("P1-3 下跌市超卖信号：方向保留但撤计划",
+      osc_dn["direction"] == "bullish" and osc_dn["trade_plan"] is None, str(osc_dn)[:150])
+check("P1-3 下跌市超卖信号：强度≤0.4", osc_dn["strength"] <= 0.4 + 1e-9,
+      str(osc_dn["strength"]))
+check("P1-3 降级说明写入 reasoning", "已降级" in osc_dn["reasoning"],
+      osc_dn["reasoning"][:120])
+osc_up = jts.signal_oscillator(df_mono_up)
+check("P1-3 上涨市超买信号同理降级",
+      osc_up["direction"] == "bearish" and osc_up["trade_plan"] is None
+      and osc_up["strength"] <= 0.4 + 1e-9 and "已降级" in osc_up["reasoning"],
+      str(osc_up)[:150])
+
 print(f"\n{'=' * 40}\n通过 {PASS} / 失败 {FAIL}")
 raise SystemExit(1 if FAIL else 0)

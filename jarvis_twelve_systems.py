@@ -84,6 +84,71 @@ def _swing_points(df: pd.DataFrame, window: int = 5) -> tuple[list[int], list[in
     return highs, lows
 
 
+# ── [信号篇 P1-3] 摆动系逆势门控 ────────────────────────────────────────────
+# 单边趋势中摆动系（oscillator/triple_rsi）逆势信号是「买了就跌」重灾区
+# （SYSTEM_META 自述"趋势市毒药"）；regime 判定完全 df 内自足，不引新依赖。
+COUNTER_TREND_STRENGTH_MULT = 0.4   # 逆势信号强度打折系数
+_REGIME_MA_PERIOD = 50              # 道氏结构交织时的兜底均线周期
+_REGIME_SLOPE_BARS = 10             # MA 斜率测量窗口（根）
+_REGIME_SLOPE_ATR = 0.6             # 斜率显著性阈值（xATR/10根）：不足视为震荡
+
+
+def _trend_regime(df: pd.DataFrame) -> str:
+    """趋势 regime 粗判：up / down / range（摆动系逆势门控专用，df 内自足）。
+
+    口径：优先用现成 _swing_points 判道氏结构（近 3 个 swing 高/低点同向抬升
+    或压低）；结构交织时退化为 MA50 斜率（近 10 根 MA 变化量按 ATR 归一，
+    ≥0.6 判单边）。数据不足或判定异常一律返回 range（不门控）——宁可漏拦，
+    不在震荡市误杀均值回归信号。
+    """
+    try:
+        if len(df) < MIN_BARS:
+            return "range"
+        highs_i, lows_i = _swing_points(df, window=5)
+        h_vals = [float(df["high"].iloc[i]) for i in highs_i[-3:]]
+        l_vals = [float(df["low"].iloc[i]) for i in lows_i[-3:]]
+        if len(h_vals) >= 2 and len(l_vals) >= 2:
+            hh = all(h_vals[i] < h_vals[i + 1] for i in range(len(h_vals) - 1))
+            hl = all(l_vals[i] < l_vals[i + 1] for i in range(len(l_vals) - 1))
+            lh = all(h_vals[i] > h_vals[i + 1] for i in range(len(h_vals) - 1))
+            ll = all(l_vals[i] > l_vals[i + 1] for i in range(len(l_vals) - 1))
+            if hh and hl:
+                return "up"
+            if lh and ll:
+                return "down"
+        if len(df) >= _REGIME_MA_PERIOD + _REGIME_SLOPE_BARS:
+            ma = df["close"].rolling(_REGIME_MA_PERIOD,
+                                     min_periods=_REGIME_MA_PERIOD).mean()
+            ma_now = float(ma.iloc[-1])
+            ma_prev = float(ma.iloc[-1 - _REGIME_SLOPE_BARS])
+            atr_v = float(_atr(df).iloc[-1])
+            if math.isfinite(ma_now) and math.isfinite(ma_prev) and atr_v > 0:
+                slope = (ma_now - ma_prev) / atr_v
+                if slope >= _REGIME_SLOPE_ATR:
+                    return "up"
+                if slope <= -_REGIME_SLOPE_ATR:
+                    return "down"
+    except Exception:  # noqa: BLE001 — regime 判定失败不门控，绝不拖垮信号器
+        pass
+    return "range"
+
+
+def _apply_counter_trend_gate(direction: str, strength: float, plan: dict | None,
+                              regime: str) -> tuple[float, dict | None, str]:
+    """逆势门控：单边趋势中逆势方向 strength×0.4、撤销交易计划、返回说明后缀。
+
+    顺势 / 震荡（range）原样放行，说明后缀为空串。
+    """
+    counter = (regime == "up" and direction == "bearish") or \
+              (regime == "down" and direction == "bullish")
+    if not counter:
+        return strength, plan, ""
+    trend_cn = "单边上涨" if regime == "up" else "单边下跌"
+    return (strength * COUNTER_TREND_STRENGTH_MULT, None,
+            f"；{trend_cn}趋势中逆势信号已降级（强度×{COUNTER_TREND_STRENGTH_MULT:g}、"
+            "不给交易计划，防接飞刀/摸顶）")
+
+
 def _sig(system: str, name_cn: str, direction: str, strength: float,
          reasoning: str, key_levels: list[dict] | None = None,
          trade_plan: dict | None = None) -> dict:
@@ -665,7 +730,11 @@ def signal_martingale(df: pd.DataFrame, trade_history: list[dict] | None = None)
 # ═══════════════════════════ 10. 摆动震荡 ═══════════════════════════
 
 def signal_oscillator(df: pd.DataFrame) -> dict:
-    """RSI/KDJ 超买超卖：RSI<30 或 KDJ<20 买入；RSI>70 或 KDJ>80 卖出。"""
+    """RSI/KDJ 超买超卖：RSI<30 或 KDJ<20 买入；RSI>70 或 KDJ>80 卖出。
+
+    [P1-3] 内置逆势门控：单边趋势（_trend_regime）中逆势超卖/超买信号
+    strength×0.4 且撤销交易计划——只提示不给计划，防单边市接飞刀/摸顶。
+    """
     name = ("oscillator", "摆动震荡")
     if len(df) < MIN_BARS:
         return _insufficient(*name, f"数据不足（{len(df)} 根 < {MIN_BARS}）")
@@ -679,6 +748,7 @@ def signal_oscillator(df: pd.DataFrame) -> dict:
     atr = float(_atr(df).iloc[-1])
     range_hi = float(df["high"].iloc[-20:].max())
     range_lo = float(df["low"].iloc[-20:].min())
+    regime = _trend_regime(df)
     # 点位：entry=现价，SL=近期 swing 外侧 1xATR，TP=区间对侧
     plan_bull = _plan("bullish", close, "market", range_lo - atr, range_hi,
                       "超卖均值回归做多；SL=近期低点外侧1xATR；TP=区间对侧（近期高点）")
@@ -686,25 +756,37 @@ def signal_oscillator(df: pd.DataFrame) -> dict:
                       "超买均值回归做空；SL=近期高点外侧1xATR；TP=区间对侧（近期低点）")
     if votes_bull:
         depth = max((30 - rsi) / 30 if rsi < 30 else 0, (20 - kv) / 20 if kv < 20 else 0)
-        return _sig(*name, "bullish", min(1.0, 0.4 + votes_bull * 0.2 + depth * 0.3),
-                    detail + f" → 超卖（{votes_bull}/2 指标命中），均值回归看反弹",
-                    trade_plan=plan_bull)
+        strength = min(1.0, 0.4 + votes_bull * 0.2 + depth * 0.3)
+        strength, plan, gate_note = _apply_counter_trend_gate(
+            "bullish", strength, plan_bull, regime)
+        return _sig(*name, "bullish", strength,
+                    detail + f" → 超卖（{votes_bull}/2 指标命中），均值回归看反弹" + gate_note,
+                    trade_plan=plan)
     if votes_bear:
         depth = max((rsi - 70) / 30 if rsi > 70 else 0, (kv - 80) / 20 if kv > 80 else 0)
-        return _sig(*name, "bearish", min(1.0, 0.4 + votes_bear * 0.2 + depth * 0.3),
-                    detail + f" → 超买（{votes_bear}/2 指标命中），均值回归看回落",
-                    trade_plan=plan_bear)
+        strength = min(1.0, 0.4 + votes_bear * 0.2 + depth * 0.3)
+        strength, plan, gate_note = _apply_counter_trend_gate(
+            "bearish", strength, plan_bear, regime)
+        return _sig(*name, "bearish", strength,
+                    detail + f" → 超买（{votes_bear}/2 指标命中），均值回归看回落" + gate_note,
+                    trade_plan=plan)
     lean = "bullish" if rsi < 45 and kv < dv else ("bearish" if rsi > 55 and kv > dv else "neutral")
     if lean != "neutral":
-        return _sig(*name, lean, 0.2, detail + " → 未达超买超卖阈值，仅弱倾向",
-                    trade_plan=plan_bull if lean == "bullish" else plan_bear)
+        strength, plan, gate_note = _apply_counter_trend_gate(
+            lean, 0.2, plan_bull if lean == "bullish" else plan_bear, regime)
+        return _sig(*name, lean, strength,
+                    detail + " → 未达超买超卖阈值，仅弱倾向" + gate_note, trade_plan=plan)
     return _sig(*name, "neutral", 0.15, detail + " → 指标中性区间，观望")
 
 
 # ═══════════════════════════ 11. 三重平滑 RSI ═══════════════════════════
 
 def signal_triple_rsi(df: pd.DataFrame) -> dict:
-    """布朗三重平滑 RSI：短→中→长逐级 EMA 平滑，金叉/死叉 + 顶底背离共振。"""
+    """布朗三重平滑 RSI：短→中→长逐级 EMA 平滑，金叉/死叉 + 顶底背离共振。
+
+    [P1-3] 逆势金叉/死叉同摆动系门控：单边下跌中的金叉、单边上涨中的死叉
+    strength×0.4 且撤销交易计划（背离酝酿/快慢线排列分支不属交叉信号，不门控）。
+    """
     name = ("triple_rsi", "三重平滑RSI")
     if len(df) < 60:
         return _insufficient(*name, f"数据不足（{len(df)} 根 < 60，三级平滑需要更长样本）")
@@ -729,23 +811,34 @@ def signal_triple_rsi(df: pd.DataFrame) -> dict:
     detail = f"三重平滑RSI 快线={fast_now:.1f} 慢线={slow_now:.1f}"
     px = float(close.iloc[-1])
     atr = float(_atr(df).iloc[-1])
+    regime = _trend_regime(df)
     # 点位：entry=现价，SL=1.5xATR，TP=2R
     plan_bull = _plan("bullish", px, "market", px - 1.5 * atr, px + 3.0 * atr,
                       "三重平滑RSI 多头信号现价入场；SL=1.5xATR；TP=2R")
     plan_bear = _plan("bearish", px, "market", px + 1.5 * atr, px - 3.0 * atr,
                       "三重平滑RSI 空头信号现价入场；SL=1.5xATR；TP=2R")
     if golden and bottom_div:
-        return _sig(*name, "bullish", 0.8, detail + " → 金叉 + 底背离双共振，多头信号强",
-                    trade_plan=plan_bull)
+        strength, plan, gate_note = _apply_counter_trend_gate(
+            "bullish", 0.8, plan_bull, regime)
+        return _sig(*name, "bullish", strength,
+                    detail + " → 金叉 + 底背离双共振，多头信号强" + gate_note,
+                    trade_plan=plan)
     if death and top_div:
-        return _sig(*name, "bearish", 0.8, detail + " → 死叉 + 顶背离双共振，空头信号强",
-                    trade_plan=plan_bear)
+        strength, plan, gate_note = _apply_counter_trend_gate(
+            "bearish", 0.8, plan_bear, regime)
+        return _sig(*name, "bearish", strength,
+                    detail + " → 死叉 + 顶背离双共振，空头信号强" + gate_note,
+                    trade_plan=plan)
     if golden:
-        return _sig(*name, "bullish", 0.5, detail + " → 金叉（无背离共振），偏多",
-                    trade_plan=plan_bull)
+        strength, plan, gate_note = _apply_counter_trend_gate(
+            "bullish", 0.5, plan_bull, regime)
+        return _sig(*name, "bullish", strength,
+                    detail + " → 金叉（无背离共振），偏多" + gate_note, trade_plan=plan)
     if death:
-        return _sig(*name, "bearish", 0.5, detail + " → 死叉（无背离共振），偏空",
-                    trade_plan=plan_bear)
+        strength, plan, gate_note = _apply_counter_trend_gate(
+            "bearish", 0.5, plan_bear, regime)
+        return _sig(*name, "bearish", strength,
+                    detail + " → 死叉（无背离共振），偏空" + gate_note, trade_plan=plan)
     if bottom_div:
         return _sig(*name, "bullish", 0.35, detail + " → 底背离酝酿中，待金叉确认",
                     trade_plan=plan_bull)
@@ -895,13 +988,14 @@ SYSTEM_META: dict[str, dict] = {
         "type": "均值回归", "trigger": "RSI<30/KDJ<20 超卖，RSI>70/KDJ>80 超买",
         "best_tfs": ["15m", "1h"],
         "lag": "震荡市利器、趋势市毒药：单边行情中超买可以更超买，逆势接飞刀是"
-               "「买了就跌」重灾区；需道氏顶层过滤配合",
+               "「买了就跌」重灾区；已内置逆势门控——单边趋势中逆势信号强度×0.4"
+               "且不给交易计划，只提示不建仓",
     },
     "triple_rsi": {
         "type": "动量平滑", "trigger": "三级 EMA 平滑 RSI 金叉/死叉 + 顶底背离共振",
         "best_tfs": ["1h", "4h"],
         "lag": "三重平滑显著降噪但也显著滞后，交叉信号出现时短线波段常已过半；"
-               "背离分量偏左侧可提前预警",
+               "背离分量偏左侧可提前预警；逆势金叉/死叉已内置降级（强度×0.4 撤计划）",
     },
     "arbitrage": {
         "type": "中性套利",
