@@ -134,12 +134,13 @@ check("buckets上限-总额不丢", b7 is not None and abs(b7["buy"] - 800) < 0.
       f"buy={b7['buy'] if b7 else None}")
 
 # ── 6) actors 多空口径：机构全买 / 散户全卖 / overall 接筹码判词 ──────
+# （散户 12 笔≥样本门禁 MIN_ACTOR_N——D1 诚实化后小样本 long_pct=None，
+#   本用例测的是多空口径而非门禁，构造给足样本）
 SYM2 = "ACTUSDT"
 m9 = (T0_MIN + 9) * 60_000
 feed(SYM2, 100.0, 150_000, True, m9 + 1_000)   # 单笔 ≥ tier1(10万) → inst
-feed(SYM2, 100.0, 1_000, False, m9 + 2_000)    # 散户卖 ×3
-feed(SYM2, 100.1, 1_000, False, m9 + 3_000)
-feed(SYM2, 99.9, 1_000, False, m9 + 4_000)
+for _i in range(12):                            # 散户卖 ×12（qty 各异防成指纹组）
+    feed(SYM2, 100.0 + (_i % 3) * 0.1, 1_000 + _i * 7, False, m9 + 2_000 + _i * 150)
 res_a = jtc.footprint(SYM2, "1m", 10, 40, cfg={}, now_ms=(T0_MIN + 10) * 60_000)
 acts = res_a["actors"]
 check("actors-inst全买", acts["inst"]["long_pct"] == 100.0
@@ -149,9 +150,10 @@ check("actors-retail全卖", acts["retail"]["long_pct"] == 0.0
 check("actors-overall接筹码判词", "机构在接散户筹码" in acts["overall"]["verdict_cn"]
       and "做多情绪主导" in acts["overall"]["verdict_cn"],
       f"{acts['overall']['verdict_cn']}")
+_retail_sell = sum(1_000 + _i * 7 for _i in range(12))   # 12 笔散户卖总额
 check("actors-overall数值", abs(acts["overall"]["buy"] - 150_000) < 0.01
-      and abs(acts["overall"]["sell"] - 3_000) < 0.01
-      and abs(acts["overall"]["delta"] - 147_000) < 0.01)
+      and abs(acts["overall"]["sell"] - _retail_sell) < 0.01
+      and abs(acts["overall"]["delta"] - (150_000 - _retail_sell)) < 0.01)
 # summary() 的 breakdown 同步带 long_pct/verdict_cn（任务 3 口径）
 sm = jtc.summary(SYM2, cfg={}, window_min=15,
                  now_ms=(T0_MIN + 10) * 60_000)

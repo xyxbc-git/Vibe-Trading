@@ -50,6 +50,18 @@ BURST_RATIO = 3.0            # 最近 60 秒大单额 ≥ 窗口其余时段分�
 # 砸盘力度减弱判定
 FADE_WINDOW_MIN = 6          # 观察最近 N 个整分钟
 FADE_RATIO = 0.45            # 最近 2 分钟均值 ≤ 峰值 × 0.45
+# ── 画像 P0 诚实化（方案 20260813 §三 A1-A3 + B3，任务 D1）────────────────
+# 样本门禁：笔数与金额**双条件**都不足才判 insufficient——大额本身是强证据
+# （3 笔 $180k 机构单的信息量远高于 30 笔 $50 散户单），只按笔数会把
+# 大单稀疏的真信号误杀；「机构 0.0% +$60」这类噪声则两条都不满足。
+MIN_ACTOR_N = 10             # actor 桶最少笔数（不足且金额也小 → 样本不足）
+MIN_VERDICT_N = 30           # verdict 总样本最少笔数（同上双条件）
+# 结论翻转阻尼（B3）：新判定连续 N 轮（轮间隔 ≥ MIN_INTERVAL 去抖）才切换
+# 展示值；5 分钟内实际切换 ≥ CHAOS_FLIPS 次 → 显式「混沌」态。
+DAMP_CONFIRM_N = 3           # 连续同向轮数
+DAMP_MIN_INTERVAL_S = 20.0   # 轮间隔下限（3s 轮询去抖：3 轮 ≈ 1 分钟稳定期）
+DAMP_CHAOS_FLIPS = 3         # 混沌判定：5min 内展示值切换次数
+DAMP_CHAOS_WIN_S = 300.0
 # 足迹图（Footprint）分钟×价格档聚合
 FOOT_MINUTES_MAX = 240       # 足迹分钟桶上限（内存窗口；完结分钟经 flush_bars 落库长期保留）
 FOOT_CELLS_MAX = 120         # 每分钟价格档上限（超出归并到边缘档，防内存爆）
@@ -130,31 +142,62 @@ def classify_trade(usd: float, tier1: float, group_cls: str) -> str:
 
 
 ACTOR_CN = {"retail": "散户", "mid": "中户", "inst": "机构/大户", "maker": "做市商/算法"}
+# A2 身份词降格：主标签=单笔规模分布（客观事实），身份词退副标签（推断）。
+# maker 桶只能来自指纹组（双边行为证据），其余桶身份词均为金额推断。
+SIZE_CN = {"retail": "小单", "mid": "中单", "inst": "大单", "maker": "双边算法"}
+LABEL_NOTE = "按单笔金额推断，非真实身份"
+LABEL_NOTE_FP = "含数量指纹组行为证据（拆单/双边报价）"
 
 
 def build_breakdown(trades: list[dict], tier1: float,
                     groups: dict[str, dict]) -> dict:
-    """窗口成交 → 主体份额分解 {actor: {usd, buy_usd, sell_usd, n}}。"""
-    acc = {k: {"usd": 0.0, "buy_usd": 0.0, "sell_usd": 0.0, "n": 0}
+    """窗口成交 → 主体份额分解 {actor: {usd, buy_usd, sell_usd, n, ...}}。
+
+    P0 诚实化（任务 D1）：每桶增 size_cn 主标签 / fp_usd 指纹组证据额 /
+    confidence 文字三档 / insufficient 样本门禁（笔数与金额双条件，
+    不足时 pct/long_pct 置 None 不给精确数，绝对额保留供 L2 原始数据）。
+    """
+    acc = {k: {"usd": 0.0, "buy_usd": 0.0, "sell_usd": 0.0, "n": 0, "fp_usd": 0.0}
            for k in ACTOR_CN}
     for t in trades:
         g = groups.get(t["fp"])
-        cls = classify_trade(t["usd"], tier1, classify_group(g) if g else "")
+        gcls = classify_group(g) if g else ""
+        cls = classify_trade(t["usd"], tier1, gcls)
         a = acc[cls]
         a["usd"] += t["usd"]
         a["n"] += 1
+        if gcls:                       # 该笔归类来自指纹组行为证据
+            a["fp_usd"] += t["usd"]
         if t["is_buy"]:
             a["buy_usd"] += t["usd"]
         else:
             a["sell_usd"] += t["usd"]
     total = sum(a["usd"] for a in acc.values())
     for k, a in acc.items():
-        a["pct"] = round(a["usd"] / total * 100, 2) if total > 0 else 0.0
         a["net_usd"] = round(a["buy_usd"] - a["sell_usd"], 2)
-        for f in ("usd", "buy_usd", "sell_usd"):
+        for f in ("usd", "buy_usd", "sell_usd", "fp_usd"):
             a[f] = round(a[f], 2)
         a["actor"] = k
         a["actor_cn"] = ACTOR_CN[k]
+        a["size_cn"] = SIZE_CN[k]
+        fp_share = (a["fp_usd"] / a["usd"]) if a["usd"] > 0 else 0.0
+        a["label_note"] = LABEL_NOTE_FP if fp_share >= 0.5 else LABEL_NOTE
+        # 置信度文字三档：指纹组证据占比 + 样本量（不用小数，前端直显）
+        if fp_share >= 0.5 and a["n"] >= 5:
+            a["confidence"] = "证据充分"
+        elif fp_share >= 0.2 or a["n"] >= MIN_ACTOR_N:
+            a["confidence"] = "一般"
+        else:
+            a["confidence"] = "仅金额分层"
+        # 样本门禁（双条件）：笔数少 且 金额小 → 不给精确百分比与方向倾向
+        a["insufficient"] = a["n"] < MIN_ACTOR_N and a["usd"] < tier1
+        if a["insufficient"]:
+            a["pct"] = None
+            a["long_pct"] = None
+            a["verdict_cn"] = (f"样本不足（仅 {a['n']} 笔），不足以判读"
+                               if a["n"] else "窗口内无成交")
+            continue
+        a["pct"] = round(a["usd"] / total * 100, 2) if total > 0 else 0.0
         # 多空倾向：主动买=做多倾向 / 主动卖=做空倾向（taker 方向启发式，非真实持仓）
         side_tot = a["buy_usd"] + a["sell_usd"]
         if side_tot > 0:
@@ -169,7 +212,38 @@ def build_breakdown(trades: list[dict], tier1: float,
         else:
             a["long_pct"] = None
             a["verdict_cn"] = "窗口内无成交"
-    return {"total_usd": round(total, 2), "actors": acc}
+    return {"total_usd": round(total, 2), "total_n": sum(a["n"] for a in acc.values()),
+            "actors": acc}
+
+
+def apply_damping(damp: dict, raw_action: str, now_s: float) -> tuple[str, bool]:
+    """结论翻转阻尼（B3，纯函数改 damp 状态）→ (展示动作, 是否混沌)。
+
+    - 首见直接采纳；此后新判定须连续 DAMP_CONFIRM_N 轮（轮间隔 ≥
+      DAMP_MIN_INTERVAL_S 去抖，3s 轮询不算轮）才切换展示值；
+    - 5 分钟内展示值实际切换 ≥ DAMP_CHAOS_FLIPS 次 → 返回混沌态
+      （L0 显「市场混沌」，底层展示值保留，退出混沌自动恢复）。
+    damp 结构：{displayed, candidate, cand_n, last_ts, flips: list[ts]}。
+    """
+    if damp.get("displayed") is None:
+        damp.update(displayed=raw_action, candidate=None, cand_n=0,
+                    last_ts=now_s, flips=[])
+        return raw_action, False
+    if raw_action == damp["displayed"]:
+        damp["candidate"], damp["cand_n"] = None, 0
+    elif raw_action == damp.get("candidate"):
+        if now_s - damp["last_ts"] >= DAMP_MIN_INTERVAL_S:
+            damp["cand_n"] += 1
+            damp["last_ts"] = now_s
+        if damp["cand_n"] >= DAMP_CONFIRM_N:
+            damp["displayed"] = raw_action
+            damp["candidate"], damp["cand_n"] = None, 0
+            damp["flips"].append(now_s)
+    else:
+        damp["candidate"], damp["cand_n"] = raw_action, 1
+        damp["last_ts"] = now_s
+    damp["flips"] = [t for t in damp["flips"] if t >= now_s - DAMP_CHAOS_WIN_S][-20:]
+    return damp["displayed"], len(damp["flips"]) >= DAMP_CHAOS_FLIPS
 
 
 def _fmt_usd(v: float) -> str:
@@ -254,6 +328,36 @@ def build_verdict(breakdown: dict, minute_rows: list[dict],
                           f"{_fmt_usd(recent_avg)}/分钟（-{(1 - recent_avg / peak) * 100:.0f}%）"
                           "——砸盘力度衰减，可关注企稳后的入场时机（非建议，需自行确认结构）")
 
+    # ── P0 诚实化（任务 D1）：总样本门禁 + 判定置信度 + L0 结论句 ──
+    # 总门禁同为双条件：笔数与金额都不足才「不可判定」（大额=强证据）。
+    total_n = int(breakdown.get("total_n") or 0)
+    insufficient = total_n < MIN_VERDICT_N and total < tier1 * 3
+    # 置信度：inst+maker 的指纹组证据占比 +（非散户）样本量，文字档直显
+    im_usd = actors["inst"]["usd"] + actors["maker"]["usd"]
+    im_fp = actors["inst"].get("fp_usd", 0.0) + actors["maker"].get("fp_usd", 0.0)
+    im_n = actors["inst"]["n"] + actors["maker"]["n"]
+    fp_share = (im_fp / im_usd) if im_usd > 0 else 0.0
+    if insufficient:
+        confidence = "样本不足"
+    elif fp_share >= 0.5 and im_n >= 10:
+        confidence = "证据充分"
+    elif fp_share >= 0.2 or im_n >= 10:
+        confidence = "一般"
+    else:
+        confidence = "仅金额分层"
+    if insufficient:
+        action, note = "不可判定", (f"窗口内仅 {total_n} 笔 / {_fmt_usd(total)}，"
+                                    "样本不足以支撑任何判定")
+    # L0 一句话结论：限于描述盘口行为本身，不给方向/开单建议
+    # （方案 §五 边界三原则：方向级结论归 HUD/导师）。
+    if insufficient:
+        l0 = "样本不足，暂不判定——本窗口数据不足以支撑任何结论"
+    elif action == "中性":
+        l0 = (f"主力买卖大致均衡（{confidence}）：非散户占比 {nr_share:.0f}%，"
+              f"净流 {_fmt_usd(inst_net)} 未过判定阈值")
+    else:
+        l0 = f"主力疑似{action}（{confidence}）：{note}"
+
     return {
         "dominant": dominant,
         "dominant_cn": ACTOR_CN[dominant],
@@ -263,6 +367,10 @@ def build_verdict(breakdown: dict, minute_rows: list[dict],
         "note": note,
         "burst": burst,
         "entry_hint": entry_hint,
+        "insufficient": insufficient,
+        "total_n": total_n,
+        "confidence": confidence,
+        "l0_text": l0,
     }
 
 
@@ -280,7 +388,10 @@ def _sym_state(symbol: str) -> dict:
         st = {"trades": deque(maxlen=TRADES_MAX), "groups": {},
               "minutes": deque(maxlen=BUCKETS_MAX),
               "footprint": deque(maxlen=FOOT_MINUTES_MAX),
-              "foot_step": None, "foot_anchor": None, "foot_pending": None}
+              "foot_step": None, "foot_anchor": None, "foot_pending": None,
+              # B3 结论翻转阻尼状态（apply_damping 读写）
+              "damp": {"displayed": None, "candidate": None, "cand_n": 0,
+                       "last_ts": 0.0, "flips": []}}
         _STATE[symbol] = st
     return st
 
@@ -447,8 +558,40 @@ def summary(symbol: str, cfg: dict | None = None, window_min: int = 15,
         groups = {fp: dict(g) for fp, g in st["groups"].items()}
         minute_rows = [dict(m) for m in st["minutes"]
                        if m["minute"] >= cutoff // 60000]
+        damp = st.setdefault("damp", {"displayed": None, "candidate": None,
+                                      "cand_n": 0, "last_ts": 0.0, "flips": []})
 
     breakdown = build_breakdown(trades, tier1, groups)
+
+    # ── A1 窗口真实性：份额分解受环形缓冲限制，实际覆盖 ≠ 标称窗口 ──
+    # actual_window_min = 窗口内最老一笔到现在的跨度；高频期 6000 笔缓冲
+    # 只覆盖数分钟，此前 UI 标 240min 名不副实——诚实口径以本字段为准。
+    actual_window_min = (round((now - trades[0]["ts_ms"]) / 60000.0, 1)
+                         if trades else 0.0)
+    # coverage：实际覆盖范围内「有成交分钟」占比 + 连续缺口列表。
+    # 注意：分钟桶只在有成交时产生，缺口=无成交分钟（对主流币基本等于
+    # 采集断档，对低流动币可能是真无成交），语义如实标注不强判。
+    start_min = (trades[0]["ts_ms"] // 60000) if trades else (cutoff // 60000)
+    now_min = now // 60000
+    # expected 不含「当前进行中的分钟」（尚未完结，计入会让覆盖率恒扣一格）
+    expected = max(1, int(now_min - start_min))
+    present_mins = sorted({m["minute"] for m in minute_rows
+                           if start_min <= m["minute"] < now_min})
+    present = len(present_mins)
+    cov_pct = round(present / expected * 100.0, 1)
+    grade = ("continuous" if cov_pct >= 90.0 else
+             "gapped" if cov_pct >= 50.0 else "severe_gaps")
+    gaps = []
+    for a, b in zip(present_mins, present_mins[1:]):
+        if b - a >= 3:                      # 连续缺 ≥2 分钟才记
+            gaps.append({"from_min": int(a + 1), "to_min": int(b - 1),
+                         "missing_min": int(b - a - 1)})
+    coverage = {"grade": grade, "grade_cn": {"continuous": "连续",
+                                             "gapped": "有断档",
+                                             "severe_gaps": "严重断档"}[grade],
+                "pct": cov_pct, "present_minutes": present,
+                "expected_minutes": expected, "gaps": gaps[:5],
+                "note": "缺口=无成交分钟（主流币≈采集断档；低流动币可能是真无成交）"}
 
     # 窗口价格变化（主力行为定性用）
     first_p = next((m["first_price"] for m in minute_rows if m.get("first_price")), None)
@@ -458,6 +601,20 @@ def summary(symbol: str, cfg: dict | None = None, window_min: int = 15,
                  if first_p and last_p and first_p > 0 else None)
 
     verdict = build_verdict(breakdown, minute_rows, price_chg, tier1, now)
+
+    # ── B3 结论翻转阻尼：raw 判定 → 展示值（连续确认才切换 + 混沌态）──
+    raw_action = verdict["action"]
+    with _LOCK:
+        displayed, chaotic = apply_damping(damp, raw_action, now / 1000.0)
+    verdict["action_raw"] = raw_action
+    verdict["action"] = displayed
+    verdict["chaotic"] = chaotic
+    if chaotic:
+        verdict["l0_text"] = "市场混沌，信号打架——多空判定快速交替，暂无稳定结论"
+    elif displayed != raw_action:
+        # 展示值仍是旧判定（新判定未过确认轮数）：L0 跟展示值走，注明待确认
+        verdict["l0_text"] = (f"主力行为暂按「{displayed}」（新判定「{raw_action}」"
+                              f"待连续确认）")
 
     # 指纹聚合表：窗口内活跃（last_ts≥cutoff）且 n≥2，按总额取前 14
     fps = []
@@ -496,11 +653,24 @@ def summary(symbol: str, cfg: dict | None = None, window_min: int = 15,
 
     return {
         "symbol": sym, "active": True, "window_min": win,
+        "actual_window_min": actual_window_min,
+        "coverage": coverage,
         "price_change_pct": price_chg,
         "breakdown": breakdown, "verdict": verdict,
         "fingerprints": fps[:14], "recent": recent, "series": series,
         "tier1_usd": tier1, "retail_max_usd": RETAIL_MAX_USD,
         "disclaimer": DISCLAIMER,
+        # HUD 引用契约（方案 §五：一处结论一处引用；字段名以此为准）
+        "hud": {
+            "action": verdict["action"],
+            "confidence": verdict["confidence"],
+            "nr_share_pct": verdict["non_retail_share_pct"],
+            "actual_window_min": actual_window_min,
+            "coverage": coverage["grade"],
+            "burst": verdict["burst"],
+            "entry_hint": verdict["entry_hint"],
+            "l0_text": verdict["l0_text"],
+        },
     }
 
 
