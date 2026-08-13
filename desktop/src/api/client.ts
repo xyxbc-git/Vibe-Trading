@@ -1941,6 +1941,8 @@ export interface TwelveConsensusResponse {
   symbol?: string;
   price?: number | null;
   tf_available?: string[];
+  /** 各周期末根 K 线是否已收盘；false = 该周期信号盘中可能重绘（旧后端无此字段） */
+  bar_closed?: Record<string, boolean>;
   consensus?: TwelveConsensus | null;
   error?: string;
 }
@@ -2406,6 +2408,8 @@ export interface TwelveSignalsResponse {
   symbol?: string;
   tf?: string;
   price?: number;
+  /** 末根 K 线是否已收盘；false = 信号基于进行中 bar，收盘前可能重绘（旧后端无此字段） */
+  bar_closed?: boolean;
   signals: TwelveSignal[];
   consensus?: TwelveConsensus | null;
   error?: string;

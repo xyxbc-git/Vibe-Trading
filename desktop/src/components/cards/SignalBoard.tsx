@@ -1081,6 +1081,15 @@ export default function SignalBoard({ symbol, tf, onTfChange }: SignalBoardProps
             {dataTf}
             {tf === "auto" && " 信号"}
           </span>
+          {/* [信号篇 P0-1] 末根未收盘 = 信号基于进行中 bar，收盘前可能重绘（严格 === false：旧后端无此字段不显示） */}
+          {data?.ok && !stale && data.bar_closed === false && (
+            <span
+              className="inline-flex items-center gap-0.5 text-[10px] px-1.5 py-0.5 rounded bg-jarvis-yellow/15 text-jarvis-yellow cursor-help"
+              title={`当前 ${dataTf} 末根 K 线尚未收盘：矩阵信号含进行中 bar（实时判读口径），收盘前方向/强度可能改变（重绘）；「胜率回测」只统计已收盘 bar——两者口径不同，请勿把盘中信号当回测口径的最终信号`}
+            >
+              ⏳ 未收盘，可能重绘
+            </span>
+          )}
           {signals.length > 0 && (
             <span className="text-xs font-mono">
               <span className="text-jarvis-green">{bullCount}涨</span>
