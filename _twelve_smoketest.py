@@ -740,5 +740,55 @@ check("P2-1 members 明细仍含全部成员（含中性）",
 check("P2-1 共识 score 仍∈[-1,1] 且结构完整",
       -1.0 <= _c_dilute["score"] <= 1.0 and CONS_FIELDS.issubset(_c_dilute.keys()))
 
+# ── 16. [信号篇 P1-2] 单系统 SL 隐蔽化（_plan 统一出口） ─────────────
+
+# 环境变量固定配置（测试确定性，不受用户 config.yaml 影响），跑完即恢复
+import jarvis_config as _jc_t
+
+os.environ["JARVIS_CFG_SL_AVOID_ROUND_LEVELS"] = "1"
+os.environ["JARVIS_CFG_SL_SINGLE_ATR_BUFFER_MULT"] = "1.0"
+_jc_t._LOAD_CACHE.clear()
+try:
+    # 价位 ~95 的关口步长为 2.0（{1,2,5}×10^n 心理刻度）→ 关口在偶数位；
+    # SL=94.2 贴关口 94（|Δ|=0.2 < near_zone=0.5×ATR）→ 向下避让 1×ATR 到 93
+    p_st = jts._plan("bullish", 100.0, "market", 94.2, 110.0, "t", atr=1.0)
+    check("P1-2 多单 SL 挪出整数关口扫单区（94.2→93）",
+          p_st is not None and abs(p_st["stop_loss"] - 93.0) < 1e-9,
+          str(p_st and p_st["stop_loss"]))
+    check("P1-2 note 写明隐蔽化依据", p_st is not None and "隐蔽化" in p_st["note"]
+          and "缓冲 1×ATR" in p_st["note"], str(p_st and p_st["note"])[:120])
+    check("P1-2 RR 按调整后 SL 重算（10/7≈1.43）",
+          p_st is not None and abs(p_st["rr"] - round(10.0 / 7.0, 2)) < 1e-9,
+          str(p_st and p_st["rr"]))
+    # 空单镜像：SL=105.8 贴关口 106 → 向上避让到 107
+    p_sh = jts._plan("bearish", 100.0, "market", 105.8, 90.0, "t", atr=1.0)
+    check("P1-2 空单 SL 向上避让（105.8→107）",
+          p_sh is not None and abs(p_sh["stop_loss"] - 107.0) < 1e-9,
+          str(p_sh and p_sh["stop_loss"]))
+    # 方向自洽仍强校验：调整后仍多单 SL<entry<TP
+    check("P1-2 调整后自洽（SL<entry<TP）",
+          p_st is not None and p_st["stop_loss"] < p_st["entry"] < p_st["take_profit"])
+    # 远离关口的 SL 原样不动（95.0 距关口 94/96 均 1.0 ≥ near_zone）
+    p_far = jts._plan("bullish", 100.0, "market", 95.0, 110.0, "t", atr=1.0)
+    check("P1-2 远离关口的 SL 不动（95 原样）",
+          p_far is not None and abs(p_far["stop_loss"] - 95.0) < 1e-9
+          and "隐蔽化" not in p_far["note"], str(p_far and p_far["stop_loss"]))
+    # 主开关关闭 → 贴关口的 SL 也零调整
+    os.environ["JARVIS_CFG_SL_AVOID_ROUND_LEVELS"] = "0"
+    _jc_t._LOAD_CACHE.clear()
+    p_off = jts._plan("bullish", 100.0, "market", 94.2, 110.0, "t", atr=1.0)
+    check("P1-2 主开关关闭时零调整（SL 原样 94.2）",
+          p_off is not None and abs(p_off["stop_loss"] - 94.2) < 1e-9
+          and "隐蔽化" not in p_off["note"], str(p_off and p_off["stop_loss"]))
+finally:
+    os.environ.pop("JARVIS_CFG_SL_AVOID_ROUND_LEVELS", None)
+    os.environ.pop("JARVIS_CFG_SL_SINGLE_ATR_BUFFER_MULT", None)
+    _jc_t._LOAD_CACHE.clear()
+
+# 配置读取兜底：缺键/异常回退默认 1.0 且夹紧 [0,2]
+check("P1-2 缓冲配置读取（默认 1.0，夹紧范围内）",
+      0.0 <= jts._single_sl_buffer_from_config() <= 2.0,
+      str(jts._single_sl_buffer_from_config()))
+
 print(f"\n{'=' * 40}\n通过 {PASS} / 失败 {FAIL}")
 raise SystemExit(1 if FAIL else 0)

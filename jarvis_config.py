@@ -152,6 +152,11 @@ DEFAULTS: dict = {
     # ── Sprint1 T1.2 止损隐蔽化（避开整数关口/摆动点扫单区）──────────────────
     "sl_avoid_round_levels": True,    # 开关：系统默认 SL 自动避开整数关口/前高前低
     "sl_atr_buffer_mult": 0.3,        # 避让缓冲 = 该系数 × ATR（方向远离扫单区）
+    # ── [信号篇 P1-2] 单系统 trade_plan SL 隐蔽化缓冲（jarvis_twelve_systems._plan）──
+    # 12 套单系统计划的止损统一过 stealth_stop_loss；缓冲对齐 stop_hunt 插针标定
+    # ATR_MULT=1.0（刺破幅度≤1×ATR 算常规扫单，0.2-0.5×ATR 的教科书缓冲在扫单区内）。
+    # 共识聚合层仍用上面的 sl_atr_buffer_mult（0.3），两层各自可调。
+    "sl_single_atr_buffer_mult": 1.0,  # 单系统 SL 避让缓冲 = 该系数 × ATR
     # ── Sprint1 T1.5 熔断冷静期 ─────────────────────────────────────────────
     "cooldown_hours": 4.0,            # 熔断触发后锁单时长（小时）；0=禁用冷静期
     # ── M2 s5 清算/止损密集区估计器（jarvis_liq_map）─────────────────────────
@@ -379,6 +384,7 @@ GROUPS: dict[str, str] = {
     "min_rr_warning": "risk",
     "sl_avoid_round_levels": "risk",
     "sl_atr_buffer_mult": "risk",
+    "sl_single_atr_buffer_mult": "risk",
     "cooldown_hours": "risk",
     "sl_proximity_warn_pct": "risk",
     "twelve_min_sl_pct": "risk",
@@ -527,6 +533,7 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "default_leverage": (1.0, 125.0),
     "max_leverage_no_confirm": (1.0, 125.0),
     "sl_atr_buffer_mult": (0.0, 2.0),
+    "sl_single_atr_buffer_mult": (0.0, 2.0),  # 单系统 SL 隐蔽化缓冲（xATR）
     "cooldown_hours": (0.0, 72.0),
     "divergence_threshold": (0.01, 0.60),   # 大户背离占比差阈值（0.15=15 个百分点）
     "whale_tier1_usd": (1000.0, 1e8),       # 大单一档下限：过低失去「大单」意义

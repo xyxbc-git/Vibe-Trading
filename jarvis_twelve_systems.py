@@ -221,11 +221,33 @@ def _round_price(v: float) -> float:
     return round(v, digits)
 
 
+# [信号篇 P1-2] 单系统 SL 隐蔽化缓冲（xATR）：对齐 stop_hunt.ATR_MULT=1.0 插针标定
+# （刺破幅度 ≤1×ATR 属常规扫单，教科书位 0.2-0.5×ATR 缓冲正好摆在扫单区里）
+DEFAULT_SINGLE_SL_BUF_ATR = 1.0
+
+
+def _single_sl_buffer_from_config() -> float:
+    """读 jarvis_config.sl_single_atr_buffer_mult（缺失/异常回退 1.0），夹到 [0, 2]。"""
+    try:
+        import jarvis_config as _jc
+        v = float(_jc.get("sl_single_atr_buffer_mult"))
+        if math.isfinite(v):
+            return min(2.0, max(0.0, v))
+    except Exception:  # noqa: BLE001 — 配置层故障不拖垮信号引擎
+        pass
+    return DEFAULT_SINGLE_SL_BUF_ATR
+
+
 def _plan(direction: str, entry: float, entry_type: str, stop_loss: float,
-          take_profit: float, note: str) -> dict | None:
+          take_profit: float, note: str, atr: float | None = None) -> dict | None:
     """构造 trade_plan 并强校验方向自洽：多单 SL<entry<TP，空单 TP<entry<SL。
 
     不自洽 / 非有限值 → 返回 None（宁缺毋滥，不硬造点位）。
+
+    [P1-2] 所有单系统计划的唯一出口：系统默认 SL 统一过 stealth_stop_loss
+    隐蔽化（避开整数关口/扫单区，缓冲 sl_single_atr_buffer_mult×ATR，默认
+    1.0 对齐 stop_hunt 插针标定），RR 按调整后 SL 重算；调整后不自洽照旧
+    返回 None。atr 缺省时隐蔽化退化为 SL 的 0.5% 兜底缓冲（stealth 内建）。
     """
     try:
         e, sl, tp = float(entry), float(stop_loss), float(take_profit)
@@ -233,11 +255,23 @@ def _plan(direction: str, entry: float, entry_type: str, stop_loss: float,
         return None
     if not all(math.isfinite(x) and x > 0 for x in (e, sl, tp)):
         return None
+    if direction not in ("bullish", "bearish"):
+        return None
+    # [P1-2] 止损隐蔽化：仅系统生成的默认 SL 经过此链路（entry 已知做方向兜底；
+    # 主开关 sl_avoid_round_levels 由 stealth 内部读取，失败原样返回不断链）
+    try:
+        from jarvis_position_calc import stealth_stop_loss as _stealth
+        sl_adj, _st_note = _stealth(sl, direction, atr, entry=e,
+                                    buffer_mult=_single_sl_buffer_from_config())
+        if _st_note:
+            sl = float(sl_adj)
+            note = f"{note}；隐蔽化：{_st_note}"
+    except Exception:  # noqa: BLE001 — 隐蔽化失败沿用原 SL，不断信号链
+        pass
+    # 方向自洽校验按（可能已调整的）SL 执行；不自洽照旧返 None
     if direction == "bullish" and not (sl < e < tp):
         return None
     if direction == "bearish" and not (tp < e < sl):
-        return None
-    if direction not in ("bullish", "bearish"):
         return None
     risk = abs(e - sl)
     if risk <= 0:
@@ -293,7 +327,7 @@ def signal_turtle(df: pd.DataFrame) -> dict:
         plan = _plan("bullish", hh20, "breakout",
                      hh20 - 2 * atr, hh20 + 4 * atr,
                      f"20日高突破入场；SL=entry-2xATR；TP=entry+2倍风险；"
-                     f"另有10日低点 {exit_low10:.2f} 动态退出（以先到者为准）")
+                     f"另有10日低点 {exit_low10:.2f} 动态退出（以先到者为准）", atr=atr)
         return _sig(*name, "bullish", min(1.0, 0.5 + margin * 0.25) * vol_k,
                     f"价格 {close:.2f} 突破20日高点 {hh20:.2f}（超出 {margin:.2f} ATR），"
                     f"顺势做多；退出参考10日低点 {exit_low10:.2f}，止损 {stop:.2f}（2xATR）"
@@ -307,7 +341,7 @@ def signal_turtle(df: pd.DataFrame) -> dict:
         plan = _plan("bearish", ll20, "breakout",
                      ll20 + 2 * atr, ll20 - 4 * atr,
                      f"20日低跌破入场；SL=entry+2xATR；TP=entry-2倍风险；"
-                     f"另有10日高点 {exit_high10:.2f} 动态退出（以先到者为准）")
+                     f"另有10日高点 {exit_high10:.2f} 动态退出（以先到者为准）", atr=atr)
         return _sig(*name, "bearish", min(1.0, 0.5 + margin * 0.25) * vol_k,
                     f"价格 {close:.2f} 跌破20日低点 {ll20:.2f}（超出 {margin:.2f} ATR），"
                     f"顺势做空；退出参考10日高点 {exit_high10:.2f}，止损 {stop:.2f}（2xATR）"
@@ -343,10 +377,12 @@ def signal_dow(df: pd.DataFrame) -> dict:
     # 前高已被突破（TP≤entry）时 _plan 自洽校验返回 None——不硬造目标位。
     plan_bull = _plan("bullish", close, "market",
                       l_vals[-1] - 0.5 * atr, h_vals[-1],
-                      "道氏趋势确认现价入场；SL=最近swing低点下方0.5xATR；TP=前高")
+                      "道氏趋势确认现价入场；SL=最近swing低点下方0.5xATR；TP=前高",
+                      atr=atr)
     plan_bear = _plan("bearish", close, "market",
                       h_vals[-1] + 0.5 * atr, l_vals[-1],
-                      "道氏趋势确认现价入场；SL=最近swing高点上方0.5xATR；TP=前低")
+                      "道氏趋势确认现价入场；SL=最近swing高点上方0.5xATR；TP=前低",
+                      atr=atr)
     if hh and hl:
         return _sig(*name, "bullish", min(1.0, 0.5 + 0.15 * n_struct),
                     f"高低点逐级抬高（近{len(h_vals)}个高点、{len(l_vals)}个低点均上移），"
@@ -390,10 +426,11 @@ def signal_elliott(df: pd.DataFrame) -> dict:
         f618 = lo + (hi - lo) * 0.618
     levels = [_lv("fib 0.382", f382), _lv("fib 0.5", f500), _lv("fib 0.618", f618),
               _lv("波段高点", hi), _lv("波段低点", lo)]
+    atr = float(_atr(df).iloc[-1])   # [P1-2] SL 隐蔽化缓冲用
     if up_leg:
         if close >= f382:
             plan = _plan("bullish", f382, "pullback", f500, hi,
-                         "回踩 fib0.382 低吸；SL=下一档 fib0.5；TP=波段前高")
+                         "回踩 fib0.382 低吸；SL=下一档 fib0.5；TP=波段前高", atr=atr)
             return _sig(*name, "bullish", 0.55,
                         f"上行主浪后回撤未破 0.382（{f382:.2f}），浪型结构偏多，"
                         f"回踩 fib 支撑区可视为低吸参考", levels, trade_plan=plan)
@@ -401,14 +438,15 @@ def signal_elliott(df: pd.DataFrame) -> dict:
             return _sig(*name, "neutral", 0.35,
                         f"回撤进入 0.382~0.618（{f618:.2f}~{f382:.2f}）黄金分割区，多空转换观察区", levels)
         plan = _plan("bearish", close, "market", f618, lo,
-                     "跌破 fib0.618 浪型破坏顺势空；SL=收复 0.618 即离场；TP=波段前低")
+                     "跌破 fib0.618 浪型破坏顺势空；SL=收复 0.618 即离场；TP=波段前低",
+                     atr=atr)
         return _sig(*name, "bearish", 0.5,
                     f"回撤跌破 0.618（{f618:.2f}），上行浪型大概率破坏，偏空", levels,
                     trade_plan=plan)
     # 下行主浪：反弹幅度衡量
     if close <= f382:
         plan = _plan("bearish", f382, "pullback", f500, lo,
-                     "反弹至 fib0.382 承压做空；SL=下一档 fib0.5；TP=波段前低")
+                     "反弹至 fib0.382 承压做空；SL=下一档 fib0.5；TP=波段前低", atr=atr)
         return _sig(*name, "bearish", 0.55,
                     f"下行主浪后反弹未过 0.382（{f382:.2f}），浪型结构偏空", levels,
                     trade_plan=plan)
@@ -416,7 +454,7 @@ def signal_elliott(df: pd.DataFrame) -> dict:
         return _sig(*name, "neutral", 0.35,
                     f"反弹进入 0.382~0.618（{f382:.2f}~{f618:.2f}）区间，方向待确认", levels)
     plan = _plan("bullish", close, "market", f618, hi,
-                 "收复 fib0.618 浪型反转做多；SL=跌回 0.618 即离场；TP=波段前高")
+                 "收复 fib0.618 浪型反转做多；SL=跌回 0.618 即离场；TP=波段前高", atr=atr)
     return _sig(*name, "bullish", 0.5,
                 f"反弹收复 0.618（{f618:.2f}），下行浪型大概率破坏，偏多", levels,
                 trade_plan=plan)
@@ -563,7 +601,8 @@ def signal_chanlun(df: pd.DataFrame) -> dict:
         if close > zg:
             kind = "三买近似（突破中枢上沿后运行于其上）"
             plan = _plan("bullish", zg, "pullback", zd - 0.2 * atr, zg + zone_h,
-                         "三买：回踩中枢上沿接多；SL=中枢下沿下方；TP=中枢测幅上翻")
+                         "三买：回踩中枢上沿接多；SL=中枢下沿下方；TP=中枢测幅上翻",
+                         atr=atr)
             return _sig(*name, "bullish", 0.6 if not divergence else 0.4,
                         f"中枢 [{zd:.2f}, {zg:.2f}]，现价 {close:.2f} 站上中枢上沿 → {kind}"
                         + ("；但最后一笔力度衰减（背离迹象），强度打折" if divergence else ""),
@@ -571,7 +610,8 @@ def signal_chanlun(df: pd.DataFrame) -> dict:
         if close < zd:
             kind = "三卖近似（跌破中枢下沿后运行于其下）"
             plan = _plan("bearish", zd, "pullback", zg + 0.2 * atr, zd - zone_h,
-                         "三卖：反抽中枢下沿做空；SL=中枢上沿上方；TP=中枢测幅下翻")
+                         "三卖：反抽中枢下沿做空；SL=中枢上沿上方；TP=中枢测幅下翻",
+                         atr=atr)
             return _sig(*name, "bearish", 0.6 if not divergence else 0.4,
                         f"中枢 [{zd:.2f}, {zg:.2f}]，现价 {close:.2f} 跌破中枢下沿 → {kind}"
                         + ("；但最后一笔力度衰减（背离迹象），强度打折" if divergence else ""),
@@ -579,13 +619,15 @@ def signal_chanlun(df: pd.DataFrame) -> dict:
         # 中枢内部：看最后一笔方向 + 背离 → 一买/一卖近似
         if divergence and last_stroke["dir"] == "down":
             plan = _plan("bullish", zd, "pullback", zd - 0.5 * atr, zg,
-                         "一买近似：中枢下沿背离接多；SL=下沿下方0.5xATR；TP=中枢上沿")
+                         "一买近似：中枢下沿背离接多；SL=下沿下方0.5xATR；TP=中枢上沿",
+                         atr=atr)
             return _sig(*name, "bullish", 0.45,
                         f"中枢 [{zd:.2f}, {zg:.2f}] 内下跌笔力度衰减（背离）→ 一买近似，关注下沿支撑",
                         levels, trade_plan=plan)
         if divergence and last_stroke["dir"] == "up":
             plan = _plan("bearish", zg, "pullback", zg + 0.5 * atr, zd,
-                         "一卖近似：中枢上沿背离做空；SL=上沿上方0.5xATR；TP=中枢下沿")
+                         "一卖近似：中枢上沿背离做空；SL=上沿上方0.5xATR；TP=中枢下沿",
+                         atr=atr)
             return _sig(*name, "bearish", 0.45,
                         f"中枢 [{zd:.2f}, {zg:.2f}] 内上涨笔力度衰减（背离）→ 一卖近似，关注上沿压力",
                         levels, trade_plan=plan)
@@ -679,7 +721,8 @@ def signal_rule123(df: pd.DataFrame) -> dict:
             risk = rebound_high - sl
             plan = _plan("bullish", rebound_high, "breakout", sl,
                          rebound_high + 1.75 * risk,
-                         "123做多：突破反弹高点入场；SL=阶段最低点下方0.5xATR；TP=1.75R")
+                         "123做多：突破反弹高点入场；SL=阶段最低点下方0.5xATR；TP=1.75R",
+                         atr=atr)
         strength = (0.35, 0.6, 0.85)[steps_long - 1]
         if steps_long >= 2:   # 方向性输出才做突破量能确认（P1-4）
             vol_k, vol_note = _breakout_volume_factor(df)
@@ -699,7 +742,8 @@ def signal_rule123(df: pd.DataFrame) -> dict:
             risk = sl - pullback_low
             plan = _plan("bearish", pullback_low, "breakout", sl,
                          pullback_low - 1.75 * risk,
-                         "123做空：跌破回调低点入场；SL=阶段最高点上方0.5xATR；TP=1.75R")
+                         "123做空：跌破回调低点入场；SL=阶段最高点上方0.5xATR；TP=1.75R",
+                         atr=atr)
         strength = (0.35, 0.6, 0.85)[steps_short - 1]
         if steps_short >= 2:
             vol_k, vol_note = _breakout_volume_factor(df)
@@ -750,7 +794,8 @@ def signal_gap(df: pd.DataFrame) -> dict:
         if close >= g["bottom"]:
             plan = _plan("bullish", g["top"], "pullback", g["bottom"],
                          g["top"] + gap_h,
-                         "回踩向上缺口上沿接多；SL=缺口下沿（回补=失效）；TP=缺口测幅上翻")
+                         "回踩向上缺口上沿接多；SL=缺口下沿（回补=失效）；TP=缺口测幅上翻",
+                         atr=atr)
             return _sig(*name, "bullish", min(1.0, 0.45 + 0.05 * dist_bars) * vol_k,
                         f"向上缺口 [{g['bottom']:.2f}, {g['top']:.2f}] 未回补（{dist_bars} 根），"
                         "缺口上方运行=支撑有效，回踩缺口不破可做多"
@@ -761,7 +806,8 @@ def signal_gap(df: pd.DataFrame) -> dict:
     if close <= g["top"]:
         plan = _plan("bearish", g["bottom"], "pullback", g["top"],
                      g["bottom"] - gap_h,
-                     "反弹至向下缺口下沿承压做空；SL=缺口上沿（回补=失效）；TP=缺口测幅下翻")
+                     "反弹至向下缺口下沿承压做空；SL=缺口上沿（回补=失效）；TP=缺口测幅下翻",
+                     atr=atr)
         return _sig(*name, "bearish", min(1.0, 0.45 + 0.05 * dist_bars) * vol_k,
                     f"向下缺口 [{g['bottom']:.2f}, {g['top']:.2f}] 未回补（{dist_bars} 根），"
                     "缺口下方运行=压力有效，反弹承压缺口可做空"
@@ -819,9 +865,11 @@ def signal_oscillator(df: pd.DataFrame) -> dict:
     regime = _trend_regime(df)
     # 点位：entry=现价，SL=近期 swing 外侧 1xATR，TP=区间对侧
     plan_bull = _plan("bullish", close, "market", range_lo - atr, range_hi,
-                      "超卖均值回归做多；SL=近期低点外侧1xATR；TP=区间对侧（近期高点）")
+                      "超卖均值回归做多；SL=近期低点外侧1xATR；TP=区间对侧（近期高点）",
+                      atr=atr)
     plan_bear = _plan("bearish", close, "market", range_hi + atr, range_lo,
-                      "超买均值回归做空；SL=近期高点外侧1xATR；TP=区间对侧（近期低点）")
+                      "超买均值回归做空；SL=近期高点外侧1xATR；TP=区间对侧（近期低点）",
+                      atr=atr)
     if votes_bull:
         depth = max((30 - rsi) / 30 if rsi < 30 else 0, (20 - kv) / 20 if kv < 20 else 0)
         strength = min(1.0, 0.4 + votes_bull * 0.2 + depth * 0.3)
@@ -882,9 +930,9 @@ def signal_triple_rsi(df: pd.DataFrame) -> dict:
     regime = _trend_regime(df)
     # 点位：entry=现价，SL=1.5xATR，TP=2R
     plan_bull = _plan("bullish", px, "market", px - 1.5 * atr, px + 3.0 * atr,
-                      "三重平滑RSI 多头信号现价入场；SL=1.5xATR；TP=2R")
+                      "三重平滑RSI 多头信号现价入场；SL=1.5xATR；TP=2R", atr=atr)
     plan_bear = _plan("bearish", px, "market", px + 1.5 * atr, px - 3.0 * atr,
-                      "三重平滑RSI 空头信号现价入场；SL=1.5xATR；TP=2R")
+                      "三重平滑RSI 空头信号现价入场；SL=1.5xATR；TP=2R", atr=atr)
     if golden and bottom_div:
         strength, plan, gate_note = _apply_counter_trend_gate(
             "bullish", 0.8, plan_bull, regime)
