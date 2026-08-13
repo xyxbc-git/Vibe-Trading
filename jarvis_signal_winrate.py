@@ -15,10 +15,16 @@
     4h=42根(7天) / 1d=14根。
   - 防未来函数：信号只吃「触发 bar 及之前 WINDOW 根」切片；未来数据只用于
     **度量结果**，绝不参与信号生成。
+  - [信号篇 P0-3] 摩擦口径：每笔扣双边手续费（fee_pct，读 jarvis_config
+    twelve_sim_fee_pct 与模拟交易器同源同键）；触 SL 离场额外扣滑点
+    （winrate_slip_pct，止损位常在扫损插针路径上，真实成交劣于 SL 精确价）。
+    毛（pnl_pct）/净（pnl_net_pct）两套并列输出，统计不撒谎。
 
 产出（按 系统×方向 与 方向汇总 两级）：
-  胜率、平均盈亏比(payoff)、期望值/笔、最大回撤(MAE 最差值)、平均持有根数、
-  样本量与 low_sample 标记。结果缓存 JSON，供 dashboard 随信号展示。
+  胜率、平均盈亏比(payoff)、期望值/笔（毛/净两套：win_rate_pct 与
+  win_rate_net_pct、expectancy_pct 与 expectancy_net_pct、payoff_ratio 与
+  payoff_ratio_net）、最大回撤(MAE 最差值)、平均持有根数、样本量与
+  low_sample 标记。结果缓存 JSON（含 friction 口径回显），供 dashboard 展示。
 
 用法：
   python jarvis_signal_winrate.py run --symbols BTC --tfs 4h --days 30
@@ -30,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import threading
@@ -59,16 +66,47 @@ def horizon_bars(tf: str) -> int:
     return _TIME_STOP_DAYS.get(tf, 7) * _TF_BARS_PER_DAY.get(tf, 6)
 
 
+# ─────────────────────────── 摩擦口径（P0-3） ───────────────────────────
+
+DEFAULT_FEE_PCT = 0.05    # 单边手续费%兜底（= jarvis_config.twelve_sim_fee_pct 默认）
+DEFAULT_SLIP_PCT = 0.03   # 触 SL 额外滑点%兜底（= jarvis_config.winrate_slip_pct 默认）
+
+
+def _friction_from_config() -> tuple[float, float]:
+    """读回测摩擦参数 (fee_pct, slip_pct)：
+
+    fee 读 twelve_sim_fee_pct——与模拟交易器同源同键，回测/实盘口径不漂移；
+    slip 读 winrate_slip_pct。读取失败/非法值回退内置默认，永不抛出。
+    """
+    fee, slip = DEFAULT_FEE_PCT, DEFAULT_SLIP_PCT
+    try:
+        import jarvis_config as _jc
+        f = float(_jc.get("twelve_sim_fee_pct"))
+        if math.isfinite(f) and f >= 0:
+            fee = f
+        s = float(_jc.get("winrate_slip_pct"))
+        if math.isfinite(s) and s >= 0:
+            slip = s
+    except Exception:  # noqa: BLE001 — 配置层故障不拖垮回测
+        pass
+    return fee, slip
+
+
 # ─────────────────────────── 单样本离场判定 ───────────────────────────
 
 def _resolve_sample(df: pd.DataFrame, i: int, side: str, entry: float,
-                    sl: float | None, tp: float | None, horizon: int) -> dict | None:
+                    sl: float | None, tp: float | None, horizon: int,
+                    fee_pct: float = 0.0, slip_pct: float = 0.0) -> dict | None:
     """从触发 bar i 的下一根起向前扫 horizon 根，判定样本结果。
 
     仅用未来数据度量结果（信号生成不碰未来）。返回：
-      {win, pnl_pct, mae_pct, bars_held, mode, exit_price}。
+      {win, pnl_pct, win_net, pnl_net_pct, mae_pct, bars_held, mode, exit_price}。
     尾部悬空样本（观察期被数据末尾截断且未触 SL/TP）返回 None 丢弃——
     半程快照会系统性低估波动，宁可少样本不要脏样本。
+
+    [P0-3] 净口径：pnl_net_pct = pnl_pct - 2×fee_pct - (触SL ? slip_pct : 0)。
+    fee 双边各收一次；滑点只罚 SL 离场（止损常在扫损插针路径上，真实成交
+    劣于 SL 精确价；TP/期末收盘离场不加罚）。缺省 0 摩擦 = 旧毛口径零回归。
     """
     start, end = i + 1, min(i + horizon, len(df) - 1)
     if start > end:
@@ -85,6 +123,7 @@ def _resolve_sample(df: pd.DataFrame, i: int, side: str, entry: float,
 
     mae = 0.0          # 最大不利偏移（%，≤0），即持有期间的最大回撤
     exit_price = None
+    hit_sl = False     # [P0-3] SL 离场标记：滑点只罚扫损路径上的止损成交
     bars_held = end - i
     for j in range(start, end + 1):
         hi, lo = float(df["high"].iloc[j]), float(df["low"].iloc[j])
@@ -93,14 +132,14 @@ def _resolve_sample(df: pd.DataFrame, i: int, side: str, entry: float,
         if has_plan:
             if side == "long":
                 if lo <= sl:            # 同根双触保守按止损（悲观口径）
-                    exit_price, bars_held = sl, j - i
+                    exit_price, bars_held, hit_sl = sl, j - i, True
                     break
                 if hi >= tp:
                     exit_price, bars_held = tp, j - i
                     break
             else:
                 if hi >= sl:
-                    exit_price, bars_held = sl, j - i
+                    exit_price, bars_held, hit_sl = sl, j - i, True
                     break
                 if lo <= tp:
                     exit_price, bars_held = tp, j - i
@@ -110,7 +149,10 @@ def _resolve_sample(df: pd.DataFrame, i: int, side: str, entry: float,
             return None                 # 悬空样本：既没走完观察期也没触 SL/TP
         exit_price = float(df["close"].iloc[end])   # 满观察期 → 期末收盘离场
     pnl_pct = (exit_price / entry - 1.0) * 100 * sign
+    friction = 2.0 * max(0.0, fee_pct) + (max(0.0, slip_pct) if hit_sl else 0.0)
+    pnl_net_pct = pnl_pct - friction
     return {"win": pnl_pct > 0, "pnl_pct": round(pnl_pct, 4),
+            "win_net": pnl_net_pct > 0, "pnl_net_pct": round(pnl_net_pct, 4),
             "mae_pct": round(mae, 4), "bars_held": bars_held,
             "mode": "plan" if has_plan else "horizon",
             "exit_price": round(float(exit_price), 8)}
@@ -119,28 +161,44 @@ def _resolve_sample(df: pd.DataFrame, i: int, side: str, entry: float,
 # ─────────────────────────── 样本聚合 ───────────────────────────
 
 def _grade(samples: list[dict]) -> dict | None:
-    """一组样本 → 胜率/盈亏比/期望/最大回撤 标准块（空样本返回 None）。"""
+    """一组样本 → 胜率/盈亏比/期望/最大回撤 标准块（空样本返回 None）。
+
+    [P0-3] 毛/净两套并列：win_rate_pct/expectancy_pct/payoff_ratio 为毛口径
+    （纯价差，与历史缓存兼容），*_net 为扣双边费+SL 滑点后的净口径。
+    旧样本无 pnl_net_pct 字段时净=毛（零摩擦兼容）。
+    """
     if not samples:
         return None
     pnls = [s["pnl_pct"] for s in samples]
+    nets = [s.get("pnl_net_pct", s["pnl_pct"]) for s in samples]
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p <= 0]
+    wins_net = [p for p in nets if p > 0]
+    losses_net = [p for p in nets if p <= 0]
     n = len(pnls)
+
+    def _payoff(ws: list[float], ls: list[float]) -> float | None:
+        # 与旧口径逐位一致：先 round(…,3) 均值再求比（毛口径零回归）
+        aw = round(sum(ws) / len(ws), 3) if ws else None
+        al = round(sum(ls) / len(ls), 3) if ls else None
+        if aw is not None and al is not None and al < 0:
+            return round(aw / abs(al), 2)
+        return None
+
     avg_win = round(sum(wins) / len(wins), 3) if wins else None
     avg_loss = round(sum(losses) / len(losses), 3) if losses else None   # ≤0
-    payoff = None
-    if avg_win is not None and avg_loss is not None and avg_loss < 0:
-        payoff = round(avg_win / abs(avg_loss), 2)
-    expectancy = round(sum(pnls) / n, 3)
     return {
         "trades": n,
         "wins": len(wins),
         "losses": len(losses),
         "win_rate_pct": round(100.0 * len(wins) / n, 1),
+        "win_rate_net_pct": round(100.0 * len(wins_net) / n, 1),
         "avg_win_pct": avg_win,
         "avg_loss_pct": avg_loss,
-        "payoff_ratio": payoff,
-        "expectancy_pct": expectancy,
+        "payoff_ratio": _payoff(wins, losses),
+        "payoff_ratio_net": _payoff(wins_net, losses_net),
+        "expectancy_pct": round(sum(pnls) / n, 3),
+        "expectancy_net_pct": round(sum(nets) / n, 3),
         "max_drawdown_pct": round(min(s["mae_pct"] for s in samples), 2),
         "avg_bars_held": round(sum(s["bars_held"] for s in samples) / n, 1),
         "low_sample": n < LOW_SAMPLE_N,
@@ -150,29 +208,38 @@ def _grade(samples: list[dict]) -> dict | None:
 # ─────────────────────────── 单 symbol×tf 回测内核 ───────────────────────────
 
 def backtest_df(symbol: str, tf: str, df: pd.DataFrame, *,
-                run_all=None, stride: int = 1, progress_cb=None) -> dict:
+                run_all=None, stride: int = 1, progress_cb=None,
+                fee_pct: float | None = None,
+                slip_pct: float | None = None) -> dict:
     """对一段历史 K 线做单信号级边沿触发回测（纯本地计算，测试可注入 run_all）。
 
     Args:
         run_all: fn(window_df) -> list[signal dict]；默认 jarvis_twelve_systems.run_all
         stride: 每 N 根评估一次信号（加速用，默认逐根）
         progress_cb: fn(done_bars, total_bars)
+        fee_pct / slip_pct: [P0-3] 摩擦口径（%）；None=读 jarvis_config
+            （twelve_sim_fee_pct / winrate_slip_pct，与模拟盘同源），显式传 0 复现旧零摩擦
     Returns:
         {symbol, tf, days?, horizon_bars, bars, samples, systems, directions,
-         trades, computed_at}；K 线不足带 error。trades 为逐笔明细（按触发时间
-        升序）：{t, exit_t(ms), system, side, entry, sl, tp, exit_price, win,
-        pnl_pct, bars_held, mode}，供前端在 K 线图上标记历史盈损点。
+         trades, friction, computed_at}；K 线不足带 error。trades 为逐笔明细
+        （按触发时间升序）：{t, exit_t(ms), system, side, entry, sl, tp,
+        exit_price, win, pnl_pct, win_net, pnl_net_pct, bars_held, mode}，
+        供前端在 K 线图上标记历史盈损点。
     """
     if run_all is None:
         import jarvis_twelve_systems as jts
         run_all = jts.run_all
+    cfg_fee, cfg_slip = _friction_from_config()
+    fee = max(0.0, float(fee_pct)) if fee_pct is not None else cfg_fee
+    slip = max(0.0, float(slip_pct)) if slip_pct is not None else cfg_slip
+    friction = {"fee_pct": round(fee, 4), "slip_pct": round(slip, 4)}
 
     sym = (symbol if symbol.upper().endswith(("USDT", "USDC")) else symbol + "USDT").upper()
     horizon = horizon_bars(tf)
     if df is None or len(df) <= WINDOW + 1:
         return {"symbol": sym, "tf": tf, "horizon_bars": horizon, "bars": 0,
                 "samples": 0, "systems": {}, "directions": {}, "trades": [],
-                "computed_at": time.time(),
+                "friction": friction, "computed_at": time.time(),
                 "error": f"K线不足（{0 if df is None else len(df)} ≤ {WINDOW + 1}）"}
 
     per: dict[tuple[str, str], list[dict]] = {}     # (system, side) -> samples
@@ -204,7 +271,8 @@ def backtest_df(symbol: str, tf: str, df: pd.DataFrame, *,
             sl, tp = plan.get("stop_loss"), plan.get("take_profit")
             sl_f = float(sl) if sl is not None else None
             tp_f = float(tp) if tp is not None else None
-            res = _resolve_sample(df, i, side, close, sl_f, tp_f, horizon)
+            res = _resolve_sample(df, i, side, close, sl_f, tp_f, horizon,
+                                  fee_pct=fee, slip_pct=slip)
             if res is None:
                 continue                              # 观察期不足的尾部样本丢弃
             per.setdefault((system, side), []).append(res)
@@ -221,6 +289,8 @@ def backtest_df(symbol: str, tf: str, df: pd.DataFrame, *,
                 "exit_price": res["exit_price"],
                 "win": res["win"],
                 "pnl_pct": res["pnl_pct"],
+                "win_net": res["win_net"],
+                "pnl_net_pct": res["pnl_net_pct"],
                 "bars_held": res["bars_held"],
                 "mode": res["mode"],
             })
@@ -241,7 +311,7 @@ def backtest_df(symbol: str, tf: str, df: pd.DataFrame, *,
     return {"symbol": sym, "tf": tf, "horizon_bars": horizon, "bars": total,
             "samples": n_samples, "systems": systems_out,
             "directions": directions_out, "trades": trades,
-            "computed_at": time.time()}
+            "friction": friction, "computed_at": time.time()}
 
 
 # ─────────────────────────── 结果缓存（JSON） ───────────────────────────

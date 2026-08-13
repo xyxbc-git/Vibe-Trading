@@ -216,6 +216,10 @@ DEFAULTS: dict = {
     # 独立引擎，不影响 12 信号主链路；参数主要走 twelve_sim_config 表分层覆盖，
     # 此处仅登记全局费率（数据经 jarvis_sync 旁路同步到 RuoYi 分析）。
     "twelve_sim_fee_pct": 0.05,       # 单边手续费%（按名义，开/平双边各收一次）
+    # ── [信号篇 P0-3] 单信号胜率回测摩擦口径（jarvis_signal_winrate）─────────
+    # 手续费直接复用上面的 twelve_sim_fee_pct（同源同键，回测与模拟盘不漂移）；
+    # 此处只登记 SL 滑点：止损位常在扫损插针路径上，真实成交劣于 SL 精确价。
+    "winrate_slip_pct": 0.03,         # 触 SL 样本额外滑点%（单边劣化；0=关闭）
     # ── 12信号亏损止血 S1：止损最小距离门禁 + 杠杆与止损解耦（2026-08-06）────────
     # R10 取证：sl 平仓 228 笔胜率 4.4%、5m 中位 SL 距离 0.172% 在噪声带内，
     # 且旧自动杠杆 floor(0.5/SL距离) 顶格 20×——止损越窄杠杆越大。
@@ -451,6 +455,7 @@ GROUPS: dict[str, str] = {
     "twelve_tf_deweight": "risk",
     # data——数据/回测口径
     "backtest_cost_bps": "data",
+    "winrate_slip_pct": "data",
     "ws_stream_kline": "data",
     "ws_stream_aggtrade": "data",
     "ws_stream_forceorder": "data",
@@ -572,6 +577,7 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "twelve_max_open_positions": (1, 20),
     "twelve_reopen_cooldown_min": (0, 1440),  # 0=关闭 ~ 24 小时
     "twelve_sim_fee_pct": (0.0, 1.0),         # 模拟交易器单边费率%
+    "winrate_slip_pct": (0.0, 2.0),           # 胜率回测触 SL 滑点%（对齐 paper_slippage_pct 区间）
     "twelve_auto_lev_loss_frac": (0.05, 1.0),  # 打到 SL 目标亏损占保证金比例
     "twelve_min_rr": (1.0, 10.0),              # 最小盈亏比（<1 无意义）
     "twelve_sl_atr_mult": (0.0, 5.0),          # SL/ATR 最小倍数（0=关闭该门禁）

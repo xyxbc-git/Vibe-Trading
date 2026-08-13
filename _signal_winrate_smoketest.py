@@ -203,5 +203,79 @@ check("资金管理类系统无样本",
       "martingale" not in out_real["systems"] and "arbitrage" not in out_real["systems"],
       str(list(out_real["systems"].keys())))
 
+# ── 6. [信号篇 P0-3] 摩擦口径：双边费 + 触 SL 滑点，毛/净两套 ────────────
+
+# 缺省参数 = 零摩擦：净=毛（旧口径零回归）
+r0 = jsw._resolve_sample(df5, 0, "long", 100.0, 95.0, 110.0, horizon=4)
+check("P0-3 缺省零摩擦（净=毛）", r0 is not None and r0["pnl_net_pct"] == r0["pnl_pct"]
+      and r0["win_net"] == r0["win"], str(r0))
+
+# TP 赢单：只扣双边费 2×0.05=0.1，不扣滑点
+r_tp = jsw._resolve_sample(df5, 0, "long", 100.0, 95.0, 110.0, horizon=4,
+                           fee_pct=0.05, slip_pct=0.03)
+check("P0-3 TP 赢单净=毛-0.1（无滑点罚）", r_tp is not None
+      and abs(r_tp["pnl_net_pct"] - (r_tp["pnl_pct"] - 0.1)) < 1e-9, str(r_tp))
+
+# SL 亏单（同根双触保守按 SL）：双边费 + 滑点 = 0.13
+r_sl = jsw._resolve_sample(df_dual, 0, "long", 100.0, 95.0, 110.0, horizon=2,
+                           fee_pct=0.05, slip_pct=0.03)
+check("P0-3 触 SL 净=毛-0.1-0.03（滑点劣化）", r_sl is not None
+      and abs(r_sl["pnl_net_pct"] - (r_sl["pnl_pct"] - 0.13)) < 1e-9, str(r_sl))
+
+# horizon 模式（期末收盘离场）：只扣费不扣滑点
+r_hz = jsw._resolve_sample(df_h, 0, "long", 100.0, None, None, horizon=3,
+                           fee_pct=0.05, slip_pct=0.03)
+check("P0-3 horizon 离场净=毛-0.1", r_hz is not None
+      and abs(r_hz["pnl_net_pct"] - (r_hz["pnl_pct"] - 0.1)) < 1e-9, str(r_hz))
+
+# 毛赢净亏翻转：TP 离场毛 +0.05% < 双边费 0.1% → win=True / win_net=False
+df_thin = pd.DataFrame([
+    {"time": 0, "open": 100, "high": 100, "low": 100, "close": 100, "volume": 1},
+    {"time": 1, "open": 100, "high": 100.2, "low": 99.8, "close": 100, "volume": 1},
+])
+r_flip = jsw._resolve_sample(df_thin, 0, "long", 100.0, 99.0, 100.05, horizon=1,
+                             fee_pct=0.05, slip_pct=0.03)
+check("P0-3 毛赢净亏：win 与 win_net 分离", r_flip is not None and r_flip["win"]
+      and not r_flip["win_net"] and r_flip["pnl_net_pct"] < 0, str(r_flip))
+
+# _grade 净口径字段 + 旧样本（无 pnl_net_pct）兼容
+g_net = jsw._grade([
+    {"pnl_pct": 2.0, "pnl_net_pct": 1.9, "mae_pct": -1.0, "bars_held": 3},
+    {"pnl_pct": 0.05, "pnl_net_pct": -0.08, "mae_pct": -0.5, "bars_held": 5},
+])
+check("P0-3 _grade 毛/净两套并列", g_net is not None
+      and g_net["win_rate_pct"] == 100.0 and g_net["win_rate_net_pct"] == 50.0
+      and abs(g_net["expectancy_pct"] - 1.025) < 1e-9
+      and abs(g_net["expectancy_net_pct"] - 0.91) < 1e-9, str(g_net))
+g_old = jsw._grade([{"pnl_pct": 2.0, "mae_pct": -1.0, "bars_held": 3}])
+check("P0-3 _grade 旧样本兼容（净=毛）", g_old is not None
+      and g_old["expectancy_net_pct"] == g_old["expectancy_pct"]
+      and g_old["win_rate_net_pct"] == g_old["win_rate_pct"], str(g_old))
+check("P0-3 payoff 毛/净字段齐备", g_net is not None
+      and "payoff_ratio_net" in g_net and "payoff_ratio" in g_net)
+
+# backtest_df 显式摩擦：friction 回显 + trades 带净字段 + 净≤毛
+out_f = jsw.backtest_df("TEST", "1h", df, run_all=fake_run_all,
+                        fee_pct=0.05, slip_pct=0.03)
+check("P0-3 backtest 回显 friction 口径",
+      out_f.get("friction") == {"fee_pct": 0.05, "slip_pct": 0.03},
+      str(out_f.get("friction")))
+check("P0-3 trades 逐笔带净字段", bool(out_f["trades"])
+      and all("pnl_net_pct" in t and "win_net" in t for t in out_f["trades"]))
+check("P0-3 净恒≤毛（摩擦只减不增）",
+      all(t["pnl_net_pct"] <= t["pnl_pct"] + 1e-12 for t in out_f["trades"]))
+_dir_f = [b for b in out_f["directions"].values() if b]
+check("P0-3 方向汇总带净口径且净≤毛", bool(_dir_f)
+      and all(b["expectancy_net_pct"] <= b["expectancy_pct"] + 1e-12 for b in _dir_f),
+      str(_dir_f)[:160])
+# 显式 0 摩擦 = 旧行为复现
+out_0 = jsw.backtest_df("TEST", "1h", df, run_all=fake_run_all, fee_pct=0, slip_pct=0)
+check("P0-3 显式零摩擦復現旧口径",
+      all(t["pnl_net_pct"] == t["pnl_pct"] for t in out_0["trades"]))
+# 配置读取兜底：返回非负有限值
+_fee_c, _slip_c = jsw._friction_from_config()
+check("P0-3 配置摩擦读取（非负）", _fee_c >= 0 and _slip_c >= 0,
+      f"fee={_fee_c} slip={_slip_c}")
+
 print(f"\n{'=' * 40}\n通过 {PASS} / 失败 {FAIL}")
 raise SystemExit(1 if FAIL else 0)
