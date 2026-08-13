@@ -1,6 +1,9 @@
 -- ============================================================================
 -- 贾维斯模拟交易器 → RuoYi MySQL 镜像表初始化脚本（Vibe-Trading 子任务2）
--- 版本: v1.0 (2026-07-31)  配套: jarvis_mysql_init.sql（13 张主镜像表）
+-- 版本: v1.1 (2026-08-13)  配套: jarvis_mysql_init.sql（13 张主镜像表）
+--   v1.1 任务 H/L：jarvis_sim_config 建表 DDL 合入 5 个周期纪律列
+--     （tp_mode/tp_rr_ratio/tp_pct_factor/sl_mode/sl_atr_mult，NULL=跟随信号）；
+--     存量库对应增量脚本为 RuoYi 侧 sql/jarvis_sim_discipline_20260813.sql
 -- ============================================================================
 -- 【前提】
 --   1. MySQL >= 8.0；库 `jiaweisi` 已存在
@@ -41,6 +44,11 @@ CREATE TABLE IF NOT EXISTS jarvis_sim_config (
   position_pct    DECIMAL(10,4) DEFAULT NULL COMMENT '单笔仓位比例%',
   stop_loss_pct   DECIMAL(10,4) DEFAULT NULL COMMENT '止损比例%',
   take_profit_pct DECIMAL(10,4) DEFAULT NULL COMMENT '止盈比例%',
+  tp_mode         VARCHAR(16)   DEFAULT NULL COMMENT '止盈方式（NULL=跟随信号 signal跟随信号 fixed_rr固定RR倍数 pct_factor盈利比例系数）',
+  tp_rr_ratio     DECIMAL(10,4) DEFAULT NULL COMMENT '固定RR倍数（tp_mode=fixed_rr 生效：止盈距离=止损距离×该倍数）',
+  tp_pct_factor   DECIMAL(10,4) DEFAULT NULL COMMENT '盈利比例系数（tp_mode=pct_factor 生效：信号止盈距离×该系数）',
+  sl_mode         VARCHAR(16)   DEFAULT NULL COMMENT '止损方式（NULL=跟随信号 signal跟随信号 atr_buffer ATR缓冲系数）',
+  sl_atr_mult     DECIMAL(10,4) DEFAULT NULL COMMENT 'ATR缓冲系数（sl_mode=atr_buffer 生效：止损距离=该TF ATR14%×该系数）',
   enabled         CHAR(1)       NOT NULL DEFAULT '1' COMMENT '是否启用（0停用 1启用）',
   remark          VARCHAR(500)  DEFAULT NULL COMMENT '备注',
   create_time     DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
