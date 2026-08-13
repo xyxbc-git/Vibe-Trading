@@ -891,9 +891,9 @@ function SignalCell({
       )}
 
       {/* 交易计划：折叠态紧凑 chips / 展开态完整点位（均带醒目多空徽章 + K线区间入口）。
-          [任务S] 不适用周期的卡片不显示任何计划点位——防看错下单的关键 */}
-      {!unsuitable &&
-        signal.trade_plan &&
+          [任务S2] 不适用周期的卡片照常展示点位推荐（用户明确要求「继续推就行，
+          让我知道他不适合就行」）——警示靠黄标+灰化，信息不剥夺 */}
+      {signal.trade_plan &&
         (() => {
           const plan = signal.trade_plan;
           // 方向可判定才给「K线区间」入口（区间几何要求多空明确）
@@ -1377,6 +1377,7 @@ export default function SignalBoard({ symbol, tf, onTfChange }: SignalBoardProps
                       currentTf={dataTf}
                       price={data?.price ?? null}
                       onExplain={explainSignal}
+                      onShowZone={showZoneOnChart}
                       onShowStructure={showStructureOnChart}
                       unsuitable
                     />
