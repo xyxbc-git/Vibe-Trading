@@ -66,9 +66,12 @@
      - 参数级门禁（合成参数后）：先过 T2 窄止损处理 _widen_stop_to_floor
        （twelve_sl_gate_mode：rewrite 新默认=SL 拉到地板距离 + qty 同比例缩
        （1R 守恒）落 context_tags='sl_widened'；deweight=打标降权放行；
-       reject=回退旧硬拒单 sl_too_tight），再过 _risk_gate：最小盈亏比
-       （twelve_min_rr）、费用负担（twelve_fee_burden_mult × 双边费用）、
-       D5 ATR 下限不满足 → 拒单不入场；
+       reject=回退旧硬拒单 sl_too_tight；地板 = max(twelve_min_sl_pct 静态档,
+       T3 过路费地板 (2×费率)÷twelve_max_toll_ratio)），再过 _risk_gate：
+       T3 过路费地板（toll_ratio > twelve_max_toll_ratio → 'toll_too_high'，
+       改写后仍超标才会触发）、最小盈亏比（twelve_min_rr）、费用负担
+       （twelve_fee_burden_mult × 双边费用）、D5 ATR 下限不满足 → 拒单不入场；
+       每笔平仓落 trade.toll_ratio 供归因分档；
      - 两级门禁拒单统一落 status='rejected' + reject_reason 行 + signal_log
        留痕（不静默丢弃，S6 归因报表可按原因聚合）；挂单在成交时刻同样再验一次；
   5. 参数：止损/止盈/杠杆/仓位% 优先用 twelve_sim_config 覆盖
@@ -185,6 +188,16 @@ SL_FILL_MODE_DEFAULT = "bar"
 SL_GATE_MODE_DEFAULT = "rewrite"
 SL_DEWEIGHT_DEFAULT = 0.5
 
+# T3 过路费地板门禁（2026-08-11 正期望重建：判据换成 fee/R 不变量）。
+# 会计恒等式：过路费÷风险预算 = (2×单边费率%)÷SL距离%，与杠杆/周期/标的/信号
+# 全部无关。取证：SL<0.1% 档 95 笔（21.9%）过路费=2×风险预算、胜率 9.5%——
+# 下单那一刻就注定亏损。toll_ratio 超 twelve_max_toll_ratio 先交 T2 改写
+# （_sl_floor_pct 已并入 toll 地板），改写后仍超标才拒 'toll_too_high'。
+# 默认 0.20 对应 SL 距离 0.5%（=实测过路费 0.143R 档入口，与 S1 原 5m 阈值
+# 数值重合但理由完全不同：不是噪声带，是过路费占比）。0=关闭；999=事实关闭
+# （回滚档）。每笔平仓落 trade.toll_ratio 供归因分档（报表端点归任务 D）。
+MAX_TOLL_RATIO_DEFAULT = 0.20
+
 # 拒单(rejected)留痕行保留天数（与 canceled 同哲学：窗口期可复盘，到期物理清理；
 # twelve_sim_signal_log 的 reject 留痕永久保留）
 REJECTED_RETENTION_DAYS = 7
@@ -294,6 +307,7 @@ GATE_TAG_FACTORS = {
 REJECT_REASON_CN = {
     "sl_too_tight": "止损距离低于该周期下限",
     "sl_below_atr": "止损距离低于 ATR 噪声带（波动率自适应下限）",
+    "toll_too_high": "过路费占风险预算比超上限（改写后仍超标，结构性必亏）",
     "rr_too_low": "盈亏比低于下限",
     "fee_negative_ev": "止盈不足以覆盖费用负担（负期望）",
     "circuit_breaker": "信号×周期战绩熔断中",
@@ -425,7 +439,10 @@ def init_db() -> None:
         _upgrades = ["ALTER TABLE twelve_sim_position ADD COLUMN cancel_reason TEXT",
                      "ALTER TABLE twelve_sim_position ADD COLUMN canceled_ts REAL",
                      "ALTER TABLE twelve_sim_position ADD COLUMN reject_reason TEXT",
-                     "ALTER TABLE twelve_sim_trade ADD COLUMN funding_fee REAL"]
+                     "ALTER TABLE twelve_sim_trade ADD COLUMN funding_fee REAL",
+                     # T3：过路费占风险预算比（(2×单边费率%)÷SL距离%，开仓计划
+                     # 级不变量），平仓时落库供归因分档（报表端点归任务 D）
+                     "ALTER TABLE twelve_sim_trade ADD COLUMN toll_ratio REAL"]
         _upgrades += [f"ALTER TABLE {_tbl} ADD COLUMN {_col} {_typ}"
                       for _tbl in ("twelve_sim_position", "twelve_sim_trade")
                       for _col, _typ in CTX_COLUMNS_DDL]
@@ -908,11 +925,22 @@ def _auto_leverage(entry: float, stop_loss: float, tf: str | None = None) -> flo
 
 
 def _sl_floor_pct(tf: str) -> float:
-    """SL 距离目标地板（%）：S1 静态分层档 twelve_min_sl_pct（按 TF）。
+    """S1 静态分层地板（%）：twelve_min_sl_pct（按 TF）。
 
-    T2 起该键语义降级：rewrite/deweight 档作改写目标地板，reject 档才拒单。
+    T2 起语义降级：rewrite/deweight 档作改写目标地板的静态分量，
+    reject 档才用于拒单（保持与改前逐字节一致，不掺 T3 toll 地板）。
     """
     return _tf_gate_num("twelve_min_sl_pct", tf, MIN_SL_PCT_BY_TF, 0.0)
+
+
+def _toll_floor_pct() -> float:
+    """T3 过路费地板距离（%）=(2×单边费率%)÷twelve_max_toll_ratio。
+
+    改写到此距离后 toll_ratio 恰好落到上限内（超标先交 T2 改写，改写后
+    仍超标才拒 toll_too_high）；max_toll ≤ 0 时关闭返回 0。
+    """
+    max_toll = _gate_num("twelve_max_toll_ratio", MAX_TOLL_RATIO_DEFAULT)
+    return 2.0 * _fee_pct() / max_toll if max_toll > 0 else 0.0
 
 
 def _widen_stop_to_floor(tf: str, entry: float, params: dict) -> dict:
@@ -939,7 +967,8 @@ def _widen_stop_to_floor(tf: str, entry: float, params: dict) -> dict:
         dist = abs(entry - sl) / entry * 100.0
     except (KeyError, TypeError, ValueError, ZeroDivisionError):
         return params
-    floor = _sl_floor_pct(tf)
+    # 改写目标地板 = max(S1 静态分层档, T3 过路费地板)——改写后同时满足两道门禁
+    floor = max(_sl_floor_pct(tf), _toll_floor_pct())
     if dist <= 0 or floor <= 0 or dist >= floor:
         return params   # 达标 / 无地板 / SL 非法：零动作
     if mode == "deweight":
@@ -970,6 +999,9 @@ def _risk_gate(tf: str, entry: float, params: dict,
        _widen_stop_to_floor 改写/降权，本档不再拒单）；
     D5 ATR 自适应档：SL 距离(%) < twelve_sl_atr_mult × 该 TF ATR14% →
        'sl_below_atr'（sym 缺省 / ATR 取数失败 / mult=0 → 跳过，静态档兜底）；
+    T3 过路费地板：toll_ratio = (2×单边费率%)÷SL距离% > twelve_max_toll_ratio
+       → 'toll_too_high'（fee/R 不变量判据；rewrite 档已先改写到地板，改写后
+       仍超标才会走到这里；0=关闭，999=事实关闭回滚档）；
     S2 最小盈亏比：TP距离/SL距离 < twelve_min_rr → 'rr_too_low'；
     S2 费用负担：单笔止盈收益(占保证金%) < twelve_fee_burden_mult ×
        双边费用(占保证金% = 单边费率×2×杠杆) → 'fee_negative_ev'。
@@ -993,6 +1025,12 @@ def _risk_gate(tf: str, entry: float, params: dict,
             atr_pct = None
         if atr_pct and sl_dist < mult * float(atr_pct):
             return "sl_below_atr"
+    # T3：过路费地板（会计恒等式判据，与杠杆无关；1e-9 相对余量防
+    # 「改写恰好落在地板」的浮点尘埃误拒）
+    max_toll = _gate_num("twelve_max_toll_ratio", MAX_TOLL_RATIO_DEFAULT)
+    if (max_toll > 0 and sl_dist > 0
+            and 2.0 * _fee_pct() / sl_dist > max_toll * (1.0 + 1e-9)):
+        return "toll_too_high"
     if sl_dist <= 0 or tp_dist / sl_dist < _gate_num("twelve_min_rr", MIN_RR_DEFAULT):
         return "rr_too_low"
     lev = float(params.get("leverage") or 1.0)
@@ -1445,7 +1483,8 @@ def _do_open(conn, sym: str, tf: str, system: str,
 def _do_close(conn, pos: dict, exit_price: float, reason: str, now: float) -> dict:
     """平仓：净 PnL = 毛盈亏 − 开/平双边手续费（按名义，出场名义=qty×出场价，
     多空同式无方向 bug）；爆仓(liq) 直接亏光保证金、不再另计费；
-    逐仓亏损钳到 -margin → 记台账 → 更新钱包战绩。"""
+    逐仓亏损钳到 -margin → 记台账（含 T3 toll_ratio 过路费占风险预算比，
+    与退出方式无关的计划级不变量）→ 更新钱包战绩。"""
     sym, tf, system = pos["symbol"], pos["tf"], pos["system"]
     entry = float(pos["entry_price"])
     qty = float(pos["qty"])
@@ -1473,6 +1512,16 @@ def _do_close(conn, pos: dict, exit_price: float, reason: str, now: float) -> di
         risk = abs(entry - float(sl))
         if risk > 0:
             rr = round(abs(float(tp) - entry) / risk, 2)
+    # T3：toll_ratio = (2×单边费率%)÷SL距离%——与杠杆/周期/退出方式无关的
+    # 计划级不变量，落台账供归因分档（legacy 行无 SL 时为 NULL）
+    toll_ratio = None
+    if sl is not None and entry > 0:
+        try:
+            _sl_dist_pct = abs(entry - float(sl)) / entry * 100.0
+            if _sl_dist_pct > 0:
+                toll_ratio = round(2.0 * _fee_pct() / _sl_dist_pct, 6)
+        except (TypeError, ValueError):
+            toll_ratio = None
     holding_min = round((now - float(pos["entry_ts"])) / 60.0, 1)
 
     conn.execute("UPDATE twelve_sim_position SET status='closed', cur_price=?, "
@@ -1494,9 +1543,9 @@ def _do_close(conn, pos: dict, exit_price: float, reason: str, now: float) -> di
            funding_fee,
            ctx_regime, ctx_regime_dir, ctx_atr_pct, ctx_vol_bucket, ctx_wyckoff,
            ctx_funding, ctx_oi_btc_chg, ctx_hour_utc, ctx_btc_trend,
-           context_tags, size_factor)
+           context_tags, size_factor, toll_ratio)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                ?,?,?,?,?,?,?,?,?,?,?)
+                ?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (sym, tf, system, NAME_CN.get(system, system), pos["direction"],
          entry, pos["entry_ts"], exit_price, now, qty, margin,
@@ -1504,7 +1553,7 @@ def _do_close(conn, pos: dict, exit_price: float, reason: str, now: float) -> di
          balance_after, holding_min, funding,
          # D0：开仓时刻环境快照原样拷入台账（pos 来自 SELECT *，新列已就位）
          *(pos.get(f) for f in CTX_FIELDS),
-         pos.get("context_tags"), pos.get("size_factor")))
+         pos.get("context_tags"), pos.get("size_factor"), toll_ratio))
 
     # 钱包战绩重算（该槽位全量台账，72 槽位×小样本，代价可忽略）
     rows = conn.execute(

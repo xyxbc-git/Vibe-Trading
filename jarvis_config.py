@@ -318,6 +318,13 @@ DEFAULTS: dict = {
     # 仅 reject 档仍用于拒单。
     "twelve_sl_gate_mode": "rewrite",
     "twelve_sl_deweight": 0.5,        # deweight 档窄止损仓位系数（1.0=不降权）
+    # ── T3 过路费地板门禁（2026-08-11 正期望重建：判据换成 fee/R 不变量）────────
+    # 会计恒等式：过路费÷风险预算 = (2×单边费率%)÷SL距离%，与杠杆/周期/标的
+    # 无关。取证：SL<0.1% 档 95 笔过路费=2×风险预算、胜率 9.5%（结构性必亏）。
+    # 超标先交 T2 改写（改写地板已并入 toll 地板），改写后仍超标才拒
+    # toll_too_high。0.20 对应 SL 距离 0.5%（过路费 0.143R 档入口，与 S1 原
+    # 5m 阈值数值重合但理由不同）。0=关闭；999=事实关闭（回滚档）。
+    "twelve_max_toll_ratio": 0.20,
     # ── T7 零成交体系处置（2026-08-13 正期望重建：12 套实为 7 套）────────────
     # 诊断结论（一句话+行号，全文见开发计划 §T7）：12 套注册仅 7 套真正成交过。
     #   volatility / martingale / arbitrage —— 设计上恒 neutral 不产生方向信号
@@ -478,9 +485,10 @@ GROUPS: dict[str, str] = {
     # sim——twelve 模拟盘结算口径（T1 正期望重建）
     "twelve_sl_slippage_pct": "sim",
     "twelve_sl_fill_mode": "sim",
-    # risk——T2 窄止损改写档（正期望重建）
+    # risk——T2 窄止损改写档 + T3 过路费地板（正期望重建）
     "twelve_sl_gate_mode": "risk",
     "twelve_sl_deweight": "risk",
+    "twelve_max_toll_ratio": "risk",
     # T7 零成交体系处置：12 套体系启停显式标记（dict 键，BOUNDS 不适用）
     "twelve_system_enabled": "signal",
 }
@@ -587,6 +595,7 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "twelve_tf_deweight": (0.05, 1.0),
     "twelve_sl_slippage_pct": (0.0, 0.5),      # 止损常数滑点%（真实滑点 0.01~0.03）
     "twelve_sl_deweight": (0.05, 1.0),         # 降权下限 0.05：绝不降到 0 断样本
+    "twelve_max_toll_ratio": (0.0, 999.0),     # 过路费/风险上限（0=关，999=事实关闭）
 }
 
 # 允许的枚举键。

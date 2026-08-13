@@ -103,6 +103,7 @@ _GATES: dict = {
     "twelve_funding_rate": 0.0,     # 旧口径无资金费（保持整数 pnl 断言）
     "twelve_sl_slippage_pct": 0.0,  # T1 后默认 0.02：旧用例免滑点保持「结算=触发位」断言
     "twelve_sl_gate_mode": "reject",  # T2 后默认 rewrite：旧用例按旧硬拒单口径跑
+    "twelve_max_toll_ratio": 0.0,   # T3 后默认 0.2：旧用例关过路费地板（0=关闭）
 }
 _orig_gate_cfg = jtt._gate_cfg
 jtt._gate_cfg = lambda key, default: _GATES.get(key, default)
@@ -2065,6 +2066,101 @@ with jtt._conn() as conn:
     conn.execute("DELETE FROM twelve_sim_position WHERE status='pending'")
     conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
 set_signal("5m", "gap", "neutral", None)
+
+# ═══════════ 29. T3 过路费地板门禁（判据换成 fee/R 不变量，2026-08-11 正期望重建） ═══════════
+check("T3 配置登记：twelve_max_toll_ratio=0.20 + 护栏 (0,999) + risk 组",
+      jc.default_config().get("twelve_max_toll_ratio") == 0.20
+      and jc.BOUNDS.get("twelve_max_toll_ratio") == (0.0, 999.0)
+      and jc.GROUPS.get("twelve_max_toll_ratio") == "risk")
+
+T19 = T18 + 96 * 3600
+_PRICE["v"] = 100.0
+jtt._fee_pct = lambda: 0.05                 # 开真实费率：toll = 0.1% ÷ SL距离%
+_GATES["twelve_max_toll_ratio"] = 0.2       # 开 T3 地板（新默认）
+_GATES["twelve_min_sl_pct"] = {tf: 0.0 for tf in jtt.TFS}   # 关静态档：验 toll 独立判据
+
+# a) reject 档（无改写可救）：SL 0.25% → toll=0.4 > 0.2 → 拒 toll_too_high
+_GATES["twelve_sl_gate_mode"] = "reject"
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.75, "take_profit": 103.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T19)
+rej = [r for r in out["symbols"][SYM]["rejected"]
+       if (r["tf"], r["system"]) == ("5m", "gap")]
+check("T3a：SL 0.25%（toll=0.4 > 0.2）+ reject 档 → 拒 toll_too_high",
+      len(rej) == 1 and rej[0]["reason"] == "toll_too_high"
+      and not out["symbols"][SYM]["opened"], str(rej))
+tlogs = [l for l in jtt.signal_logs(SYM, "5m", "gap")
+         if l["change_kinds"] == "reject" and "过路费" in str(l["note"])]
+check("T3a：拒单留痕中文原因（REJECT_REASON_CN 含过路费说明）",
+      len(tlogs) >= 1, str(tlogs[:1]))
+
+# b) rewrite 档（新默认）：同信号先交 T2 改写——地板并入 toll 地板
+#    (2×0.05)÷0.2=0.5% → SL 99.75→99.5、qty ×0.5，改写后 toll=0.2 恰达标 → 成交
+_GATES["twelve_sl_gate_mode"] = "rewrite"
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.75, "take_profit": 103.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T19 + 60)
+r_sym = out["symbols"][SYM]
+op = [o for o in r_sym["opened"] if (o["tf"], o["system"]) == ("5m", "gap")]
+check("T3b：rewrite 档先改写（SL→99.5 落 toll 地板 0.5%）→ 成交不拒（超标先改写）",
+      len(op) == 1 and not r_sym["rejected"]
+      and abs(op[0]["stop_loss"] - 99.5) < 1e-9
+      and "sl_widened" in str(op[0]["context_tags"])
+      and abs(op[0]["margin"] - 5.0) < 1e-9,
+      str((r_sym["opened"], r_sym["rejected"])))
+
+# c) SL 0.6%（toll≈0.167 ≤ 0.2 且 ≥ toll 地板 0.5%）→ 不改写不拒，原样成交
+set_signal("15m", "oscillator", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.4, "take_profit": 103.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T19 + 120)
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("15m", "oscillator")]
+check("T3c：SL 0.6%（toll=0.167 达标）→ 不改写不打标原样成交",
+      len(op) == 1 and abs(op[0]["stop_loss"] - 99.4) < 1e-9
+      and op[0]["context_tags"] is None, str(op))
+
+# d) 回滚档 twelve_max_toll_ratio=999 = 事实关闭：极窄 SL 0.05%（toll=2.0）
+#    在 reject 档下也放行（地板失效，且静态档已关 → 无任何 SL 距离拦截）
+_GATES["twelve_max_toll_ratio"] = 999.0
+_GATES["twelve_sl_gate_mode"] = "reject"
+set_signal("30m", "gann", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.95, "take_profit": 103.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T19 + 180)
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("30m", "gann")]
+check("T3d：max_toll=999 回滚档 → 极窄 SL 0.05%（toll=2.0）也放行（事实关闭）",
+      len(op) == 1 and abs(op[0]["stop_loss"] - 99.95) < 1e-9
+      and op[0]["context_tags"] is None,
+      str((op, out["symbols"][SYM]["rejected"])))
+
+# e) 台账落库：b 的改写仓触 TP 平仓 → trade.toll_ratio = (2×0.05)÷0.5 = 0.2
+_GATES["twelve_max_toll_ratio"] = 0.2
+_PRICE["v"] = 103.0
+out = jtt.run_cycle(cfg={}, now=T19 + 240)
+with jtt._conn() as conn:
+    tr = conn.execute(
+        "SELECT exit_reason, stop_loss, toll_ratio FROM twelve_sim_trade "
+        "WHERE symbol=? AND tf='5m' AND system='gap' "
+        "ORDER BY id DESC LIMIT 1", (SYM,)).fetchone()
+check("T3e：平仓落 trade.toll_ratio=0.2（改写后 fee/R 恰在地板，供归因分档）",
+      tr is not None and tr["exit_reason"] == "tp"
+      and abs(float(tr["toll_ratio"]) - 0.2) < 1e-6, str(dict(tr) if tr else None))
+
+# 复位：费率归零 + 地板关闭 + 门禁模式回旧硬拒单桩 + 清场
+jtt._fee_pct = lambda: 0.0
+_GATES["twelve_max_toll_ratio"] = 0.0
+_GATES["twelve_sl_gate_mode"] = "reject"
+_PRICE["v"] = 100.0
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+    conn.execute("DELETE FROM twelve_sim_position WHERE status='pending'")
+    conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
+for _tf, _sys in [("5m", "gap"), ("15m", "oscillator"), ("30m", "gann")]:
+    set_signal(_tf, _sys, "neutral", None)
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS ✅")
