@@ -73,6 +73,19 @@ def configured() -> bool:
     return _load_key() is not None
 
 
+def enabled() -> bool:
+    """金十通讯总开关（jin10_enabled，默认 False）。
+
+    任务 U2：用户未拿到 key 前担心误出网被封——关闭时**所有出网路径短路**
+    （无论有无 key）。jarvis_config YAML/Settings 热加载，打开无需重启。
+    """
+    try:
+        import jarvis_config as jc
+        return bool(jc.get("jin10_enabled"))
+    except Exception:  # noqa: BLE001 — 配置层异常按关闭处理（宁可不拉不误出网）
+        return False
+
+
 def _cfg_num(key: str, default: float) -> float:
     try:
         import jarvis_config as jc
@@ -178,39 +191,48 @@ def _disk_save(events: list[dict]) -> None:
 def events(force: bool = False) -> dict:
     """取归一化事件列表（1h TTL：进程内 → 磁盘 → 出网）。
 
-    返回 {ok, configured, events, fetched_at, stale, note}——
-    未配置 key 时 ok=False + configured=False，events 恒空**不伪造**。
+    返回 {ok, enabled, configured, events, fetched_at, stale, note}——
+    总开关关闭 / 未配置 key 时 ok=False，events 恒空**不伪造**；两个短路
+    都在任何缓存与出网逻辑之前，_fetch_remote 是全模块唯一出网点。
     """
     now = time.time()
+    if not enabled():   # U2 总开关：短路一切（无论有无 key），零出网
+        return {"ok": False, "enabled": False, "configured": configured(),
+                "events": [], "fetched_at": None, "stale": False,
+                "note": "事件日历未启用（jin10_enabled=false）——拿到 key 后在 "
+                        "Settings·data 组打开，热加载无需重启"}
     key = _load_key()
     if key is None:
-        return {"ok": False, "configured": False, "events": [], "fetched_at": None,
-                "stale": False,
+        return {"ok": False, "enabled": True, "configured": False, "events": [],
+                "fetched_at": None, "stale": False,
                 "note": f"未配置金十 secret-key：去 open.jin10.com 注册后将 "
                         f"{{\"secret_key\": \"...\"}} 写入 {KEY_PATH}（chmod 600）"}
     if (not force and _mem_cache["events"] is not None
             and now - _mem_cache["ts"] < CALENDAR_TTL_S):
-        return {"ok": True, "configured": True, "events": _mem_cache["events"],
+        return {"ok": True, "enabled": True, "configured": True,
+                "events": _mem_cache["events"],
                 "fetched_at": _mem_cache["ts"], "stale": False, "note": None}
     disk_ts, disk_events = _disk_load()
     if not force and disk_events and now - disk_ts < CALENDAR_TTL_S:
         _mem_cache.update(ts=disk_ts, events=disk_events)
-        return {"ok": True, "configured": True, "events": disk_events,
+        return {"ok": True, "enabled": True, "configured": True,
+                "events": disk_events,
                 "fetched_at": disk_ts, "stale": False, "note": None}
     try:
         fresh = _fetch_remote(key)
         _mem_cache.update(ts=now, events=fresh)
         _disk_save(fresh)
-        return {"ok": True, "configured": True, "events": fresh,
+        return {"ok": True, "enabled": True, "configured": True, "events": fresh,
                 "fetched_at": now, "stale": False, "note": None}
     except Exception as exc:  # noqa: BLE001 — 出网失败回退旧缓存，如实标 stale
         note = f"jin10 拉取失败：{exc!r}"[:200]
         if disk_events:
             _mem_cache.update(ts=now - CALENDAR_TTL_S + 300.0, events=disk_events)
-            return {"ok": True, "configured": True, "events": disk_events,
+            return {"ok": True, "enabled": True, "configured": True,
+                    "events": disk_events,
                     "fetched_at": disk_ts, "stale": True, "note": note + "（用旧缓存）"}
-        return {"ok": False, "configured": True, "events": [], "fetched_at": None,
-                "stale": False, "note": note}
+        return {"ok": False, "enabled": True, "configured": True, "events": [],
+                "fetched_at": None, "stale": False, "note": note}
 
 
 # ─────────────────────────── 查询接口 ───────────────────────────
@@ -226,7 +248,8 @@ def upcoming_events(within_minutes: float = 1440.0, min_star: int = 1) -> dict:
         if e["importance"] >= int(min_star)
         and now - post <= e["ts"] <= now + within_minutes * 60.0
     ]
-    return {"ok": box["ok"], "configured": box["configured"],
+    return {"ok": box["ok"], "enabled": box.get("enabled", True),
+            "configured": box["configured"],
             "events": picked, "stale": box.get("stale", False),
             "note": box.get("note")}
 
@@ -285,9 +308,19 @@ def mentor_item(symbol: str | None = None) -> dict:
 def status() -> dict:
     """配置/缓存健康态（dashboard /api/events/status 直出）。"""
     key = _load_key()
+    on = enabled()
     disk_ts, disk_events = _disk_load()
     now = time.time()
+    if not on:
+        note = ("事件日历未启用（jin10_enabled=false，出网通路已短路）——"
+                "拿到 key 后在 Settings·data 组打开，热加载无需重启")
+    elif key is None:
+        note = (f"未配置：去 open.jin10.com 注册开发者账号，控制台申请 secret-key 后"
+                f"写入 {KEY_PATH}（格式 {{\"secret_key\": \"...\"}}，chmod 600）")
+    else:
+        note = None
     return {
+        "enabled": on,
         "configured": key is not None,
         "key_path": KEY_PATH,
         "cache_events": len(disk_events),
@@ -298,9 +331,7 @@ def status() -> dict:
             "pre_min": int(_cfg_num("event_risk_pre_min", PRE_MIN_DEFAULT)),
             "post_min": int(_cfg_num("event_risk_post_min", POST_MIN_DEFAULT)),
         },
-        "note": (None if key is not None else
-                 f"未配置：去 open.jin10.com 注册开发者账号，控制台申请 secret-key 后"
-                 f"写入 {KEY_PATH}（格式 {{\"secret_key\": \"...\"}}，chmod 600）"),
+        "note": note,
     }
 
 

@@ -28,6 +28,8 @@ export interface CalendarEvent {
 
 export interface EventsUpcomingResponse {
   ok: boolean;
+  /** U2 通讯总开关（jin10_enabled，默认关）：false 时后端零出网短路 */
+  enabled?: boolean;
   configured: boolean;
   events: CalendarEvent[];
   risk: {
@@ -72,7 +74,8 @@ function useNowTick(enabled: boolean): number {
 export function EventRibbon() {
   const { data } = usePolling(() => fetchUpcoming(24, 3), 60_000, []);
   const now = useNowTick(Boolean(data?.configured && data.events.length));
-  if (!data?.configured || !data.ok) return null; // 未配置：横条不占位，引导在总览卡片
+  // 未启用（U2 总开关）/ 未配置 / 拉取失败：横条不占位，引导与状态在总览卡片
+  if (!data?.ok || data.enabled === false || !data.configured) return null;
   const events = (data.events ?? []).slice(0, 6);
   if (!events.length) return null;
   const inWindow = Boolean(data.risk?.in_window);
@@ -118,6 +121,12 @@ export default function TodayEventsCard() {
       </p>
       {!data && loading ? (
         <p className="text-xs text-jarvis-text-secondary">加载中…</p>
+      ) : data?.enabled === false ? (
+        <p className="text-xs text-jarvis-text-secondary">
+          事件日历未启用（出网通路已关闭）——拿到金十 key 后在 Settings · 数据组打开
+          <code className="mx-1 px-1 bg-jarvis-panel rounded">jin10_enabled</code>
+          即可，无需重启。
+        </p>
       ) : !data?.configured ? (
         <div className="text-xs text-jarvis-text-secondary space-y-2">
           <p className="flex items-center gap-1.5">

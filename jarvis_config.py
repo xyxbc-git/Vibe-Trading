@@ -338,6 +338,9 @@ DEFAULTS: dict = {
     # 高影响宏观数据（CPI/非农/FOMC）公布瞬间常见插针——事件前 pre / 后 post
     # 分钟内算风险窗口，导师证据链 event_risk 路在窗口内出 warn 提示。
     # 数据源金十开放平台（secret-key 放 ~/.vibe-trading/jin10.json，不进 git）。
+    # U2 总开关：默认 false（用户拿到 key 前不出网，防误请求被封）；打开后
+    # 模块才允许对金十域名出网，关闭时所有出网路径短路（无论有无 key）。
+    "jin10_enabled": False,          # 金十通讯总开关（拿到 key 后手动打开）
     "event_risk_min_star": 3,        # ≥该星级(1-3)才算高影响事件
     "event_risk_pre_min": 30,        # 事件公布前 N 分钟进入风险窗口
     "event_risk_post_min": 15,       # 事件公布后 N 分钟仍在风险窗口
@@ -533,7 +536,8 @@ GROUPS: dict[str, str] = {
     "twelve_max_toll_ratio": "risk",
     # T7 零成交体系处置：12 套体系启停显式标记（dict 键，BOUNDS 不适用）
     "twelve_system_enabled": "signal",
-    # 任务 U：金十事件日历·风险窗口阈值
+    # 任务 U：金十事件日历·风险窗口阈值 + U2 通讯总开关
+    "jin10_enabled": "data",
     "event_risk_min_star": "risk",
     "event_risk_pre_min": "risk",
     "event_risk_post_min": "risk",

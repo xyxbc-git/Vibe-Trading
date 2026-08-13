@@ -15,6 +15,10 @@ import jarvis_trade_mentor as jtm
 PASS: list[str] = []
 FAIL: list[str] = []
 
+# 落盘隔离：冒烟不写/不读真实磁盘缓存（曾把打桩事件写进 ~/.vibe-trading/cache）
+jec._disk_save = lambda events: None  # type: ignore[assignment]
+jec._disk_load = lambda: (0.0, [])  # type: ignore[assignment]
+
 
 def check(name: str, cond: bool, detail: str = "") -> None:
     (PASS if cond else FAIL).append(name)
@@ -25,9 +29,10 @@ NOW = time.time()
 
 
 def _inject(events: list[dict]) -> None:
-    """把构造事件灌进模块进程内缓存（key 探测也一并打桩为已配置）。"""
+    """把构造事件灌进模块进程内缓存（开关与 key 探测一并打桩为开启/已配置）。"""
     jec._mem_cache.update(ts=time.time(), events=events)
     jec._load_key = lambda: "smoke-test-key"  # type: ignore[assignment]
+    jec.enabled = lambda: True  # type: ignore[assignment]
 
 
 def _ev(minutes_from_now: float, star: int = 3, title: str = "CPI",
@@ -56,7 +61,8 @@ check("N3 毫秒时间戳被折算", abs(next(e for e in norm if "毫秒" in e["
 check("N4 北京时间字符串可解析",
       any("字符串" in e["title"] and e["ts"] > 1e9 for e in norm))
 
-# ── 2. 未配置态（诚实 not_configured，绝不伪造）──
+# ── 2. 未配置态（诚实 not_configured，绝不伪造；开关打开只为测 key 短路层）──
+jec.enabled = lambda: True  # type: ignore[assignment]
 jec._load_key = lambda: None  # type: ignore[assignment]
 jec._mem_cache.update(ts=0.0, events=None)
 box = jec.events()
@@ -68,6 +74,43 @@ check("C2 未配置 risk_window available=False（没数据≠没风险）",
 st = jec.status()
 check("C3 status 未配置含引导路径", st["configured"] is False
       and "open.jin10.com" in (st["note"] or ""))
+
+# ── 2E. U2 通讯总开关：零出网证据（_fetch_remote 是全模块唯一出网点，打桩计数）──
+_fetch_calls = {"n": 0}
+
+
+def _counting_fetch(key):
+    _fetch_calls["n"] += 1
+    return [_ev(30, 3, "打桩事件")]
+
+
+jec._fetch_remote = _counting_fetch  # type: ignore[assignment]
+
+# E1 disabled：有 key 也短路（开关优先于一切）
+jec.enabled = lambda: False  # type: ignore[assignment]
+jec._load_key = lambda: "some-key"  # type: ignore[assignment]
+jec._mem_cache.update(ts=0.0, events=None)
+box = jec.events(force=True)
+check("E1 disabled 短路：有 key 也零出网 + enabled=false + 提示语",
+      _fetch_calls["n"] == 0 and box["ok"] is False and box["enabled"] is False
+      and "jin10_enabled" in (box["note"] or ""), f"calls={_fetch_calls['n']}")
+st = jec.status()
+check("E1b status 报 enabled=false + 出网短路提示",
+      st["enabled"] is False and "短路" in (st["note"] or ""))
+
+# E2 enabled + 无 key：仍零出网（key 短路层在出网之前）
+jec.enabled = lambda: True  # type: ignore[assignment]
+jec._load_key = lambda: None  # type: ignore[assignment]
+box = jec.events(force=True)
+check("E2 enabled+无 key 零出网", _fetch_calls["n"] == 0 and box["ok"] is False
+      and box["configured"] is False, f"calls={_fetch_calls['n']}")
+
+# E3 enabled + 有 key：才会走到出网点（打桩返回构造数据）
+jec._load_key = lambda: "some-key"  # type: ignore[assignment]
+box = jec.events(force=True)
+check("E3 enabled+有 key 才出网（打桩被调 1 次且数据落缓存）",
+      _fetch_calls["n"] == 1 and box["ok"] and box["events"][0]["title"] == "打桩事件",
+      f"calls={_fetch_calls['n']}")
 
 # ── 3. 风险窗口三态（配置桩 + 构造事件）──
 _inject([_ev(20, star=3)])            # 高影响事件 20 分钟后（pre=30 窗口内）
