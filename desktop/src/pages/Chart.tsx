@@ -490,15 +490,30 @@ export default function Chart() {
   const smartActive = !isPro || smart;
   const twelveActive = viewMode === "advanced" || (isPro && twelve);
 
+  // 切周期防抖（150ms）：TF 按钮快速扫过多档时只为停留档发 K 线请求，
+  // 中间档位一次请求都不发（UI 高亮仍用 tf 即时响应，无感延迟）
+  const [tfSettled, setTfSettled] = useState(tf);
+  useEffect(() => {
+    if (tfSettled === tf) return;
+    const t = window.setTimeout(() => setTfSettled(tf), 150);
+    return () => window.clearTimeout(t);
+  }, [tf, tfSettled]);
+
   // 实时窗口轮询（节奏与旧版一致）+ 向左拖懒加载更早历史（end_time 分页，
-  // 多页前插合并，切币种/周期自动清空）——见 useKlineHistory
+  // 多页前插合并，切币种/周期整组切换，已加载历史段有内存缓存切回免重拉）
+  // ——见 useKlineHistory
   const {
     rows: klineRows,
     loading,
     error,
     loadingOlder,
     loadOlder,
-  } = useKlineHistory(symbol, tf, LIMITS[tf], tf === "1m" ? 10_000 : 60_000);
+  } = useKlineHistory(
+    symbol,
+    tfSettled,
+    LIMITS[tfSettled],
+    tfSettled === "1m" ? 10_000 : 60_000,
+  );
 
   const { candles, volumes } = useMemo(() => {
     if (klineRows.length === 0) {
@@ -753,7 +768,8 @@ export default function Chart() {
   // 则暂不打标——4h 样本画在 15m 图上位置口径不对，会误导）。bar 高低点用于
   // 把徽章锚到影线外侧（多单挂低点下方 / 空单挂高点上方）。
   const sigMarks = useMemo(() => {
-    if (!sigSystem || !sigTf || tf !== sigTf) return null;
+    // 周期判定用 tfSettled 与 candles 数据口径原子一致（切 TF 防抖窗口内不错位）
+    if (!sigSystem || !sigTf || tfSettled !== sigTf) return null;
     if (!sigTradesResp?.ok || !Array.isArray(sigTradesResp.trades) || candles.length === 0) {
       return null;
     }
@@ -768,7 +784,7 @@ export default function Chart() {
       toSec,
       bars,
     );
-  }, [sigSystem, sigTf, tf, sigTradesResp, candles]);
+  }, [sigSystem, sigTf, tfSettled, sigTradesResp, candles]);
 
   // 画线引擎输入沿用「最近固定窗口」口径（与 LIMITS 上限一致）：懒加载前插
   // 的更早历史不进画线/自调计算——避免每页前插触发自调参数重搜（TUNE_KEY
@@ -776,8 +792,9 @@ export default function Chart() {
   // 膨胀；引擎设计本来就只看最近窗口。输出的 bar 索引在传入图表前经
   // shiftDrawingIndexes 平移 drawingsIndexOffset 对齐全量数据。
   const recentCandles = useMemo(
-    () => (candles.length > LIMITS[tf] ? candles.slice(-LIMITS[tf]) : candles),
-    [candles, tf],
+    () =>
+      candles.length > LIMITS[tfSettled] ? candles.slice(-LIMITS[tfSettled]) : candles,
+    [candles, tfSettled],
   );
   const drawingsIndexOffset = candles.length - recentCandles.length;
 
@@ -815,27 +832,29 @@ export default function Chart() {
     const bars = baseData.closes.length;
     const strategy: "full" | "coordinate" = bars > COORDINATE_BARS ? "coordinate" : "full";
 
-    const cached = loadTunedParams(symbol, tf, bars);
+    // 键用 tfSettled 与 baseData 数据口径原子一致：防抖窗口内 tf 先行变化时
+    // 不得用旧周期数据网格搜索后存进新周期缓存键（既污染缓存又白耗一轮重搜）
+    const cached = loadTunedParams(symbol, tfSettled, bars);
     if (cached) return { params: cached, score: 0, tuned: true };
 
-    const warm = loadWarmParams(symbol, tf);
+    const warm = loadWarmParams(symbol, tfSettled);
     if (warm) {
       const ev = evaluateParams(baseData, warm);
       if (ev.uplift > 0) {
-        saveTunedParams(symbol, tf, warm, ev.score, bars);
+        saveTunedParams(symbol, tfSettled, warm, ev.score, bars);
         return { params: warm, score: ev.score, tuned: true };
       }
       const res = gridSearchParams(baseData, { seed: warm, strategy });
-      saveWarmParams(symbol, tf, res.params);
-      saveTunedParams(symbol, tf, res.params, res.score, bars);
+      saveWarmParams(symbol, tfSettled, res.params);
+      saveTunedParams(symbol, tfSettled, res.params, res.score, bars);
       return { params: res.params, score: res.score, tuned: true };
     }
 
     const res = gridSearchParams(baseData, { strategy });
-    saveWarmParams(symbol, tf, res.params);
-    saveTunedParams(symbol, tf, res.params, res.score, bars);
+    saveWarmParams(symbol, tfSettled, res.params);
+    saveTunedParams(symbol, tfSettled, res.params, res.score, bars);
     return { params: res.params, score: res.score, tuned: true };
-  }, [autoTune, effectiveDraws.size, baseData, symbol, tf]);
+  }, [autoTune, effectiveDraws.size, baseData, symbol, tfSettled]);
 
   // ── 命中率（tuned vs 默认参数基线，同一验证段） ──
   const modeScores = useMemo(() => {
@@ -2117,7 +2136,7 @@ export default function Chart() {
               trapMarks={trapMarks}
               onTrapClick={(mark) => setSelectedTrap(mark)}
               wyckoff={wyckoffOverlay}
-              datasetKey={`${symbol}|${tf}`}
+              datasetKey={`${symbol}|${tfSettled}`}
               onNearLeftEdge={loadOlder}
               loadingOlder={loadingOlder}
             />

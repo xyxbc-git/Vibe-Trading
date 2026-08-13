@@ -22,6 +22,30 @@ import {
 /** 总根数护栏：防连续分页把内存拖爆（≈10+ 页，远超肉眼回看需求） */
 const MAX_TOTAL_BARS = 3000;
 
+/**
+ * 已加载历史段的内存缓存（symbol|interval → 历史页 + 到头标记）：
+ * 来回切 TF/币种时免重新逐页拉取（历史已收线不会变，天然可缓存；
+ * 实时窗口不缓存，仍由轮询保持新鲜）。LRU 上限防长会话内存膨胀
+ * （12 键 × ≤3000 行，量级远小于一张截图）。
+ */
+const olderCache = new Map<string, { rows: KlineRow[]; hasMore: boolean }>();
+const OLDER_CACHE_MAX_KEYS = 12;
+
+function cacheOlderPages(key: string, rows: KlineRow[], hasMore: boolean): void {
+  olderCache.delete(key);
+  olderCache.set(key, { rows, hasMore });
+  while (olderCache.size > OLDER_CACHE_MAX_KEYS) {
+    const oldest = olderCache.keys().next().value;
+    if (oldest === undefined) break;
+    olderCache.delete(oldest);
+  }
+}
+
+/** 测试专用：清空历史段缓存 */
+export function clearOlderCacheForTest(): void {
+  olderCache.clear();
+}
+
 export interface UseKlineHistoryResult {
   /** 历史页 + 实时窗口合并后的全量行（ts 升序） */
   rows: KlineRow[];
@@ -68,13 +92,16 @@ export function useKlineHistory(
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [hasMoreHistory, setHasMoreHistory] = useState(true);
   const keyRef = useRef(`${symbol}|${interval}`);
+  const olderRef = useRef<KlineRow[]>([]);
   const inFlightRef = useRef(false);
 
-  // 切币种/周期：历史页整组清空，游标状态复位
+  // 切币种/周期：先查段缓存（切回免重新分页），未命中才整组清空复位
   useEffect(() => {
     keyRef.current = `${symbol}|${interval}`;
-    setOlder([]);
-    setHasMoreHistory(true);
+    const cached = olderCache.get(keyRef.current);
+    olderRef.current = cached?.rows ?? [];
+    setOlder(olderRef.current);
+    setHasMoreHistory(cached?.hasMore ?? true);
     setLoadingOlder(false);
     inFlightRef.current = false;
   }, [symbol, interval]);
@@ -100,10 +127,15 @@ export function useKlineHistory(
         const page = extractKlineRows(raw).filter((r) => r.ts <= cursor);
         if (page.length === 0) {
           setHasMoreHistory(false);
+          cacheOlderPages(key, olderRef.current, false);
           return;
         }
-        setOlder((prev) => mergeKlineRows(page, prev));
-        if (page.length < limit) setHasMoreHistory(false); // 不足一页 = 到头
+        const merged = mergeKlineRows(page, olderRef.current);
+        olderRef.current = merged;
+        setOlder(merged);
+        const more = page.length >= limit; // 不足一页 = 到头
+        if (!more) setHasMoreHistory(false);
+        cacheOlderPages(key, merged, more);
       } catch {
         // 网络失败：保留 hasMoreHistory，用户再向左拖即重试
       } finally {
