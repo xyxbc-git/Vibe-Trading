@@ -29,6 +29,8 @@ export interface FvgZoneView {
   bottom: number;
   /** 形成 bar 开盘时间（epoch 秒，与蜡烛 time 同源对齐） */
   timeSec: number;
+  /** [R10] 带右端截止时间（epoch 秒）：首次被触及的蜡烛；null=从未触碰延伸到图右缘 */
+  endTimeSec: number | null;
   /** 最深回踩占缺口高度 0~100 */
   fillPct: number;
   tooltip: string;
@@ -53,6 +55,8 @@ const FILLED_OVERLAY_ALPHA = 0.1; // 已回补部分的「冲淡」覆盖
 
 interface ZoneLayout {
   xLeft: number;
+  /** null = 延伸到图右缘（未被触碰的活缺口） */
+  xRight: number | null;
   yTop: number;
   yBottom: number;
   view: FvgZoneView;
@@ -138,7 +142,11 @@ class FvgRenderer implements ISeriesPrimitivePaneRenderer {
         if (h <= 0 || top > height || top + h < 0) continue;
         const color = L.view.type === "bullish" ? COLOR_BULL : COLOR_BEAR;
         const x = Math.max(L.xLeft, 0);
-        const w = width - x; // 延伸到图右缘（未回补缺口持续有效）
+        // [R10] 回补即截断：被触及的缺口右端止于首次触及蜡烛；
+        // 只有从未被触碰的活缺口才延伸到图右缘（SMC 绘图惯例，防叠压）
+        const xEnd = L.xRight === null ? width : Math.min(L.xRight, width);
+        const w = xEnd - x;
+        if (w <= 0) continue;
 
         ctx.fillStyle = rgba(color, FILL_ALPHA);
         ctx.fillRect(x, top, w, h);
@@ -148,9 +156,9 @@ class FvgRenderer implements ISeriesPrimitivePaneRenderer {
         ctx.setLineDash([3, 3]);
         ctx.beginPath();
         ctx.moveTo(x, top + 0.5);
-        ctx.lineTo(width, top + 0.5);
+        ctx.lineTo(xEnd, top + 0.5);
         ctx.moveTo(x, top + h - 0.5);
-        ctx.lineTo(width, top + h - 0.5);
+        ctx.lineTo(xEnd, top + h - 0.5);
         ctx.stroke();
         ctx.setLineDash([]);
 
@@ -246,7 +254,8 @@ export class FvgPrimitive implements ISeriesPrimitive<Time> {
     for (const L of this._layouts) {
       const top = Math.min(L.yTop, L.yBottom);
       const bottom = Math.max(L.yTop, L.yBottom);
-      if (x >= L.xLeft && y >= top && y <= bottom) return L.view.tooltip;
+      const withinX = x >= L.xLeft && (L.xRight === null || x <= L.xRight);
+      if (withinX && y >= top && y <= bottom) return L.view.tooltip;
     }
     return null;
   }
@@ -265,7 +274,18 @@ export class FvgPrimitive implements ISeriesPrimitive<Time> {
       const yBottom = series.priceToCoordinate(z.bottom);
       // 形成 bar 已滚出已加载数据左缘时 x=null：带从图左缘起画（缺口仍有效）
       if (yTop === null || yBottom === null) continue;
-      this._layouts.push({ xLeft: x ?? 0, yTop, yBottom, view: z });
+      // [R10] 被触及的缺口截断到触及蜡烛；触及 bar 不在已加载窗口时保守不画尾巴
+      const xr =
+        z.endTimeSec === null
+          ? null
+          : timeScale.timeToCoordinate(z.endTimeSec as Time);
+      this._layouts.push({
+        xLeft: x ?? 0,
+        xRight: z.endTimeSec === null ? null : (xr ?? 0),
+        yTop,
+        yBottom,
+        view: z,
+      });
     }
     const pd = this._pd;
     if (pd) {

@@ -48,7 +48,7 @@ check("检出至少一个 zone", len(zones) >= 1, f"n={len(zones)}")
 need_keys = {"type", "top", "bottom", "created_i", "mitigated", "fill_pct", "age_bars"}
 check("zone 契约字段齐全", bool(zones) and need_keys <= set(zones[0].keys()))
 
-# ── 2) created_ts 映射（端点核心逻辑）──────────────────────────────
+# ── 2) created_ts / first_touch_ts 映射（端点核心逻辑）─────────────
 mapped = jd._fvg_zones_with_ts(df, zones)
 check("每个 zone 附 created_ts", all("created_ts" in z for z in mapped))
 ok_ts = all(
@@ -57,6 +57,17 @@ ok_ts = all(
     if z["created_ts"] is not None
 )
 check("created_ts 与 created_i 对齐", ok_ts)
+check("每个 zone 附 first_touch_ts 键", all("first_touch_ts" in z for z in mapped))
+# 合成序列缺口形成后价格持续上行不回踩 → 全部未触碰（None，前端延伸右缘）
+check("未回踩缺口 first_touch_ts=None", all(z["first_touch_ts"] is None for z in mapped))
+# 构造被回踩场景：末段价格跌回缺口区内 → first_touch_ts 指向首根触及 bar
+df_touch = df.copy()
+df_touch.loc[len(df_touch) - 5, "low"] = float(zones[0]["bottom"]) + 0.01
+touched = jd._fvg_zones_with_ts(df_touch, zones)
+z0 = touched[0]
+check("回踩后 first_touch_ts 命中触及 bar",
+      z0["first_touch_ts"] == int(df_touch["time"].iloc[len(df_touch) - 5]),
+      f"got={z0['first_touch_ts']}")
 bad = jd._fvg_zones_with_ts(df, [{"created_i": 9999}, {"created_i": "x"}, {}])
 check("越界/异常下标 → created_ts=None 不抛", all(z["created_ts"] is None for z in bad))
 check("空 zones 容错", jd._fvg_zones_with_ts(df, []) == [])

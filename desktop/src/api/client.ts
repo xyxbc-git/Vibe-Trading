@@ -2429,6 +2429,8 @@ export interface FvgZone {
   created_i?: number;
   /** 形成 bar 开盘毫秒时间戳（前端对齐蜡烛；下标异常时 null） */
   created_ts?: number | null;
+  /** 形成后首次被价格触及（回补开始）的 bar 毫秒时间戳；从未触碰为 null（R10） */
+  first_touch_ts?: number | null;
   age_bars?: number;
   /** 完全回补=缺口失效 */
   mitigated: boolean;

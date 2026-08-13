@@ -8333,15 +8333,39 @@ def _fvg_zones_with_ts(df, zones: list) -> list:
 
     前端 lightweight-charts 以 bar 时间为稳定锚点画矩形带（历史前插不漂移）；
     下标越界/字段异常时 created_ts 置 None（前端跳过该 zone，不砸渲染）。
+
+    [R10] 补算 first_touch_ts：形成后首根与缺口区间有交集（价格回到区内=回补
+    开始）的 bar 开盘毫秒时间戳；从未被触碰为 None（前端只让这类活缺口延伸到
+    右缘，被触碰的截断到触碰蜡烛——SMC 绘图惯例，防老缺口横穿全图叠压）。
+    检测器 jarvis_fvg 只读不改，触及扫描在本层做（O(zones×bars) 量级可忽略）。
     """
     out = []
+    try:
+        highs = df["high"].values
+        lows = df["low"].values
+        times = df["time"]
+        n = len(df)
+    except Exception:  # noqa: BLE001
+        highs = lows = times = None
+        n = 0
     for z in zones or []:
         try:
             i = int(z.get("created_i", -1))
-            ts = int(df["time"].iloc[i]) if 0 <= i < len(df) else None
+            ts = int(times.iloc[i]) if times is not None and 0 <= i < n else None
         except Exception:  # noqa: BLE001
-            ts = None
-        out.append({**z, "created_ts": ts})
+            i, ts = -1, None
+        touch_ts = None
+        if ts is not None and highs is not None:
+            try:
+                top = float(z.get("top"))
+                bottom = float(z.get("bottom"))
+                for j in range(i + 1, n):
+                    if float(lows[j]) <= top and float(highs[j]) >= bottom:
+                        touch_ts = int(times.iloc[j])
+                        break
+            except Exception:  # noqa: BLE001
+                touch_ts = None
+        out.append({**z, "created_ts": ts, "first_touch_ts": touch_ts})
     return out
 
 

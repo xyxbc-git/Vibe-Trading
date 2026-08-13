@@ -1235,22 +1235,32 @@ export default function Chart() {
     if (isStaleEcho(symbol, fvgResp.symbol) || (fvgResp.tf != null && fvgResp.tf !== tfSettled)) {
       return null;
     }
+    // [R10] 裁剪规则：只留「还有交易价值的活缺口」——高回补（≥80%）/完全回补/
+    // 过老（>200 根）隐藏；同屏最多 6 个（检测器已按未回补优先+新鲜优先排序）
+    const HIDE_FILL_PCT = 80;
+    const HIDE_AGE_BARS = 200;
+    const MAX_SHOWN = 6;
     const out: FvgZoneView[] = [];
     for (const z of fvgResp.zones ?? []) {
-      // 完全回补的缺口已失效：默认不显示（与任务口径一致）
+      if (out.length >= MAX_SHOWN) break;
       if (z.mitigated || z.created_ts == null) continue;
+      if ((z.fill_pct ?? 0) >= HIDE_FILL_PCT) continue;
+      if ((z.age_bars ?? 0) > HIDE_AGE_BARS) continue;
       if (!(Number.isFinite(z.top) && Number.isFinite(z.bottom) && z.top > z.bottom)) continue;
       const bull = z.type === "bullish";
+      const touched = z.first_touch_ts != null;
       out.push({
         type: z.type,
         top: z.top,
         bottom: z.bottom,
         timeSec: Math.floor(z.created_ts / 1000),
+        // 回补即截断：带右端止于首次触及蜡烛；从未触碰的活缺口延伸到右缘
+        endTimeSec: touched ? Math.floor(z.first_touch_ts! / 1000) : null,
         fillPct: z.fill_pct ?? 0,
         tooltip:
           `${bull ? "看涨" : "看跌"} FVG（价格失衡缺口）\n` +
           `区间 ${z.bottom.toLocaleString()} ~ ${z.top.toLocaleString()}\n` +
-          `回补 ${Math.round(z.fill_pct ?? 0)}%${(z.fill_pct ?? 0) > 0 ? "（部分回踩）" : "（未回补）"}` +
+          `回补 ${Math.round(z.fill_pct ?? 0)}%${touched ? "（已被触及，带止于首次回踩）" : "（未触碰，持续有效）"}` +
           ` · 形成于 ${new Date(z.created_ts).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}\n` +
           `${bull ? "缺口常成回踩支撑区——价格回补进带内是常见入场观察位" : "缺口常成反弹压力区——价格反抽进带内是常见入场观察位"}`,
       });
