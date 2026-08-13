@@ -8,6 +8,7 @@ import { useLivePrice } from "@/hooks/usePrice";
 import { api, formatPrice, type TwelveSignal, type ConsensusTradePlan, type KeyLevel, type LiqMapResponse, type SignalDirection } from "@/api/client";
 import KlineChart from "@/components/charts/KlineChart";
 import type { FvgZoneView } from "@/components/charts/FvgPrimitive";
+import type { StructureEventView } from "@/components/charts/SmcStructurePrimitive";
 import { EventRibbon } from "@/components/cards/EventCalendarCard";
 import { tradesToMarks } from "@/lib/signalTrades";
 import {
@@ -1216,12 +1217,15 @@ export default function Chart() {
   // 回退 K 线本地演示推演（角标标注），与预测层同一套降级模式 ──
   const [deltaOn, setDeltaOn] = useState(toggleOr(persistedToggles, "deltaOn", false));
 
-  // ── [R8] FVG 失衡区叠加：GET /api/fvg（60s 后端缓存），矩形带画进主图 ──
+  // ── [R8] FVG 失衡区 + SMC 结构线（BOS/CHoCH）：同一 GET /api/fvg 数据源
+  // （60s 后端缓存），两个独立开关共享请求——任一开启才拉取 ──
   const [fvgOn, setFvgOn] = useState(toggleOr(persistedToggles, "fvgOn", false));
+  const [bosOn, setBosOn] = useState(toggleOr(persistedToggles, "bosOn", false));
+  const smcActive = fvgOn || bosOn;
   const { data: fvgResp } = usePolling(
-    () => (fvgOn ? api.fvg(symbol, tfSettled) : Promise.resolve(null)),
-    fvgOn ? 60_000 : 0,
-    [fvgOn, symbol, tfSettled],
+    () => (smcActive ? api.fvg(symbol, tfSettled) : Promise.resolve(null)),
+    smcActive ? 60_000 : 0,
+    [smcActive, symbol, tfSettled],
   );
   const fvgZoneViews = useMemo<FvgZoneView[] | null>(() => {
     if (!fvgOn || !fvgResp?.ok) return null;
@@ -1252,6 +1256,34 @@ export default function Chart() {
     return out;
   }, [fvgOn, fvgResp, symbol, tfSettled]);
 
+  // SMC 结构事件 → 线段视图（BOS 实线 / CHoCH 琥珀虚线，被突破 swing 点→突破蜡烛）
+  const smcEventViews = useMemo<StructureEventView[] | null>(() => {
+    if (!bosOn || !fvgResp?.ok) return null;
+    if (isStaleEcho(symbol, fvgResp.symbol) || (fvgResp.tf != null && fvgResp.tf !== tfSettled)) {
+      return null;
+    }
+    const out: StructureEventView[] = [];
+    for (const e of fvgResp.structure_events ?? []) {
+      if (e.swing_ts == null || e.break_ts == null || !Number.isFinite(e.level)) continue;
+      const bull = e.direction === "bullish";
+      const isBos = e.kind === "bos";
+      out.push({
+        kind: e.kind,
+        direction: e.direction,
+        level: e.level,
+        swingTimeSec: Math.floor(e.swing_ts / 1000),
+        breakTimeSec: Math.floor(e.break_ts / 1000),
+        tooltip:
+          `${isBos ? "BOS 结构突破" : "CHoCH 结构转换"}（${bull ? "看涨" : "看跌"}）\n` +
+          `收盘${bull ? "上破" : "跌破"} swing ${bull ? "高" : "低"}点 ${e.level.toLocaleString()}\n` +
+          (isBos
+            ? "趋势延续确认：结构方向上的又一次有效突破（只认收盘，影线扫单不算）"
+            : "结构转换警示：首次逆结构方向的收盘突破——原趋势的结构基础被破坏，警惕反转"),
+      });
+    }
+    return out;
+  }, [bosOn, fvgResp, symbol, tfSettled]);
+
   // [R6] 指标开关统一写回：任一开关/画线集合/周期变化即持久化（读-合并-写，
   // 首帧写回初始值幂等；viewMode/ichimoku/trap/wyckoff 沿用各自历史键不迁移）
   useEffect(() => {
@@ -1266,10 +1298,11 @@ export default function Chart() {
       macdOn,
       deltaOn,
       fvgOn,
+      bosOn,
       draws: [...draws],
       tf,
     });
-  }, [smart, autoTune, twelve, plan, predictOn, patternOn, liqOn, macdOn, deltaOn, fvgOn, draws, tf]);
+  }, [smart, autoTune, twelve, plan, predictOn, patternOn, liqOn, macdOn, deltaOn, fvgOn, bosOn, draws, tf]);
   const [deltaResp, setDeltaResp] = useState<DeltaResponse | null>(null);
   const [deltaLoading, setDeltaLoading] = useState(false);
   const [deltaError, setDeltaError] = useState<string | null>(null);
@@ -1596,6 +1629,15 @@ export default function Chart() {
           className={pillCls(fvgOn)}
         >
           FVG{fvgOn ? "·开" : "·关"}
+        </button>
+
+        {/* [R8追加] BOS/CHoCH 结构线：SMC 市场结构突破与转换事件 */}
+        <button
+          onClick={() => setBosOn((v) => !v)}
+          title="BOS/CHoCH 结构线：BOS=收盘突破最近 swing 高/低点（趋势延续确认，绿涨红跌实线）；CHoCH=首次逆结构方向突破（结构转换警示，琥珀虚线）。只认收盘突破防扫单假信号，最多展示最近 8 个事件。线段从被突破 swing 点画到突破蜡烛，悬停看解释"
+          className={pillCls(bosOn)}
+        >
+          BOS{bosOn ? "·开" : "·关"}
         </button>
 
         {/* 图例：解释当前模式下每类线的含义 */}
@@ -2210,6 +2252,7 @@ export default function Chart() {
               ichimoku={ichimokuData?.overlay ?? null}
               trapMarks={trapMarks}
               fvgZones={fvgZoneViews}
+              smcEvents={smcEventViews}
               onTrapClick={(mark) => setSelectedTrap(mark)}
               wyckoff={wyckoffOverlay}
               datasetKey={`${symbol}|${tfSettled}`}

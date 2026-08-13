@@ -33,6 +33,8 @@ export interface ChartToggles {
   deltaOn?: boolean;
   /** K 线页：FVG 失衡区叠加（R8） */
   fvgOn?: boolean;
+  /** K 线页：BOS/CHoCH 结构线叠加（R8 追加） */
+  bosOn?: boolean;
   /** K 线页：手动画线模式集合（DrawMode 名） */
   draws?: string[];
   /** K 线页：周期档 */

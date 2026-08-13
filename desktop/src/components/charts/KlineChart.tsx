@@ -30,6 +30,7 @@ import { IchimokuCloudPrimitive } from "./IchimokuCloudPrimitive";
 import { TrapSignalsPrimitive } from "./TrapSignalsPrimitive";
 import { WyckoffPrimitive } from "./WyckoffPrimitive";
 import { FvgPrimitive, type FvgZoneView } from "./FvgPrimitive";
+import { SmcStructurePrimitive, type StructureEventView } from "./SmcStructurePrimitive";
 
 /** 云图叠加载荷：三条线走 LineSeries，云带（含未来段）走 primitive */
 export interface IchimokuOverlay {
@@ -115,6 +116,12 @@ interface KlineChartProps {
    */
   fvgZones?: FvgZoneView[] | null;
   /**
+   * SMC 结构事件线（R8 追加）：BOS/CHoCH 素雅细线从被突破 swing 点延伸到
+   * 突破蜡烛+小字标签（看涨绿/看跌红/CHoCH 琥珀虚线）；hover 出事件摘要。
+   * null/undefined 不渲染。
+   */
+  smcEvents?: StructureEventView[] | null;
+  /**
    * 数据集标识（如 "BTCUSDT|15m"）。提供时启用「视口保持」模式：仅该 key
    * 变化（切币种/切周期/图表重建）才 fitContent 重置视口；同 key 的数据
    * 更新（轮询刷新、历史前插）恢复原可见时间区间，用户缩放/平移与向左
@@ -176,6 +183,7 @@ export default function KlineChart({
   onTrapClick,
   wyckoff,
   fvgZones,
+  smcEvents,
   datasetKey,
   onNearLeftEdge,
   loadingOlder,
@@ -194,6 +202,7 @@ export default function KlineChart({
   const trapPrimitiveRef = useRef<TrapSignalsPrimitive | null>(null);
   const wyckoffPrimitiveRef = useRef<WyckoffPrimitive | null>(null);
   const fvgPrimitiveRef = useRef<FvgPrimitive | null>(null);
+  const smcPrimitiveRef = useRef<SmcStructurePrimitive | null>(null);
   // 点击回调 latest-ref：init effect 里的 subscribeClick 闭包始终调到最新回调
   const onTrapClickRef = useRef(onTrapClick);
   onTrapClickRef.current = onTrapClick;
@@ -282,6 +291,9 @@ export default function KlineChart({
     // FVG 失衡区矩形带（R8，normal 层垫蜡烛下，悬停出摘要）
     const fvgPrimitive = new FvgPrimitive();
     candleSeries.attachPrimitive(fvgPrimitive);
+    // SMC 结构事件线（R8 追加：BOS/CHoCH 细线+小字标签，悬停出摘要）
+    const smcPrimitive = new SmcStructurePrimitive();
+    candleSeries.attachPrimitive(smcPrimitive);
 
     // 悬停浮层（多类命中共用一个浮层，陷阱警示 > 徽章 > 预测层）：
     //   0. 诱多/诱空三角警示牌：命中 → 陷阱类型/置信度/价位摘要
@@ -323,6 +335,12 @@ export default function KlineChart({
         setZoneTip({ x: pt.x, y: pt.y, text: ichiTip });
         return;
       }
+      // SMC 结构线命中（精确线段，优先于大面积 FVG 带）
+      const smcTip = smcPrimitive.eventAt(pt.x, pt.y);
+      if (smcTip) {
+        setZoneTip({ x: pt.x, y: pt.y, text: smcTip });
+        return;
+      }
       // FVG 带命中（大面积区域，优先级垫底防挡其它 tooltip）
       const fvgTip = fvgPrimitive.zoneAt(pt.x, pt.y);
       setZoneTip(fvgTip ? { x: pt.x, y: pt.y, text: fvgTip } : null);
@@ -357,6 +375,7 @@ export default function KlineChart({
     trapPrimitiveRef.current = trapPrimitive;
     wyckoffPrimitiveRef.current = wyckoffPrimitive;
     fvgPrimitiveRef.current = fvgPrimitive;
+    smcPrimitiveRef.current = smcPrimitive;
     priceLinesRef.current = [];
     overlaySeriesRef.current = [];
     ichimokuSeriesRef.current = [];
@@ -388,6 +407,7 @@ export default function KlineChart({
       trapPrimitiveRef.current = null;
       wyckoffPrimitiveRef.current = null;
       fvgPrimitiveRef.current = null;
+      smcPrimitiveRef.current = null;
       priceLinesRef.current = [];
       overlaySeriesRef.current = [];
       ichimokuSeriesRef.current = [];
@@ -601,6 +621,16 @@ export default function KlineChart({
       // chart may have been disposed between render and effect
     }
   }, [fvgZones, initVersion]);
+
+  // SMC 结构事件线（R8 追加）：prop 变化整组重设，传空/未传即清空。
+  useEffect(() => {
+    if (disposedRef.current) return;
+    try {
+      smcPrimitiveRef.current?.setEvents(smcEvents ?? []);
+    } catch {
+      // chart may have been disposed between render and effect
+    }
+  }, [smcEvents, initVersion]);
 
   // 信号结构买卖点标注 → 原生 setMarkers。替换式 API：prop 变化整组重设，
   // 清空/未传时重设为空数组；库要求按 time 升序，窗口外的标注直接丢弃。

@@ -2438,6 +2438,20 @@ export interface FvgZone {
   dist_atr?: number;
 }
 
+/** SMC 结构事件（BOS/CHoCH，jarvis_smc_structure 契约 + 时间戳） */
+export interface SmcStructureEvent {
+  kind: "bos" | "choch";
+  direction: "bullish" | "bearish";
+  /** 被突破的 swing 价位 */
+  level: number;
+  swing_i?: number;
+  break_i?: number;
+  /** 被突破 swing 点 bar 开盘毫秒时间戳 */
+  swing_ts?: number | null;
+  /** 突破 bar 开盘毫秒时间戳 */
+  break_ts?: number | null;
+}
+
 export interface FvgResponse {
   ok: boolean;
   reason?: string | null;
@@ -2447,6 +2461,9 @@ export interface FvgResponse {
   price?: number;
   atr?: number;
   zones: FvgZone[];
+  /** SMC 结构事件（R8 追加；旧后端无此字段） */
+  structure_events?: SmcStructureEvent[];
+  structure_direction?: "up" | "down" | null;
   error?: string;
 }
 
