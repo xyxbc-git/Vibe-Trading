@@ -8122,111 +8122,80 @@ def api_mentor_stats(days: int = 90):
         return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
 
 
-# ─────────────── 交易导师·情绪风控 API（计划裁决/台账/信任回路） ───────────────
-# 说明：裁决核心与台账在 jarvis_trade_mentor（确定性规则引擎，不依赖 LLM 也完整
-# 工作；AI 解释层由并行任务在 verdict 之上做润色，灯色与分数以规则引擎为准）。
-# 这里只挂路由 + 注入本进程共识缓存（与 /api/twelve/consensus 同键复用，零重复取数）。
-
-import jarvis_trade_mentor as jtm
+# ─────────────── 交易导师·AI 解释层（小白话 SSE，任务 N agent-3 区段） ───────────────
+# 在 jarvis_trade_mentor 的确定性 verdict 之上做小白话润色：灯色/分数以规则引擎
+# 为准，AI 只解释不改判。证据包经 jarvis_mentor_explain.fetch_plan_bundle
+# （try-import 容错）；帧格式与 /api/twelve/signal-explain/stream 一致。
 
 
-class MentorPlanReq(BaseModel):
-    symbol: str = "ETHUSDT"
-    direction: str                      # long / short
-    entry: float
-    stop_loss: float
-    take_profit: float
-    tf: str = "30m"                     # 计划主判读周期（关键位/微观/历史按此取证）
-    reason: str = ""                    # 用户的下单理由（复盘对照用）
-    emotion_score: int = 3              # 情绪自评 1-5（≥4 = 上头，触发强制降档规则）
+@app.post("/api/mentor/explain/stream")
+def api_mentor_explain_stream(data: dict | None = None):
+    """导师计划裁决「小白话解释」（SSE 流式）。
 
+    body：{"plan_id": <mentor_plan.id>} 常规路径（读计划+verdict+币种原则档案）；
+          {"bundle": {...}} 联调直传（绕过台账，前端开发/测试用）；
+          {"demo": 1} 内置样例（无库无 LLM 前端也能先接 UI）。
+    未配置 LLM → {ok:false, code:"not_configured"}（HTTP 200，前端引导设置页）；
+    找不到计划 → {ok:false, code:"plan_not_found"}。记账 module=mentor_explain。
+    """
+    import jarvis_llm_config as jlc
+    import jarvis_mentor_explain as jme
 
-class MentorOutcomeReq(BaseModel):
-    result: str                         # win / loss / breakeven / skipped
-    pnl_pct: float | None = None
-    followed: bool | None = None        # 是否听从了裁决建议（信任回路数据源）
-    note: str = ""
+    d = data or {}
+    bundle = d.get("bundle") if isinstance(d.get("bundle"), dict) else None
+    if bundle is None and d.get("demo"):
+        bundle = jme.sample_bundle()
+    if bundle is None and d.get("plan_id") is not None:
+        bundle = jme.fetch_plan_bundle(d.get("plan_id"))
+    if bundle is None:
+        return JSONResponse({
+            "ok": False, "code": "plan_not_found",
+            "message": "未找到该计划的裁决证据包（plan_id 不存在或台账未就绪；"
+                       "联调可在 body 直传 bundle 或 demo:1）"})
 
+    cfg = jlc.get_llm_config()
+    if not cfg:
+        return JSONResponse({"ok": False, "code": "not_configured",
+                             "message": "未配置 AI（LLM API Key），请到「设置」页配置后再用导师解读"})
 
-def _mentor_consensus_provider(sym: str):
-    """复用本进程 /api/twelve/consensus 的缓存桶（同键直读；未命中返回 None，
-    mentor 侧自动回退直连取数）。"""
-    def _get():
-        hit = _CACHE.get(f"twelve:cons:{sym}:c0")
-        return hit[1] if hit else None
-    return _get
-
-
-@app.post("/api/mentor/plan")
-def api_mentor_plan(req: MentorPlanReq):
-    """提交交易计划 → 实时证据裁决（红黄绿灯）→ 落台账。返回 {ok, plan_id, verdict}。"""
     try:
-        sym = req.symbol.upper().replace("-", "").replace("/", "")
-        if not sym.endswith(("USDT", "USDC")):
-            sym += "USDT"
-        if req.direction not in ("long", "short"):
-            return JSONResponse({"ok": False, "error": "direction 须为 long/short"},
-                                status_code=422)
-        if min(req.entry, req.stop_loss, req.take_profit) <= 0:
-            return JSONResponse({"ok": False, "error": "entry/stop_loss/take_profit 须为正数"},
-                                status_code=422)
-        plan = {**req.model_dump(), "symbol": sym}
-        ev = jtm.build_evidence(sym, req.direction, req.entry, req.stop_loss,
-                                req.take_profit, tf=req.tf,
-                                consensus_provider=_mentor_consensus_provider(sym))
-        vd = jtm.verdict(ev, plan)
-        pid = jtm.save_plan(plan, vd)
-        return JSONResponse({"ok": True, "plan_id": pid, "verdict": vd})
-    except Exception as e:  # noqa: BLE001
-        return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
+        messages = jme.build_messages(bundle)
+    except Exception as exc:  # noqa: BLE001 — 证据包畸形不 500，讲清原因
+        return JSONResponse({"ok": False, "code": "bad_bundle",
+                             "message": f"证据包解析失败：{repr(exc)[:160]}"})
 
+    def _sse(obj: dict) -> str:
+        return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
 
-@app.get("/api/mentor/plans")
-def api_mentor_plans(symbol: str = "", days: int = 30):
-    """计划台账列表（含灯色/分数/回填结果），默认近 30 天。"""
-    try:
-        return JSONResponse({"ok": True,
-                             "plans": jtm.list_plans(symbol or None, days)})
-    except Exception as e:  # noqa: BLE001
-        return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
+    def gen():
+        try:
+            stream = jlc.chat_stream(messages, timeout=90, module="mentor_explain")
+            yield _sse({"type": "meta", "engine": "llm", "model": cfg.get("model"),
+                        "plan_id": bundle.get("id") or bundle.get("plan_id"),
+                        "light": (bundle.get("verdict") or {}).get("light")
+                        or bundle.get("light")})
+            got_any = False
+            for delta in stream:
+                got_any = True
+                yield _sse({"type": "delta", "content": delta})
+            if not got_any:
+                yield _sse({"type": "delta", "content": "模型没有返回内容，请稍后重试。"})
+            yield _sse({"type": "done"})
+        except (jlc.LLMNotConfigured, jlc.LLMCallError) as exc:
+            _log_emit(f"mentor-explain LLM 失败: {exc}", "warn", "ask")
+            yield _sse({"type": "error", "message": f"AI 调用失败：{str(exc)[:160]}，稍后重试"})
+        except Exception as exc:  # noqa: BLE001 — 流中断兜底，已推送内容仍有效
+            yield _sse({"type": "error", "message": f"解读中断：{repr(exc)[:120]}"})
 
-
-@app.get("/api/mentor/plan/{plan_id}")
-def api_mentor_plan_show(plan_id: int):
-    """单条计划完整详情（含裁决 items 明细，前端复盘页消费）。"""
-    try:
-        out = jtm.get_plan(plan_id)
-        if out is None:
-            return JSONResponse({"ok": False, "error": "plan 不存在"}, status_code=404)
-        return JSONResponse({"ok": True, "plan": out})
-    except Exception as e:  # noqa: BLE001
-        return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
-
-
-@app.post("/api/mentor/plan/{plan_id}/outcome")
-def api_mentor_outcome(plan_id: int, req: MentorOutcomeReq):
-    """事后回填结果（win/loss/breakeven/skipped + 是否听劝）——信任回路的数据来源。"""
-    try:
-        if req.result not in ("win", "loss", "breakeven", "skipped"):
-            return JSONResponse(
-                {"ok": False, "error": "result 须为 win/loss/breakeven/skipped"},
-                status_code=422)
-        ok = jtm.set_outcome(plan_id, result=req.result, pnl_pct=req.pnl_pct,
-                             followed=req.followed, note=req.note)
-        if not ok:
-            return JSONResponse({"ok": False, "error": "plan 不存在"}, status_code=404)
-        return JSONResponse({"ok": True})
-    except Exception as e:  # noqa: BLE001
-        return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
-
-
-@app.get("/api/mentor/stats")
-def api_mentor_stats(days: int = 90):
-    """信任回路统计：红/黄/绿灯各自胜率 + 听劝 vs 不听劝盈亏对比。"""
-    try:
-        return JSONResponse({"ok": True, **jtm.stats(days)})
-    except Exception as e:  # noqa: BLE001
-        return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 def main() -> int:
