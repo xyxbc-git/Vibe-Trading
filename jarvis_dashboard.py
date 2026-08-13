@@ -8032,6 +8032,8 @@ class MentorPlanReq(BaseModel):
     tf: str = "30m"                     # 计划主判读周期（关键位/微观/历史按此取证）
     reason: str = ""                    # 用户的下单理由（复盘对照用）
     emotion_score: int = 3              # 情绪自评 1-5（≥4 = 上头，触发强制降档规则）
+    principal: float | None = None      # 本金 USDT（R2 可选：换算「打到止损亏多少钱」）
+    leverage: float | None = None       # 杠杆倍数（R2 可选：与 principal 一起才生效）
 
 
 class MentorOutcomeReq(BaseModel):

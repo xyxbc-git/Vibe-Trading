@@ -218,9 +218,64 @@ fvg_ev = jtm._fvg_evidence("TESTUSDT", "30m")
 check("FVG 未就绪诚实降级", fvg_ev["available"] is False and "降级" in fvg_ev["reason"]
       or fvg_ev["available"] in (True, False))  # jarvis_fvg 已交付时也不算错
 
+# ── 23. R2 契约：items 所有展示字段必须是字符串（前端直接渲染，dict 会崩 React）──
+for probe_ev, probe_emotion in ((ev, 3), (ev5, 5), (ev15, 3), (ev10, 3), (ev14, 3)):
+    pv = jtm.verdict(probe_ev, plan_of(probe_ev, emotion=probe_emotion))
+    for it in pv["items"]:
+        if not isinstance(it["evidence"], str) or not isinstance(it["detail"], str):
+            check(f"展示字段非字符串：{it['key']}", False,
+                  f"evidence={type(it['evidence'])} detail={type(it['detail'])}")
+            break
+        if not isinstance(it["raw"], dict):
+            check(f"raw 须为 dict：{it['key']}", False, str(type(it["raw"])))
+            break
+    for fld in ("summary", "light"):
+        if not isinstance(pv[fld], str):
+            check(f"{fld} 非字符串", False, str(type(pv[fld])))
+            break
+else:
+    check("R2：全部展示字段均为字符串（evidence/detail/summary）", True)
+
+# ── 24. R2 principal/leverage：预亏换算 + 重仓 warn ──
+ev24 = ev_base()   # 止损距离 2%
+p24 = {**plan_of(ev24), "principal": 1000.0, "leverage": 10.0}   # 预亏 = 20% 本金
+vd24 = jtm.verdict(ev24, p24)
+it24 = next(i for i in vd24["items"] if i["key"] == "risk")
+check("R2 预亏人话（名义/亏损/占比）", "10,000 U" in it24["evidence"]
+      and "200.0 U" in it24["evidence"] and "20.0%" in it24["evidence"],
+      it24["evidence"][-90:])
+check("R2 预亏 20% 不触发重仓 warn", it24["level"] == "pass", it24["level"])
+
+p24h = {**plan_of(ev24), "principal": 1000.0, "leverage": 30.0}  # 预亏 = 60% 本金
+vd24h = jtm.verdict(ev24, p24h)
+it24h = next(i for i in vd24h["items"] if i["key"] == "risk")
+check("R2 预亏 60% → 重仓 warn", it24h["level"] == "warn"
+      and "重仓" in it24h["evidence"], it24h["level"])
+
+vd24n = jtm.verdict(ev24, plan_of(ev24))   # 不提供 principal
+it24n = next(i for i in vd24n["items"] if i["key"] == "risk")
+check("R2 未提供 principal 不追加换算", "本金" not in it24n["evidence"])
+
+# ── 25. R2 台账回显 principal/leverage ──
+_tmp2 = tempfile.mkdtemp(prefix="mentor_smoke2_")
+_orig_db2 = jj.DB_PATH
+try:
+    jj.DB_PATH = os.path.join(_tmp2, "t.db")
+    pid24 = jtm.save_plan(p24, vd24)
+    row = jtm.get_plan(pid24)
+    check("R2 detail 回显 principal/leverage",
+          row["principal"] == 1000.0 and row["leverage"] == 10.0)
+    lst = jtm.list_plans("TESTUSDT", 30)
+    check("R2 列表回显 principal/leverage",
+          lst[0]["principal"] == 1000.0 and lst[0]["leverage"] == 10.0)
+finally:
+    jj.DB_PATH = _orig_db2
+    import shutil as _sh
+    _sh.rmtree(_tmp2, ignore_errors=True)
+
 # ── 汇总 ──
 print()
 if fails:
     print(f"FAILED {len(fails)}: {fails}")
     raise SystemExit(1)
-print("ALL PASS（22 组 / 覆盖红线、权重、情绪、关键位、台账、信任回路）")
+print("ALL PASS（25 组 / 覆盖红线、权重、情绪、关键位、台账、信任回路、R2 字符串契约+principal）")

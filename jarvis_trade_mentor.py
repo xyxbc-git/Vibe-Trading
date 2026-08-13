@@ -282,9 +282,13 @@ def build_evidence(symbol: str, direction: str, entry: float, sl: float, tp: flo
 
 # ═══════════════════════════ 裁决核心（纯函数） ═══════════════════════════
 
-def _item(key: str, level: str, evidence: str, detail: dict | None = None) -> dict:
+def _item(key: str, level: str, evidence: str, detail: str = "",
+          raw: dict | None = None) -> dict:
+    """裁决明细项。契约（R2 热修后）：evidence/detail 是**人话字符串**（前端可
+    直接渲染）；结构化数据一律放 raw（前端不得直接当 child 渲染）。"""
     return {"key": key, "level": level, "weight": WEIGHTS.get(key, 0),
-            "evidence": evidence, "detail": detail or {}}
+            "evidence": str(evidence), "detail": str(detail or ""),
+            "raw": raw or {}}
 
 
 def _judge_trend(ev: dict, plan_dir: str) -> dict:
@@ -309,21 +313,29 @@ def _judge_trend(ev: dict, plan_dir: str) -> dict:
         wk_txt = f"；1h 威科夫 {wk.get('side')}-{wk.get('phase')} 段"
     base = (f"多周期共识{dir_cn}（加权分 {score:+.3f}，置信度 {conf:.0%}），"
             f"你的{_DIR_CN[plan_dir]}")
+    # R2 契约：detail 只放人话字符串；机器可读的方向/置信度进 raw
+    detail_txt = f"共识{dir_cn}，置信度 {conf:.0%}"
+    raw = {"direction": d, "confidence": conf}
     if d == want:
         if conf >= 0.5:
             return _item("trend", "pass", base + f"与共识同向{timing}{wk_txt}",
-                         {"direction": d, "confidence": conf})
+                         detail_txt, raw)
         return _item("trend", "warn", base + f"同向但共识置信度只有 {conf:.0%}，"
-                     f"方向证据还不扎实{timing}{wk_txt}", {"direction": d, "confidence": conf})
+                     f"方向证据还不扎实{timing}{wk_txt}", detail_txt, raw)
     if d == "neutral":
-        return _item("trend", "warn", base + f"面对的是中性市——方向暂无共识支撑{timing}{wk_txt}",
-                     {"direction": d, "confidence": conf})
+        return _item("trend", "warn",
+                     base + f"面对的是中性市——方向暂无共识支撑{timing}{wk_txt}",
+                     detail_txt, raw)
     return _item("trend", "fail", base + f"与共识**反向**{timing}{wk_txt}",
-                 {"direction": d, "confidence": conf})
+                 detail_txt, raw)
 
 
-def _judge_risk(ev: dict) -> tuple[dict, list[str]]:
-    """风险数学 + 红线否决清单（红线独立于加权，见预登记）。"""
+def _judge_risk(ev: dict, plan: dict | None = None) -> tuple[dict, list[str]]:
+    """风险数学 + 红线否决清单（红线独立于加权，见预登记）。
+
+    plan 提供 principal（本金 USDT）与 leverage 时，追加一条「打到止损亏多少、
+    占本金百分之几」的人话证据；预亏占本金 > 50% 时该项至少 warn（重仓提醒）。
+    """
     r = ev["risk"]
     rr, toll = r["rr"], r["toll_ratio"]
     vetoes: list[str] = []
@@ -334,15 +346,43 @@ def _judge_risk(ev: dict) -> tuple[dict, list[str]]:
                       + TOLL_QUOTE)
     base = (f"RR={rr:.2f}（配置门槛 {r['plan_min_rr']}），止损距离 {r['sl_dist_pct']:.3f}%，"
             f"过路费占风险预算 {toll:.1%}")
+
+    # principal/leverage 追加句（R2）：把抽象百分比翻译成用户钱包里的钱
+    sizing_txt = ""
+    heavy = False
+    principal = float((plan or {}).get("principal") or 0)
+    leverage = float((plan or {}).get("leverage") or 0)
+    if principal > 0 and leverage > 0:
+        notional = principal * leverage
+        loss_usd = notional * r["sl_dist_pct"] / 100.0
+        loss_pct_of_principal = leverage * r["sl_dist_pct"]
+        heavy = loss_pct_of_principal > 50.0
+        sizing_txt = (f"；本单名义 {notional:,.0f} U（本金 {principal:,.0f} U × "
+                      f"{leverage:g}x），打到止损预计亏 {loss_usd:,.1f} U"
+                      f"（占本金 {loss_pct_of_principal:.1f}%）")
+        if heavy:
+            sizing_txt += "——单笔风险超过本金一半，属于重仓豪赌，强烈建议缩仓"
+    detail_txt = (f"RR={rr:.2f}，toll={toll:.1%}"
+                  + (f"，预亏占本金 {leverage * r['sl_dist_pct']:.1f}%"
+                     if principal > 0 and leverage > 0 else ""))
+    raw = {**r, "principal": principal or None, "leverage": leverage or None}
+
     if vetoes:
-        return _item("risk", "fail", base + "——数学否决", dict(r)), vetoes
+        return _item("risk", "fail", base + sizing_txt + "——数学否决",
+                     detail_txt, raw), vetoes
     if rr < r["plan_min_rr"]:
-        return _item("risk", "warn", base + f"——RR 低于配置门槛 {r['plan_min_rr']}", dict(r)), []
+        return _item("risk", "warn",
+                     base + f"——RR 低于配置门槛 {r['plan_min_rr']}" + sizing_txt,
+                     detail_txt, raw), []
     if toll > TOLL_WARN:
         return _item("risk", "warn",
                      base + f"——过路费占比超过 {TOLL_WARN:.0%} 警戒档（引擎 T3 同口径），"
-                            "考虑放宽止损并同比例缩仓", dict(r)), []
-    return _item("risk", "pass", base + "——赔率与成本结构健康", dict(r)), []
+                            "考虑放宽止损并同比例缩仓" + sizing_txt,
+                     detail_txt, raw), []
+    if heavy:
+        return _item("risk", "warn", base + sizing_txt, detail_txt, raw), []
+    return _item("risk", "pass", base + "——赔率与成本结构健康" + sizing_txt,
+                 detail_txt, raw), []
 
 
 def _judge_levels(ev: dict, plan: dict) -> dict:
@@ -397,11 +437,12 @@ def _judge_levels(ev: dict, plan: dict) -> dict:
 
     if not warns and not passes:
         return _item("levels", "unavailable", "关键位证据不足以判读")
-    detail = {"warns": warns, "passes": passes}
+    detail_txt = f"警示 {len(warns)} 条 / 通过 {len(passes)} 条"
+    raw = {"warns": warns, "passes": passes}
     if warns:
         level = "warn" if passes or len(warns) == 1 else "fail"
-        return _item("levels", level, "；".join(warns + passes), detail)
-    return _item("levels", "pass", "；".join(passes), detail)
+        return _item("levels", level, "；".join(warns + passes), detail_txt, raw)
+    return _item("levels", "pass", "；".join(passes), detail_txt, raw)
 
 
 def _judge_structure(ev: dict, plan_dir: str) -> dict:
@@ -421,26 +462,29 @@ def _judge_structure(ev: dict, plan_dir: str) -> dict:
         mine = [g for g in fvg.get("gaps", []) if g.get("type") == want]
         fvg_txt = (f"；同向未回补 FVG {len(mine)} 个" if mine else "；无同向未回补 FVG")
 
+    detail_txt = (("逆势" if against else "顺势")
+                  + (f"，反转四条件 {rev_sat}/4" if rev_sat is not None else ""))
+    raw = {"against": against, "reversal": rev_sat}
     if against:
         if rev_sat is None:
             return _item("structure", "fail",
                          "计划与多周期共识反向（逆势），且反转证据引擎不可用——"
-                         "没有证据支持的逆势是赌博" + fvg_txt, {"against": True})
+                         "没有证据支持的逆势是赌博" + fvg_txt, detail_txt, raw)
         if rev_sat >= REVERSAL_MIN_SCORE:
             return _item("structure", "pass",
                          f"逆势计划但反转四条件 {rev_sat}/4 达标（{rev.get('verdict')}）"
-                         + fvg_txt, {"against": True, "reversal": rev_sat})
+                         + fvg_txt, detail_txt, raw)
         return _item("structure", "fail",
                      f"逆势计划且反转证据不足：四条件仅 {rev_sat}/4（需 ≥{REVERSAL_MIN_SCORE}），"
-                     f"缺口见反转评分明细" + fvg_txt, {"against": True, "reversal": rev_sat})
+                     f"缺口见反转评分明细" + fvg_txt, detail_txt, raw)
     if not t.get("available"):
         return _item("structure", "unavailable", "共识不可用，无法判定顺逆势" + fvg_txt)
     if rev_sat is not None and rev_sat >= REVERSAL_MIN_SCORE:
         return _item("structure", "pass",
                      f"顺势计划，另有反转四条件 {rev_sat}/4 的底部/顶部证据加持" + fvg_txt,
-                     {"against": False, "reversal": rev_sat})
+                     detail_txt, raw)
     return _item("structure", "pass", "顺势计划（与共识同向或共识中性）" + fvg_txt,
-                 {"against": False, "reversal": rev_sat})
+                 detail_txt, raw)
 
 
 def _judge_micro(ev: dict, plan: dict) -> dict:
@@ -488,7 +532,7 @@ def verdict(evidence: dict, plan: dict) -> dict:
     plan_dir = plan.get("direction", "long")
     emotion = int(plan.get("emotion_score") or 3)
 
-    risk_item, vetoes = _judge_risk(evidence)
+    risk_item, vetoes = _judge_risk(evidence, plan)
     items = [
         _judge_trend(evidence, plan_dir),
         risk_item,
@@ -601,6 +645,15 @@ def ensure_schema() -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mentor_plan_sym "
                      "ON mentor_plan(symbol, created_ts)")
+        # R2 升级列（幂等）：SQLite 重复加列抛错=已升级；jarvis_db 对 pg 自动
+        # 翻译 ADD COLUMN IF NOT EXISTS。必须放在 CREATE TABLE 之后（同
+        # twelve_trader 的教训：放前面全新库会静默缺列）。
+        for _ddl in ("ALTER TABLE mentor_plan ADD COLUMN principal REAL",
+                     "ALTER TABLE mentor_plan ADD COLUMN leverage REAL"):
+            try:
+                conn.execute(_ddl)
+            except Exception:  # noqa: BLE001 — duplicate column = 已升级过
+                pass
 
 
 def save_plan(plan: dict, vd: dict) -> int:
@@ -613,14 +666,17 @@ def save_plan(plan: dict, vd: dict) -> int:
             """
             INSERT INTO mentor_plan
               (created_ts, symbol, tf, direction, entry, stop_loss, take_profit,
-               reason, emotion_score, light, score, cooldown_until, verdict_json, status)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               reason, emotion_score, light, score, cooldown_until, verdict_json,
+               status, principal, leverage)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (now, plan["symbol"].upper(), plan.get("tf"), plan["direction"],
              float(plan["entry"]), float(plan["stop_loss"]), float(plan["take_profit"]),
              plan.get("reason"), int(plan.get("emotion_score") or 3),
              vd["light"], float(vd["score"]), cooldown_until,
-             json.dumps(vd, ensure_ascii=False, default=str), "open"))
+             json.dumps(vd, ensure_ascii=False, default=str), "open",
+             float(plan["principal"]) if plan.get("principal") else None,
+             float(plan["leverage"]) if plan.get("leverage") else None))
         rid = cur.lastrowid
     return int(rid or 0)
 
@@ -630,7 +686,8 @@ def list_plans(symbol: str | None = None, days: int = 30, limit: int = 200) -> l
     since = time.time() - days * 86400.0
     sql = ("SELECT id, created_ts, symbol, tf, direction, entry, stop_loss, take_profit, "
            "reason, emotion_score, light, score, cooldown_until, status, followed, "
-           "result, pnl_pct, note, closed_ts FROM mentor_plan WHERE created_ts >= ?")
+           "result, pnl_pct, note, closed_ts, principal, leverage "
+           "FROM mentor_plan WHERE created_ts >= ?")
     params: list = [since]
     if symbol:
         sql += " AND symbol = ?"
@@ -720,13 +777,16 @@ def main() -> int:
     p.add_argument("--tf", default="30m")
     p.add_argument("--emotion", type=int, default=3, help="情绪自评 1-5（≥4=上头）")
     p.add_argument("--reason", default="", help="下单理由（一句话）")
+    p.add_argument("--principal", type=float, default=None, help="本金 USDT（可选）")
+    p.add_argument("--leverage", type=float, default=None, help="杠杆倍数（可选）")
     p.add_argument("--save", action="store_true", help="裁决后落台账")
     args = ap.parse_args()
 
     if args.cmd == "check":
         plan = {"symbol": args.symbol.upper(), "tf": args.tf, "direction": args.direction,
                 "entry": args.entry, "stop_loss": args.sl, "take_profit": args.tp,
-                "emotion_score": args.emotion, "reason": args.reason}
+                "emotion_score": args.emotion, "reason": args.reason,
+                "principal": args.principal, "leverage": args.leverage}
         ev = build_evidence(args.symbol.upper(), args.direction, args.entry,
                             args.sl, args.tp, tf=args.tf)
         vd = verdict(ev, plan)
