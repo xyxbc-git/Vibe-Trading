@@ -4211,7 +4211,9 @@ def api_twelve_consensus(symbol: str = "BTCUSDT", closed_only: int = 0):
         # 未就绪时 status=unavailable，不影响共识主体。强背离顺带落页内提醒。
         try:
             import jarvis_seatbelt as jsb
-            delta_payload = _delta_payload(sym)
+            # [信号篇 P1-6] Delta 取证周期与共识主周期对齐（缺省 15m 会用 15m
+            # 的吸收/背离证据去确认 4h 共识，周期错配削弱安全带含金量）
+            delta_payload = _delta_payload(sym, merged.get("primary_tf") or "15m")
             merged = jsb.apply_to_consensus(merged, delta_payload)
             jsb.maybe_alert_strong_divergence(sym, delta_payload)
         except Exception:  # noqa: BLE001
