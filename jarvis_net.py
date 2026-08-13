@@ -164,6 +164,7 @@ def report_ban(url_or_host: str, until_ts: float) -> None:
         if _ban_cache.get(host, 0.0) >= until_ts:
             return
         _ban_cache[host] = until_ts
+        _probe_on_ban(host, until_ts)   # 软着陆层：连续违规计数 + 阶梯冷却
         alive = {h: t for h, t in _ban_cache.items() if t > now}
         os.makedirs(os.path.dirname(_BAN_PATH), exist_ok=True)
         tmp = _BAN_PATH + ".tmp"
@@ -175,13 +176,154 @@ def report_ban(url_or_host: str, until_ts: float) -> None:
 
 
 def banned_until(url_or_host: str) -> float:
-    """主机的封禁截止（秒级 epoch）；未封禁 / 已过期返回 0.0。"""
+    """主机的封禁截止（秒级 epoch）；未封禁 / 已过期返回 0.0。
+
+    [2026-08-13 软着陆] 硬封禁到期后不再立即全量放行：若该主机有近期封禁史
+    （net_probe.json 有 streak 记录），只放一支「探针」先试路，其余调用方拿到
+    合成截止时间继续走缓存；探针存活满确认窗才恢复常态（见 _probe_check）。
+    无封禁史 / 探针层任何异常 → 行为与旧版完全一致。
+    """
     try:
         now = time.time()
         _ban_load(now)
-        t = _ban_cache.get(_ban_key(url_or_host), 0.0)
-        return t if t > now else 0.0
+        host = _ban_key(url_or_host)
+        t = _ban_cache.get(host, 0.0)
+        if t > now:
+            return t
+        pt = _probe_check(host)
+        return pt if pt > now else 0.0
     except Exception:  # noqa: BLE001
+        return 0.0
+
+
+# ── 封禁到期软着陆（post-ban 单探针试路 + 重复封禁阶梯冷却）─────────────────
+# 背景（2026-08-13 封禁复盘取证）：封禁到期瞬间 daemon / dashboard / sync /
+# twelvesim 多进程同时恢复出网，而共享代理出口 IP 往往仍处高水位（别家流量
+# 也计入同一 IP 权重）——到期即齐发 → 立刻再 418 → 币安对惯犯阶梯加罚，
+# 实测 09:39 到期 → 09:53 再禁 → 09:55 再禁 → 10:07 直接 4 小时。
+# 本层对调用方完全透明：banned_until() 在探针窗内对非探针进程返回合成截止；
+# 探针放行后满确认窗（期间无新封禁登记）才全面恢复；探针再次撞禁则按
+# 2^n 阶梯推迟下次试路。任何异常一律回退旧行为（放行），绝不额外阻断出网。
+_PROBE_PATH = os.path.expanduser("~/.vibe-trading/net_probe.json")
+_PROBE_CONFIRM_S = 90.0     # 探针放行后无新封禁登记视为通路恢复的确认窗
+_REBAN_WINDOW_S = 1800.0    # 上次封禁结束后多久内再封算「连续违规」
+_REBAN_PAD_BASE_S = 60.0    # 连续第 2 次封禁起的阶梯附加冷却基数
+_REBAN_PAD_CAP_S = 900.0    # 阶梯附加冷却封顶（15 分钟）
+
+
+def _probe_cfg(key: str, default: float) -> float:
+    """探针参数：jarvis_config 可覆盖（键未登记/配置层异常用内置默认）。"""
+    try:
+        import jarvis_config as _jc
+        v = _jc.get(key)
+        return float(v) if v is not None else float(default)
+    except Exception:  # noqa: BLE001
+        return float(default)
+
+
+def _probe_rmw(fn):
+    """fcntl 独占锁下读改写 net_probe.json：fn(data) -> (result, changed)。
+
+    与 _budget_try 同一套多进程互斥纪律；异常上抛由调用方兜底放行。
+    """
+    import fcntl
+    os.makedirs(os.path.dirname(_PROBE_PATH), exist_ok=True)
+    with open(_PROBE_PATH, "a+", encoding="utf-8") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.seek(0)
+            txt = f.read()
+            try:
+                data = json.loads(txt) if txt.strip() else {}
+                if not isinstance(data, dict):
+                    data = {}
+            except Exception:  # noqa: BLE001 — 文件损坏视为空状态
+                data = {}
+            result, changed = fn(data)
+            if changed:
+                f.seek(0)
+                f.truncate()
+                f.write(json.dumps(data))
+                f.flush()
+            return result
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def _probe_on_ban(host: str, until_ts: float) -> None:
+    """封禁/冷却登记时同步探针状态：连续违规 streak+1，第 2 次起附加阶梯冷却。
+
+    附加冷却只延后「试路时点」（probe_at），不改 net_ban.json 的硬封禁本身——
+    对外可见的封禁截止仍以交易所回报为准，阶梯是本地自律不是伪造封禁。
+    """
+    def _upd(data: dict):
+        now = time.time()
+        rec = data.get(host) if isinstance(data.get(host), dict) else {}
+        try:
+            last_until = float(rec.get("until") or 0.0)
+            streak = int(rec.get("streak") or 0)
+        except (TypeError, ValueError):
+            last_until, streak = 0.0, 0
+        window = _probe_cfg("net_reban_window_s", _REBAN_WINDOW_S)
+        in_window = last_until > 0 and (now - last_until) < window
+        streak = streak + 1 if in_window else 1
+        pad = 0.0
+        if streak >= 2:
+            base = _probe_cfg("net_reban_pad_base_s", _REBAN_PAD_BASE_S)
+            cap = _probe_cfg("net_reban_pad_cap_s", _REBAN_PAD_CAP_S)
+            pad = min(base * (2 ** (streak - 2)), cap)
+        data[host] = {"until": float(until_ts), "streak": streak,
+                      "probe_at": float(until_ts) + pad, "lease": 0.0}
+        return None, True
+    try:
+        _probe_rmw(_upd)
+    except Exception:  # noqa: BLE001 — 探针层故障不影响封禁登记主链路
+        pass
+
+
+def _probe_check(host: str) -> float:
+    """硬封禁已过期时的探针门。返回 0=放行（常态 / 本调用方即探针）；
+    >0=合成截止时间（等试路时点 / 已有探针在路上，先走缓存）。
+
+    状态机（net_probe.json 单 host 记录）：
+      无记录 / streak≤0        → 常态放行；
+      now < probe_at           → 阶梯冷却未到试路时点，返回 probe_at；
+      lease==0                 → 本调用方领取探针资格（写 lease=now），放行；
+      lease 活跃（<确认窗）     → 返回 lease+确认窗，其余进程短路到缓存；
+      lease 满确认窗且无新登记  → 通路恢复，清记录放行（新封禁会刷新 probe_at，
+                                  走不到这一步）。
+    """
+    def _upd(data: dict):
+        rec = data.get(host)
+        if not isinstance(rec, dict):
+            return 0.0, False
+        now = time.time()
+        try:
+            streak = int(rec.get("streak") or 0)
+            probe_at = float(rec.get("probe_at") or 0.0)
+            lease = float(rec.get("lease") or 0.0)
+        except (TypeError, ValueError):
+            data.pop(host, None)
+            return 0.0, True
+        if streak <= 0:
+            data.pop(host, None)
+            return 0.0, True
+        confirm = _probe_cfg("net_probe_confirm_s", _PROBE_CONFIRM_S)
+        if lease > 0 and now - lease >= confirm:
+            data.pop(host, None)      # 探针存活满确认窗 → 通路恢复
+            return 0.0, True
+        if now < probe_at:
+            return probe_at, False
+        if lease <= 0:
+            rec["lease"] = now        # 领取探针资格：仅此一支先行试路
+            data[host] = rec
+            return 0.0, True
+        return lease + confirm, False
+    try:
+        if not os.path.exists(_PROBE_PATH):
+            return 0.0
+        return float(_probe_rmw(_upd))
+    except Exception:  # noqa: BLE001 — 探针层故障回退旧行为（放行）
         return 0.0
 
 
