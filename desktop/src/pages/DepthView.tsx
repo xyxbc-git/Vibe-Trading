@@ -280,7 +280,42 @@ interface StatusResult {
   insufficient: boolean;
   /** tooltip 详情：保留后端原句/依据（术语不进主视野但证据不丢） */
   detail: string;
+  /** U3 方向倾向：up=偏多 / down=偏空 / none=无方向（小白不知道「派发」=偏空） */
+  bias: "up" | "down" | "none";
+  /** U3 一句小白话方向解读（固定映射表，不走 LLM；样本不足为空串不显示） */
+  plain: string;
 }
+
+/** U3 状态 → 方向倾向 + 小白话解读（写死映射；徽标只表资金行为倾向非开单指令） */
+const STATUS_BIAS: Record<
+  "smash" | "pump" | "accumulate" | "distribute" | "neutral" | "chaotic",
+  { bias: "up" | "down" | "none"; plain: string }
+> = {
+  smash: {
+    bias: "down",
+    plain: "主力在主动向下抛售，短线杀跌动能强，此时接飞刀风险高",
+  },
+  pump: {
+    bias: "up",
+    plain: "主力在主动买入推价，短线上行动能强，逆势做空风险高",
+  },
+  accumulate: {
+    bias: "up",
+    plain: "主力在低位默默买入，下方承接变强，破位风险降低",
+  },
+  distribute: {
+    bias: "down",
+    plain: "主力在相对高位持续出货，短线下行压力大，追多风险高",
+  },
+  neutral: {
+    bias: "none",
+    plain: "主力资金没有明显方向动作，跟风交易缺乏依据，等信号明朗再动",
+  },
+  chaotic: {
+    bias: "none",
+    plain: "窗口内买卖方向反复翻转，此时进场容易两边挨打",
+  },
+};
 
 /** U2 状态式结论：从结构化字段合成短状态词；后端 l0_text 原句与阈值口径
  * 全部退 tooltip。纪律不变（方案 §五）：只描述盘口行为，不给方向/开单建议；
@@ -302,6 +337,8 @@ function deriveStatus(tape: TapeFlowExt, totalTrades: number): StatusResult {
       tierCn: null,
       insufficient: true,
       detail: detail || "本窗口成交笔数不足以支撑任何结论",
+      bias: "none",
+      plain: "",
     };
   }
   const tierCn = v.confidence
@@ -320,20 +357,21 @@ function deriveStatus(tape: TapeFlowExt, totalTrades: number): StatusResult {
       tierCn,
       insufficient: false,
       detail: `本窗口行为方向反复翻转，不给行为结论。\n${detail}`,
+      ...STATUS_BIAS.chaotic,
     };
   }
   const a = v.action ?? "";
   if (a.includes("砸")) {
-    return { text: "空方主导 · 砸盘", toneCls: "text-jarvis-red", dots, tierCn, insufficient: false, detail };
+    return { text: "空方主导 · 砸盘", toneCls: "text-jarvis-red", dots, tierCn, insufficient: false, detail, ...STATUS_BIAS.smash };
   }
   if (a.includes("拉")) {
-    return { text: "多方主导 · 拉盘", toneCls: "text-jarvis-green", dots, tierCn, insufficient: false, detail };
+    return { text: "多方主导 · 拉盘", toneCls: "text-jarvis-green", dots, tierCn, insufficient: false, detail, ...STATUS_BIAS.pump };
   }
   if (a.includes("吸")) {
-    return { text: "主力吸筹", toneCls: "text-sky-400", dots, tierCn, insufficient: false, detail };
+    return { text: "主力吸筹", toneCls: "text-sky-400", dots, tierCn, insufficient: false, detail, ...STATUS_BIAS.accumulate };
   }
   if (a.includes("派") || a.includes("出货")) {
-    return { text: "主力派发", toneCls: "text-orange-400", dots, tierCn, insufficient: false, detail };
+    return { text: "主力派发", toneCls: "text-orange-400", dots, tierCn, insufficient: false, detail, ...STATUS_BIAS.distribute };
   }
   // 中性/未过阈：统一观望态，绝不把小额净流当信号展示
   return {
@@ -343,8 +381,31 @@ function deriveStatus(tape: TapeFlowExt, totalTrades: number): StatusResult {
     tierCn,
     insufficient: false,
     detail: detail || "非散户净流未过主力方向判定线，视为无主力动向",
+    ...STATUS_BIAS.neutral,
   };
 }
+
+/** U3 方向徽标样式：置信 ≥2 点实底、<2 点空心（弱证据不装强信号）。 */
+function biasBadgeCls(bias: "up" | "down" | "none", dots: number): string {
+  const solid = dots >= 2;
+  if (bias === "up") {
+    return solid
+      ? "bg-jarvis-green/15 border-jarvis-green/60 text-jarvis-green"
+      : "border-jarvis-green/40 text-jarvis-green/70";
+  }
+  if (bias === "down") {
+    return solid
+      ? "bg-jarvis-red/15 border-jarvis-red/60 text-jarvis-red"
+      : "border-jarvis-red/40 text-jarvis-red/70";
+  }
+  return "border-jarvis-border text-jarvis-text-secondary";
+}
+
+const BIAS_LABEL: Record<"up" | "down" | "none", string> = {
+  up: "↑ 偏多",
+  down: "↓ 偏空",
+  none: "— 无方向",
+};
 
 /** 采集连续性脚注（保留原覆盖度诚实口径，术语收敛为一行小字） */
 function deriveCoverageNote(
@@ -678,7 +739,7 @@ function VerdictCard({
         )}
       </p>
 
-      {/* U2 状态式大字结论 + 置信度点阵：扫一眼得结论；原句与阈值口径在 tooltip */}
+      {/* U2 状态式大字结论 + U3 方向徽标 + 置信度点阵；原句与阈值口径在 tooltip */}
       <div>
         <div className="flex items-center gap-2 flex-wrap">
           <p
@@ -687,6 +748,19 @@ function VerdictCard({
           >
             {st.text}
           </p>
+          {/* U3 方向徽标：小白不知道「派发」=偏空——固定映射直给；
+              置信 <2 点空心样式（弱证据不装强信号）；tooltip 声明非开单指令 */}
+          {!st.insufficient && (
+            <span
+              className={clsx(
+                "text-[10px] px-1.5 py-0.5 rounded-full border font-medium cursor-help",
+                biasBadgeCls(st.bias, st.dots),
+              )}
+              title="这是资金行为倾向，不是开单指令；结构确认看 12 信号矩阵，开单前问导师"
+            >
+              {BIAS_LABEL[st.bias]}
+            </span>
+          )}
           {st.dots > 0 && (
             <span
               className="flex items-center gap-0.5 cursor-help"
@@ -713,6 +787,13 @@ function VerdictCard({
             问导师这单能不能做
           </button>
         </div>
+        {/* U3 小白话方向解读：一行小字固定文案（不走 LLM）；与过渡态提示行
+            （如「抛压衰减可关注企稳」）并存不打架——徽标表当前状态，提示表趋势 */}
+        {!st.insufficient && st.plain && (
+          <p className="mt-1 text-[10px] text-jarvis-text-secondary leading-snug">
+            {st.plain}
+          </p>
+        )}
       </div>
 
       {/* U2 三指标 chip：占比（带本机基线区间）/ 净流向（阈值语义）/ 大单活动 */}
