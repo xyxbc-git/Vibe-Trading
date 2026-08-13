@@ -8365,12 +8365,31 @@ def api_fvg(symbol: str = "BTCUSDT", tf: str = "15m", max_zones: int = 10):
         df = jts.fetch_klines_df(sym, iv, 300)
         if df is None or len(df) < 30:
             return {"ok": False, "reason": "K线数据不足或拉取失败",
-                    "symbol": sym, "tf": iv, "zones": []}
+                    "symbol": sym, "tf": iv, "zones": [], "structure_events": []}
         out = jfvg.detect(df, max_zones=mz)
+        # [R8追加] SMC 结构事件（BOS/CHoCH）：与 FVG 同源同参一次取数零额外出网；
+        # 附 swing_ts/break_ts（bar 开盘毫秒）供前端画被突破 swing 点→突破蜡烛的线段
+        structure_events: list = []
+        structure_dir = None
+        try:
+            import jarvis_smc_structure as jsmc
+            st = jsmc.detect_structure(df)
+            times = df["time"]
+            structure_events = [
+                {**e,
+                 "swing_ts": int(times.iloc[e["swing_i"]]),
+                 "break_ts": int(times.iloc[e["break_i"]])}
+                for e in st.get("events") or []
+            ]
+            structure_dir = st.get("direction")
+        except Exception:  # noqa: BLE001 — 结构层失败不拖垮 FVG 主体
+            structure_events, structure_dir = [], None
         return {"ok": bool(out.get("ok")), "reason": out.get("reason"),
                 "symbol": sym, "tf": iv, "as_of": time.time(),
                 "price": out.get("price"), "atr": out.get("atr"),
-                "zones": _fvg_zones_with_ts(df, out.get("zones") or [])}
+                "zones": _fvg_zones_with_ts(df, out.get("zones") or []),
+                "structure_events": structure_events,
+                "structure_direction": structure_dir}
 
     return JSONResponse(_cached(f"fvg:{sym}:{iv}:{mz}", 60, _calc))
 
