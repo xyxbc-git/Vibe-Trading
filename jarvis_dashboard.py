@@ -706,8 +706,14 @@ def api_config_center_get():
         if k in jc_mod.ENUMS:
             item["enum"] = list(jc_mod.ENUMS[k])
         meta_fields[k] = item
+    # 组清单从 jarvis_config 动态取（曾硬编码六组名，T1 新增的 sim 组在
+    # Settings 不可见）：GROUP_COMMENTS 定义序为展示序，GROUPS 中出现但
+    # 未写注释的组补在末尾兜底，新增组无需再改本端点。
+    group_names = list(jc_mod.GROUP_COMMENTS)
+    group_names += sorted({g for g in jc_mod.GROUPS.values()
+                           if g not in jc_mod.GROUP_COMMENTS})
     return JSONResponse({
-        "groups": {g: grouped.get(g, {}) for g in ("trading", "risk", "signal", "data", "notify", "system")},
+        "groups": {g: grouped.get(g, {}) for g in group_names},
         "group_comments": jc_mod.GROUP_COMMENTS,
         "fields": meta_fields,
         "meta": cfg.get("meta", {}),
