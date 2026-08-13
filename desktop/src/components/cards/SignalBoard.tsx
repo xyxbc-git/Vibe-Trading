@@ -989,6 +989,7 @@ export default function SignalBoard({ symbol, tf, onTfChange }: SignalBoardProps
         return;
       }
       wrTimer.current = window.setInterval(async () => {
+        if (document.hidden) return; // 后台标签不查进度，回前台下一 tick 恢复
         try {
           const st = await api.twelveSignalWinrateStatus();
           if (st.running) {

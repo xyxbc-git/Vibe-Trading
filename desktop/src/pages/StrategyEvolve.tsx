@@ -147,7 +147,9 @@ export default function StrategyEvolve() {
       }
     };
     poll();
-    timer = setInterval(poll, 3000);
+    timer = setInterval(() => {
+      if (!document.hidden) void poll(); // 后台标签不打接口，回前台下一 tick 恢复
+    }, 3000);
     return () => {
       if (timer) clearInterval(timer);
     };

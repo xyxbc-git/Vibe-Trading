@@ -53,6 +53,7 @@ export default function Terminal() {
     const startPolling = () => {
       if (pollTimer) return;
       pollTimer = setInterval(async () => {
+        if (document.hidden) return; // 后台标签不打接口，回前台下一 tick 恢复
         try {
           const res = await api.logs(MAX_LINES);
           if (cancelled) return;

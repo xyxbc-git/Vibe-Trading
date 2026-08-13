@@ -184,6 +184,7 @@ export default function SignalWinRate() {
         return;
       }
       pollTimer.current = window.setInterval(async () => {
+        if (document.hidden) return; // 后台标签不查进度，回前台下一 tick 恢复
         try {
           const st = await api.get<ReplayStatus>("/twelve/replay/status");
           if (st.running) {
