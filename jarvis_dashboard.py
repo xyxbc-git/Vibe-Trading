@@ -5415,13 +5415,15 @@ def api_twelve_attribution(days: int = 7, dim: str | None = None):
             "rejected": rejected,
             "amplitude": amplitude,
             # T7 零成交诊断：「12 套」为注册数，真实成交套数见 traded——
-            # volatility/martingale/arbitrage 设计上恒 neutral（结构性零成交），
-            # gann 方向信号无点位被静默跳过、gap 在成交标的上无方向信号。
+            # volatility/martingale/arbitrage 设计上恒 neutral（结构性零成交）；
+            # gann 诊断时方向信号无点位被静默跳过，信号篇 P2-5 起已降级恒
+            # neutral；gap 在成交标的上无方向信号（缺口条件几乎不满足）。
             # 启停显式标记 jarvis_config.twelve_system_enabled（0=不产生方向信号）。
             "systems_note": {
                 "registered": len(jtt.SYSTEMS),
                 "traded": len({c["system"] for c in cells}),
                 "always_neutral": ["volatility", "martingale", "arbitrage"],
+                "direction_downgraded": ["gann"],
                 "enabled_map": jc_mod.get("twelve_system_enabled") or {},
                 "note": "「12 套」为注册口径；本窗口真实成交套数见 traded，"
                         "零成交根因见开发计划 §T7 与 twelve_system_enabled 注释",

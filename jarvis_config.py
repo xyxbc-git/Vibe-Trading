@@ -321,18 +321,20 @@ DEFAULTS: dict = {
     # ── T7 零成交体系处置（2026-08-13 正期望重建：12 套实为 7 套）────────────
     # 诊断结论（一句话+行号，全文见开发计划 §T7）：12 套注册仅 7 套真正成交过。
     #   volatility / martingale / arbitrage —— 设计上恒 neutral 不产生方向信号
-    #   （jarvis_twelve_systems.py:334-340 / :646-662 / :780-821），trader 对
-    #   neutral 恒跳过（jarvis_twelve_trader.py:2322）→ 结构性零成交，标 0；
-    #   gann —— 方向信号不带 trade_plan（jarvis_twelve_systems.py:366-375）且槽位
-    #   无 SL/TP 配置，_resolve_entry_params 返回 None 被静默跳过
-    #   （jarvis_twelve_trader.py:942/2356）→ 实现缺陷零成交，修复前保持 1；
-    #   gap —— 成交标的 ETHUSDT 上方向信号为零（缺口条件在高流动性币上不满足，
-    #   jarvis_twelve_systems.py:603-613）→ 信号侧零输入，保持 1。
-    # 0=设计上不产生方向信号（恒 neutral，非人工停用）；1=参与成交层。
+    #   （jarvis_twelve_systems.py 各返回分支），trader 对 neutral 恒跳过
+    #   （jarvis_twelve_trader.py:2322）→ 结构性零成交，标 0；
+    #   gann —— 诊断时：方向信号不带 trade_plan 且槽位无 SL/TP 配置，
+    #   _resolve_entry_params 返回 None 被静默跳过（jarvis_twelve_trader.py:942）；
+    #   信号篇 P2-5（2026-08-13）已把时间窗方向降级恒 neutral（方向证据薄弱），
+    #   此后与上面三套同为结构性零成交 → 标 0；
+    #   gap —— 成交标的 ETHUSDT 上方向信号为零（缺口条件在高流动性币上几乎
+    #   不满足，jarvis_twelve_systems.py signal_gap 缺口判定）→ 信号侧零输入，
+    #   体系本身具方向能力，保持 1。
+    # 0=设计上/降级后不产生方向信号（恒 neutral，非人工停用）；1=参与成交层。
     # 本键为 T7 的「配置显式标记」+ 界面「12 套」口径的真实数字依据；
     # 交易引擎按本键硬禁用的接线归 trader 侧任务，此处先落口径。
     "twelve_system_enabled": {
-        "turtle": 1, "dow": 1, "elliott": 1, "volatility": 0, "gann": 1,
+        "turtle": 1, "dow": 1, "elliott": 1, "volatility": 0, "gann": 0,
         "chanlun": 1, "rule123": 1, "gap": 1, "martingale": 0,
         "oscillator": 1, "triple_rsi": 1, "arbitrage": 0},
 }
