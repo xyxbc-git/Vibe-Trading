@@ -307,15 +307,28 @@ function WinRateLine({
       </p>
     );
   }
+  // [信号篇 P0-3] 有净口径字段（扣双边手续费+触 SL 滑点）优先展示净值；
+  // 旧回测缓存无这批字段 → 照旧展示毛口径，绝不砸渲染
+  const isNet = grade.win_rate_net_pct != null;
+  const rate = grade.win_rate_net_pct ?? grade.win_rate_pct;
+  const payoff = (isNet ? grade.payoff_ratio_net : undefined) ?? grade.payoff_ratio;
+  const expectancy = (isNet ? grade.expectancy_net_pct : undefined) ?? grade.expectancy_pct;
   return (
     <div className="mt-1">
       <p className="text-[10px] font-mono flex items-center gap-1 flex-wrap">
-        <span className={winRateColor(grade.win_rate_pct)}>
-          近 {grade.trades} 次胜率 {grade.win_rate_pct.toFixed(0)}%
+        <span
+          className={clsx(winRateColor(rate), isNet && "cursor-help")}
+          title={
+            isNet
+              ? `净口径：已扣双边手续费+触及止损的滑点（毛胜率 ${grade.win_rate_pct.toFixed(0)}%）`
+              : undefined
+          }
+        >
+          近 {grade.trades} 次胜率 {rate.toFixed(0)}%{isNet && "（净）"}
         </span>
-        {grade.payoff_ratio != null && (
+        {payoff != null && (
           <span className="text-jarvis-text-secondary">
-            · 盈亏比 {grade.payoff_ratio.toFixed(1)}
+            · 盈亏比 {payoff.toFixed(1)}
           </span>
         )}
         {grade.low_sample && (
@@ -353,10 +366,10 @@ function WinRateLine({
       </p>
       {expanded && (
         <p className="text-[10px] font-mono text-jarvis-text-secondary mt-0.5">
-          期望{" "}
-          <span className={grade.expectancy_pct >= 0 ? "text-jarvis-green" : "text-jarvis-red"}>
-            {grade.expectancy_pct >= 0 ? "+" : ""}
-            {grade.expectancy_pct.toFixed(2)}%
+          期望{isNet && "（净）"}{" "}
+          <span className={expectancy >= 0 ? "text-jarvis-green" : "text-jarvis-red"}>
+            {expectancy >= 0 ? "+" : ""}
+            {expectancy.toFixed(2)}%
           </span>
           /笔 · 最大回撤{" "}
           <span className="text-jarvis-red">{grade.max_drawdown_pct.toFixed(1)}%</span>
@@ -1234,7 +1247,11 @@ export default function SignalBoard({ symbol, tf, onTfChange }: SignalBoardProps
             {winrate ? (
               <>
                 历史胜率口径：信号方向翻转当根收盘价入场，{winrate.horizon_bars} 根内先触
-                止损/止盈定输赢（无计划按期末收盘），同根双触保守计亏；共{" "}
+                止损/止盈定输赢（无计划按期末收盘），同根双触保守计亏
+                {winrate.friction
+                  ? `；净值已扣双边手续费 ${winrate.friction.fee_pct}%×2${winrate.friction.slip_pct ? ` + 触损滑点 ${winrate.friction.slip_pct}%` : ""}`
+                  : ""}
+                ；共{" "}
                 {winrate.samples} 个样本
                 {winrate.days ? `（近 ${winrate.days} 天）` : ""}
                 ，样本 &lt;30 的分组带「样本不足」徽标。点信号格可展开触发原因与适用周期；点「盈损点」跳

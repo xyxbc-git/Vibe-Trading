@@ -2329,6 +2329,10 @@ export interface SignalGradeStats {
   avg_bars_held: number;
   /** 样本 <30，统计置信度低 */
   low_sample: boolean;
+  /** 净口径（扣双边手续费+触 SL 滑点，[信号篇 P0-3]）；旧回测缓存无这批字段 */
+  win_rate_net_pct?: number;
+  payoff_ratio_net?: number | null;
+  expectancy_net_pct?: number;
 }
 
 export interface SignalWinrateStats {
@@ -2345,6 +2349,8 @@ export interface SignalWinrateStats {
   >;
   directions: { long: SignalGradeStats | null; short: SignalGradeStats | null };
   computed_at: number;
+  /** 摩擦口径回显（净字段的扣费参数）；旧回测缓存无此字段 */
+  friction?: { fee_pct: number; slip_pct: number };
   error?: string;
 }
 
