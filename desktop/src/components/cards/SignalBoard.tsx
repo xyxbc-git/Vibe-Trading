@@ -148,6 +148,73 @@ export function ChaseWarning({
   );
 }
 
+/**
+ * [任务S追加] 计划触发状态（纯前端展示层判定，后端/引擎零改动）：
+ * waiting=等待触发（结构化入场是挂单语义，等价格来找你，不等于现价下单）；
+ * near=接近触发（距入场 ≤0.15%）；passed=已越过（现价朝止盈方向偏离入场 ≥1%
+ * 或已达 TP——挂单大概率追不回来，按旧点位下单容易接错）。
+ * 引擎计划不携带 ATR（jarvis_twelve_systems 只读红线），阈值用入场价百分比近似。
+ */
+export function planTriggerState(
+  plan: { entry?: number; take_profit?: number },
+  side: "long" | "short" | null,
+  price: number | null | undefined,
+): { kind: "waiting" | "near" | "passed"; distPct: number } | null {
+  const entry = Number(plan.entry);
+  const tp = Number(plan.take_profit);
+  const p = Number(price);
+  if (side == null || ![entry, p].every((v) => Number.isFinite(v) && v > 0)) return null;
+  // 带符号距离：正 = 现价高于入场价
+  const distPct = ((p - entry) / entry) * 100;
+  const towardTp = side === "long" ? distPct : -distPct; // 正 = 朝止盈方向偏离
+  const tpReached = Number.isFinite(tp) && tp > 0 && (side === "long" ? p >= tp : p <= tp);
+  if (tpReached || towardTp >= 1) return { kind: "passed", distPct };
+  if (Math.abs(distPct) <= 0.15) return { kind: "near", distPct };
+  return { kind: "waiting", distPct };
+}
+
+/** 触发状态徽标（含现价与入场位的实时距离，管理「推荐价≠现价」的预期） */
+function TriggerStateBadge({
+  state,
+  size = "sm",
+}: {
+  state: { kind: "waiting" | "near" | "passed"; distPct: number } | null;
+  size?: "sm" | "md";
+}) {
+  if (state == null) return null;
+  const dist = `现价${state.distPct >= 0 ? "高于" : "低于"}入场 ${Math.abs(state.distPct).toFixed(2)}%`;
+  const cls = size === "md" ? "text-[10px] px-1.5 py-0.5" : "text-[9px] px-1 py-px";
+  if (state.kind === "passed") {
+    return (
+      <span
+        className={clsx("inline-flex items-center gap-0.5 rounded bg-jarvis-yellow/20 text-jarvis-yellow whitespace-nowrap cursor-help", cls)}
+        title={`${dist}：价格已朝止盈方向越过入场位（或已达目标位），这份挂单计划大概率追不回来了——请勿按旧点位下单，等信号下轮刷新`}
+      >
+        <AlertTriangle size={size === "md" ? 10 : 9} />
+        已越过，可能失效
+      </span>
+    );
+  }
+  if (state.kind === "near") {
+    return (
+      <span
+        className={clsx("inline-flex items-center gap-0.5 rounded bg-jarvis-blue/20 text-jarvis-blue whitespace-nowrap cursor-help", cls)}
+        title={`${dist}：价格正在接近计划入场位，若继续靠近即可能触发挂单条件`}
+      >
+        接近触发 {Math.abs(state.distPct).toFixed(2)}%
+      </span>
+    );
+  }
+  return (
+    <span
+      className={clsx("inline-flex items-center gap-0.5 rounded bg-jarvis-bg text-jarvis-text-secondary whitespace-nowrap cursor-help", cls)}
+      title={`${dist}：结构化入场是「挂单」语义（回踩/突破到位才成交），推荐价本就不等于现价——等价格来找你，不要按现价追`}
+    >
+      等待触发 · 距入场 {Math.abs(state.distPct).toFixed(2)}%
+    </span>
+  );
+}
+
 /** 方向徽章与信号卡涨跌标签矛盾时的黄色警示（理论不应发生，出现=后端数据异常） */
 function MismatchWarn() {
   return (
@@ -194,7 +261,7 @@ function SignalTimeLine({
       {updatedAt != null && (
         <span
           className="inline-flex items-center gap-0.5 cursor-help"
-          title={`最近一次信号计算：${clockTime(updatedAt)}`}
+          title={`最近一次信号计算：${clockTime(updatedAt)}。刷新节奏：信号引擎 60~120s 缓存 + 前端 60s 轮询，显示「几分钟前」属正常延迟（防封禁不加频），不代表信号失效`}
         >
           <Clock size={8} />
           更新 {relTime(updatedAt)}
@@ -499,29 +566,42 @@ function ZoneChartEntry({
   );
 }
 
-/** 折叠态：多空徽章 + 入场/止损/止盈紧凑 chips 一行 */
+/** 折叠态：多空徽章 + 入场方式/触发状态 + 入场/止损/止盈紧凑 chips */
 function PlanChips({
   plan,
   mismatch,
+  price,
   onShowZone,
 }: {
   plan: SignalTradePlan;
   mismatch: boolean;
+  /** 当前现价（触发状态/距离判定）；缺失时不判定 */
+  price?: number | null;
   /** 跳 K 线图画多空区间图；计划方向不可判定时不传（不显示入口） */
   onShowZone?: () => void;
 }) {
   const side = planSide(plan);
+  const trig = planTriggerState(plan, side, price);
+  const passed = trig?.kind === "passed";
   return (
     <div className="flex flex-wrap items-center gap-1 mt-1.5">
       <SideBadge side={side} size="sm" />
       {mismatch && <MismatchWarn />}
-      <span className="text-[10px] px-1.5 py-0.5 rounded bg-jarvis-blue/10 text-jarvis-blue font-mono">
+      {/* 入场方式徽标：回踩/突破=挂单语义，推荐价≠现价是设计意图 */}
+      <span
+        className="text-[9px] px-1 py-px rounded bg-jarvis-bg text-jarvis-text-secondary whitespace-nowrap cursor-help"
+        title="入场方式：回踩/突破类计划是「挂单」——等价格走到入场位才成交，不是按现价立即下单"
+      >
+        {entryTypeCn(plan.entry_type, side)}
+      </span>
+      <TriggerStateBadge state={trig} />
+      <span className={clsx("text-[10px] px-1.5 py-0.5 rounded bg-jarvis-blue/10 text-jarvis-blue font-mono", passed && "opacity-50 line-through")}>
         入 {formatPrice(plan.entry)}
       </span>
-      <span className="text-[10px] px-1.5 py-0.5 rounded bg-jarvis-red/10 text-jarvis-red font-mono">
+      <span className={clsx("text-[10px] px-1.5 py-0.5 rounded bg-jarvis-red/10 text-jarvis-red font-mono", passed && "opacity-50 line-through")}>
         损 {formatPrice(plan.stop_loss)}
       </span>
-      <span className="text-[10px] px-1.5 py-0.5 rounded bg-jarvis-green/10 text-jarvis-green font-mono">
+      <span className={clsx("text-[10px] px-1.5 py-0.5 rounded bg-jarvis-green/10 text-jarvis-green font-mono", passed && "opacity-50 line-through")}>
         盈 {formatPrice(plan.take_profit)}
       </span>
       {onShowZone && <ZoneChartEntry onShowZone={onShowZone} />}
@@ -544,15 +624,21 @@ function PlanDetail({
   onShowZone?: () => void;
 }) {
   const side = planSide(plan);
+  const trig = planTriggerState(plan, side, price);
+  const passed = trig?.kind === "passed";
   return (
     <div className="mt-2 pt-2 border-t border-jarvis-border/60 space-y-1.5">
       <div className="flex items-center justify-between gap-1 flex-wrap">
         <span className="flex items-center gap-1.5">
           <SideBadge side={side} />
           {mismatch && <MismatchWarn />}
-          <span className="text-[10px] text-jarvis-text-secondary">
+          <span
+            className="text-[10px] text-jarvis-text-secondary cursor-help"
+            title="入场方式：回踩/突破类计划是「挂单」——等价格走到入场位才成交，不是按现价立即下单"
+          >
             {entryTypeCn(plan.entry_type, side)}
           </span>
+          <TriggerStateBadge state={trig} size="md" />
         </span>
         <span className="flex items-center gap-1.5">
           {onShowZone && <ZoneChartEntry onShowZone={onShowZone} size="md" />}
@@ -564,22 +650,23 @@ function PlanDetail({
           {planSummary(side, plan.entry_type, plan.entry, plan.stop_loss, plan.take_profit)}
         </p>
       )}
-      <ChaseWarning side={side} price={price} entryLo={plan.entry} />
+      {/* 已越过时用触发状态徽标示警，追高警示不再重复出现 */}
+      {!passed && <ChaseWarning side={side} price={price} entryLo={plan.entry} />}
 
-      <div className="grid grid-cols-3 gap-1 text-[11px] font-mono">
+      <div className={clsx("grid grid-cols-3 gap-1 text-[11px] font-mono", passed && "opacity-50")}>
         <div>
           <p className="text-jarvis-text-secondary text-[9px]">入场</p>
-          <p className="text-jarvis-text">{formatPrice(plan.entry)}</p>
+          <p className={clsx("text-jarvis-text", passed && "line-through")}>{formatPrice(plan.entry)}</p>
         </div>
         <div>
           <p className="text-jarvis-text-secondary text-[9px]">
             止损{side === "short" ? "（涨破离场）" : side === "long" ? "（跌破离场）" : ""}
           </p>
-          <p className="text-jarvis-red">{formatPrice(plan.stop_loss)}</p>
+          <p className={clsx("text-jarvis-red", passed && "line-through")}>{formatPrice(plan.stop_loss)}</p>
         </div>
         <div>
           <p className="text-jarvis-text-secondary text-[9px]">止盈</p>
-          <p className="text-jarvis-green">{formatPrice(plan.take_profit)}</p>
+          <p className={clsx("text-jarvis-green", passed && "line-through")}>{formatPrice(plan.take_profit)}</p>
         </div>
       </div>
       {plan.note && (
@@ -817,7 +904,7 @@ function SignalCell({
           return open ? (
             <PlanDetail plan={plan} mismatch={mismatch} price={price} onShowZone={showZone} />
           ) : (
-            <PlanChips plan={plan} mismatch={mismatch} onShowZone={showZone} />
+            <PlanChips plan={plan} mismatch={mismatch} price={price} onShowZone={showZone} />
           );
         })()}
 
