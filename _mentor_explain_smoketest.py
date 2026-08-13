@@ -156,6 +156,74 @@ with tempfile.TemporaryDirectory() as tmpd:
     finally:
         jme.PROFILE_DIR = _orig_dir
 
+# ── 8. [R3] 返空重试 + 本地解读三级降级（注入假 chat_stream，全离线） ────
+from jarvis_llm_config import LLMCallError  # noqa: E402
+
+
+def _mk_fn(script: list, calls: list):
+    """script[i] = 第 i 次调用行为：list[str]=逐段输出 / Exception=首包前抛错。"""
+    def fn(messages, **kw):
+        i = len(calls)
+        calls.append({"messages": messages, "kw": kw})
+        behavior = script[min(i, len(script) - 1)]
+        if isinstance(behavior, Exception):
+            raise behavior
+        yield from behavior
+    return fn
+
+
+_SB = jme.sample_bundle()
+_PROFILE = "# X\n\n## 我的纪律\n- 单笔风险 ≤ 1%\n- 不逆势加仓\n"
+
+# 8a 正常：一次出内容，不重试不加注
+c1: list = []
+out1 = "".join(jme.stream_explanation(_SB, profile_md=_PROFILE,
+                                      chat_stream_fn=_mk_fn([["你好", "答案"]], c1)))
+check("R3-a 正常路径直通（1 次调用，无降级提示）",
+      out1 == "你好答案" and len(c1) == 1 and "本地解读" not in out1, out1[:80])
+
+# 8b 首次返空 → 精简 prompt + max_tokens=2000 重试成功
+c2: list = []
+out2 = "".join(jme.stream_explanation(_SB, profile_md=_PROFILE,
+                                      chat_stream_fn=_mk_fn([[], ["精简答案OK"]], c2)))
+check("R3-b 返空自动重试且带提示", "首次返回为空" in out2 and "精简答案OK" in out2
+      and len(c2) == 2, out2[:120])
+check("R3-b 重试用精简 prompt + 显式 2000 预算",
+      c2[1]["kw"].get("max_tokens") == jme.RETRY_MAX_TOKENS
+      and c2[1]["messages"][0]["content"] == jme.MENTOR_SYS_LITE
+      and len(c2[1]["messages"][1]["content"]) < len(c2[0]["messages"][1]["content"]),
+      str(c2[1]["kw"]))
+
+# 8c 两次都空 → 本地解读兜底（标注 + 灯色 + 逐条证据 + 免责）
+c3: list = []
+out3 = "".join(jme.stream_explanation(_SB, profile_md=_PROFILE,
+                                      chat_stream_fn=_mk_fn([[], []], c3)))
+check("R3-c 仍空降级本地解读", "已降级本地解读" in out3 and "本地解读，AI 暂不可用" in out3
+      and len(c3) == 2, out3[:150])
+check("R3-c 本地解读含灯色/硬红线/纪律对照/免责",
+      "红灯" in out3 and "一票否决" in out3 and "不逆势加仓" in out3
+      and "不构成投资建议" in out3, out3[-120:])
+
+# 8d 首包前调用失败 → 直接本地解读（错误文案带原因）
+c4: list = []
+out4 = "".join(jme.stream_explanation(_SB, profile_md=_PROFILE,
+                                      chat_stream_fn=_mk_fn([LLMCallError("HTTP 500: boom")], c4)))
+check("R3-d 调用失败降级本地并带原因", "AI 调用失败" in out4 and "HTTP 500" in out4
+      and "本地解读，AI 暂不可用" in out4 and len(c4) == 1, out4[:150])
+
+# 8e 精简消息：证据按 fail 优先排序、≤5 条、纪律入载荷
+lite = jme.build_messages_lite(_SB, profile_md=_PROFILE)
+_ld = json.loads(lite[1]["content"])
+check("R3-e lite 载荷骨架（checks≤5 且 fail 优先）",
+      len(_ld["verdict"]["checks"]) <= 5
+      and _ld["verdict"]["checks"][0]["level"] == "fail"
+      and _ld["verdict"]["light"] == "red"
+      and "单笔风险" in _ld["discipline"], str(_ld["verdict"]["checks"][0]))
+
+# 8f 本地解读：坏输入不抛出
+check("R3-f 本地解读坏输入兜底", "本地解读" in jme.local_explanation({})
+      and "不构成投资建议" in jme.local_explanation(None))
+
 # ── 7. dashboard 可导入且解释路由已注册 ─────────────────────────────────
 try:
     import jarvis_dashboard as jd

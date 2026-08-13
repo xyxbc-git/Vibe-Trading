@@ -8187,7 +8187,7 @@ def api_mentor_explain_stream(data: dict | None = None):
                              "message": "未配置 AI（LLM API Key），请到「设置」页配置后再用导师解读"})
 
     try:
-        messages = jme.build_messages(bundle)
+        jme.build_messages(bundle)   # 预检：证据包可组装（畸形直接 bad_bundle，不进流）
     except Exception as exc:  # noqa: BLE001 — 证据包畸形不 500，讲清原因
         return JSONResponse({"ok": False, "code": "bad_bundle",
                              "message": f"证据包解析失败：{repr(exc)[:160]}"})
@@ -8196,23 +8196,22 @@ def api_mentor_explain_stream(data: dict | None = None):
         return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
 
     def gen():
+        # [R3] 三级降级流水线移入 jarvis_mentor_explain.stream_explanation：
+        # 全量 prompt → 返空自动精简重试（混合推理模型思考烧光输出预算的根因修复）
+        # → 本地规则解读兜底；端点恒有内容输出，导师体验不因 LLM 抽风而断。
         try:
-            stream = jlc.chat_stream(messages, timeout=90, module="mentor_explain")
             yield _sse({"type": "meta", "engine": "llm", "model": cfg.get("model"),
                         "plan_id": bundle.get("id") or bundle.get("plan_id"),
                         "light": (bundle.get("verdict") or {}).get("light")
                         or bundle.get("light")})
-            got_any = False
-            for delta in stream:
-                got_any = True
+            for delta in jme.stream_explanation(bundle):
                 yield _sse({"type": "delta", "content": delta})
-            if not got_any:
-                yield _sse({"type": "delta", "content": "模型没有返回内容，请稍后重试。"})
             yield _sse({"type": "done"})
-        except (jlc.LLMNotConfigured, jlc.LLMCallError) as exc:
-            _log_emit(f"mentor-explain LLM 失败: {exc}", "warn", "ask")
-            yield _sse({"type": "error", "message": f"AI 调用失败：{str(exc)[:160]}，稍后重试"})
-        except Exception as exc:  # noqa: BLE001 — 流中断兜底，已推送内容仍有效
+        except jlc.LLMNotConfigured:
+            yield _sse({"type": "error",
+                        "message": "未配置 AI（LLM API Key），请到「设置」页配置"})
+        except (jlc.LLMCallError, Exception) as exc:  # noqa: BLE001 — 流中断兜底
+            _log_emit(f"mentor-explain 流中断: {exc}", "warn", "ask")
             yield _sse({"type": "error", "message": f"解读中断：{repr(exc)[:120]}"})
 
     return StreamingResponse(

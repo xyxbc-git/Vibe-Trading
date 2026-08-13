@@ -293,8 +293,32 @@ MENTOR_SYS = (
     f"emotion_score ≥ {EMOTION_HOT_SCORE}（1-5 自评，≥{EMOTION_HOT_SCORE}=上头）时"
     "第 1 段先用一两句话共情（认可亏损/焦虑的感受），再讲规则，语气坚定但不训斥；"
     "不要复述 JSON 字段名，说人话。\n"
+    "思考过程尽量精简，把输出预算留给正式回答（这是流式教学场景，答案本体优先）。\n"
     "结尾固定输出一行：「以上为交易纪律教学，不构成投资建议。」"
 )
+
+# [R3] 返空重试用精简版：混合推理模型（deepseek-v4-flash 等）思考 token 走
+# reasoning_content 且计入 max_tokens——全量档案+全部证据会诱发长思考，把
+# 用户设置的输出预算（默认 900）整个烧光，正式回答一个字都没开始
+# （实测 finish_reason=length、content 0 块）。精简版只保留裁决骨架。
+MENTOR_SYS_LITE = (
+    "你是情绪风控导师，对象是新手。输入是下单计划的系统裁决摘要"
+    "（light: green=可执行/yellow=有硬伤/red=建议放弃；checks 逐条证据，"
+    "pass=false 为不过关项；discipline 是用户自己写的纪律）。\n"
+    "直接输出 Markdown 答案（不要长篇思考），200~350 字：\n"
+    "1. 灯色结论一句话（以输入为准不改判）\n"
+    "2. 逐条把 checks 翻译成人话（不过关项一条不许漏）\n"
+    "3. 对照 discipline 指出违反/符合的条目\n"
+    "4. 若坚持要开需先满足的具体条件\n"
+    "只引用输入里的数字与事实，不编造；结尾固定一行："
+    "「以上为交易纪律教学，不构成投资建议。」"
+)
+
+RETRY_MAX_TOKENS = 2000     # 重试档显式输出预算（钳制区间 100~8000 内）
+_LITE_MAX_CHECKS = 5        # 精简证据条数上限
+_LITE_EVIDENCE_CHARS = 100  # 单条证据截断长度
+_LITE_REASON_CHARS = 120    # 用户理由截断长度
+_LITE_DISCIPLINE_CHARS = 400
 
 
 def build_messages(bundle: dict, profile_md: str | None = None) -> list[dict]:
@@ -315,3 +339,205 @@ def build_messages(bundle: dict, profile_md: str | None = None) -> list[dict]:
         {"role": "user", "content": json.dumps(digest, ensure_ascii=False,
                                                default=str)},
     ]
+
+
+# ─────────────────────────── [R3] 返空重试 + 本地解读兜底 ───────────────────────────
+
+def _resolve_profile(bundle: dict, profile_md: str | None) -> str:
+    if profile_md is not None:
+        return profile_md
+    symbol = (bundle or {}).get("symbol") or "UNKNOWN"
+    md = load_profile(symbol)
+    return md if md is not None else ensure_profile(symbol)["content"]
+
+
+def _discipline_lines(profile_md: str | None) -> list[str]:
+    """从档案提取「## 我的纪律」区段的条目行（无档案/无区段返回空表）。"""
+    if not profile_md:
+        return []
+    lines, hit = [], False
+    for ln in profile_md.splitlines():
+        if ln.strip().startswith("## "):
+            hit = ln.strip() == "## 我的纪律"
+            continue
+        if hit and ln.strip().startswith("-"):
+            lines.append(ln.strip())
+    return lines
+
+
+_LEVEL_RANK = {"fail": 0, "warn": 1, "unavailable": 2, "pass": 3}
+
+
+def build_messages_lite(bundle: dict, profile_md: str | None = None) -> list[dict]:
+    """精简版 messages（返空重试档）：只带裁决骨架，把推理负担降下来。
+
+    内容：计划要点 + verdict 的 light/score/summary/vetoes + 按 fail→warn→
+    unavailable→pass 排序的前 5 条证据（每条截 100 字）+ 档案「我的纪律」条目
+    （截 400 字）。目标是让混合推理模型的思考远短于输出预算。
+    """
+    b = bundle or {}
+    profile_md = _resolve_profile(b, profile_md)
+    vd = b.get("verdict") or {}
+    items = sorted([it for it in (vd.get("items") or []) if isinstance(it, dict)],
+                   key=lambda it: _LEVEL_RANK.get(it.get("level"), 9))
+    checks = [{"name": it.get("key"), "level": it.get("level"),
+               "evidence": str(it.get("evidence") or "")[:_LITE_EVIDENCE_CHARS]}
+              for it in items[:_LITE_MAX_CHECKS]]
+    digest = {
+        "symbol": _safe_symbol(b.get("symbol") or "UNKNOWN"),
+        "plan": {k: b.get(k) for k in ("direction", "entry", "stop_loss",
+                                       "take_profit", "tf", "emotion_score")},
+        "reason": str(b.get("reason") or "")[:_LITE_REASON_CHARS],
+        "verdict": {"light": vd.get("light") or b.get("light"),
+                    "score": vd.get("score", b.get("score")),
+                    "summary": vd.get("summary"),
+                    "vetoes": vd.get("vetoes") or [],
+                    "cooldown_min": vd.get("cooldown_min") or 0,
+                    "checks": checks},
+        "discipline": "\n".join(_discipline_lines(profile_md))[:_LITE_DISCIPLINE_CHARS],
+    }
+    return [
+        {"role": "system", "content": MENTOR_SYS_LITE},
+        {"role": "user", "content": json.dumps(digest, ensure_ascii=False,
+                                               default=str)},
+    ]
+
+
+_LIGHT_CN = {"green": "🟢 绿灯：证据结构成立，可按计划执行",
+             "yellow": "🟡 黄灯：有硬伤未解决，建议缩仓一半或等待确认",
+             "red": "🔴 红灯：证据不支持这单，强烈建议放弃"}
+_LEVEL_ICON = {"pass": "✅", "warn": "⚠️", "fail": "❌", "unavailable": "❔"}
+_KEY_CN = {"trend": "趋势/共识", "risk": "风险与止损", "levels": "关键价位",
+           "structure": "结构证据", "micro": "微观资金流"}
+_FAIL_ADVICE = {
+    "trend": "等共识转到与你同向，或出现明确的反转确认再考虑进场",
+    "risk": "把止损放到结构位外侧（参考档案的插针深度提示），并守住盈亏比门槛",
+    "levels": "避开正对的压力/支撑与未回补缺口，等价格离开磁吸区再评估",
+    "structure": "等结构证据（阶段/形态）与方向一致再进场",
+    "micro": "等微观资金流不再与方向打架（主动买卖/大单不逆向）",
+}
+
+
+def local_explanation(bundle: dict, profile_md: str | None = None) -> str:
+    """本地规则解读（零 LLM）：用 verdict 拼模板化小白话——AI 抽风时的最终兜底。
+
+    永不抛出；证据缺失多少讲多少，开头固定标注「本地解读，AI 暂不可用」。
+    """
+    try:
+        b = bundle or {}
+        vd = b.get("verdict") or {}
+        light = vd.get("light") or b.get("light") or "yellow"
+        score = vd.get("score", b.get("score"))
+        parts = ["> 🤖 **本地解读，AI 暂不可用**（以下由确定性规则引擎生成）", ""]
+        head = _LIGHT_CN.get(light, f"裁决灯色：{light}")
+        parts.append(f"**{head}**" + (f"（{score:.0f} 分）" if isinstance(
+            score, (int, float)) else ""))
+        if vd.get("summary"):
+            parts.append(str(vd["summary"]))
+        items = [it for it in (vd.get("items") or []) if isinstance(it, dict)]
+        if items:
+            parts.append("")
+            parts.append("**每条证据在说什么**")
+            for it in sorted(items, key=lambda x: _LEVEL_RANK.get(x.get("level"), 9)):
+                icon = _LEVEL_ICON.get(it.get("level"), "•")
+                name = _KEY_CN.get(it.get("key"), it.get("key") or "证据")
+                ev = str(it.get("evidence") or "").strip()
+                suffix = "（证据源不可用≠没问题）" if it.get("level") == "unavailable" else ""
+                parts.append(f"- {icon} **{name}**：{ev}{suffix}")
+        vetoes = vd.get("vetoes") or []
+        if vetoes:
+            parts.append("")
+            parts.append("**一票否决（硬红线）**")
+            parts += [f"- ✗✗ {v}" for v in vetoes]
+        disc = _discipline_lines(_resolve_profile(b, profile_md))
+        if disc:
+            parts.append("")
+            parts.append("**对照你自己的纪律（逐条自查）**")
+            parts += disc[:6]
+        fails = [it for it in items if it.get("level") == "fail"]
+        if fails or vetoes:
+            parts.append("")
+            parts.append("**如果你坚持要开，先满足这些**")
+            seen = set()
+            for it in fails:
+                adv = _FAIL_ADVICE.get(it.get("key"))
+                if adv and adv not in seen:
+                    seen.add(adv)
+                    parts.append(f"- {adv}")
+            cd = vd.get("cooldown_min") or 0
+            if cd:
+                parts.append(f"- 先冷静 {cd} 分钟再重新提交裁决（当前处于强制冷静期）")
+        if vd.get("emotion_note"):
+            parts.append("")
+            parts.append(f"> {vd['emotion_note']}")
+        parts.append("")
+        parts.append("以上为交易纪律教学，不构成投资建议。")
+        return "\n".join(parts)
+    except Exception:  # noqa: BLE001 — 兜底的兜底：结构异常也要给出可读文本
+        return ("> 🤖 **本地解读，AI 暂不可用**\n\n证据包结构异常，无法逐条解读；"
+                "请以面板上的灯色与证据行为准。\n\n以上为交易纪律教学，不构成投资建议。")
+
+
+def stream_explanation(bundle: dict, *, chat_stream_fn=None,
+                       profile_md: str | None = None):
+    """导师解释三级降级流水线（生成器，逐段 yield 文本）：
+
+      ① 全量 prompt（档案+全部证据）流式；有内容即正常结束
+      ② 返空 → 提示后用精简 prompt + 显式 max_tokens=2000 重试一次
+         （根因：混合推理模型思考 token 计入输出预算，全量 prompt 诱发长思考
+         把预算烧光，content 一个字没出就 finish_reason=length）
+      ③ 仍空/调用失败 → 本地规则解读（标注「本地解读，AI 暂不可用」）
+    chat_stream_fn(messages, **kw) 缺省用 jarvis_llm_config.chat_stream
+    （module=mentor_explain 记账）；未配置 LLM 的 LLMNotConfigured 原样上抛
+    （端点层已前置拦截，这里不吞）。除此之外本生成器自身不抛出。
+    """
+    from jarvis_llm_config import LLMCallError, LLMNotConfigured
+
+    if chat_stream_fn is None:
+        import jarvis_llm_config as _jlc
+
+        def chat_stream_fn(messages, **kw):  # noqa: ANN001
+            return _jlc.chat_stream(messages, timeout=90,
+                                    module="mentor_explain", **kw)
+
+    profile_md = _resolve_profile(bundle, profile_md)
+
+    class _EmptyStream(Exception):
+        pass
+
+    def _attempt(messages, **kw):
+        got = False
+        for delta in chat_stream_fn(messages, **kw):
+            got = True
+            yield delta
+        if not got:
+            raise _EmptyStream()
+
+    # ── ① 全量 prompt ──
+    try:
+        yield from _attempt(build_messages(bundle, profile_md))
+        return
+    except _EmptyStream:
+        yield ("\n> ⚠️ AI 首次返回为空（推理占满输出预算），"
+               "已自动用精简提示重试…\n\n")
+    except LLMNotConfigured:
+        raise
+    except LLMCallError as exc:
+        yield f"\n> ⚠️ AI 调用失败（{str(exc)[:120]}），以下为本地规则解读：\n\n"
+        yield local_explanation(bundle, profile_md)
+        return
+
+    # ── ② 精简 prompt 重试（显式放大输出预算） ──
+    try:
+        yield from _attempt(build_messages_lite(bundle, profile_md),
+                            max_tokens=RETRY_MAX_TOKENS)
+        return
+    except _EmptyStream:
+        yield "\n> ⚠️ AI 重试仍未返回内容，已降级本地解读：\n\n"
+    except LLMNotConfigured:
+        raise
+    except LLMCallError as exc:
+        yield f"\n> ⚠️ AI 重试调用失败（{str(exc)[:120]}），以下为本地规则解读：\n\n"
+
+    # ── ③ 本地规则解读兜底 ──
+    yield local_explanation(bundle, profile_md)
