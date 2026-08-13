@@ -956,22 +956,24 @@ function VerdictCard({
               );
             })}
           </div>
-          {/* U2：图例收成单行（色块+规模词），精确占比/净额全部退 hover tooltip */}
-          <div className="mt-1.5 flex items-center gap-3 flex-wrap">
+          {/* U2 图例收单行 + U4 内联各档累计成交额：「小单 $2.1M · 71.5%」；
+              带方向的净额（±）留在 tooltip 防台面正负号混淆；两档一行可换行 */}
+          <div className="mt-1.5 flex items-center gap-x-3 gap-y-1 flex-wrap">
             {ACTOR_ORDER.map((a) => {
               const s = actors[a] as (typeof actors)[TapeActor] & TapeActorExt;
               if (!s) return null;
               const pct = Number.isFinite(Number(s.pct)) ? Number(s.pct) : null;
+              const gross = Number.isFinite(Number(s.usd)) ? Number(s.usd) : null;
               const insufficient =
                 s.insufficient === true || pct == null || (s.n ?? 0) < ACTOR_MIN_TRADES;
               return (
                 <span
                   key={a}
-                  className="flex items-center gap-1 text-[10px] text-jarvis-text-secondary cursor-help"
+                  className="flex items-center gap-1 text-[10px] text-jarvis-text-secondary cursor-help whitespace-nowrap"
                   title={
                     insufficient
-                      ? `${s.size_cn ?? s.actor_cn}：仅 ${s.n} 笔，样本不足不给精确占比与净额方向。${s.label_note ?? "按单笔金额推断，非真实身份"}`
-                      : `${s.size_cn ?? s.actor_cn} 占比 ${pct.toFixed(1)}% · 净额 ${fmtSignedUsd(s.net_usd)} · ${s.n} 笔。${s.label_note ?? "按单笔金额推断，非真实身份"}`
+                      ? `${s.size_cn ?? s.actor_cn}：累计成交 ${gross != null ? fmtUsd(gross) : "—"}，仅 ${s.n} 笔——样本不足不给精确占比与净额方向。${s.label_note ?? "按单笔金额推断，非真实身份"}`
+                      : `${s.size_cn ?? s.actor_cn} 累计成交 ${gross != null ? fmtUsd(gross) : "—"} · 占比 ${pct.toFixed(1)}% · 净额 ${fmtSignedUsd(s.net_usd)} · ${s.n} 笔。${s.label_note ?? "按单笔金额推断，非真实身份"}`
                   }
                 >
                   <span
@@ -981,7 +983,21 @@ function VerdictCard({
                     )}
                   />
                   {s.size_cn ?? s.actor_cn}
-                  {insufficient && <span className="text-jarvis-text-secondary/50">·少</span>}
+                  {gross != null && (
+                    <span
+                      className={clsx(
+                        "font-mono",
+                        insufficient ? "text-jarvis-text-secondary/60" : "text-jarvis-text",
+                      )}
+                    >
+                      {fmtUsd(gross)}
+                    </span>
+                  )}
+                  {insufficient ? (
+                    <span className="text-jarvis-text-secondary/50">·样本少</span>
+                  ) : (
+                    <span className="text-jarvis-text-secondary/70">· {pct.toFixed(1)}%</span>
+                  )}
                 </span>
               );
             })}
