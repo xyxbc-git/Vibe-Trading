@@ -943,6 +943,14 @@ def run(symbols: list[str] | None = None, tfs: list[str] | None = None) -> int:
     """常驻采集主循环（launchd/systemd 入口）：心跳落状态 json，永不自杀。"""
     if not start(symbols=symbols, tfs=tfs):
         return 1
+    try:
+        import signal as _signal
+
+        def _term(_sig, _frm):  # launchd unload / systemctl stop 发 SIGTERM
+            raise KeyboardInterrupt
+        _signal.signal(_signal.SIGTERM, _term)
+    except Exception:  # noqa: BLE001 — 非主线程等场景装不上 handler 也不影响采集
+        pass
     _log("进入常驻循环（Ctrl-C / SIGTERM 退出）")
     try:
         last_status = 0.0
