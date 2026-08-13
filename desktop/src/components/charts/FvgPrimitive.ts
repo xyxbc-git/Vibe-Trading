@@ -164,7 +164,7 @@ class FvgRenderer implements ISeriesPrimitivePaneRenderer {
           const remain = Math.max(0, Math.round(100 - L.view.fillPct));
           const label =
             (L.view.type === "bullish" ? "FVG↑" : "FVG↓") +
-            (L.view.fillPct > 0 ? ` 残余 ${remain}%` : "");
+            (L.view.fillPct > 0 ? ` 缺口剩 ${remain}%` : "");
           ctx.fillText(label, x + 4, top + h / 2);
         }
       }

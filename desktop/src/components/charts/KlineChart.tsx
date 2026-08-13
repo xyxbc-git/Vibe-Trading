@@ -979,17 +979,27 @@ export default function KlineChart({
           加载更早 K 线…
         </div>
       )}
-      {zoneTip && (
-        <div
-          className="pointer-events-none absolute z-10 px-2 py-1 rounded border border-jarvis-border bg-jarvis-card/95 text-xs text-jarvis-text whitespace-nowrap shadow-lg"
-          style={{
-            left: Math.min(zoneTip.x + 12, (containerRef.current?.clientWidth ?? 0) - 240),
-            top: zoneTip.y + 12,
-          }}
-        >
-          {zoneTip.text}
-        </div>
-      )}
+      {zoneTip &&
+        (() => {
+          // [R13] 多行浮层 + 越屏翻转：\n 按行渲染（pre-line）、限宽；
+          // 靠近右缘翻到鼠标左侧、靠近下缘翻到上方，不再溢出容器
+          const cw = containerRef.current?.clientWidth ?? 0;
+          const flipX = zoneTip.x > cw - 300;
+          const flipY = zoneTip.y > height - 150;
+          return (
+            <div
+              className="pointer-events-none absolute z-10 px-2.5 py-1.5 rounded border border-jarvis-border bg-jarvis-card/95 text-xs text-jarvis-text whitespace-pre-line max-w-[280px] leading-5 shadow-lg"
+              style={{
+                left: flipX ? undefined : zoneTip.x + 12,
+                right: flipX ? Math.max(0, cw - zoneTip.x + 12) : undefined,
+                top: flipY ? undefined : zoneTip.y + 12,
+                bottom: flipY ? Math.max(0, height - zoneTip.y + 12) : undefined,
+              }}
+            >
+              {zoneTip.text}
+            </div>
+          );
+        })()}
     </div>
   );
 }

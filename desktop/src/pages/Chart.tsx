@@ -1270,14 +1270,15 @@ export default function Chart() {
         bottom: remBottom,
         timeSec: Math.floor(z.created_ts / 1000),
         fillPct,
+        // [R13] 三行紧凑 + 小白措辞（浮层 pre-line 按行渲染）
         tooltip:
-          `${bull ? "看涨" : "看跌"} FVG（价格失衡缺口）\n` +
-          `原始区间 ${z.bottom.toLocaleString()} ~ ${z.top.toLocaleString()}` +
+          `${bull ? "看涨" : "看跌"} FVG 缺口 · ${fillPct > 0 ? `已被填掉 ${Math.round(fillPct)}%` : "还没被碰过"}\n` +
+          `原始缺口 ${z.bottom.toLocaleString()} ~ ${z.top.toLocaleString()}\n` +
           (fillPct > 0
-            ? ` · 已回补 ${Math.round(fillPct)}%\n残余活跃区 ${remBottom.toLocaleString()} ~ ${remTop.toLocaleString()}（残余 ${Math.round(100 - fillPct)}%）`
-            : "（未回补，完整有效）") +
-          `\n形成于 ${new Date(z.created_ts).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}\n` +
-          `${bull ? "残余缺口常成回踩支撑区——价格进带内是常见入场观察位" : "残余缺口常成反弹压力区——价格进带内是常见入场观察位"}`,
+            ? `还没被价格填掉的部分 ${remBottom.toLocaleString()} ~ ${remTop.toLocaleString()}（仍是有效吸引区）\n`
+            : "") +
+          `${new Date(z.created_ts).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })} 形成 · ` +
+          `价格常${bull ? "回踩" : "反弹"}进这块区域后继续原方向`,
       });
     }
     return out;
