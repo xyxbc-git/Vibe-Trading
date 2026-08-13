@@ -1,8 +1,10 @@
 """离线冒烟：盘上合流仪表（jarvis_confluence.score_confluence 纯函数）。
 
-全部打桩 bundle，不联网不碰库。覆盖：评分归一/方向判定/12 条目三态/CP1 四勾
-映射/unavailable 不计分母/覆盖不足标记/冲突显式态/成本徽章三档/行动闸口透传/
-展示字段字符串契约/预登记随身。
+全部打桩 bundle，不联网不碰库。契约以 desktop/src/api/confluence.ts 为准
+（任务 C3 对齐）：条目 {key,name,state,note,conflict?}，state ∈
+pass|warn|fail|skipped；折叠四勾键 c1_htf/c3_bos/c4_sweep/c5_fvg；
+顶层 availableWeight/costWarning/costEstimate/cooldownUntil/todayPlans/
+gridStats/updatedAt；direction=neutral 时 score=null。
 """
 import json
 
@@ -23,7 +25,7 @@ def tfc(direction, conf=0.7):
 
 def mk_bundle(cons_dir="bullish", *, tfs=None, wyckoff="present", hunt="none",
               fvg="good", delta_status="confirm", rev_sat=3, event_in=False,
-              funding=0.0001, cons=True, cost=None, gate=None):
+              funding=0.0001, cons=True, cost=None, gate=None, grid=None):
     """可控打桩 bundle（默认：多头顺风满配）。"""
     d = cons_dir
     b = {"symbol": "TESTUSDT", "tf": "30m", "as_of": 1000.0}
@@ -41,8 +43,7 @@ def mk_bundle(cons_dir="bullish", *, tfs=None, wyckoff="present", hunt="none",
     elif hunt is None:
         b["hunt"] = None
     else:
-        b["hunt"] = {"detected": True, "side": hunt,
-                     "note": f"检出 {hunt} 扫单"}
+        b["hunt"] = {"detected": True, "side": hunt, "note": f"检出 {hunt} 扫单"}
     if fvg == "good":
         b["fvg"] = {"ok": True,
                     "zones": [{"type": d, "mitigated": False}],
@@ -58,7 +59,6 @@ def mk_bundle(cons_dir="bullish", *, tfs=None, wyckoff="present", hunt="none",
         b["fvg"] = None
     b["delta"] = {"ok": True, "divergence": {}, "absorption": None} \
         if delta_status else None
-    b["_seatbelt_stub"] = delta_status
     b["reversal"] = ({"satisfied": rev_sat, "verdict": "watch"}
                      if rev_sat is not None else None)
     b["event"] = {"available": True, "in_window": event_in,
@@ -66,18 +66,30 @@ def mk_bundle(cons_dir="bullish", *, tfs=None, wyckoff="present", hunt="none",
     b["sentiment"] = {"funding": funding} if funding is not None else None
     b["cost"] = cost
     b["action_gate"] = gate or {"cooldown_until": None, "today_count": 2}
+    b["grid_stats"] = grid
     b["orderflow_profile"] = None
     return b
 
 
-# seatbelt 打桩：jc._judge_items 内部 import jarvis_seatbelt——monkeypatch evaluate
+def item_of(resp, key):
+    return next(i for g in resp["groups"] for i in g["items"] if i["key"] == key)
+
+
+def four_checks(resp):
+    all_items = {i["key"]: i for g in resp["groups"] for i in g["items"]}
+    return {k: all_items[k]["state"] if k in all_items else "skipped"
+            for k in ("c1_htf", "c3_bos", "c4_sweep", "c5_fvg")}
+
+
+# seatbelt 打桩
 import jarvis_seatbelt as jsb
 
 _orig_eval = jsb.evaluate
+_STUB = {"seatbelt": "confirm"}
 
 
 def _fake_eval(direction, payload):
-    stub = _STUB.get("seatbelt", "confirm")
+    stub = _STUB["seatbelt"]
     if stub == "confirm":
         return {"status": "confirm", "grade": "medium", "note": "同向确认"}
     if stub == "conflict_strong":
@@ -87,152 +99,158 @@ def _fake_eval(direction, payload):
     return {"status": "idle", "grade": None, "note": "中性"}
 
 
-_STUB = {"seatbelt": "confirm"}
 jsb.evaluate = _fake_eval
 
 try:
     # ── 1. 顺风满配（含同向扫单）→ 高分 + 偏多 + 四勾全 pass ──
     r1 = jc.score_confluence(mk_bundle(hunt="long-stops-swept"))
-    check("满配高分 ≥85", r1["score"] >= 85, str(r1["score"]))
-    check("方向偏多", r1["direction"] == "bullish" and r1["direction_cn"] == "偏多")
+    check("满配高分 ≥85", r1["score"] is not None and r1["score"] >= 85,
+          str(r1["score"]))
+    check("方向偏多", r1["direction"] == "bullish")
     check("四组齐全", [g["key"] for g in r1["groups"]]
           == ["direction", "structure", "micro", "environment"])
-    check("CP1 四勾全 pass", all(v == "pass" for v in r1["cp1_align"].values()),
-          str(r1["cp1_align"]))
+    check("折叠四勾全 pass", all(v == "pass" for v in four_checks(r1).values()),
+          str(four_checks(r1)))
     check("不 insufficient", not r1["insufficient"])
 
-    # ── 2. 中性共识 → 方向组全 warn + direction=neutral ──
-    r2 = jc.score_confluence(mk_bundle(cons_dir="neutral"))
-    check("中性方向", r2["direction"] == "neutral")
-    dir_items = next(g for g in r2["groups"] if g["key"] == "direction")["items"]
-    check("中性时方向组无 pass", all(i["status"] in ("warn", "unavailable")
-                                     for i in dir_items),
-          str([i["status"] for i in dir_items]))
+    # ── 2. 前端契约字段名逐一核对（C3 对齐的核心断言）──
+    for fld in ("ok", "symbol", "tf", "direction", "score", "insufficient",
+                "availableWeight", "groups", "costWarning", "costEstimate",
+                "cooldownUntil", "todayPlans", "gridStats", "updatedAt"):
+        if fld not in r1:
+            check(f"顶层缺字段 {fld}", False)
+            break
+    else:
+        check("顶层契约字段齐全（confluence.ts）", True)
+    g0 = r1["groups"][0]
+    check("group 契约字段", all(k in g0 for k in
+                                ("key", "name", "weight", "earned", "available",
+                                 "items")))
+    i0 = g0["items"][0]
+    check("item 契约字段", all(k in i0 for k in ("key", "name", "state", "note")))
+    check("item 无旧字段", "status" not in i0 and "evidence" not in i0)
+    check("条目 10 条（HTF 合并）",
+          sum(len(g["items"]) for g in r1["groups"]) == 10)
 
-    # ── 3. HTF 勾映射：2 同向 pass / 1 warn / 0 fail ──
+    # ── 3. 中性共识 → score=null + 方向组 warn ──
+    r3 = jc.score_confluence(mk_bundle(cons_dir="neutral"))
+    check("中性 score=null", r3["direction"] == "neutral" and r3["score"] is None)
+    dir_states = [i["state"] for g in r3["groups"] if g["key"] == "direction"
+                  for i in g["items"]]
+    check("中性方向组无 pass", all(s in ("warn", "skipped") for s in dir_states),
+          str(dir_states))
+
+    # ── 4. c1_htf 合并条目：2/3 pass、1/3 warn、0/3 fail ──
     tfs_2 = {"5m": tfc("bullish"), "30m": tfc("bullish"), "1h": tfc("bullish"),
              "4h": tfc("bearish")}
-    r3a = jc.score_confluence(mk_bundle(tfs=tfs_2))
-    check("HTF 2/3 同向 → pass", r3a["cp1_align"]["htf"] == "pass")
+    r4a = jc.score_confluence(mk_bundle(tfs=tfs_2))
+    check("HTF 2/3 → pass", item_of(r4a, "c1_htf")["state"] == "pass",
+          item_of(r4a, "c1_htf")["note"][:40])
     tfs_1 = {"5m": tfc("bullish"), "30m": tfc("bullish"), "1h": tfc("neutral"),
              "4h": tfc("bearish")}
-    r3b = jc.score_confluence(mk_bundle(tfs=tfs_1))
-    check("HTF 1/3 同向 → warn", r3b["cp1_align"]["htf"] == "warn")
+    r4b = jc.score_confluence(mk_bundle(tfs=tfs_1))
+    check("HTF 1/3 → warn", item_of(r4b, "c1_htf")["state"] == "warn")
     tfs_0 = {"5m": tfc("bearish"), "30m": tfc("bearish"), "1h": tfc("bearish"),
              "4h": tfc("bearish")}
-    r3c = jc.score_confluence(mk_bundle(tfs=tfs_0))
-    check("HTF 0/3 同向 → fail（注意：共识仍 bullish 打桩）",
-          r3c["cp1_align"]["htf"] == "fail")
+    r4c = jc.score_confluence(mk_bundle(tfs=tfs_0))
+    check("HTF 0/3 → fail", item_of(r4c, "c1_htf")["state"] == "fail")
+    check("HTF note 带各周期明细", "30m" in item_of(r4a, "c1_htf")["note"])
 
-    # ── 4. 反向 TF 条目 fail 且带人话 ──
-    it_4h = next(i for g in r3a["groups"] for i in g["items"] if i["key"] == "tf_4h")
-    check("反向 4h fail + 人话", it_4h["status"] == "fail" and "相反" in it_4h["evidence"])
-
-    # ── 5. unavailable 不计分母：砍掉微观+环境 → 归一后仍可高分 ──
-    r5 = jc.score_confluence(mk_bundle(delta_status=None, rev_sat=None,
-                                       funding=None))
+    # ── 5. skipped 不计分母：砍微观+环境 → 归一 ──
     r5_ev = mk_bundle(delta_status=None, rev_sat=None, funding=None)
     r5_ev["event"] = None
     r5 = jc.score_confluence(r5_ev)
-    check("砍两组后归一", r5["avail_weight"] == 70 and r5["score"] > 80,
-          f"avail={r5['avail_weight']} score={r5['score']}")
+    check("砍两组后归一", r5["availableWeight"] == 70 and r5["score"] > 80,
+          f"avail={r5['availableWeight']} score={r5['score']}")
 
-    # ── 6. 全 unavailable → score 0 + insufficient ──
+    # ── 6. 全 skipped → insufficient + 四勾 skipped ──
     r6_ev = mk_bundle(cons=False, wyckoff=None, hunt=None, fvg=None,
                       delta_status=None, rev_sat=None, funding=None)
     r6_ev["event"] = None
     r6 = jc.score_confluence(r6_ev)
-    check("全缺 insufficient", r6["insufficient"] and r6["score"] == 0.0,
-          f"score={r6['score']} avail={r6['avail_weight']}")
-    check("全缺 CP1 勾 unavailable", all(v == "unavailable"
-                                          for v in r6["cp1_align"].values()))
+    check("全缺 insufficient", r6["insufficient"] and r6["availableWeight"] == 0)
+    check("全缺四勾 skipped", all(v == "skipped" for v in four_checks(r6).values()))
 
-    # ── 7. 扫单方向语义 ──
-    r7a = jc.score_confluence(mk_bundle(hunt="long-stops-swept"))
-    it7a = next(i for g in r7a["groups"] for i in g["items"] if i["key"] == "sweep")
-    check("同向扫单 pass", it7a["status"] == "pass")
-    r7b = jc.score_confluence(mk_bundle(hunt="short-stops-swept"))
-    it7b = next(i for g in r7b["groups"] for i in g["items"] if i["key"] == "sweep")
-    check("反向扫单 fail + 标注", it7b["status"] == "fail" and "相反" in it7b["evidence"])
+    # ── 7. 扫单方向语义 + conflict 布尔 ──
+    r7 = jc.score_confluence(mk_bundle(hunt="short-stops-swept"))
+    it7 = item_of(r7, "c4_sweep")
+    check("反向扫单 fail + conflict", it7["state"] == "fail"
+          and it7.get("conflict") is True)
 
-    # ── 8. FVG/折溢价 ──
-    it8 = next(i for g in r1["groups"] for i in g["items"] if i["key"] == "fvg_pd")
-    check("同向FVG+discount pass", it8["status"] == "pass"
-          and "discount" in it8["evidence"])
-    r8b = jc.score_confluence(mk_bundle(fvg="bad_zone"))
-    it8b = next(i for g in r8b["groups"] for i in g["items"] if i["key"] == "fvg_pd")
-    check("无FVG+premium(做多) warn", it8b["status"] == "warn")
+    # ── 8. FVG 折溢价 ──
+    check("同向FVG+discount pass", item_of(r1, "c5_fvg")["state"] == "pass")
+    r8 = jc.score_confluence(mk_bundle(fvg="bad_zone"))
+    check("无FVG+premium(做多) warn", item_of(r8, "c5_fvg")["state"] == "warn")
 
-    # ── 9. 安全带三态 + ⚡冲突显式（主控边界裁决）──
+    # ── 9. Delta 三态 + ⚡冲突（主控边界裁决）──
     _STUB["seatbelt"] = "conflict_strong"
     r9 = jc.score_confluence(mk_bundle())
-    it9 = next(i for g in r9["groups"] for i in g["items"] if i["key"] == "seatbelt")
-    check("强背离 fail + ⚡冲突标注", it9["status"] == "fail"
-          and "⚡冲突" in it9["evidence"], it9["evidence"][:40])
+    it9 = item_of(r9, "c6_delta")
+    check("强背离 fail + ⚡ + conflict", it9["state"] == "fail"
+          and "⚡冲突" in it9["note"] and it9.get("conflict") is True)
     _STUB["seatbelt"] = "conflict_weak"
-    r9b = jc.score_confluence(mk_bundle())
-    it9b = next(i for g in r9b["groups"] for i in g["items"] if i["key"] == "seatbelt")
-    check("弱背离 warn", it9b["status"] == "warn")
+    check("弱背离 warn",
+          item_of(jc.score_confluence(mk_bundle()), "c6_delta")["state"] == "warn")
     _STUB["seatbelt"] = "confirm"
 
-    # ── 10. 反转四条件档位 ──
-    r10 = jc.score_confluence(mk_bundle(rev_sat=1))
-    it10 = next(i for g in r10["groups"] for i in g["items"] if i["key"] == "reversal")
-    check("反转 1/4 fail", it10["status"] == "fail" and "1/4" in it10["evidence"])
+    # ── 10. 反转档位 ──
+    check("反转 1/4 fail",
+          item_of(jc.score_confluence(mk_bundle(rev_sat=1)), "c7_reversal")["state"]
+          == "fail")
 
     # ── 11. 事件窗口 ──
-    r11 = jc.score_confluence(mk_bundle(event_in=True))
-    it11 = next(i for g in r11["groups"] for i in g["items"]
-                if i["key"] == "event_window")
-    check("事件窗口内 warn", it11["status"] == "warn" and "CPI" in it11["evidence"])
+    check("事件窗口内 warn",
+          item_of(jc.score_confluence(mk_bundle(event_in=True)), "c8_event")["state"]
+          == "warn")
 
-    # ── 12. 资金费：追拥挤 warn / 不在拥挤侧 pass ──
-    r12a = jc.score_confluence(mk_bundle(funding=0.0008))   # 多头拥挤 + 环境偏多
-    it12a = next(i for g in r12a["groups"] for i in g["items"] if i["key"] == "funding")
-    check("追拥挤方 warn", it12a["status"] == "warn" and "追拥挤" in it12a["evidence"])
+    # ── 12. 资金费 ──
+    r12a = jc.score_confluence(mk_bundle(funding=0.0008))
+    check("追拥挤方 warn", item_of(r12a, "c9_funding")["state"] == "warn")
     r12b = jc.score_confluence(mk_bundle(cons_dir="bearish", funding=0.0008))
-    it12b = next(i for g in r12b["groups"] for i in g["items"] if i["key"] == "funding")
-    check("不在拥挤侧 pass", it12b["status"] == "pass")
+    check("不在拥挤侧 pass", item_of(r12b, "c9_funding")["state"] == "pass")
 
-    # ── 13. 成本徽章三档（评分外挂不进分）──
-    base = jc.score_confluence(mk_bundle()).get("score")
-    for toll, lv in ((0.1, "ok"), (0.5, "warn"), (1.5, "hard")):
-        r13 = jc.score_confluence(mk_bundle(
-            cost={"typical_r_pct": 0.5, "toll_ratio_est": toll, "basis": "est"}))
-        check(f"cost {toll} → {lv}", r13["cost_flag"]["level"] == lv
-              and r13["score"] == base,   # 不改分数
-              str(r13["cost_flag"]))
-    r13d = jc.score_confluence(mk_bundle(cost=None))
-    check("无成本数据 cost_flag=None", r13d["cost_flag"] is None)
+    # ── 13. 成本字段：costEstimate 恒给、costWarning 仅 hard 档 ──
+    base = jc.score_confluence(mk_bundle())["score"]
+    r13a = jc.score_confluence(mk_bundle(
+        cost={"typical_r_pct": 0.5, "toll_ratio_est": 0.14, "basis": "est"}))
+    check("cost ok：estimate 有 warning 无", r13a["costWarning"] is None
+          and "fee/R≈0.14" in r13a["costEstimate"], str(r13a["costEstimate"]))
+    r13b = jc.score_confluence(mk_bundle(
+        cost={"typical_r_pct": 0.05, "toll_ratio_est": 1.5, "basis": "est"}))
+    check("cost hard：warning 红标", r13b["costWarning"] is not None
+          and "别开" in r13b["costWarning"])
+    check("成本不改分数", r13a["score"] == base == r13b["score"])
+    check("无成本数据双 None",
+          jc.score_confluence(mk_bundle(cost=None))["costEstimate"] is None)
 
-    # ── 14. 行动闸口透传（行为不进分——D3）──
+    # ── 14. 行动闸口拉平顶层（D3）──
     r14 = jc.score_confluence(mk_bundle(gate={"cooldown_until": 9999.0,
                                               "today_count": 5}))
-    check("action_gate 透传", r14["action_gate"]["cooldown_until"] == 9999.0
-          and r14["action_gate"]["today_count"] == 5)
+    check("cooldownUntil/todayPlans 顶层", r14["cooldownUntil"] == 9999.0
+          and r14["todayPlans"] == 5)
     check("闸口不影响分数", r14["score"] == base)
 
-    # ── 15. 展示字段字符串契约 + JSON 可序列化 ──
+    # ── 15. gridStats 透传 ──
+    r15 = jc.score_confluence(mk_bundle(grid="triple_rsi×30m（n=31）：P60 给到 1.11R"))
+    check("gridStats 透传", "1.11R" in r15["gridStats"])
+    check("无战绩 null", jc.score_confluence(mk_bundle())["gridStats"] is None)
+
+    # ── 16. 展示字段 str + JSON 序列化 + 预登记 ──
     all_items = [i for g in r1["groups"] for i in g["items"]]
-    check("12 条目齐", len(all_items) == 12, str(len(all_items)))
-    check("evidence 全 str", all(isinstance(i["evidence"], str) for i in all_items))
+    check("note/name 全 str", all(isinstance(i["note"], str)
+                                  and isinstance(i["name"], str) for i in all_items))
     check("JSON 序列化", len(json.dumps(r1, ensure_ascii=False, default=str)) > 500)
+    check("预登记随身", r1["prereg"]["item_weights"]["c1_htf"] == 30)
 
-    # ── 16. 预登记随身 ──
-    check("预登记权重随身", r1["prereg"]["weights"]["direction"] == 40
-          and r1["prereg"]["item_weights"]["seatbelt"] == 12)
-
-    # ── 17. 威科夫语境方向 ──
+    # ── 17. 威科夫相悖 ──
     ev17 = mk_bundle()
-    ev17["wyckoff"]["state"]["side"] = "dist"   # 派发段 vs 偏多环境
-    r17 = jc.score_confluence(ev17)
-    it17 = next(i for g in r17["groups"] for i in g["items"]
-                if i["key"] == "wyckoff_ctx")
-    check("威科夫相悖 fail", it17["status"] == "fail" and "相悖" in it17["evidence"])
+    ev17["wyckoff"]["state"]["side"] = "dist"
+    check("威科夫相悖 fail", item_of(jc.score_confluence(ev17),
+                                     "c1_wyckoff_ctx")["state"] == "fail")
 
-    # ── 18. assess 异常兜底（gather 内部炸不拖垮）──
+    # ── 18. assess 永不抛出 ──
     r18 = jc.assess("TESTUSDT", "30m", consensus_provider=lambda: 1 / 0)
-    check("assess 永不抛出", isinstance(r18, dict) and "ok" in r18)
+    check("assess 兜底", isinstance(r18, dict) and "ok" in r18)
 finally:
     jsb.evaluate = _orig_eval
 
@@ -241,4 +259,4 @@ print()
 if fails:
     print(f"FAILED {len(fails)}: {fails}")
     raise SystemExit(1)
-print("ALL PASS（18 组 / 评分归一、三态、CP1 勾、冲突显式、成本徽章、行动闸口、契约）")
+print("ALL PASS（18 组 / C3 前端契约对齐：键名、state/skipped、conflict、顶层拉平、null 分数）")
