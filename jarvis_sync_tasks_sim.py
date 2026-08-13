@@ -271,6 +271,63 @@ def _ctx_values(r) -> tuple:
     return tuple(r[c] for c in _CTX_COL_NAMES)
 
 
+# ── T3 toll_ratio 镜像列（正期望重建·任务 K）───────────────────────────────
+# 源表 twelve_sim_trade 已有 toll_ratio（=2×单边费率%÷计划SL距离%，T3 门禁判据）；
+# 镜像列缺失时降级旧映射同步不断流（toll 留 NULL），**不自动 ALTER**——与 ctx
+# 的自动补列不同，本列 DDL 按纪律统一走人工确认：请以 root 执行
+# sql/jarvis_sim_toll_ratio_column.sql，执行后 ≤10 分钟（_CTX_PROBE_TTL_S）
+# 探测自动升级，无需重启同步器。
+_toll_dst_state: dict[str, tuple[float, bool]] = {}
+_toll_src_state: dict[str, tuple[float, bool]] = {}
+
+
+def _src_has_toll(src_table: str) -> bool:
+    """源表是否已有 toll_ratio 列（旧 trader 库降级判定；TTL 缓存同镜像侧）。"""
+    now = time.time()
+    hit = _toll_src_state.get(src_table)
+    if hit and (hit[1] or now - hit[0] < _CTX_PROBE_TTL_S):
+        return hit[1]
+    try:
+        with _local_db() as src:
+            src.execute(f"SELECT toll_ratio FROM {src_table} LIMIT 1").fetchall()
+        ok = True
+    except Exception:  # noqa: BLE001 — 缺表/缺列都按「源未就绪」降级
+        ok = False
+    _toll_src_state[src_table] = (now, ok)
+    return ok
+
+
+def _toll_dst_ready(mysql_conn, table: str) -> bool:
+    """镜像表 toll_ratio 列是否可写；缺列只提示不 ALTER（DDL 走人工确认）。"""
+    now = time.time()
+    hit = _toll_dst_state.get(table)
+    if hit and (hit[1] or now - hit[0] < _CTX_PROBE_TTL_S):
+        return hit[1]
+    try:
+        with mysql_conn.cursor() as cur:
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = DATABASE() AND table_name = %s "
+                "AND column_name = 'toll_ratio'", (table,))
+            ready = cur.fetchone() is not None
+    except Exception as e:  # noqa: BLE001 — 探测失败按未就绪，不影响主同步
+        log.warning("[%s] toll_ratio 列探测失败（%s），本轮按旧列映射同步", table, e)
+        _toll_dst_state[table] = (now, False)
+        return False
+    if not ready and not (hit and not hit[1]):   # 首次发现缺列才提示，不刷日志
+        log.warning(
+            "[%s] 缺 toll_ratio 镜像列——按旧列映射降级同步（toll 留 NULL），"
+            "请以 root 执行 sql/jarvis_sim_toll_ratio_column.sql，执行后自动升级",
+            table)
+    _toll_dst_state[table] = (now, ready)
+    return ready
+
+
+def _toll_enabled(mysql_conn, table: str, src_table: str) -> bool:
+    """双端就绪才带 toll_ratio 列（任一端缺列自动降级，同步不断流）。"""
+    return _toll_dst_ready(mysql_conn, table) and _src_has_toll(src_table)
+
+
 # hist 归档列（去掉 create_time；trade_id 对应镜像列 id，reset_epoch/archived_at 归档侧生成）
 _TRADE_ARCHIVE_COLS = (
     "symbol, tf, system_code, name_cn, direction, entry_price, entry_time, "
@@ -577,8 +634,14 @@ def sync_sim_trade(ctx: SyncContext) -> TaskResult:
     batch = int(ctx.config["batch_size"])
     exec_batch = int(ctx.config["exec_batch"])
     with_ctx = _ctx_enabled(mysql_conn, TRADE_TABLE, "twelve_sim_trade")
-    src_sql = _src_sql(_TRADE_SRC_COLS, "twelve_sim_trade", with_ctx)
-    dst_sql = _upsert_sql(TRADE_TABLE, _TRADE_DST_COLS, with_ctx)
+    # toll_ratio 独立探测（任务 K）：列拼在 base 之后 ctx 之前，
+    # src 按名取值列序无关，dst 列序与 payload 元组序由本处同构保证
+    with_toll = _toll_enabled(mysql_conn, TRADE_TABLE, "twelve_sim_trade")
+    src_sql = _src_sql(_TRADE_SRC_COLS + (", toll_ratio" if with_toll else ""),
+                       "twelve_sim_trade", with_ctx)
+    dst_sql = _upsert_sql(
+        TRADE_TABLE, _TRADE_DST_COLS + (("toll_ratio",) if with_toll else ()),
+        with_ctx)
     state = {"cursor": int(ctx.cursors.get(TRADE_TABLE) or 0)}
     try:
         state["cursor"] = _detect_source_reset(
@@ -620,7 +683,8 @@ def sync_sim_trade(ctx: SyncContext) -> TaskResult:
                 r["leverage"], r["stop_loss"], r["take_profit"], r["exit_reason"],
                 r["pnl"], r["pnl_pct"], r["rr"], r["balance_after"],
                 int(round(float(hold))) if hold is not None else None, exit_ts,
-            ) + (_ctx_values(r) if with_ctx else ()))
+            ) + ((r["toll_ratio"],) if with_toll else ())
+              + (_ctx_values(r) if with_ctx else ()))
         _upsert_many(mysql_conn, dst_sql, payload, exec_batch)
         # 游标从不后退：写 MySQL commit 成功后才推进并落盘
         state["cursor"] = int(rows[-1]["id"])
