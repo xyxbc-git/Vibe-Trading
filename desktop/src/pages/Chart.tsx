@@ -2,6 +2,7 @@ import { useState, useMemo, useEffect } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useApi, usePolling } from "@/hooks/useApi";
 import { useKlineHistory } from "@/hooks/useKlineHistory";
+import { enumOr, listOr, loadChartToggles, saveChartToggles, toggleOr } from "@/lib/chartToggles";
 import { useSymbol } from "@/hooks/useSymbol";
 import { useLivePrice } from "@/hooks/usePrice";
 import { api, formatPrice, type TwelveSignal, type ConsensusTradePlan, type KeyLevel, type LiqMapResponse, type SignalDirection } from "@/api/client";
@@ -259,7 +260,11 @@ const ICHIMOKU_LEGEND: { name: string; color: string; dashed?: boolean; explain:
 ];
 
 export default function Chart() {
-  const [tf, setTf] = useState<Timeframe>("15m");
+  // [R6] 指标开关持久化：挂载读一次快照，各开关据此恢复；变更统一写回（见下方 effect）
+  const [persistedToggles] = useState(loadChartToggles);
+  const [tf, setTf] = useState<Timeframe>(
+    enumOr(persistedToggles, "tf", TIMEFRAMES, "15m"),
+  );
   // 三档视图（简洁/进阶/专业），选择持久化；细粒度开关只在专业模式生效
   const [viewMode, setViewModeState] = useState<ViewMode>(() => loadViewMode());
   const setViewMode = (m: ViewMode) => {
@@ -267,13 +272,15 @@ export default function Chart() {
     saveViewMode(m);
   };
   const [legendOpen, setLegendOpen] = useState(false);
-  const [smart, setSmart] = useState(true);
-  const [draws, setDraws] = useState<Set<DrawMode>>(new Set());
-  const [autoTune, setAutoTune] = useState(true);
-  const [twelve, setTwelve] = useState(false);
-  const [plan, setPlan] = useState(true);
+  const [smart, setSmart] = useState(toggleOr(persistedToggles, "smart", true));
+  const [draws, setDraws] = useState<Set<DrawMode>>(
+    () => new Set(listOr(persistedToggles, "draws", ALL_DRAW_MODES)),
+  );
+  const [autoTune, setAutoTune] = useState(toggleOr(persistedToggles, "autoTune", true));
+  const [twelve, setTwelve] = useState(toggleOr(persistedToggles, "twelve", false));
+  const [plan, setPlan] = useState(toggleOr(persistedToggles, "plan", true));
   // 走势预测层（概率锥/路径/研判卡片）独立开关；默认关，避免干扰常规看盘
-  const [predictOn, setPredictOn] = useState(false);
+  const [predictOn, setPredictOn] = useState(toggleOr(persistedToggles, "predictOn", false));
   // 云图（一目均衡表）开关：localStorage 记住偏好，默认关
   const [ichimokuOn, setIchimokuOnState] = useState<boolean>(() => {
     try {
@@ -323,7 +330,7 @@ export default function Chart() {
     }
   };
   // 形态分析开关（专业模式）：识别经典形态 → 图上标注 + 解释卡片；默认关
-  const [patternOn, setPatternOn] = useState(false);
+  const [patternOn, setPatternOn] = useState(toggleOr(persistedToggles, "patternOn", false));
   // 当前图上标注/卡片展开的形态下标（多形态时卡片 tab 切换联动图上标注）
   const [patternIdx, setPatternIdx] = useState(0);
   const { symbol } = useSymbol();
@@ -1181,7 +1188,7 @@ export default function Chart() {
   }, [predictOn, predictResp, candles]);
 
   // ── [M2 s5] 磁吸位叠加：清算/止损密集区水平线（priceLine，复用 keyLevels 通道）──
-  const [liqOn, setLiqOn] = useState(false);
+  const [liqOn, setLiqOn] = useState(toggleOr(persistedToggles, "liqOn", false));
   const { data: liqMap } = usePolling(
     () => (liqOn ? api.liqMap(symbol, "15m") : Promise.resolve(null)),
     120_000,
@@ -1202,11 +1209,29 @@ export default function Chart() {
   }, [liqOn, liqMap]);
 
   // ── MACD 指标副图：主图 K 线本地计算（12/26/9），无额外请求 ──
-  const [macdOn, setMacdOn] = useState(false);
+  const [macdOn, setMacdOn] = useState(toggleOr(persistedToggles, "macdOn", false));
 
   // ── Delta/CVD 订单流副图（「安全带」层）：引擎 GET /api/delta，未就绪时
   // 回退 K 线本地演示推演（角标标注），与预测层同一套降级模式 ──
-  const [deltaOn, setDeltaOn] = useState(false);
+  const [deltaOn, setDeltaOn] = useState(toggleOr(persistedToggles, "deltaOn", false));
+
+  // [R6] 指标开关统一写回：任一开关/画线集合/周期变化即持久化（读-合并-写，
+  // 首帧写回初始值幂等；viewMode/ichimoku/trap/wyckoff 沿用各自历史键不迁移）
+  useEffect(() => {
+    saveChartToggles({
+      smart,
+      autoTune,
+      twelve,
+      plan,
+      predictOn,
+      patternOn,
+      liqOn,
+      macdOn,
+      deltaOn,
+      draws: [...draws],
+      tf,
+    });
+  }, [smart, autoTune, twelve, plan, predictOn, patternOn, liqOn, macdOn, deltaOn, draws, tf]);
   const [deltaResp, setDeltaResp] = useState<DeltaResponse | null>(null);
   const [deltaLoading, setDeltaLoading] = useState(false);
   const [deltaError, setDeltaError] = useState<string | null>(null);

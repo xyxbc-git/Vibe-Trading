@@ -16,6 +16,8 @@ import {
   isHistoryTimeframe,
 } from "@/lib/footprint/historyService";
 import { useSymbol } from "@/hooks/useSymbol";
+import { TIMEFRAMES } from "@/lib/footprint/aggregator";
+import { enumOr, loadChartToggles, saveChartToggles } from "@/lib/chartToggles";
 import type { BadgeBox, HoverInfo, Layout } from "./renderer";
 import {
   AXIS_W,
@@ -124,7 +126,20 @@ export default function FootprintChart() {
   const signalsRef = useRef<FpSignal[]>([]);
   const badgeBoxesRef = useRef<BadgeBox[]>([]);
 
-  const [tf, setTf] = useState<Timeframe>("1m");
+  // [R6] 周期档持久化：刷新后恢复（fpTf 键，与 K 线页 tf 独立）
+  const [tf, setTfState] = useState<Timeframe>(() =>
+    enumOr(loadChartToggles(), "fpTf", TIMEFRAMES, "1m"),
+  );
+  const setTf = useCallback(
+    (next: Timeframe | ((cur: Timeframe) => Timeframe)) => {
+      setTfState((cur) => {
+        const v = typeof next === "function" ? next(cur) : next;
+        saveChartToggles({ fpTf: v }); // StrictMode 双调用幂等（同值覆盖）
+        return v;
+      });
+    },
+    [],
+  );
   const [hover, setHover] = useState<HoverInfo>(null);
   // 指针坐标与 tooltip 定位不进 React state：mousemove 60~120Hz，走 state 会让
   // 整棵组件树以指针回报率重渲染（滑动卡顿主因）。坐标存 ref，tooltip 容器
