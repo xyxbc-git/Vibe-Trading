@@ -283,6 +283,30 @@ DEFAULTS: dict = {
     # 作 D7 反向影子验证的输入；仅统计筛选，不影响交易引擎。
     "twelve_diag_min_samples": 20,    # 稳定亏候选最小样本数（笔）
     "twelve_diag_max_winrate": 30.0,  # 稳定亏候选胜率上限%
+    # ── T1 止损结算口径纠偏（2026-08-11 正期望重建：轮询粒度 → 挂单语义）────────
+    # 取证：模拟盘止损结算单边悲观伪影 51.35U（82% 为代码伪影非真滑点）。
+    # bar=按触发 bar 结算：常规触发=触发位+常数滑点（方向恒不利），真跳空
+    # （触发 bar 开盘已越过触发位）按 open 结算不叠滑点；poll=回退改前
+    # 「触发位与快照价取更差」行为（零回归通道）。止盈限价语义不动。
+    "twelve_sl_slippage_pct": 0.02,   # 止损市价单常数滑点%（方向恒不利）
+    "twelve_sl_fill_mode": "bar",     # bar=触发bar结算（新默认）/ poll=旧行为回退
+    # ── T7 零成交体系处置（2026-08-13 正期望重建：12 套实为 7 套）────────────
+    # 诊断结论（一句话+行号，全文见开发计划 §T7）：12 套注册仅 7 套真正成交过。
+    #   volatility / martingale / arbitrage —— 设计上恒 neutral 不产生方向信号
+    #   （jarvis_twelve_systems.py:334-340 / :646-662 / :780-821），trader 对
+    #   neutral 恒跳过（jarvis_twelve_trader.py:2322）→ 结构性零成交，标 0；
+    #   gann —— 方向信号不带 trade_plan（jarvis_twelve_systems.py:366-375）且槽位
+    #   无 SL/TP 配置，_resolve_entry_params 返回 None 被静默跳过
+    #   （jarvis_twelve_trader.py:942/2356）→ 实现缺陷零成交，修复前保持 1；
+    #   gap —— 成交标的 ETHUSDT 上方向信号为零（缺口条件在高流动性币上不满足，
+    #   jarvis_twelve_systems.py:603-613）→ 信号侧零输入，保持 1。
+    # 0=设计上不产生方向信号（恒 neutral，非人工停用）；1=参与成交层。
+    # 本键为 T7 的「配置显式标记」+ 界面「12 套」口径的真实数字依据；
+    # 交易引擎按本键硬禁用的接线归 trader 侧任务，此处先落口径。
+    "twelve_system_enabled": {
+        "turtle": 1, "dow": 1, "elliott": 1, "volatility": 0, "gann": 1,
+        "chanlun": 1, "rule123": 1, "gap": 1, "martingale": 0,
+        "oscillator": 1, "triple_rsi": 1, "arbitrage": 0},
 }
 
 # ── YAML 分组 schema：key → 组名（trading/risk/signal/data/notify/system）────────
@@ -412,6 +436,11 @@ GROUPS: dict[str, str] = {
     "dashboard_port": "system",
     "ws_enabled": "system",
     "book_enabled": "system",
+    # sim——twelve 模拟盘结算口径（T1 正期望重建）
+    "twelve_sl_slippage_pct": "sim",
+    "twelve_sl_fill_mode": "sim",
+    # T7 零成交体系处置：12 套体系启停显式标记（dict 键，BOUNDS 不适用）
+    "twelve_system_enabled": "signal",
 }
 
 # 组内注释（init 模板用；也是 Settings 页分组展示的口径说明）。
@@ -422,6 +451,7 @@ GROUP_COMMENTS: dict[str, str] = {
     "data": "数据与回测：回测滑点成本等口径",
     "notify": "通知：渠道超时（token/webhook 走 notify_config.json 或环境变量，不放这里）",
     "system": "系统：守护进程周期 / 仪表盘监听地址端口",
+    "sim": "模拟结算：twelve 模拟盘止损结算口径（触发 bar 结算档位 / 常数滑点）",
 }
 
 # 关键风控旋钮的安全区间（写入时夹紧；未列的键不夹）。
@@ -508,6 +538,7 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "twelve_ctx_deweight_crowded": (0.05, 1.0),  # 降权下限 0.05：绝不降到 0 断样本
     "twelve_cb_deweight": (0.05, 1.0),
     "twelve_tf_deweight": (0.05, 1.0),
+    "twelve_sl_slippage_pct": (0.0, 0.5),      # 止损常数滑点%（真实滑点 0.01~0.03）
 }
 
 # 允许的枚举键。
@@ -519,6 +550,7 @@ ENUMS: dict[str, tuple[str, ...]] = {
     "twelve_trend_filter_mode": ("reject", "deweight"),
     "twelve_cb_mode": ("reject", "deweight"),
     "twelve_tf_gate_mode": ("reject", "deweight"),
+    "twelve_sl_fill_mode": ("bar", "poll"),
 }
 
 
@@ -795,7 +827,7 @@ def init_yaml_template(yaml_path: str | None = None, *, force: bool = False) -> 
         "# 覆盖优先级：内置默认 < 旧 jarvis_config.json < 本文件 < 环境变量 JARVIS_CFG_<KEY大写>",
         "",
     ]
-    for g in ("trading", "risk", "signal", "data", "notify", "system"):
+    for g in ("trading", "risk", "signal", "data", "notify", "system", "sim"):
         lines.append(f"# ── {GROUP_COMMENTS.get(g, g)}")
         lines.append(f"{g}:")
         for k, grp in GROUPS.items():

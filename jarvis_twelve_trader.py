@@ -14,8 +14,12 @@
 交易规则（每轮 run_cycle，平仓判定优先级 爆仓 > 止损 > 止盈 > 时间止损；
 2026-08-06 R3 重构：点位触发才成交 + 信号变更失效留痕 + 已成交仓位独立）：
   1. 盯盘：持仓槽位先用「自开仓以来已收盘 bar 的 high/low」判断 爆仓(liq)/
-     止损(sl)/止盈(tp) 盘中触碰（影线也算；同 bar 双触按保守取 SL；结算价=触发位；
-     K 线取不到时优雅回退快照现价比对，缺口按更差价结算）；
+     止损(sl)/止盈(tp) 盘中触碰（影线也算；同 bar 双触按保守取 SL；
+     止盈按计划位结算——限价语义；止损结算走 T1 挂单语义（2026-08-11 正期望
+     重建）：twelve_sl_fill_mode=bar（新默认）按**触发那根 bar**结算——常规
+     触发=触发位+常数滑点 twelve_sl_slippage_pct（方向恒不利，镜像止损市价单），
+     真跳空（bar open 已越过触发位）按 open 结算不叠滑点；poll=回退改前
+     「触发位与当前快照价取更差」口径；K 线取不到时优雅回退快照现价比对）；
   2. 已成交仓位独立（R3 规则3）：持仓后同槽位信号再变化（反向/转中性/点位更新）
      **绝不影响已成交仓位**——不 flip 平仓、不跟随更新 SL/TP，仅记 applied=0
      留痕日志；持仓只按自身 liq/sl/tp/timeout 生命周期退出。反向信号作为
@@ -151,6 +155,18 @@ MIN_SL_PCT_BY_TF = {"5m": 0.5, "15m": 0.7, "30m": 1.0,
 # ATR14% → 拒单 'sl_below_atr'（止损埋在噪声带内，扫损概率极高）。
 # 0=关闭；ATR 取数失败自动放行（可用性优先，静态档仍兜底）。
 SL_ATR_MULT_DEFAULT = 1.5
+
+# T1 止损结算口径纠偏（2026-08-11 正期望重建：轮询粒度 → 挂单语义）。
+# 取证定案：79 笔止盈 100% 精确按计划位结算而 240 笔止损 134 笔劣于计划位、
+# 0 笔优于——单边悲观伪影 51.35U（其中 82% 为代码伪影非真滑点）；且旧口径用
+# 「检出时快照价」结算，穿透随持仓时长增长（r=+0.230，滞后签名非市场签名）。
+# bar（新默认）：结算取**触发那根 bar**的价——常规触发=触发位+常数滑点
+# （方向恒不利，镜像止损市价单真实成交）；真跳空（触发 bar 开盘已越过触发位）
+# 按 open 结算不叠滑点（市场缺口诚实入账，检测延迟不算缺口）。
+# poll（回退档）：改前行为逐字节保留（触发位与当前快照价取更差侧）。
+# 止盈为限价单语义（恰在限价成交），不动。
+SL_SLIPPAGE_PCT_DEFAULT = 0.02
+SL_FILL_MODE_DEFAULT = "bar"
 
 # 拒单(rejected)留痕行保留天数（与 canceled 同哲学：窗口期可复盘，到期物理清理；
 # twelve_sim_signal_log 的 reject 留痕永久保留）
@@ -566,17 +582,19 @@ def _tf_gate_num(key: str, tf: str, defaults: dict, fallback: float = 0.0) -> fl
 
 
 def _fetch_bars(symbol: str, tf: str) -> list[dict] | None:
-    """取该 TF 最近的已收盘 K 线（[{time(ms), high, low}]），供影线盘中触发判定。
+    """取该 TF 最近的已收盘 K 线（[{time(ms), open, high, low}]），供影线盘中
+    触发判定；open 供 T1 止损结算的真跳空判据（bar 开盘即越过触发位）。
 
     只拉数据不算信号（不触发 12 信号重算）；失败返回 None → 调用方
-    优雅回退快照现价比对。冒烟测试直接对本函数打桩。
+    优雅回退快照现价比对。冒烟测试直接对本函数打桩（缺 open 键时结算
+    按常规触发处理，不影响触发判定）。
     """
     try:
         import jarvis_twelve_systems as jts
         df = jts.fetch_klines_df(symbol, tf, 300, drop_unclosed=True)
         if df is None or len(df) == 0:
             return None
-        return df[["time", "high", "low"]].to_dict("records")
+        return df[["time", "open", "high", "low"]].to_dict("records")
     except Exception as exc:  # noqa: BLE001 — 取数失败降级为快照比对
         _log(f"⚠️ {symbol} [{tf}] 取K线失败（回退现价比对）: {exc!r}"[:160])
         return None
@@ -1452,23 +1470,65 @@ def _liq_price(entry: float, direction: str, leverage: float) -> float | None:
     return entry * (1.0 - 1.0 / lev) if direction == "long" else entry * (1.0 + 1.0 / lev)
 
 
+def _sl_fill_price(sl: float, price: float, rel: list[dict],
+                   long_side: bool) -> float:
+    """T1 止损结算价（触发判定已由调用方完成，此处只定结算口径）。
+
+    bar（twelve_sl_fill_mode 新默认）——结算取**触发那根 bar**的价：
+      · 常规触发（bar 内穿越触发位 / 无已收盘触发 bar 时快照触发同口径）：
+        触发位 + 常数滑点 twelve_sl_slippage_pct，滑点方向恒为不利方
+        （多头更低 / 空头更高，镜像止损市价单真实成交）；
+      · 真跳空（触发 bar 的 open 已越过触发位）：按 open 结算，不叠加滑点
+        （判据是「bar 开盘即越过」而非「快照价越过」——前者是市场缺口，
+        后者是检测延迟）；bar 缺 open 键（旧打桩/降级数据）按常规触发处理。
+    poll（回退档）——改前行为逐字节保留：止损位与当前快照价取更差侧
+    （检测滞后的穿透会全部记进成绩，即 T1 要修的悲观伪影）。
+    """
+    if str(_gate_cfg("twelve_sl_fill_mode", SL_FILL_MODE_DEFAULT)).lower() == "poll":
+        return min(sl, price) if long_side else max(sl, price)
+    trig = None
+    for b in rel:   # rel 已按 bar 时间升序：第一根触及 bar 即触发 bar
+        try:
+            touched = (float(b["low"]) <= sl) if long_side \
+                else (float(b["high"]) >= sl)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if touched:
+            trig = b
+            break
+    if trig is not None:
+        try:
+            o = float(trig["open"]) if trig.get("open") is not None else None
+        except (TypeError, ValueError):
+            o = None
+        if o is not None and ((long_side and o <= sl)
+                              or (not long_side and o >= sl)):
+            return o   # 真跳空：触发 bar 开盘已越过触发位，按 open 诚实结算
+    slip = max(0.0, _gate_num("twelve_sl_slippage_pct",
+                              SL_SLIPPAGE_PCT_DEFAULT)) / 100.0
+    return sl * (1.0 - slip) if long_side else sl * (1.0 + slip)
+
+
 def _exit_check(pos: dict, price: float,
                 bars: list[dict] | None,
                 mark_price: float | None = None) -> tuple[str, float] | None:
     """爆仓/止损/止盈 盘中触发判定 → (reason, 结算价) 或 None。
 
-    bars=自开仓以来已收盘 bar（含影线 high/low）；None/为空 → 回退快照现价。
-    优先级 liq > sl > tp（同 bar 双触按保守取 SL）；结算价=触发位本身，
-    缺口行情（快照已越过触发位）按更差价结算。
+    bars=自开仓以来已收盘 bar（含影线 high/low + open）；None/为空 → 回退
+    快照现价。优先级 liq > sl > tp（同 bar 双触按保守取 SL）。
+    结算口径：止盈按计划位（限价语义）；止损按 _sl_fill_price（T1 挂单语义：
+    bar 档触发 bar 结算 + 常数滑点 + 真跳空按 open；poll 档回退旧「更差价」）。
     mark_price=合约标记价（2026-08-05 口径切换：爆仓按 markPrice 判定，与币安
     强平规则一致）；None 时回退 price（成交价），sl/tp 始终按成交价口径。
     """
     entry = float(pos["entry_price"])
     long_side = pos["direction"] == "long"
     hi = lo = None
+    rel: list[dict] = []
     if bars:
         entry_ms = float(pos["entry_ts"]) * 1000.0
-        rel = [b for b in bars if float(b["time"]) > entry_ms]
+        rel = sorted((b for b in bars if float(b["time"]) > entry_ms),
+                     key=lambda b: float(b["time"]))
         if rel:
             hi = max(float(b["high"]) for b in rel)
             lo = min(float(b["low"]) for b in rel)
@@ -1490,9 +1550,9 @@ def _exit_check(pos: dict, price: float,
     if sl is not None:
         sl = float(sl)
         if long_side and eff_lo <= sl:
-            return ("sl", min(sl, price))    # 缺口向下：按更差的快照价结算
+            return ("sl", _sl_fill_price(sl, price, rel, True))
         if not long_side and eff_hi >= sl:
-            return ("sl", max(sl, price))
+            return ("sl", _sl_fill_price(sl, price, rel, False))
     if tp is not None:
         tp = float(tp)
         if long_side and eff_hi >= tp:

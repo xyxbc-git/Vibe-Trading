@@ -101,6 +101,7 @@ _GATES: dict = {
     "twelve_tf_min_confidence": {tf: 0.0 for tf in jtt.TFS},  # 旧口径无置信档
     "twelve_trend_filter_enabled": 0.0,  # 旧口径无逆势过滤（且离线不触 wyckoff）
     "twelve_funding_rate": 0.0,     # 旧口径无资金费（保持整数 pnl 断言）
+    "twelve_sl_slippage_pct": 0.0,  # T1 后默认 0.02：旧用例免滑点保持「结算=触发位」断言
 }
 _orig_gate_cfg = jtt._gate_cfg
 jtt._gate_cfg = lambda key, default: _GATES.get(key, default)
@@ -1813,6 +1814,134 @@ with jtt._conn() as conn:
     conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
     conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
 for _tf, _sys in [("5m", "gap"), ("4h", "dow")]:
+    set_signal(_tf, _sys, "neutral", None)
+
+# ═══════════ 27. T1 止损结算口径纠偏（轮询粒度 → 挂单语义，2026-08-11 正期望重建） ═══════════
+check("T1 配置登记：twelve_sl_slippage_pct=0.02 / twelve_sl_fill_mode='bar' + 枚举/护栏",
+      jc.default_config().get("twelve_sl_slippage_pct") == 0.02
+      and jc.default_config().get("twelve_sl_fill_mode") == "bar"
+      and jc.ENUMS.get("twelve_sl_fill_mode") == ("bar", "poll")
+      and jc.BOUNDS.get("twelve_sl_slippage_pct") == (0.0, 0.5)
+      and jc.GROUPS.get("twelve_sl_fill_mode") == "sim")
+
+T17 = T16 + 96 * 3600
+_GATES["twelve_sl_slippage_pct"] = 0.02   # 本节验新默认滑点口径
+_PRICE["v"] = 100.0
+
+
+def _t1_open(tf, system, direction, plan, now):
+    """开一笔仓位并断言成功（本节公共前置）。"""
+    side = "long" if direction == "bullish" else "short"
+    set_signal(tf, system, direction, {"side": side, **plan})
+    out_ = jtt.run_cycle(cfg={}, now=now)
+    ok = len([o for o in out_["symbols"][SYM]["opened"]
+              if (o["tf"], o["system"]) == (tf, system)]) == 1
+    check(f"T1 前置：{tf}/{system} 开仓", ok, str(out_["symbols"][SYM]))
+    set_signal(tf, system, "neutral", None)
+
+
+def _t1_last_close(tf, system):
+    with jtt._conn() as conn:
+        r = conn.execute(
+            "SELECT exit_reason, exit_price, stop_loss, entry_price, pnl "
+            "FROM twelve_sim_trade WHERE symbol=? AND tf=? AND system=? "
+            "ORDER BY id DESC LIMIT 1", (SYM, tf, system)).fetchone()
+    return dict(r) if r else None
+
+
+# 本节全用无 twelve_sim_config 覆盖的干净槽位 + plan 显式杠杆 2×（爆仓价远离
+# SL，绝不被 liq 优先级抢先），逐用例验证结算口径本身
+# a) 检测滞后按触发 bar 结算：bar low 94 触 SL95 后快照价已跌到 92——
+#    旧 poll 口径按更差快照价 92 结算（把 3 个点滞后穿透记进成绩）；
+#    bar 新默认档按触发位+常数滑点结算 95×(1−0.0002)，且对多头恒更低（不利方）
+_t1_open("5m", "gap", "bullish",
+         {"entry": 100.0, "stop_loss": 95.0, "take_profit": 110.0,
+          "leverage": 2.0}, T17)
+_PRICE["v"] = 92.0
+jtt._fetch_bars = lambda symbol, tf: [
+    {"time": (T17 + 60) * 1000.0, "high": 100.5, "low": 94.0}]   # 无 open 键：兼容旧桩
+out = jtt.run_cycle(cfg={}, now=T17 + 120)
+tr = _t1_last_close("5m", "gap")
+_want = 95.0 * (1.0 - 0.02 / 100.0)
+check("T1a：检测滞后按触发 bar 结算（95+滑点≈94.981，而非快照价 92）",
+      tr is not None and tr["exit_reason"] == "sl"
+      and abs(float(tr["exit_price"]) - _want) < 1e-9, str(tr))
+check("T1a：多头滑点方向恒不利（结算价 < 触发位 95）",
+      tr is not None and float(tr["exit_price"]) < 95.0, str(tr))
+
+# b) 空头滑点方向恒不利：bar high 106 触 SL105（open 104 未越过，非跳空）
+#    → 结算 105×(1+0.0002) > 105
+_PRICE["v"] = 100.0
+jtt._fetch_bars = lambda symbol, tf: None
+_t1_open("30m", "gann", "bearish",
+         {"entry": 100.0, "stop_loss": 105.0, "take_profit": 90.0,
+          "leverage": 2.0}, T17 + 300)
+jtt._fetch_bars = lambda symbol, tf: [
+    {"time": (T17 + 360) * 1000.0, "open": 104.0, "high": 106.0, "low": 103.0}]
+out = jtt.run_cycle(cfg={}, now=T17 + 420)
+tr = _t1_last_close("30m", "gann")
+_want = 105.0 * (1.0 + 0.02 / 100.0)
+check("T1b：空头常数滑点恒不利（105+滑点≈105.021 > 触发位；带 open 非跳空不按 open）",
+      tr is not None and tr["exit_reason"] == "sl"
+      and abs(float(tr["exit_price"]) - _want) < 1e-9
+      and float(tr["exit_price"]) > 105.0, str(tr))
+
+# c) 真跳空按 open 结算且不叠滑点：触发 bar open 93 已越过 SL95 → 恰按 93 结算
+_PRICE["v"] = 100.0
+jtt._fetch_bars = lambda symbol, tf: None
+_t1_open("15m", "oscillator", "bullish",
+         {"entry": 100.0, "stop_loss": 95.0, "take_profit": 110.0,
+          "leverage": 2.0}, T17 + 600)
+jtt._fetch_bars = lambda symbol, tf: [
+    {"time": (T17 + 660) * 1000.0, "open": 93.0, "high": 94.5, "low": 92.0}]
+out = jtt.run_cycle(cfg={}, now=T17 + 720)
+tr = _t1_last_close("15m", "oscillator")
+check("T1c：真跳空（bar open 93 已越过 SL95）→ 按 open 结算且不叠滑点",
+      tr is not None and tr["exit_reason"] == "sl"
+      and abs(float(tr["exit_price"]) - 93.0) < 1e-9, str(tr))
+
+# d) poll 回退档与改前行为逐字节一致：重演 a 场景（bar low 94 / 快照 92）
+#    → min(SL95, 快照92) = 92（旧「更差价」口径，含滞后穿透）
+_GATES["twelve_sl_fill_mode"] = "poll"
+_PRICE["v"] = 100.0
+jtt._fetch_bars = lambda symbol, tf: None
+_t1_open("4h", "turtle", "bullish",
+         {"entry": 100.0, "stop_loss": 95.0, "take_profit": 110.0,
+          "leverage": 2.0}, T17 + 900)
+_PRICE["v"] = 92.0
+jtt._fetch_bars = lambda symbol, tf: [
+    {"time": (T17 + 960) * 1000.0, "high": 100.5, "low": 94.0}]
+out = jtt.run_cycle(cfg={}, now=T17 + 1020)
+tr = _t1_last_close("4h", "turtle")
+check("T1d：poll 回退档=旧行为（按更差快照价 92 结算，滑点/触发 bar 口径全不生效）",
+      tr is not None and tr["exit_reason"] == "sl"
+      and abs(float(tr["exit_price"]) - 92.0) < 1e-9, str(tr))
+del _GATES["twelve_sl_fill_mode"]
+
+# e) 止盈路径零变化：滑点开着（0.02）bar high 111 触 TP110 → 恰按计划位 110 结算
+_PRICE["v"] = 100.0
+jtt._fetch_bars = lambda symbol, tf: None
+_t1_open("1d", "oscillator", "bullish",
+         {"entry": 100.0, "stop_loss": 90.0, "take_profit": 110.0,
+          "leverage": 2.0}, T17 + 1200)
+jtt._fetch_bars = lambda symbol, tf: [
+    {"time": (T17 + 1260) * 1000.0, "open": 100.5, "high": 111.0, "low": 99.5}]
+out = jtt.run_cycle(cfg={}, now=T17 + 1320)
+tr = _t1_last_close("1d", "oscillator")
+check("T1e：止盈路径零变化（滑点开启下仍恰按计划位 110 结算，限价语义）",
+      tr is not None and tr["exit_reason"] == "tp"
+      and abs(float(tr["exit_price"]) - 110.0) < 1e-9, str(tr))
+
+# 复位：滑点回旧口径 0 + K 线回全局空桩 + 清场
+_GATES["twelve_sl_slippage_pct"] = 0.0
+jtt._fetch_bars = lambda symbol, tf: None
+_PRICE["v"] = 100.0
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+    conn.execute("DELETE FROM twelve_sim_position WHERE status='pending'")
+    conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
+for _tf, _sys in [("5m", "gap"), ("30m", "gann"), ("15m", "oscillator"),
+                  ("4h", "turtle"), ("1d", "oscillator")]:
     set_signal(_tf, _sys, "neutral", None)
 
 print()
