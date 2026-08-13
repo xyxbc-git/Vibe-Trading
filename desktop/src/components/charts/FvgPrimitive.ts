@@ -83,34 +83,44 @@ class FvgRenderer implements ISeriesPrimitivePaneRenderer {
       const { width, height } = mediaSize;
       ctx.font = "9px -apple-system, BlinkMacSystemFont, PingFang SC, sans-serif";
 
-      // [N2] 折价溢价区（横贯整图的淡色背景层，先画垫底）：
-      // 溢价带（range_high~均衡）淡红=宜卖区，折价带（均衡~range_low）淡绿=宜买区
+      // [N2→R9 减噪] 折价溢价区轻量画法：不再大面积铺色洗图——只画三条极淡
+      // 参考线（区间高/低边界虚线 + 均衡点状线）+ 右缘 56px 窄带极淡着色
+      // （alpha 0.03，仅提示分区）+ 小字标签。
       const pd = this._pd;
       if (pd) {
-        const drawBand = (y1: number, y2: number, color: string) => {
+        const EDGE_W = 56;
+        const bandX = Math.max(0, width - EDGE_W);
+        const drawEdgeBand = (y1: number, y2: number, color: string) => {
           const top = Math.min(y1, y2);
           const h = Math.abs(y2 - y1);
           if (h <= 0 || top > height || top + h < 0) return;
-          ctx.fillStyle = color;
-          ctx.fillRect(0, top, width, h);
+          ctx.fillStyle = rgba(color, 0.03);
+          ctx.fillRect(bandX, top, width - bandX, h);
         };
-        drawBand(pd.yHigh, pd.yEq, "rgba(248,81,73,0.045)");
-        drawBand(pd.yEq, pd.yLow, "rgba(63,185,80,0.045)");
-        // 均衡线（0.5 中点）虚线 + 右缘标注
-        if (pd.yEq >= 0 && pd.yEq <= height) {
-          ctx.strokeStyle = "rgba(201,209,217,0.5)";
+        drawEdgeBand(pd.yHigh, pd.yEq, COLOR_BEAR);
+        drawEdgeBand(pd.yEq, pd.yLow, COLOR_BULL);
+
+        const hline = (y: number, color: string, dash: number[]) => {
+          if (y < 0 || y > height) return;
+          ctx.strokeStyle = color;
           ctx.lineWidth = 1;
-          ctx.setLineDash([6, 4]);
+          ctx.setLineDash(dash);
           ctx.beginPath();
-          ctx.moveTo(0, pd.yEq + 0.5);
-          ctx.lineTo(width, pd.yEq + 0.5);
+          ctx.moveTo(0, y + 0.5);
+          ctx.lineTo(width, y + 0.5);
           ctx.stroke();
           ctx.setLineDash([]);
+        };
+        // 区间高/低边界：极淡细虚线；均衡线：点状细线
+        hline(pd.yHigh, rgba(COLOR_BEAR, 0.3), [2, 4]);
+        hline(pd.yLow, rgba(COLOR_BULL, 0.3), [2, 4]);
+        hline(pd.yEq, "rgba(201,209,217,0.45)", [1, 3]);
+        if (pd.yEq >= 0 && pd.yEq <= height) {
           ctx.fillStyle = "rgba(201,209,217,0.85)";
           ctx.textBaseline = "bottom";
           ctx.fillText("均衡 0.5", width - 52, pd.yEq - 2);
         }
-        // 区域小字（右缘，带太矮跳过）
+        // 区域小字（右缘窄带内，带太矮跳过）
         ctx.textBaseline = "middle";
         if (Math.abs(pd.yEq - pd.yHigh) >= 24) {
           ctx.fillStyle = rgba(COLOR_BEAR, 0.55);

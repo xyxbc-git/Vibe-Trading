@@ -1221,7 +1221,9 @@ export default function Chart() {
   // （60s 后端缓存），两个独立开关共享请求——任一开启才拉取 ──
   const [fvgOn, setFvgOn] = useState(toggleOr(persistedToggles, "fvgOn", false));
   const [bosOn, setBosOn] = useState(toggleOr(persistedToggles, "bosOn", false));
-  const smcActive = fvgOn || bosOn;
+  // [R9] 折溢价区独立开关（默认关）：大面积着色曾把图洗糊，改独立开+轻量画法
+  const [pdOn, setPdOn] = useState(toggleOr(persistedToggles, "pdOn", false));
+  const smcActive = fvgOn || bosOn || pdOn;
   const { data: fvgResp } = usePolling(
     () => (smcActive ? api.fvg(symbol, tfSettled) : Promise.resolve(null)),
     smcActive ? 60_000 : 0,
@@ -1256,9 +1258,9 @@ export default function Chart() {
     return out;
   }, [fvgOn, fvgResp, symbol, tfSettled]);
 
-  // [N2] 折价溢价区 → 均衡线+区域着色（FVG 同开关同数据源；检测失败/旧后端缺字段不渲染）
+  // [N2→R9] 折价溢价区 → 均衡线+边界线+右缘窄带（独立开关 pdOn；检测失败/旧后端缺字段不渲染）
   const fvgPdView = useMemo<PremiumDiscountView | null>(() => {
-    if (!fvgOn || !fvgResp?.ok) return null;
+    if (!pdOn || !fvgResp?.ok) return null;
     if (isStaleEcho(symbol, fvgResp.symbol) || (fvgResp.tf != null && fvgResp.tf !== tfSettled)) {
       return null;
     }
@@ -1282,7 +1284,7 @@ export default function Chart() {
         `现价分位 ${Math.round(pd.pos_pct ?? 50)}% → ${zoneCn}\n` +
         `SMC 口径：折价区找做多、溢价区找做空，均衡线上下各留 5% 缓冲`,
     };
-  }, [fvgOn, fvgResp, symbol, tfSettled]);
+  }, [pdOn, fvgResp, symbol, tfSettled]);
 
   // SMC 结构事件 → 线段视图（BOS 实线 / CHoCH 琥珀虚线，被突破 swing 点→突破蜡烛）
   const smcEventViews = useMemo<StructureEventView[] | null>(() => {
@@ -1327,10 +1329,11 @@ export default function Chart() {
       deltaOn,
       fvgOn,
       bosOn,
+      pdOn,
       draws: [...draws],
       tf,
     });
-  }, [smart, autoTune, twelve, plan, predictOn, patternOn, liqOn, macdOn, deltaOn, fvgOn, bosOn, draws, tf]);
+  }, [smart, autoTune, twelve, plan, predictOn, patternOn, liqOn, macdOn, deltaOn, fvgOn, bosOn, pdOn, draws, tf]);
   const [deltaResp, setDeltaResp] = useState<DeltaResponse | null>(null);
   const [deltaLoading, setDeltaLoading] = useState(false);
   const [deltaError, setDeltaError] = useState<string | null>(null);
@@ -1666,6 +1669,15 @@ export default function Chart() {
           className={pillCls(bosOn)}
         >
           BOS{bosOn ? "·开" : "·关"}
+        </button>
+
+        {/* [R9] 折溢价区：dealing range 分位参考线（轻量画法不洗图，默认关） */}
+        <button
+          onClick={() => setPdOn((v) => !v)}
+          title="折溢价区参考线：近 120 根 swing 极值构成 dealing range，0.5 中点为均衡线——SMC 口径折价区（下半）找做多、溢价区（上半）找做空。轻量画法：均衡点状线+区间边界虚线+右缘窄带着色，不铺满全图。悬停均衡线看现价分位"
+          className={pillCls(pdOn)}
+        >
+          折溢价{pdOn ? "·开" : "·关"}
         </button>
 
         {/* 图例：解释当前模式下每类线的含义 */}
