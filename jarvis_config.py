@@ -189,6 +189,8 @@ DEFAULTS: dict = {
     # 驱动），真 bar 可用率按 UTC 小时 30%~86.5%（偏斜 2.9×）。采集器为独立常驻
     # 进程：只认已收盘 bar → 12 系统信号计算 → record_batch 落库，与面板无关。
     "sigcol_enabled": True,           # 采集器总开关（进程启动时读取；关=启动即退出）
+    "sigcol_symbols": "",             # 采集标的（逗号分隔）；空=跟随 watchlist。与 watchlist
+                                      # 解耦是为了「历史 9 标的」覆盖可独立于面板订阅扩容
     "sigcol_tfs": "5m,15m,30m,1h,4h",  # 采集 TF 集（逗号分隔，与 12 系统共识 TF 对齐）
     "sigcol_backfill_bars": 288,      # WS 断线缺口单 (币,TF) 最大回补 bar 数（0=关回补）
     "sigcol_queue_max": 4096,         # 收盘事件队列容量（满则丢新事件并计数，绝不阻塞 WS）
@@ -467,6 +469,7 @@ GROUPS: dict[str, str] = {
     "ws_reconnect_max_s": "data",
     "ws_force_order_persist": "data",
     "rest_max_per_min": "data",
+    "sigcol_symbols": "data",
     "sigcol_tfs": "data",
     "sigcol_backfill_bars": "data",
     "sigcol_queue_max": "data",

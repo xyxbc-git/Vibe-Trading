@@ -330,9 +330,33 @@ def _on_kline(sym: str, data: dict) -> None:
 
 # ────────────────────────── REST（仅种子/回补/基差，全走共享预算）──────────────────────────
 
+_LAST_BAN_LOG = 0.0
+
+
+def _rest_ban_remaining() -> float:
+    """fapi 封禁剩余秒数（未封禁 0）。封禁期种子/回补显式静默——只走 WS。
+
+    jarvis_crypto_data._get 在封禁期本就短路不出网（回缓存/报错），此处提前
+    拦截是为了：不做无谓的陈旧缓存空转、冷却直接对齐封禁到期、日志可审计。
+    """
+    try:
+        import jarvis_crypto_data as jcd
+        return max(0.0, jarvis_net.banned_until(jcd.FAPI) - time.time())
+    except Exception:  # noqa: BLE001 — 查不到按未封禁处理（_get 层仍有短路兜底）
+        return 0.0
+
+
 def _paced_fetch_df(sym: str, tf: str, limit: int):
-    """fetch_klines_df + 进程内最小间隔。只认已收盘 bar。失败返回 None。"""
-    global _LAST_REST_TS
+    """fetch_klines_df + 进程内最小间隔。只认已收盘 bar。失败/封禁期返回 None。"""
+    global _LAST_REST_TS, _LAST_BAN_LOG
+    ban = _rest_ban_remaining()
+    if ban > 0:
+        now = time.time()
+        if now - _LAST_BAN_LOG > 600:
+            _LAST_BAN_LOG = now
+            _log(f"⛔ fapi 封禁剩余 {ban / 60:.0f} 分钟：REST 静默（只走 WS），"
+                 "解禁后自动重播种/回补")
+        return None
     wait = REST_MIN_INTERVAL_S - (time.time() - _LAST_REST_TS)
     if wait > 0:
         time.sleep(wait)
@@ -458,12 +482,14 @@ def _seed_pair(sym: str, tf: str, event_open_ms: int) -> bool:
         if key not in _SEEDED:
             _HIST[key] = deque(maxlen=HIST_MAXLEN)
             _SEEDED.add(key)
-        _SEED_DEGRADED[key] = time.time() + RESEED_COOLDOWN_S
+        # 冷却对齐封禁到期：封禁期内不再空转重试，解禁后 60s 内自动重播种
+        retry_after = max(RESEED_COOLDOWN_S, _rest_ban_remaining() + 60.0)
+        _SEED_DEGRADED[key] = time.time() + retry_after
         _STATS["seed_fails" if not rows else "seed_degraded"] += 1
         _log(f"⚠ {sym} {tf} 种子不可用/陈旧"
              + (f"（缓存止于 {time.strftime('%m-%d %H:%M', time.localtime(rows[-1]['time'] / 1000))}）"
-                if rows else "（取数失败）")
-             + "，纯 WS 降级起窗，1h 后重试整窗")
+                if rows else "（取数失败/封禁静默）")
+             + f"，纯 WS 降级起窗，{retry_after / 60:.0f} 分钟后重试整窗")
         return False
     hist = _HIST.get(key)
     if hist is None:
@@ -528,11 +554,13 @@ def _backfill_gap(sym: str, tf: str, last_open_ms: int, new_open_ms: int) -> boo
     lim = min(500, max(50, n_missing + 3))
     recs = _df_rows(_paced_fetch_df(sym, tf, lim))
     if not recs or recs[-1]["time"] < new_open_ms - tfms:
-        _BACKFILL_FAIL[key] = time.time() + BACKFILL_RETRY_COOLDOWN_S
+        # 冷却对齐封禁到期：封禁期内不空转，解禁后 30s 内恢复回补
+        cool = max(BACKFILL_RETRY_COOLDOWN_S, _rest_ban_remaining() + 30.0)
+        _BACKFILL_FAIL[key] = time.time() + cool
         _log(f"{sym} {tf} 缺口回补失败（缺 {n_missing} 根，"
-             + ("取数失败" if not recs else
+             + ("取数失败/封禁静默" if not recs else
                 f"数据陈旧止于 {time.strftime('%m-%d %H:%M', time.localtime(recs[-1]['time'] / 1000))}")
-             + "，60s 冷却）")
+             + f"，{cool / 60:.0f} 分钟冷却）")
         return False
     rows = [r for r in recs if last_open_ms < r["time"] < new_open_ms]
     lost = n_missing - len(rows)
@@ -636,7 +664,11 @@ def start(symbols: list[str] | None = None, tfs: list[str] | None = None) -> boo
     if not bool(cfg.get("sigcol_enabled", True)):
         _log("采集器未启用（sigcol_enabled=false），退出")
         return False
-    syms = [str(s).upper() for s in (symbols or cfg.get("watchlist") or ["BTCUSDT"])
+    # 标的优先级：显式传参 > sigcol_symbols（与 watchlist 解耦扩容）> watchlist
+    cfg_syms = [s.strip() for s in str(cfg.get("sigcol_symbols") or "").split(",")
+                if s.strip()]
+    syms = [str(s).upper()
+            for s in (symbols or cfg_syms or cfg.get("watchlist") or ["BTCUSDT"])
             if str(s).strip()]
     tf_list = parse_tfs(tfs if tfs is not None else cfg.get("sigcol_tfs"))
     _ACTIVE_SYMBOLS.clear()
@@ -738,7 +770,10 @@ def coverage_report(days: float = 7.0, symbols: list[str] | None = None,
     t1 = float(now if now is not None else time.time())
     t0 = t1 - float(days) * 86400.0
     cfg = _cfg()
-    syms = [str(s).upper() for s in (symbols or cfg.get("watchlist") or [])] or None
+    cfg_syms = [s.strip() for s in str(cfg.get("sigcol_symbols") or "").split(",")
+                if s.strip()]
+    syms = [str(s).upper()
+            for s in (symbols or cfg_syms or cfg.get("watchlist") or [])] or None
     tf_list = parse_tfs(tfs if tfs is not None else cfg.get("sigcol_tfs"))
     rep: dict = {"generated_at": t1,
                  "window": {"days_requested": float(days), "start_ts": t0, "end_ts": t1}}

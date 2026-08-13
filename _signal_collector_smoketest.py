@@ -125,9 +125,9 @@ check("缺口-cap0 全丢", jsc.missing_opens(T0, T0 + 4 * TFMS, TFMS, 0) == ([]
 # ── 2. 配置键三处登记 ─────────────────────────────────────────────
 import jarvis_config as jc  # noqa: E402
 
-_SIGCOL_KEYS = ("sigcol_enabled", "sigcol_tfs", "sigcol_backfill_bars",
-                "sigcol_queue_max", "sigcol_ledger_retention_days",
-                "sigcol_tape", "sigcol_basis")
+_SIGCOL_KEYS = ("sigcol_enabled", "sigcol_symbols", "sigcol_tfs",
+                "sigcol_backfill_bars", "sigcol_queue_max",
+                "sigcol_ledger_retention_days", "sigcol_tape", "sigcol_basis")
 check("sigcol 键 DEFAULTS 齐全", all(k in jc.DEFAULTS for k in _SIGCOL_KEYS),
       str([k for k in _SIGCOL_KEYS if k not in jc.DEFAULTS]))
 check("sigcol 键 GROUPS 齐全", all(k in jc.GROUPS for k in _SIGCOL_KEYS))
@@ -365,6 +365,21 @@ acc = rep["acceptance"]
 check("报表-验收：窗口不足如实标注", acc["window_ok"] is False
       and acc["pass"] is False and len(acc["notes"]) >= 1, str(acc))
 check("报表-tape 缺表降级不炸", "error" in rep["tape"] or rep["tape"]["overall_rate"] is None)
+
+# ── 13b. 封禁静默：封禁期 REST 剩余时间可测（冷却对齐依据）──────────
+import jarvis_net  # noqa: E402
+
+_orig_ban = jarvis_net.banned_until
+jarvis_net.banned_until = lambda _h: time.time() + 1234.0
+try:
+    rem = jsc._rest_ban_remaining()
+    check("封禁-剩余秒数计算", 1200 < rem <= 1234, f"rem={rem}")
+    jarvis_net.banned_until = lambda _h: 0.0
+    check("封禁-未封禁归零", jsc._rest_ban_remaining() == 0.0)
+    jarvis_net.banned_until = lambda _h: (_ for _ in ()).throw(RuntimeError("x"))
+    check("封禁-查询异常放行为 0", jsc._rest_ban_remaining() == 0.0)
+finally:
+    jarvis_net.banned_until = _orig_ban
 
 # ── 14. 台账覆盖口径：n_signals 为空（史不足）不算已采 ────────────
 jsc.ledger_record("BTCUSDT", "5m", T0 + 20 * TFMS, T0 + 21 * TFMS, "ws",
