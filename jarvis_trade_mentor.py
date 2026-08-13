@@ -52,9 +52,21 @@
   R06 loss_streak    当日已连亏 ≥ streak(2) 单再提交 → fail + 降灯 + 冷静期 60min
   R07 event_window   高影响事件风险窗口内 → warn（事件日历未配置 → skipped）
   R08 risk_pct_cap   预亏 > 本金 × max_loss_pct(1.0)% → warn（未给本金 → skipped）
+  ——V3 追加（全部 warn 级行为/时机提醒，不降灯；与 R05/R06 硬约束区分）——
+  R09 session_liquidity  提交时刻落在低流动性时段 hours(UTC+8 0-6) → warn；
+                         该时段用户自身 graded≥5 时引用真实胜率说话
+  R10 funding_extreme    计划方向与极端资金费同向（|费率| > max_abs_funding
+                         (0.05%/8h) 且追拥挤方）→ warn；复用 sentiment 的
+                         funding 数值，零新增取数（数据缺 → skipped）
+  R11 reentry_discipline 同 symbol 同方向 window_min(60) 分钟内有 loss 平仓
+                         → 报复性再入场 warn；反转四条件 ≥3/4 视为新结构证据
+                         则 pass（结构位收复/123 第二步的代理口径）
+  R12 streak_hubris      当日连胜 ≥ win_streak(3) 且本单预亏占本金比高于
+                         历史基准均值 → warn（连胜后过度自信；无本金或无
+                         基准样本 → skipped）
   状态集合：pass=遵守 / warn=边缘触碰 / fail=违反 / skipped=数据缺失不判定；
-  台账上下文（当日提交数/连亏 streak/最近红灯）由 _rules_context 查库，
-  evaluate_rules 本身为纯函数（离线冒烟可构造）。
+  台账上下文（当日提交数/连亏连胜 streak/最近红灯/同向近损/时段胜率/预亏基准）
+  由 _rules_context 查库，evaluate_rules 本身为纯函数（离线冒烟可构造）。
 ──────────────────────────────────────────────────────────────────────
 
 数据纪律：pg/SQLite 只经 jarvis_journal._conn()（jarvis_db 兼容层）；
@@ -100,6 +112,14 @@ DEFAULT_RULES = (
      {"streak": 2, "extended_cooldown_min": 60}),
     ("R07", "高影响事件风险窗口内不开新仓", "event_window", {}),
     ("R08", "单笔预亏不超过本金 1%", "risk_pct_cap", {"max_loss_pct": 1.0}),
+    # V3 追加：行为/时机类提醒（全 warn 级不降灯）
+    ("R09", "凌晨低流动性时段谨慎开单", "session_liquidity",
+     {"hours": [0, 6]}),
+    ("R10", "资金费极端时不追拥挤方向", "funding_extreme",
+     {"max_abs_funding": 0.05}),
+    ("R11", "被扫损后同方向再入场需等新结构", "reentry_discipline",
+     {"window_min": 60}),
+    ("R12", "连胜后仓位回归基准", "streak_hubris", {"win_streak": 3}),
 )
 
 _DIR_CN = {"long": "多单", "short": "空单"}
@@ -221,9 +241,16 @@ def _micro_evidence(symbol: str, tf: str, plan_dir: str) -> dict:
     try:
         import jarvis_sentiment as jst
         got = jst.assess(symbol)
-        out["sentiment"] = ({"score": got.get("score"), "bias": got.get("bias"),
-                             "warnings": got.get("warnings") or []}
-                            if got.get("ok") else None)
+        if got.get("ok"):
+            # V3/R10：顺带保留资金费原始数值（小数，×100=%/8h），零新增取数
+            funding = next((f.get("value") for f in (got.get("factors") or [])
+                            if f.get("key") == "funding" and f.get("available")
+                            and f.get("value") is not None), None)
+            out["sentiment"] = {"score": got.get("score"), "bias": got.get("bias"),
+                                "warnings": got.get("warnings") or [],
+                                "funding": funding}
+        else:
+            out["sentiment"] = None
     except Exception:  # noqa: BLE001
         out["sentiment"] = None
     try:
@@ -717,6 +744,86 @@ def evaluate_rules(evidence: dict, plan: dict, rules: list[dict],
                               f"——{'已属重仓豪赌' if loss_pct > 50 else '超出你的日常风险档'}，建议缩仓")
                 else:
                     ev_txt = f"预亏占本金 {loss_pct:.2f}% ≤ {mx:g}%，仓位在日常风险档内"
+        elif rtype == "session_liquidity":
+            hours = p.get("hours", [0, 6])
+            lo_h, hi_h = int(hours[0]), int(hours[1])
+            hour = ctx.get("now_hour_utc8")
+            if hour is None:
+                status = "skipped"
+                ev_txt = "无提交时刻上下文，本条不判定"
+            elif lo_h <= int(hour) < hi_h:
+                status = "warn"
+                ev_txt = (f"当前北京时间 {int(hour):02d} 点，处于凌晨低流动性时段"
+                          f"（{lo_h:02d}-{hi_h:02d}）——点差和插针风险高，"
+                          "新手胜率普遍最差的时段")
+                ss = ctx.get("session_stats")
+                if ss and ss.get("win_rate") is not None:
+                    ev_txt += (f"；你自己在这个时段的真实胜率 {ss['win_rate']:.0%}"
+                               f"（n={ss['n']}）——用你自己的数据说话")
+            else:
+                ev_txt = f"当前北京时间 {int(hour):02d} 点，不在低流动性时段"
+        elif rtype == "funding_extreme":
+            mx = float(p.get("max_abs_funding", 0.05))   # 单位 %/8h
+            snt = (evidence.get("micro") or {}).get("sentiment") \
+                if (evidence.get("micro") or {}).get("available") else None
+            funding = (snt or {}).get("funding")
+            if funding is None:
+                status = "skipped"
+                ev_txt = "资金费数据不可用，本条不判定"
+            else:
+                f_pct = float(funding) * 100.0
+                crowd_long = f_pct > mx
+                crowd_short = f_pct < -mx
+                if crowd_long and plan_dir == "long":
+                    status = "warn"
+                    ev_txt = (f"8h 资金费 {f_pct:+.4f}% > +{mx:g}%，多头拥挤——"
+                              "你在追拥挤方向，拥挤方易被收割")
+                elif crowd_short and plan_dir == "short":
+                    status = "warn"
+                    ev_txt = (f"8h 资金费 {f_pct:+.4f}% < -{mx:g}%，空头拥挤——"
+                              "你在追拥挤方向，谨防轧空")
+                else:
+                    ev_txt = f"8h 资金费 {f_pct:+.4f}%，与计划方向无拥挤冲突"
+        elif rtype == "reentry_discipline":
+            win = float(p.get("window_min", 60))
+            age = ctx.get("last_loss_same_dir_age_min")
+            rev = ((evidence.get("micro") or {}).get("reversal")
+                   if (evidence.get("micro") or {}).get("available") else None)
+            rev_sat = int(rev.get("satisfied") or 0) if rev else 0
+            if age is None or age >= win:
+                ev_txt = (f"同方向 {win:g} 分钟内无扫损记录，不属再入场场景"
+                          if age is None else
+                          f"上次同方向亏损已过 {age:.0f} 分钟（≥{win:g}），冷却充分")
+            elif rev_sat >= REVERSAL_MIN_SCORE:
+                ev_txt = (f"上次同方向亏损仅 {age:.0f} 分钟前，但反转四条件 "
+                          f"{rev_sat}/4 达标——有新结构证据，允许再入场")
+            else:
+                status = "warn"
+                ev_txt = (f"上次同方向亏损仅 {age:.0f} 分钟前（<{win:g}），且无新结构"
+                          f"证据（反转四条件 {rev_sat}/4）——刚被扫损就同方向再入场，"
+                          "是报复性交易高发区，等结构位收复或 123 第二步确认")
+        elif rtype == "streak_hubris":
+            need = int(p.get("win_streak", 3))
+            streak = int(ctx.get("win_streak_today") or 0)
+            base = ctx.get("avg_planned_risk_pct")
+            principal = float(plan.get("principal") or 0)
+            leverage = float(plan.get("leverage") or 0)
+            if streak < need:
+                ev_txt = f"当日连胜 {streak} 单（<{need}），未触发过度自信检查"
+            elif principal <= 0 or leverage <= 0 or base is None:
+                status = "skipped"
+                ev_txt = (f"当日已连胜 {streak} 单，但缺本金/杠杆或历史基准样本(<3)，"
+                          "仓位对比不判定")
+            else:
+                this_risk = leverage * float(risk.get("sl_dist_pct") or 0)
+                if this_risk > base:
+                    status = "warn"
+                    ev_txt = (f"当日连胜 {streak} 单且本单预亏 {this_risk:.2f}% "
+                              f"高于你的历史基准 {base:.2f}%——连胜后的过度自信"
+                              "是连亏的前奏，建议仓位回归基准")
+                else:
+                    ev_txt = (f"当日连胜 {streak} 单，本单预亏 {this_risk:.2f}% "
+                              f"未超历史基准 {base:.2f}%，仓位纪律保持")
         else:
             # 用户自定义文案军规：无自动判定逻辑，只展示提醒自查
             status = "pass"
@@ -975,11 +1082,13 @@ def _day_start_utc8(now: float | None = None) -> float:
     return (int((now + 8 * 3600) // 86400)) * 86400.0 - 8 * 3600.0
 
 
-def _rules_context(symbol: str, now: float | None = None) -> dict:
-    """军规判定所需的台账上下文（R01/R05/R06）。"""
+def _rules_context(symbol: str, direction: str | None = None,
+                   now: float | None = None) -> dict:
+    """军规判定所需的台账上下文（R01/R05/R06 + V3 的 R09/R11/R12）。"""
     ensure_schema()
     now = time.time() if now is None else now
     day0 = _day_start_utc8(now)
+    hour8 = int(((now + 8 * 3600) % 86400) // 3600)
     with _conn() as conn:
         today = [dict(r) for r in conn.execute(
             "SELECT status, result, closed_ts FROM mentor_plan "
@@ -987,18 +1096,57 @@ def _rules_context(symbol: str, now: float | None = None) -> dict:
         last_red = conn.execute(
             "SELECT created_ts FROM mentor_plan WHERE symbol = ? AND light = 'red' "
             "ORDER BY created_ts DESC LIMIT 1", (symbol.upper(),)).fetchone()
+        # R09：当前 UTC+8 小时所在 6h 时段的全量真实战绩（跨 symbol，行为属性；
+        # 时段过滤在 Python 侧做，created_ts 需换算 UTC+8）
+        sess_lo = hour8 // 6 * 6
+        sess_rows = [dict(r) for r in conn.execute(
+            "SELECT created_ts, result FROM mentor_plan WHERE status = 'closed' "
+            "AND result IN ('win','loss','breakeven')").fetchall()]
+        # R11：同 symbol 同方向最近一条 loss 平仓
+        last_loss_row = (conn.execute(
+            "SELECT closed_ts FROM mentor_plan WHERE symbol = ? AND direction = ? "
+            "AND status = 'closed' AND result = 'loss' "
+            "ORDER BY closed_ts DESC LIMIT 1",
+            (symbol.upper(), direction)).fetchone() if direction else None)
+        # R12：历史预亏基准（有本金/杠杆的单，n≥3 才给均值）
+        risk_rows = [dict(r) for r in conn.execute(
+            "SELECT entry, stop_loss, principal, leverage FROM mentor_plan "
+            "WHERE principal IS NOT NULL AND leverage IS NOT NULL "
+            "AND principal > 0 AND leverage > 0").fetchall()]
     graded = sorted((r for r in today if r["status"] == "closed"
                      and r.get("result") in ("win", "loss", "breakeven")),
                     key=lambda r: float(r.get("closed_ts") or 0))
-    streak = 0
+    loss_streak = win_streak = 0
     for r in reversed(graded):
-        if r["result"] == "loss":
-            streak += 1
+        if r["result"] == "loss" and win_streak == 0:
+            loss_streak += 1
+        elif r["result"] == "win" and loss_streak == 0:
+            win_streak += 1
         else:
             break
-    return {"today_submitted": len(today), "loss_streak_today": streak,
+    sess_graded = [r for r in sess_rows
+                   if sess_lo <= int(((float(r["created_ts"]) + 8 * 3600) % 86400)
+                                     // 3600) < sess_lo + 6]
+    sess_stats = None
+    if len(sess_graded) >= MIN_STAT_N:
+        wins = sum(1 for r in sess_graded if r["result"] == "win")
+        sess_stats = {"n": len(sess_graded),
+                      "win_rate": round(wins / len(sess_graded), 4)}
+    risk_pcts = [float(r["leverage"]) * abs(float(r["entry"]) - float(r["stop_loss"]))
+                 / float(r["entry"]) * 100.0
+                 for r in risk_rows if float(r.get("entry") or 0) > 0]
+    return {"today_submitted": len(today), "loss_streak_today": loss_streak,
+            "win_streak_today": win_streak,
             "last_red_age_min": ((now - float(last_red["created_ts"])) / 60.0
-                                 if last_red else None)}
+                                 if last_red else None),
+            "now_hour_utc8": hour8,
+            "session_stats": sess_stats,
+            "last_loss_same_dir_age_min": (
+                (now - float(last_loss_row["closed_ts"])) / 60.0
+                if last_loss_row is not None and last_loss_row["closed_ts"] is not None
+                else None),
+            "avg_planned_risk_pct": (round(sum(risk_pcts) / len(risk_pcts), 4)
+                                     if len(risk_pcts) >= 3 else None)}
 
 
 def save_plan(plan: dict, vd: dict) -> int:
@@ -1194,7 +1342,7 @@ def main() -> int:
         ev = build_evidence(args.symbol.upper(), args.direction, args.entry,
                             args.sl, args.tp, tf=args.tf)
         try:
-            rules, ctx = load_rules(), _rules_context(args.symbol.upper())
+            rules, ctx = load_rules(), _rules_context(args.symbol.upper(), args.direction)
         except Exception:  # noqa: BLE001 — 台账不可用时退回无军规裁决
             rules, ctx = None, None
         vd = verdict(ev, plan, rules=rules, rules_ctx=ctx)

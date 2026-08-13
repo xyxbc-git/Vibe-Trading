@@ -292,7 +292,7 @@ ev26["trend"]["consensus"]["tfs"].update(
 ctx_clean = {"today_submitted": 0, "loss_streak_today": 0, "last_red_age_min": None}
 vd26 = jtm.verdict(ev26, plan_of(ev26), rules=RULES, rules_ctx=ctx_clean)
 rm = rules_map(vd26)
-check("V1 军规区段齐 8 条", len(rm) == 8, str(list(rm)))
+check("V1 军规区段齐全（含 V3 追加共 12 条）", len(rm) == 12, str(list(rm)))
 check("V1 顺风局 R01-R06 全 pass",
       all(rm[k]["status"] == "pass" for k in ("R01", "R02", "R03", "R04", "R05", "R06")),
       str({k: rm[k]["status"] for k in ("R01", "R02", "R03", "R04", "R05", "R06")}))
@@ -384,7 +384,7 @@ try:
     jtm.ensure_schema()
     jtm.ensure_schema()   # seed 幂等
     rules_db = jtm.load_rules()
-    check("V1 seed 默认 8 条", len(rules_db) == 8
+    check("V1 seed 默认军规（含 V3 共 12 条）", len(rules_db) == 12
           and rules_db[0]["params"].get("cooldown_min") == 30, str(len(rules_db)))
 
     up = jtm.upsert_rule("R03", params={"min_rr": 2.5}, enabled=True)
@@ -430,9 +430,107 @@ finally:
     import shutil as _sh3
     _sh3.rmtree(_tmp3, ignore_errors=True)
 
+# ══════════════ V3 · 军规追加 R09-R12（全 warn 级不降灯） ══════════════
+
+RULES12 = [{"rule_id": rid, "title": t, "rtype": rt, "params": p, "enabled": 1}
+           for rid, t, rt, p in jtm.DEFAULT_RULES]
+check("V3 默认军规 12 条", len(RULES12) == 12, str(len(RULES12)))
+
+ev36 = ev_base()
+ev36["trend"]["consensus"]["tfs"].update(
+    {"30m": {"direction": "bullish", "confidence": 0.6},
+     "1h": {"direction": "bullish", "confidence": 0.6}})
+ctx36 = dict(ctx_clean, now_hour_utc8=3, session_stats={"n": 8, "win_rate": 0.125},
+             win_streak_today=0, last_loss_same_dir_age_min=None,
+             avg_planned_risk_pct=None)
+
+# ── 36. R09：凌晨时段 warn + 引用用户自身真实胜率；白天 pass ──
+vd36 = jtm.verdict(ev36, plan_of(ev36), rules=RULES12, rules_ctx=ctx36)
+rm36 = rules_map(vd36)
+check("V3 R09 凌晨 warn", rm36["R09"]["status"] == "warn")
+check("V3 R09 引用自身胜率 13%", "13%" in rm36["R09"]["evidence"]
+      or "12" in rm36["R09"]["evidence"], rm36["R09"]["evidence"][-50:])
+check("V3 warn 军规不降灯", vd36["light"] == "green", vd36["light"])
+ctx36b = dict(ctx36, now_hour_utc8=14)
+vd36b = jtm.verdict(ev36, plan_of(ev36), rules=RULES12, rules_ctx=ctx36b)
+check("V3 R09 白天 pass", rules_map(vd36b)["R09"]["status"] == "pass")
+
+# ── 37. R10：多头追极端正费率 warn；反向/温和 pass；缺数据 skipped ──
+ev37 = ev_base()
+ev37["trend"]["consensus"]["tfs"].update(
+    {"30m": {"direction": "bullish", "confidence": 0.6},
+     "1h": {"direction": "bullish", "confidence": 0.6}})
+ev37["micro"]["sentiment"]["funding"] = 0.0008   # +0.08%/8h 多头拥挤
+vd37 = jtm.verdict(ev37, plan_of(ev37), rules=RULES12, rules_ctx=ctx36b)
+check("V3 R10 追多头拥挤 warn", rules_map(vd37)["R10"]["status"] == "warn"
+      and "+0.0800%" in rules_map(vd37)["R10"]["evidence"],
+      rules_map(vd37)["R10"]["evidence"][:60])
+ev37["micro"]["sentiment"]["funding"] = 0.0001   # 温和
+vd37b = jtm.verdict(ev37, plan_of(ev37), rules=RULES12, rules_ctx=ctx36b)
+check("V3 R10 温和费率 pass", rules_map(vd37b)["R10"]["status"] == "pass")
+ev37["micro"]["sentiment"]["funding"] = None
+vd37c = jtm.verdict(ev37, plan_of(ev37), rules=RULES12, rules_ctx=ctx36b)
+check("V3 R10 缺数据 skipped", rules_map(vd37c)["R10"]["status"] == "skipped")
+
+# ── 38. R11：60min 内同向扫损再入场 warn；反转 3/4 有新结构 pass；过窗口 pass ──
+ctx38 = dict(ctx36b, last_loss_same_dir_age_min=15.0)
+vd38 = jtm.verdict(ev36, plan_of(ev36), rules=RULES12, rules_ctx=ctx38)
+check("V3 R11 扫损后急再入场 warn", rules_map(vd38)["R11"]["status"] == "warn",
+      rules_map(vd38)["R11"]["evidence"][:50])
+ev38b = ev_base(reversal_sat=3)
+ev38b["trend"]["consensus"]["tfs"].update(
+    {"30m": {"direction": "bullish", "confidence": 0.6},
+     "1h": {"direction": "bullish", "confidence": 0.6}})
+vd38b = jtm.verdict(ev38b, plan_of(ev38b), rules=RULES12, rules_ctx=ctx38)
+check("V3 R11 有新结构证据 pass", rules_map(vd38b)["R11"]["status"] == "pass"
+      and "3/4" in rules_map(vd38b)["R11"]["evidence"])
+ctx38c = dict(ctx36b, last_loss_same_dir_age_min=90.0)
+vd38c = jtm.verdict(ev36, plan_of(ev36), rules=RULES12, rules_ctx=ctx38c)
+check("V3 R11 过冷却窗口 pass", rules_map(vd38c)["R11"]["status"] == "pass")
+
+# ── 39. R12：连胜3+仓位超基准 warn；未超 pass；无基准 skipped；连胜不足 pass ──
+ctx39 = dict(ctx36b, win_streak_today=3, avg_planned_risk_pct=5.0)
+p39 = {**plan_of(ev36), "principal": 1000.0, "leverage": 10.0}   # 预亏 20% > 基准 5%
+vd39 = jtm.verdict(ev36, p39, rules=RULES12, rules_ctx=ctx39)
+check("V3 R12 连胜+超基准 warn", rules_map(vd39)["R12"]["status"] == "warn",
+      rules_map(vd39)["R12"]["evidence"][:60])
+p39b = {**plan_of(ev36), "principal": 1000.0, "leverage": 2.0}   # 预亏 4% < 基准 5%
+vd39b = jtm.verdict(ev36, p39b, rules=RULES12, rules_ctx=ctx39)
+check("V3 R12 未超基准 pass", rules_map(vd39b)["R12"]["status"] == "pass")
+ctx39c = dict(ctx39, avg_planned_risk_pct=None)
+vd39c = jtm.verdict(ev36, p39, rules=RULES12, rules_ctx=ctx39c)
+check("V3 R12 无基准 skipped", rules_map(vd39c)["R12"]["status"] == "skipped")
+ctx39d = dict(ctx39, win_streak_today=1)
+vd39d = jtm.verdict(ev36, p39, rules=RULES12, rules_ctx=ctx39d)
+check("V3 R12 连胜不足 pass", rules_map(vd39d)["R12"]["status"] == "pass")
+
+# ── 40. V3 seed 幂等补插 + ctx 新字段（临时库）──
+_tmp4 = tempfile.mkdtemp(prefix="mentor_smoke4_")
+_orig_db4 = jj.DB_PATH
+try:
+    jj.DB_PATH = os.path.join(_tmp4, "t.db")
+    jtm.ensure_schema()
+    check("V3 seed 12 条", len(jtm.load_rules()) == 12)
+    # 造一条同向 loss + 一条有本金的历史单
+    pw = {**plan_of(ev_base()), "principal": 1000.0, "leverage": 5.0}
+    for _ in range(3):
+        pidx = jtm.save_plan(pw, jtm.verdict(ev_base(), pw))
+        jtm.set_outcome(pidx, result="loss", pnl_pct=-1.0, followed=True)
+    ctx = jtm._rules_context("TESTUSDT", "long")
+    check("V3 ctx 同向近损年龄", ctx["last_loss_same_dir_age_min"] is not None
+          and ctx["last_loss_same_dir_age_min"] < 5, str(ctx["last_loss_same_dir_age_min"]))
+    check("V3 ctx 预亏基准（3 样本）", ctx["avg_planned_risk_pct"] == 10.0,
+          str(ctx["avg_planned_risk_pct"]))
+    check("V3 ctx 时刻字段", 0 <= ctx["now_hour_utc8"] <= 23)
+    check("V3 ctx 连胜字段", ctx["win_streak_today"] == 0)
+finally:
+    jj.DB_PATH = _orig_db4
+    import shutil as _sh4
+    _sh4.rmtree(_tmp4, ignore_errors=True)
+
 # ── 汇总 ──
 print()
 if fails:
     print(f"FAILED {len(fails)}: {fails}")
     raise SystemExit(1)
-print("ALL PASS（35 组 / 红线、权重、情绪、关键位、台账、信任回路、R2 契约、V1 军规+行为统计）")
+print("ALL PASS（40 组 / 红线、权重、情绪、关键位、台账、信任回路、R2 契约、V1 军规、V3 追加 R09-R12）")

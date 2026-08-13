@@ -8095,9 +8095,9 @@ def api_mentor_plan(req: MentorPlanReq):
         ev = jtm.build_evidence(sym, req.direction, req.entry, req.stop_loss,
                                 req.take_profit, tf=req.tf,
                                 consensus_provider=_mentor_consensus_provider(sym))
-        # V1：加载启用的个人军规 + 台账上下文（当日提交/连亏/最近红灯）一起裁决
+        # V1：加载启用的个人军规 + 台账上下文（当日提交/连亏/最近红灯/同向近损）一起裁决
         try:
-            rules, rctx = jtm.load_rules(), jtm._rules_context(sym)
+            rules, rctx = jtm.load_rules(), jtm._rules_context(sym, req.direction)
         except Exception:  # noqa: BLE001 — 军规层异常不阻塞主裁决
             rules, rctx = None, None
         vd = jtm.verdict(ev, plan, rules=rules, rules_ctx=rctx)
