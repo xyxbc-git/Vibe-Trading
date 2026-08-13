@@ -690,5 +690,22 @@ check("P1-4 跳空缩量标注假突破风险", "缩量突破，假突破风险"
 _vk, _vn = jts._breakout_volume_factor(_turtle_breakout_df(500.0).iloc[-8:].reset_index(drop=True))
 check("P1-4 量能历史不足不惩罚", _vk == 1.0 and _vn == "", f"k={_vk} note={_vn}")
 
+# ── 14. [信号篇 P2-5] 江恩时间窗方向降级 ────────────────────────────
+
+# 显著低点恰在 21 根前（斐波那契窗口）→ 时间窗命中；方向应降级为 neutral
+_gann_rows = [{"open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0,
+               "volume": 1000.0} for _ in range(60)]
+_gann_rows[60 - 1 - 21] = {"open": 100.0, "high": 100.5, "low": 90.0,
+                           "close": 100.0, "volume": 1000.0}
+g_hit = jts.signal_gann(pd.DataFrame(_gann_rows))
+check("P2-5 时间窗命中（reasoning 带斐波那契提示）", "斐波那契" in g_hit["reasoning"]
+      and "变盘" in g_hit["reasoning"], g_hit["reasoning"][:120])
+check("P2-5 方向降级为 neutral 不参与投票", g_hit["direction"] == "neutral",
+      g_hit["direction"])
+check("P2-5 中性不变量：无交易计划", g_hit["trade_plan"] is None)
+check("P2-5 变盘敏感强度保留 0.4", g_hit["strength"] == 0.4, str(g_hit["strength"]))
+check("P2-5 倾向说明保留（人工参考）", "倾向" in g_hit["reasoning"],
+      g_hit["reasoning"][:150])
+
 print(f"\n{'=' * 40}\n通过 {PASS} / 失败 {FAIL}")
 raise SystemExit(1 if FAIL else 0)

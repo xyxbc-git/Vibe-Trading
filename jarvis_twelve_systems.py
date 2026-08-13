@@ -458,7 +458,10 @@ _FIB_WINDOWS = (8, 13, 21, 34, 55, 89, 144)
 
 
 def signal_gann(df: pd.DataFrame) -> dict:
-    """简化：自最近显著高/低点起数斐波那契根数，当前 bar 落在窗口（±1 根）视为变盘敏感期。"""
+    """简化：自最近显著高/低点起数斐波那契根数，当前 bar 落在窗口（±1 根）视为变盘敏感期。
+
+    [P2-5] 时间窗命中输出 neutral（变盘提示保留在 reasoning），方向不参与投票。
+    """
     name = ("gann", "江恩时间窗")
     if len(df) < MIN_BARS:
         return _insufficient(*name, f"数据不足（{len(df)} 根 < {MIN_BARS}）")
@@ -476,14 +479,16 @@ def signal_gann(df: pd.DataFrame) -> dict:
     levels = [_lv("显著高点", float(look["high"].iloc[hi_pos])),
               _lv("显著低点", float(look["low"].iloc[lo_pos]))]
     if hits:
-        # 时间窗只提示「变盘敏感」，方向交由现价相对高低点位置微调
+        # [信号篇 P2-5] 时间窗理论只说「变盘概率升高」，方向证据薄弱（按现价相对
+        # 波段中点拍均值回归方向）——降级为无方向提示因子：direction=neutral，
+        # reasoning 保留变盘提示与倾向说明，不再以 0.4 强度参与 layer3 方向投票。
         close = float(df["close"].iloc[-1])
         mid = (float(look["high"].iloc[hi_pos]) + float(look["low"].iloc[lo_pos])) / 2
-        direction = "bullish" if close < mid else "bearish"  # 敏感窗倾向均值回归
-        return _sig(*name, direction, 0.4,
+        lean_txt = ("现价靠近波段低位，若变盘倾向反弹" if close < mid
+                    else "现价靠近波段高位，若变盘倾向回落")
+        return _sig(*name, "neutral", 0.4,
                     "；".join(hits) + " → 处于斐波那契时间窗口（±1根），变盘概率升高；"
-                    + ("现价靠近波段低位，反转偏向上" if direction == "bullish"
-                       else "现价靠近波段高位，反转偏向下"),
+                    + lean_txt + "（时间窗只提示变盘不定方向，已降级为中性不参与方向投票）",
                     levels)
     nxt = min((w - bars_from_lo for w in _FIB_WINDOWS if w > bars_from_lo), default=None)
     extra = f"，距下一低点时间窗还有 {nxt} 根" if nxt is not None else ""
@@ -1026,7 +1031,8 @@ SYSTEM_META: dict[str, dict] = {
     "gann": {
         "type": "时间周期", "trigger": "距显著高/低点的斐波那契根数时间窗（±1根）",
         "best_tfs": ["4h", "1d"],
-        "lag": "提示变盘敏感期而非方向；窗口内方向按现价相对波段位置的均值回归倾向",
+        "lag": "只提示变盘敏感期不定方向（方向证据薄弱已降级为中性，不参与方向投票）；"
+               "reasoning 保留现价相对波段位置的倾向说明供人工参考",
     },
     "chanlun": {
         "type": "结构形态", "trigger": "分型→笔→中枢，三类买卖点近似 + 笔力度背离",
