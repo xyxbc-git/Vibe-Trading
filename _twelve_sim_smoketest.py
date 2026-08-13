@@ -815,10 +815,14 @@ check("S2c：RR=3 / TP 距 6% 正常单放行", len(op) == 1,
       str((out["symbols"][SYM]["opened"], out["symbols"][SYM]["rejected"])))
 
 # d) 热加载（真实配置层）：min_rr 收紧到 4 → RR=3 的同类单转拒
+#    （T7 接线后真实默认 twelve_system_enabled 可能停用 gann——本用例验的是
+#    min_rr 热加载，钉体系全启用隔离环境，与 S1e 钉 gate_mode 同一先例）
 with jtt._conn() as conn:
     conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
 jtt._gate_cfg = _orig_gate_cfg
-jc.save({"twelve_min_rr": 4.0}, source="smoketest", note="S2 热加载用例")
+jc.save({"twelve_min_rr": 4.0,
+         "twelve_system_enabled": {s: 1 for s in jtt.SYSTEMS}},
+        source="smoketest", note="S2 热加载用例")
 set_signal("30m", "gann", "bullish",
            {"side": "long", "entry": 100.0, "stop_loss": 98.0, "take_profit": 106.1})
 out = jtt.run_cycle(cfg={})
@@ -2154,6 +2158,102 @@ check("T3e：平仓落 trade.toll_ratio=0.2（改写后 fee/R 恰在地板，供
 jtt._fee_pct = lambda: 0.0
 _GATES["twelve_max_toll_ratio"] = 0.0
 _GATES["twelve_sl_gate_mode"] = "reject"
+_PRICE["v"] = 100.0
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+    conn.execute("DELETE FROM twelve_sim_position WHERE status='pending'")
+    conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
+for _tf, _sys in [("5m", "gap"), ("15m", "oscillator"), ("30m", "gann")]:
+    set_signal(_tf, _sys, "neutral", None)
+
+# ═══════════ 30. 受理入口完整性：no_plan_params 补留痕 + T7 twelve_system_enabled 消费接线 ═══════════
+# 注：gann 的启停值随任务 D 侧诊断演进（方向降级后已标 0），不在此写死
+check("T7 配置登记（任务 D 侧）：twelve_system_enabled 恒中性三套=0 / turtle=1",
+      jc.default_config().get("twelve_system_enabled", {}).get("volatility") == 0
+      and jc.default_config().get("twelve_system_enabled", {}).get("martingale") == 0
+      and jc.default_config().get("twelve_system_enabled", {}).get("arbitrage") == 0
+      and jc.default_config().get("twelve_system_enabled", {}).get("turtle") == 1)
+
+T20 = T19 + 96 * 3600
+_PRICE["v"] = 100.0
+
+# a) 直开路径点位缺失不再静默吞单：方向信号无 plan（gann 曾在此隐形消失）
+#    → 落 rejected 行 reason='no_plan_params' + signal_log 中文留痕
+set_signal("30m", "gann", "bullish", None, strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T20)
+r_sym = out["symbols"][SYM]
+rej = [r for r in r_sym["rejected"] if (r["tf"], r["system"]) == ("30m", "gann")]
+check("30a：方向信号无点位 → 不再静默，落拒单 no_plan_params（不开仓不挂计划）",
+      len(rej) == 1 and rej[0]["reason"] == "no_plan_params"
+      and not r_sym["opened"] and not r_sym["planned"],
+      str((r_sym["rejected"], r_sym["opened"])))
+nlogs = [l for l in jtt.signal_logs(SYM, "30m", "gann")
+         if l["change_kinds"] == "reject" and "点位缺失" in str(l["note"])]
+check("30a：no_plan_params 落 signal_log 中文留痕", len(nlogs) >= 1, str(nlogs[:1]))
+out = jtt.run_cycle(cfg={}, now=T20 + 60)
+check("30a：同信号下一轮防重（rejected 行数不变）",
+      not out["symbols"][SYM]["rejected"]
+      and len([r for r in jtt.rejected_positions(SYM, "30m", "gann")
+               if r["reject_reason"] == "no_plan_params"]) == 1,
+      str(out["symbols"][SYM]["rejected"]))
+set_signal("30m", "gann", "neutral", None)
+
+# b) T7 体系开关消费：disabled 系统带完整 plan 的方向信号 → 硬拒 system_disabled；
+#    未列入 map 的系统默认启用不受影响
+_GATES["twelve_system_enabled"] = {"gap": 0}
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.0, "take_profit": 103.0},
+           strength=0.9)
+set_signal("15m", "oscillator", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 97.0, "take_profit": 106.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T20 + 120)
+r_sym = out["symbols"][SYM]
+rej = [r for r in r_sym["rejected"] if (r["tf"], r["system"]) == ("5m", "gap")]
+op = [o for o in r_sym["opened"] if (o["tf"], o["system"]) == ("15m", "oscillator")]
+check("30b：twelve_system_enabled['gap']=0 → 完整 plan 也硬拒 system_disabled",
+      len(rej) == 1 and rej[0]["reason"] == "system_disabled"
+      and not [o for o in r_sym["opened"] if o["system"] == "gap"], str(rej))
+check("30b：未列入 map 的系统默认启用（oscillator 正常开仓）",
+      len(op) == 1, str((r_sym["opened"], r_sym["rejected"])))
+
+# c) 已有持仓不受体系停用影响：开关只拦新开仓，存量按自身生命周期退出
+_PRICE["v"] = 106.0   # oscillator 多单触 TP106
+out = jtt.run_cycle(cfg={}, now=T20 + 180)
+cl = [c for c in out["symbols"][SYM]["closed"]
+      if (c["tf"], c["system"]) == ("15m", "oscillator")]
+_GATES["twelve_system_enabled"] = {"gap": 0, "oscillator": 0}   # 平仓后再停用
+_PRICE["v"] = 100.0
+out = jtt.run_cycle(cfg={}, now=T20 + 240)
+check("30c：存量持仓照常平仓（tp）；停用后同信号不再开新仓",
+      len(cl) == 1 and cl[0]["exit_reason"] == "tp"
+      and not [o for o in out["symbols"][SYM]["opened"]
+               if o["system"] == "oscillator"],
+      str((cl, out["symbols"][SYM]["opened"])))
+
+# d) JSON 串形态兼容（env/手写配置路径）+ 移除配置默认全启用
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+_GATES["twelve_system_enabled"] = '{"gap": 0}'
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 98.5, "take_profit": 104.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T20 + 300)
+rej = [r for r in out["symbols"][SYM]["rejected"]
+       if (r["tf"], r["system"]) == ("5m", "gap")]
+check("30d：JSON 串形态同样生效（gap 拒 system_disabled）",
+      len(rej) == 1 and rej[0]["reason"] == "system_disabled",
+      str(out["symbols"][SYM]["rejected"]))
+del _GATES["twelve_system_enabled"]
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.0, "take_profit": 103.5},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T20 + 360)
+op = [o for o in out["symbols"][SYM]["opened"] if (o["tf"], o["system"]) == ("5m", "gap")]
+check("30d：移除配置 → 默认全启用（gap 恢复开仓）", len(op) == 1,
+      str((out["symbols"][SYM]["opened"], out["symbols"][SYM]["rejected"])))
+
+# 复位：清场 + 信号归中
 _PRICE["v"] = 100.0
 with jtt._conn() as conn:
     conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")

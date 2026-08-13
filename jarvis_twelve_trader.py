@@ -52,6 +52,8 @@
        （日志表留痕永久）；全程不产生 twelve_sim_trade；
   4.8 开仓门禁链（2026-08-06 亏损止血 S1+）：
      - 信号级前置门禁 _pre_gate（开仓/挂计划/成交时刻都先过）：
+       T7 体系开关——twelve_system_enabled=0 的系统（设计性恒中性 /
+       运营停用）硬拒 'system_disabled'，只推信号不开仓；
        S4 周期门禁——twelve_tf_enabled 停用的 TF 全拒、信号强度低于
        twelve_tf_min_confidence 该 TF 置信档（5m 默认 0.75）拒 'tf_gate'；
        S5 逆势过滤——1h 威科夫 dist-C/D/E 拒多、acc-C/D/E 拒空
@@ -74,6 +76,8 @@
        每笔平仓落 trade.toll_ratio 供归因分档；
      - 两级门禁拒单统一落 status='rejected' + reject_reason 行 + signal_log
        留痕（不静默丢弃，S6 归因报表可按原因聚合）；挂单在成交时刻同样再验一次；
+       直开路径点位缺失/不自洽（_resolve_entry_params 返回 None）同样落
+       'no_plan_params' 拒单留痕，不再静默吞单（gann 曾在此隐形消失）；
   5. 参数：止损/止盈/杠杆/仓位% 优先用 twelve_sim_config 覆盖
      （优先级 信号级 > tf组级 > 币种级），否则用 plan_json 系统推荐；杠杆双兜底：
      配置/plan 均未给时按止损距离自动推荐（S1 解耦：打到止损亏≈保证金25%
@@ -313,6 +317,8 @@ REJECT_REASON_CN = {
     "circuit_breaker": "信号×周期战绩熔断中",
     "tf_gate": "周期门禁（TF 停用或信号置信不足）",
     "counter_trend": "逆 1h 威科夫高周期趋势（短周期不逆势）",
+    "system_disabled": "信号体系已停用（twelve_system_enabled=0：设计性恒中性或运营停用）",
+    "no_plan_params": "点位缺失或不自洽（无止损/止盈可合成，宁缺毋滥不开仓）",
 }
 
 # 点位跟随：SL/TP 相对变化 ≥ 此阈值(%)才算实质变更（对齐 jarvis_signal_history
@@ -2043,6 +2049,27 @@ def breaker_states(symbol: str | None = None) -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
+def _system_enabled(system: str) -> bool:
+    """T7 消费端：twelve_system_enabled 体系启停 map（dict / JSON 串）。
+
+    0=设计性恒中性（volatility/martingale/arbitrage 不产生方向信号）或运营
+    停用——只推信号不开仓；未配置的系统 / 配置层异常一律默认启用
+    （可用性优先，绝不因配置问题断掉正常系统的样本流）。
+    """
+    raw = _gate_cfg("twelve_system_enabled", None)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = None
+    if isinstance(raw, dict) and raw.get(system) is not None:
+        try:
+            return float(raw[system]) >= 0.5
+        except (TypeError, ValueError):
+            return True
+    return True
+
+
 def _trend_context(sym: str) -> tuple[str | None, str | None]:
     """1h 威科夫趋势语境 → (side, phase)；复用 jarvis_wyckoff.analyze 的进程内
     指纹缓存（新 1h bar 才重算，不新增出网压力）。
@@ -2066,7 +2093,8 @@ def _pre_gate(conn, sym: str, tf: str, system: str, direction: str,
     """信号级门禁链（参数无关，开仓/挂计划/成交前置）
     → (reject_reason|None, 试探标记, 门禁降权标签列表)。
 
-    链序：S4 周期门禁（TF 开关 + 置信档）→ S5 高周期逆势过滤 → S3 战绩熔断。
+    链序：T7 体系开关（twelve_system_enabled，硬拒）→ S4 周期门禁（TF 开关 +
+    置信档）→ S5 高周期逆势过滤 → S3 战绩熔断。
     D6 起 S4 置信档 / S3 熔断默认 mode=deweight：不拒单，返回标签由调用方经
     _apply_gate_tags 打标降权（tf_lowconf×0.5 / breaker_deweight×0.25），信号
     继续跑、样本继续攒；mode=reject 回退旧硬拒单（零回归通道，行为与 D6 前
@@ -2075,6 +2103,11 @@ def _pre_gate(conn, sym: str, tf: str, system: str, direction: str,
     _breaker_on_close 战绩簿记与 trip/recover 状态机原样保留。
     """
     tags: list[str] = []
+    # T7 体系开关：twelve_system_enabled=0 的系统（设计性恒中性/运营停用）
+    # 硬拒 'system_disabled'（运营指令，双 mode 均硬拒；只不开单不禁展示，
+    # 调用方落 reject 留痕——若恒中性系统某天产出方向信号，此处可复盘）
+    if not _system_enabled(system):
+        return "system_disabled", False, []
     # S4 周期再平衡：TF 停用 → 拒 'tf_gate'（mode 无关）；置信不足 → 按 mode
     if _tf_gate_num("twelve_tf_enabled", tf, TF_ENABLED_DEFAULT, 1.0) < 0.5:
         return "tf_gate", False, []
@@ -2541,7 +2574,18 @@ def _cycle_symbol(sym: str, cfg: dict, now: float | None = None) -> dict:
             # 计划缺失（无点位可比）/ 现价已处于可成交侧 → 按现价立即成交（现有口径）
             params = _resolve_entry_params(direction, price, eff, plan, tf)
             if params is None:
-                continue   # 点位缺失或不自洽，宁缺毋滥
+                # 点位缺失或不自洽，宁缺毋滥不开仓——但不再静默吞单：落
+                # reject 留痕可复盘（gann 曾因方向信号不带 SL/TP 在此隐形
+                # 消失，299 条方向变更零成交零记录；_do_reject 自带同因同
+                # 点位防重，常驻信号不会爆行数）
+                rej = _do_reject(conn, sym, tf, system, direction,
+                                 "no_plan_params",
+                                 float((pts or {}).get("entry") or price),
+                                 (pts or {}).get("stop_loss"),
+                                 (pts or {}).get("take_profit"), price, ts)
+                if rej:
+                    res["rejected"].append(rej)
+                continue
             _widen_stop_to_floor(tf, price, params)   # T2：窄止损先改写/降权
             risk = _risk_gate(tf, price, params, sym)
             if risk:
