@@ -4074,67 +4074,126 @@ def _twelve_basis(sym: str) -> dict | None:
     return _cached(f"twelve:basis:{sym}", 300, _calc)
 
 
+# 周期 → 毫秒（末根收盘判定用；与 Binance kline interval 对齐）
+_TF_MS = {"5m": 300_000, "15m": 900_000, "30m": 1_800_000,
+          "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
+
+
+def _last_bar_closed(df, iv: str) -> bool:
+    """末根 bar 是否已收盘：open_time + 周期时长 ≤ now（与 Binance close_time 同语义）。
+
+    fetch_klines_df 的 time 列是 open time，close_time = open + 周期 - 1ms。
+    判定失败按未收盘处理（诚实面板宁可多提示重绘风险，不误标「已收盘」）。
+    """
+    try:
+        return float(df["time"].iloc[-1]) + _TF_MS[iv] <= time.time() * 1000
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _closed_signals_for_record(jts, df, iv: str, basis, live_out: dict,
+                               live_px: float, bar_closed: bool):
+    """[信号篇 P0-1] 变更历史去污染：只允许「已收盘 bar 口径」的信号入库。
+
+    末根已收盘 → 实时结果本身就是收盘口径，直接用（零额外开销）；
+    末根未收盘 → 去掉进行中 bar 重算一份收盘口径信号（复用同一次网络取数，
+    只多一次本地 analyze 计算）——幽灵信号（盘中插针重绘）不再写进
+    twelve_signal_changes（T9 信号地板评估台数据源）。
+    返回 (signals|None, price)；None = 数据不足，本轮跳过落库。
+    """
+    if bar_closed:
+        return live_out["signals"], live_px
+    dfc = df.iloc[:-1]
+    if len(dfc) < 30:
+        return None, live_px
+    out_c = jts.analyze(dfc, basis_data=basis)
+    return out_c["signals"], round(float(dfc["close"].iloc[-1]), 6)
+
+
 @app.get("/api/twelve/signals")
-def api_twelve_signals(symbol: str = "BTCUSDT", tf: str = "4h"):
-    """十二套技术单时间框架信号 + 分层共识（海龟/道氏/缠论…12 套逐一给方向与强度）。"""
+def api_twelve_signals(symbol: str = "BTCUSDT", tf: str = "4h", closed_only: int = 0):
+    """十二套技术单时间框架信号 + 分层共识（海龟/道氏/缠论…12 套逐一给方向与强度）。
+
+    closed_only=1 只用已收盘 bar 计算（与胜率回测同口径，无盘中重绘）；默认 0
+    保留实时行为（含进行中 bar）。响应 bar_closed 标注末根 bar 是否已收盘。
+    """
     import jarvis_twelve_systems as jts
     sym = symbol.upper().replace("-", "").replace("/", "")
     if not sym.endswith(("USDT", "USDC")):
         sym += "USDT"
     iv = tf if tf in {"5m", "15m", "30m", "1h", "4h", "1d"} else "4h"
+    co = bool(int(closed_only))
 
     def _calc():
-        df = jts.fetch_klines_df(sym, iv, 300)
+        df = jts.fetch_klines_df(sym, iv, 300, drop_unclosed=co)
         if df is None or len(df) < 30:
             return {"ok": False, "error": "K线数据不足或拉取失败", "symbol": sym,
                     "tf": iv, "signals": [], "consensus": None}
-        out = jts.analyze(df, basis_data=_twelve_basis(sym))
+        basis = _twelve_basis(sym)
+        out = jts.analyze(df, basis_data=basis)
         px = round(float(df["close"].iloc[-1]), 6)
+        bar_closed = True if co else _last_bar_closed(df, iv)
         # 信号快照/变更历史落库（需求：记录每个信号的上次更新时间与变动经历）。
         # 只在缓存未命中的真实重算路径执行，与「信号刷新」天然同频；失败不拖垮主链路。
+        # [信号篇 P0-1] 只记已收盘信号：幽灵信号（盘中重绘）不再污染变更历史。
         try:
             import jarvis_signal_history as jsh
-            meta = jsh.record_batch(sym, iv, out["signals"], price=px)
-            for s in out["signals"]:
-                m = meta.get(s.get("system"))
-                if m:
-                    s["updated_at"] = m["updated_at"]
-                    s["last_change_at"] = m["changed_at"]
+            rec_sigs, rec_px = _closed_signals_for_record(
+                jts, df, iv, basis, out, px, bar_closed)
+            if rec_sigs is not None:
+                meta = jsh.record_batch(sym, iv, rec_sigs, price=rec_px)
+                for s in out["signals"]:
+                    m = meta.get(s.get("system"))
+                    if m:
+                        s["updated_at"] = m["updated_at"]
+                        s["last_change_at"] = m["changed_at"]
         except Exception:  # noqa: BLE001
             pass
         return {"ok": True, "symbol": sym, "tf": iv, "as_of": time.time(),
-                "price": px,
+                "price": px, "bar_closed": bar_closed,
                 "signals": out["signals"], "consensus": out["consensus"]}
 
-    # 5m 一根 K 线 5 分钟，缓存同比缩短（15m+ 沿用 120s）
-    return JSONResponse(_cached(f"twelve:sig:{sym}:{iv}", 60 if iv == "5m" else 120, _calc))
+    # 5m 一根 K 线 5 分钟，缓存同比缩短（15m+ 沿用 120s）；closed_only 独立缓存桶
+    return JSONResponse(_cached(f"twelve:sig:{sym}:{iv}:c{int(co)}",
+                                60 if iv == "5m" else 120, _calc))
 
 
 @app.get("/api/twelve/consensus")
-def api_twelve_consensus(symbol: str = "BTCUSDT"):
-    """十二套技术多时间框架（5m/15m/30m/1h/4h）加权共识：看涨/看跌总裁决。"""
+def api_twelve_consensus(symbol: str = "BTCUSDT", closed_only: int = 0):
+    """十二套技术多时间框架（5m/15m/30m/1h/4h）加权共识：看涨/看跌总裁决。
+
+    closed_only=1 各周期只用已收盘 bar（与胜率回测同口径，无盘中重绘）；默认 0
+    保留实时行为。响应 bar_closed 按周期标注末根 bar 是否已收盘。
+    """
     import jarvis_twelve_systems as jts
     sym = symbol.upper().replace("-", "").replace("/", "")
     if not sym.endswith(("USDT", "USDC")):
         sym += "USDT"
+    co = bool(int(closed_only))
 
     def _calc():
         tf_cons: dict = {}
+        bar_closed: dict = {}
         price = None
         basis = _twelve_basis(sym)   # 基差与 TF 无关，整轮共用一份
         for tf in _TWELVE_TFS:
-            df = jts.fetch_klines_df(sym, tf, 300)
+            df = jts.fetch_klines_df(sym, tf, 300, drop_unclosed=co)
             if df is None or len(df) < 30:
                 continue
             out = jts.analyze(df, basis_data=basis)
             tf_cons[tf] = out["consensus"]
+            bar_closed[tf] = True if co else _last_bar_closed(df, tf)
+            live_px = round(float(df["close"].iloc[-1]), 6)
             if tf == "4h" or price is None:
-                price = round(float(df["close"].iloc[-1]), 6)
+                price = live_px
             # 多周期共识每轮重算顺带落各 TF 信号快照（变更历史更完整；失败忽略）
+            # [信号篇 P0-1] 同 /api/twelve/signals：只记已收盘口径，幽灵不入库
             try:
                 import jarvis_signal_history as jsh
-                jsh.record_batch(sym, tf, out["signals"],
-                                 price=round(float(df["close"].iloc[-1]), 6))
+                rec_sigs, rec_px = _closed_signals_for_record(
+                    jts, df, tf, basis, out, live_px, bar_closed[tf])
+                if rec_sigs is not None:
+                    jsh.record_batch(sym, tf, rec_sigs, price=rec_px)
             except Exception:  # noqa: BLE001
                 pass
         merged = jts.consensus_multi_tf(tf_cons)
@@ -4206,9 +4265,10 @@ def api_twelve_consensus(symbol: str = "BTCUSDT"):
         except Exception:  # noqa: BLE001
             pass
         return {"ok": bool(tf_cons), "symbol": sym, "price": price,
-                "tf_available": sorted(tf_cons.keys()), "consensus": merged}
+                "tf_available": sorted(tf_cons.keys()),
+                "bar_closed": bar_closed, "consensus": merged}
 
-    return JSONResponse(_cached(f"twelve:cons:{sym}", 180, _calc))
+    return JSONResponse(_cached(f"twelve:cons:{sym}:c{int(co)}", 180, _calc))
 
 
 # ─────────────────── 信号变更历史（快照/流水/管理界面 API）───────────────────
@@ -5044,7 +5104,8 @@ def api_position_calc(symbol: str = "BTCUSDT", tf: str = "auto",
                 merged = jts.consensus_multi_tf(tf_cons)
                 return {"ok": bool(tf_cons), "symbol": sym, "price": price,
                         "tf_available": sorted(tf_cons.keys()), "consensus": merged}
-            data = _cached(f"twelve:cons:{sym}", 180, _calc_cons)
+            # :c0 = /api/twelve/consensus 实时口径缓存桶（closed_only=0），继续共享
+            data = _cached(f"twelve:cons:{sym}:c0", 180, _calc_cons)
             cons = (data or {}).get("consensus") or {}
             return cons.get("trade_plan"), (data or {}).get("price"), \
                 str(cons.get("direction", "neutral"))
@@ -5058,7 +5119,8 @@ def api_position_calc(symbol: str = "BTCUSDT", tf: str = "auto",
             return {"ok": True, "symbol": sym, "tf": iv,
                     "price": round(float(df["close"].iloc[-1]), 6),
                     "signals": out["signals"], "consensus": out["consensus"]}
-        data = _cached(f"twelve:sig:{sym}:{iv}", 120, _calc_sig)
+        # :c0 = /api/twelve/signals 实时口径缓存桶（closed_only=0），继续共享
+        data = _cached(f"twelve:sig:{sym}:{iv}:c0", 120, _calc_sig)
         cons = (data or {}).get("consensus") or {}
         plan = cons.get("trade_plan")
         if plan and iv:
@@ -5224,8 +5286,16 @@ def api_twelve_attribution(days: int = 7, dim: str | None = None):
     胜率<twelve_diag_max_winrate 且净亏 的候选，按 net_pnl 升序；flip_hint 为
     反向理论值，仅作 D7 候选排序）。非法 dim 按未传处理；**无 dim 时响应与
     S6 原状同构（零回归）**。
+
+    T8（振幅准入门槛，裁决 6 落地闸门）：响应恒含 `amplitude` 键——
+    `gross_displacement`（T1 纠偏口径毛位移：sl 单按计划止损位 stop_loss 重算，
+    不吃结算伪影）/ `net_of_toll`（毛位移 − 2×单边费率地板，地板随
+    twelve_sim_fee_pct 动态走）/ system×tf 振幅达标三态表（达标/不达标/不可判定，
+    独立赌注聚类=同小时×同方向 + Bonferroni 调整区间 + 80% 功效所需笔数标注）/
+    `watch_list` 观察名单（不达标不自动停用）/ `toll_ratio` 五档分档
+    （=2×费率÷计划SL距离%，对齐计划 §三）。口径详见 jarvis_twelve_amplitude.PREREG。
     响应：{ok, days, since_ts, fee_pct_per_side, summary, attribution:[...],
-    rejected[, dim, stable_losers, stable_losers_note, notes]}
+    rejected, amplitude[, dim, stable_losers, stable_losers_note, notes]}
     """
     import jarvis_config as jc_mod
     import jarvis_twelve_trader as jtt
@@ -5315,6 +5385,20 @@ def api_twelve_attribution(days: int = 7, dim: str | None = None):
         except Exception:  # noqa: BLE001 — reject_reason 列未上线（S1-S5 未 merge）
             rejected["note"] = "门禁链(S1-S5)尚未落库 reject_reason，暂无拦截数据"
 
+        # T8 振幅准入门槛（裁决 6 落地闸门）：毛位移(T1 纠偏) vs 2×费率地板。
+        # 计算在纯函数模块 jarvis_twelve_amplitude 中（口径预登记见其 PREREG）；
+        # 统计层异常不拖垮主报表——错误如实写进 amplitude.error，不静默。
+        try:
+            import jarvis_twelve_amplitude as jta
+            with jtt._conn() as conn:
+                arows = conn.execute(
+                    "SELECT system, tf, direction, entry_price, exit_price, "
+                    "stop_loss, exit_reason, entry_ts, qty, pnl "
+                    "FROM twelve_sim_trade WHERE exit_ts >= ?", (since,)).fetchall()
+            amplitude = jta.amplitude_report([dict(r) for r in arows], fee_side_pct)
+        except Exception as exc:  # noqa: BLE001 — T8 层缺依赖/异常时主报表照常出
+            amplitude = {"error": f"T8 振幅模块不可用: {exc!r}"[:200]}
+
         out = {
             "ok": True, "days": d, "since_ts": since,
             "generated_at": time.time(), "fee_pct_per_side": fee_side_pct,
@@ -5327,8 +5411,21 @@ def api_twelve_attribution(days: int = 7, dim: str | None = None):
             },
             "attribution": cells,
             "rejected": rejected,
+            "amplitude": amplitude,
+            # T7 零成交诊断：「12 套」为注册数，真实成交套数见 traded——
+            # volatility/martingale/arbitrage 设计上恒 neutral（结构性零成交），
+            # gann 方向信号无点位被静默跳过、gap 在成交标的上无方向信号。
+            # 启停显式标记 jarvis_config.twelve_system_enabled（0=不产生方向信号）。
+            "systems_note": {
+                "registered": len(jtt.SYSTEMS),
+                "traded": len({c["system"] for c in cells}),
+                "always_neutral": ["volatility", "martingale", "arbitrage"],
+                "enabled_map": jc_mod.get("twelve_system_enabled") or {},
+                "note": "「12 套」为注册口径；本窗口真实成交套数见 traded，"
+                        "零成交根因见开发计划 §T7 与 twelve_system_enabled 注释",
+            },
         }
-        if not dim_key:      # 无 dim：与 S6 原响应同构（零回归）
+        if not dim_key:      # 无 dim：与 S6 原响应同构（零回归，仅增 amplitude/systems_note 键）
             return out
 
         # D1 稳定亏识别：(system, tf, ctx_regime) 非 NULL 组合的反向候选
