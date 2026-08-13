@@ -193,6 +193,13 @@ export default function ConfluenceHud({ symbol, tf }: ConfluenceHudProps) {
         {refreshing && (
           <span className="inline-block w-2.5 h-2.5 border border-jarvis-blue border-t-transparent rounded-full animate-spin motion-reduce:animate-none" />
         )}
+        {Boolean(error) && resp != null && !refreshing && (
+          <AlertTriangle
+            size={11}
+            className="text-jarvis-yellow"
+            aria-label={`数据为 ${fmtFreshness(resp.updatedAt) || "此前"} 的旧值，刷新失败重试中`}
+          />
+        )}
         {resp?.mock && (
           <span className="px-1 rounded bg-jarvis-yellow/15 text-jarvis-yellow text-[9px]">
             演示

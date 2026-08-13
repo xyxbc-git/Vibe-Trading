@@ -135,14 +135,20 @@ export function mockConfluence(symbol: string, tf: string): ConfluenceResponse {
   };
 }
 
-/** 取合流数据；后端 404（端点未部署）→ 演示数据；其余错误向上抛（组件保持上一态）。 */
+/** 取合流数据；后端 404（端点未部署）→ 演示数据；ok:false 与其余错误向上抛
+ *（usePolling 保留旧 data + 置 error → 组件保持上一态并亮 ⚠ 旧值标）。
+ * 契约已与后端实测对账（jarvis_confluence.assess 直调样本 2026-08-13）：
+ * 顶层/组/条目字段名、c1_htf~c9_funding 条目键、conflict 布尔均一致。 */
 export async function fetchConfluence(symbol: string, tf: string): Promise<ConfluenceResponse> {
+  let resp: ConfluenceResponse;
   try {
-    return await api.get<ConfluenceResponse>(
+    resp = await api.get<ConfluenceResponse>(
       `/confluence?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(tf)}`,
     );
   } catch (e) {
     if (e instanceof ApiError && e.status === 404) return mockConfluence(symbol, tf);
     throw e;
   }
+  if (!resp.ok) throw new Error(resp.error || "合流评分计算失败");
+  return resp;
 }
