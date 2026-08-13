@@ -12,7 +12,8 @@ export const isOhlcOnly = (bar: FootprintBar): boolean =>
 
 /**
  * 视口状态（物理引擎版，全部存 ref，不进 React state）。
- * zoomX/zoomY 各自向 target 指数趋近实现平滑缩放（滚轮同缩、拖轴单缩）；
+ * zoomX/zoomY 各自向 target 指数趋近实现平滑缩放（鼠标滚轮只缩时间轴、
+ * 捏合/⌘+滚轮同缩、拖轴单缩）；
  * velX 为横向惯性速度（px/s）；centerPrice=null 表示纵向自动取可见范围
  * 中点（跟随模式），拖拽后物化为具体价格；follow=true 时横向贴住最新柱
  * 右侧的留白锚点（rightGapBars 柱宽，TradingView 式右侧空白，拖拽可调）。
@@ -24,9 +25,25 @@ export interface ViewportState {
   zoomTargetY: number;
   /** 缩放锚点（画布坐标），保证缩放时光标下的柱位/价格不飘移 */
   anchor: { mx: number; my: number } | null;
+  /**
+   * 十字光标位置（画布内 CSS 像素，与 anchor / hitTest 同一坐标系）；
+   * 指针不在画布内时为 null。由 useViewport 的指针事件维护，绘制方按需读取。
+   */
+  crosshair: { mx: number; my: number } | null;
   scrollX: number;
   velX: number;
   centerPrice: number | null;
+  /**
+   * 自动适配态下的中心价目标（由 stepViewport 每帧按可见范围写入，
+   * centerPrice 向其平滑趋近）；手动态恒为 null。
+   */
+  centerPriceTarget: number | null;
+  /**
+   * 价格轴自动适配（对应 TradingView 价格轴右下角的 Auto）：
+   * true 时纵向缩放与中心价持续跟随可见柱的价格范围，横向缩放不会把行情
+   * 甩出屏幕；纵向拖图区 / 拖价格轴 / 捏合缩放会退出，双击轴或「自动适配」恢复。
+   */
+  priceAutoFit: boolean;
   follow: boolean;
   dragging: boolean;
   /** follow 态下最新柱与价格轴之间保留的空白（单位：柱宽倍数） */
@@ -47,6 +64,25 @@ export type HoverInfo =
     }
   | { kind: "stats"; row: number; barIndex: number }
   | null;
+
+/**
+ * Hover 语义相等判定。mousemove 以 60~120Hz 触发而 hitTest 每次返回新对象，
+ * 不判等直接 setState 会让整棵组件树以指针回报率重渲染（滑动卡顿主因）；
+ * 只有跨格移动（内容真的变了）才值得一次 React 渲染。
+ */
+export function hoverEq(a: HoverInfo, b: HoverInfo): boolean {
+  if (a === b) return true;
+  if (a === null || b === null) return false;
+  if (a.kind !== b.kind || a.barIndex !== b.barIndex) return false;
+  if (a.kind === "cell" && b.kind === "cell") {
+    return (
+      a.price === b.price &&
+      a.isPoc === b.isPoc &&
+      (a.level?.price ?? null) === (b.level?.price ?? null)
+    );
+  }
+  return a.kind === "stats" && b.kind === "stats" && a.row === b.row;
+}
 
 export interface BadgeBox {
   x: number;
@@ -708,6 +744,61 @@ function drawBadges(
   return boxes;
 }
 
+/**
+ * 十字光标（TradingView 风格）：竖线贯穿图区+时间条+统计区、横线仅价格区，
+ * 轴上带价格/时间标签。crosshair 由 useViewport 的指针事件维护（含拖拽中），
+ * 出画布为 null 不画。
+ */
+function drawCrosshair(
+  ctx: CanvasRenderingContext2D,
+  l: Layout,
+  bars: FootprintBar[],
+  cross: { mx: number; my: number } | null,
+): void {
+  if (!cross || cross.mx < 0 || cross.mx >= l.chartW) return;
+  const { mx, my } = cross;
+
+  ctx.strokeStyle = "rgba(148,163,184,0.4)";
+  ctx.lineWidth = 1;
+  ctx.setLineDash([3, 3]);
+  ctx.beginPath();
+  ctx.moveTo(Math.round(mx) + 0.5, 0);
+  ctx.lineTo(Math.round(mx) + 0.5, l.height);
+  if (my >= 0 && my < l.plotH) {
+    ctx.moveTo(0, Math.round(my) + 0.5);
+    ctx.lineTo(l.chartW, Math.round(my) + 0.5);
+  }
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  ctx.font = `600 10px ${FONT_MONO}`;
+  ctx.textBaseline = "middle";
+
+  // 价格轴标签（指针在价格区内才有意义）
+  if (my >= 0 && my < l.plotH) {
+    const price = l.centerPrice - ((my - l.plotH / 2) * l.tick) / l.rowH;
+    const y = clamp(my, 9, l.plotH - 9);
+    ctx.fillStyle = "#334f6b";
+    ctx.fillRect(l.chartW + 1, y - 9, l.width - l.chartW - 1, 18);
+    ctx.fillStyle = "#f8fafc";
+    ctx.textAlign = "left";
+    ctx.fillText(fmtPrice(price, l.tick), l.chartW + 6, y);
+  }
+
+  // 时间条标签（对齐指针所在柱的中心）
+  const i = Math.floor((mx + l.scrollX) / l.barW);
+  if (i >= 0 && i < bars.length) {
+    const label = fmtTime(bars[i].time);
+    const cx = clamp(xOfBar(l, i) + l.barW / 2, 24, l.chartW - 24);
+    const w = ctx.measureText(label).width + 12;
+    ctx.fillStyle = "#334f6b";
+    ctx.fillRect(cx - w / 2, l.plotH + 1, w, TIME_H - 2);
+    ctx.fillStyle = "#f8fafc";
+    ctx.textAlign = "center";
+    ctx.fillText(label, cx, l.plotH + TIME_H / 2 + 1);
+  }
+}
+
 export function drawFrame(
   ctx: CanvasRenderingContext2D,
   l: Layout,
@@ -716,6 +807,7 @@ export function drawFrame(
   signals: FpSignal[],
   profile: VolumeProfile | null = null,
   profileSplitColor = false,
+  crosshair: { mx: number; my: number } | null = null,
 ): BadgeBox[] {
   ctx.fillStyle = COLORS.bg;
   ctx.fillRect(0, 0, l.width, l.height);
@@ -847,6 +939,9 @@ export function drawFrame(
 
   // 底部统计
   drawStats(ctx, l, bars, hover);
+
+  // 十字光标画在最上层（TV 手感：拖拽/悬停时始终可见）
+  drawCrosshair(ctx, l, bars, crosshair);
 
   return boxes;
 }

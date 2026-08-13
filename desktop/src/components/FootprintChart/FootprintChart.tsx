@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { AlertTriangle, BarChart3, BookOpen, History, Maximize2, RefreshCw, X } from "lucide-react";
 import type { FootprintBar, PriceLevel, Timeframe } from "@/types/footprint";
 import { footprintDataService } from "@/lib/footprint/dataService";
@@ -31,6 +31,7 @@ import {
   fmtK,
   fmtPrice,
   hitTest,
+  hoverEq,
 } from "./renderer";
 import { stepViewport, useViewport } from "./useViewport";
 import { buildInsights, type Insight } from "./insight/rules";
@@ -124,7 +125,11 @@ export default function FootprintChart() {
 
   const [tf, setTf] = useState<Timeframe>("1m");
   const [hover, setHover] = useState<HoverInfo>(null);
-  const [mouse, setMouse] = useState({ x: 0, y: 0 });
+  // 指针坐标与 tooltip 定位不进 React state：mousemove 60~120Hz，走 state 会让
+  // 整棵组件树以指针回报率重渲染（滑动卡顿主因）。坐标存 ref，tooltip 容器
+  // 由 placeTooltip 命令式改 transform；hover 内容仅跨格变化时才 setState。
+  const mousePosRef = useRef({ x: 0, y: 0 });
+  const tooltipWrapRef = useRef<HTMLDivElement | null>(null);
   const [loading, setLoading] = useState(true);
   const [insights, setInsights] = useState<Insight[]>([]);
   const [guideOpen, setGuideOpen] = useState(false);
@@ -211,7 +216,8 @@ export default function FootprintChart() {
     };
   }, []);
 
-  const { vpRef, bindTarget, resetFollow, following, syncFollow, autoFit } = useViewport(getGeom);
+  const { vpRef, bindTarget, resetFollow, following, priceAutoFit, syncFollow, autoFit } =
+    useViewport(getGeom);
 
   // DEV-only 调试钩子：headless e2e 直接读视口物理状态断言（生产构建 tree-shake 掉）
   useEffect(() => {
@@ -381,7 +387,9 @@ export default function FootprintChart() {
     [],
   );
 
-  // 共识拉取：切币立即拉一次 + 每 60s 刷新；结果落 ref，随下一根柱并入解读
+  // 共识拉取：切币立即拉一次 + 每 60s 刷新；结果落 ref，随下一根柱并入解读。
+  // 页面隐藏（切走标签/最小化）时跳过本轮，回前台下一 tick 自然恢复——
+  // 后台标签不该持续打后端（频率审计：隐藏页零轮询）。
   useEffect(() => {
     let disposed = false;
     sysConsRef.current = null;
@@ -395,7 +403,9 @@ export default function FootprintChart() {
       if (changed) refreshAnalysis(true);
     };
     void pull();
-    const timer = setInterval(() => void pull(), 60_000);
+    const timer = setInterval(() => {
+      if (!document.hidden) void pull();
+    }, 60_000);
     return () => {
       disposed = true;
       clearInterval(timer);
@@ -613,28 +623,43 @@ export default function FootprintChart() {
         hoverRef.current,
         signalsRef.current,
         vpOnRef.current ? profileRef.current : null,
+        false,
+        vpRef.current.crosshair,
       );
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
   }, [vpRef, getGeom, syncFollow, scheduleProfileRecompute, requestOlderBars]);
 
+  /** tooltip 容器定位（命令式，不经 React）：右下偏移 14px + 画布内夹取 */
+  const placeTooltip = useCallback(() => {
+    const el = tooltipWrapRef.current;
+    if (!el) return;
+    const { x, y } = mousePosRef.current;
+    const left = Math.min(x + 14, Math.max(0, sizeRef.current.w - el.offsetWidth));
+    const top = Math.max(4, Math.min(y + 14, sizeRef.current.h - el.offsetHeight));
+    el.style.transform = `translate(${left}px, ${top}px)`;
+  }, []);
+
   const onMouseMove = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
       const rect = e.currentTarget.getBoundingClientRect();
       const x = e.clientX - rect.left;
       const y = e.clientY - rect.top;
-      setMouse({ x, y });
+      mousePosRef.current = { x, y };
+      placeTooltip();
+      // 十字光标随指针移动（crosshair 由 useViewport 维护），只置脏重绘 canvas
+      markDirty();
       // 拖拽/惯性期间不做 hover 命中（省计算且避免 tooltip 闪烁）
       const vp = vpRef.current;
       if (vp.dragging) return;
       const l = layoutRef.current;
       const cell = l ? hitTest(l, barsRef.current, x, y) : null;
+      if (hoverEq(hoverRef.current, cell)) return; // 同格内移动：零 React 渲染
       hoverRef.current = cell;
       setHover(cell);
-      markDirty();
     },
-    [markDirty, vpRef],
+    [markDirty, placeTooltip, vpRef],
   );
 
   const onMouseLeave = useCallback(() => {
@@ -642,6 +667,11 @@ export default function FootprintChart() {
     setHover(null);
     markDirty();
   }, [markDirty]);
+
+  // hover 内容变化（tooltip 重挂/尺寸变化）后按最新指针位置就位，避免闪到旧位
+  useLayoutEffect(() => {
+    placeTooltip();
+  }, [hover, placeTooltip]);
 
   // 点击：优先命中信号徽标。
   // 绑在容器 div（而非 canvas）上：拖拽的 setPointerCapture 会把 click 的
@@ -672,10 +702,9 @@ export default function FootprintChart() {
   const tick = tickRef.current;
 
   // ---------- 悬停解释浮层（大白话版） ----------
+  // 定位不进 style：外层 tooltipWrapRef 容器由 placeTooltip 命令式 transform 就位
   let tooltip: React.ReactNode = null;
-  const tooltipStyle = (w: number, h: number): React.CSSProperties => ({
-    left: Math.min(mouse.x + 14, Math.max(0, sizeRef.current.w - w)),
-    top: Math.max(4, Math.min(mouse.y + 14, sizeRef.current.h - h)),
+  const tooltipStyle = (w: number): React.CSSProperties => ({
     background: "rgba(7,22,34,0.96)",
     borderColor: COLORS.border,
     color: COLORS.text,
@@ -703,8 +732,8 @@ export default function FootprintChart() {
       : null;
     tooltip = (
       <div
-        className="pointer-events-none absolute z-10 rounded-lg border px-3 py-2.5 text-[11px] leading-5 shadow-xl"
-        style={tooltipStyle(240, nodeHint ? 214 : 170)}
+        className="pointer-events-none rounded-lg border px-3 py-2.5 text-[11px] leading-5 shadow-xl"
+        style={tooltipStyle(240)}
       >
         <div className="font-mono text-slate-400">
           价位 {fmtPrice(lv.price, tick)}
@@ -742,8 +771,8 @@ export default function FootprintChart() {
     ];
     tooltip = (
       <div
-        className="pointer-events-none absolute z-10 rounded-lg border px-3 py-2.5 text-[11px] leading-5 shadow-xl"
-        style={tooltipStyle(250, 150)}
+        className="pointer-events-none rounded-lg border px-3 py-2.5 text-[11px] leading-5 shadow-xl"
+        style={tooltipStyle(250)}
       >
         <div className="font-medium" style={{ color: COLORS.text }}>
           {ex.title}：<span className="font-mono">{vals[hover.row]}</span>
@@ -961,8 +990,16 @@ export default function FootprintChart() {
               markDirty();
             }}
             className="flex items-center gap-1 rounded border px-2 py-1 text-[11px] transition-colors hover:bg-white/5"
-            style={{ borderColor: COLORS.border, color: COLORS.text }}
-            title="纵向自动装下可见柱的价格范围（也可双击价格轴/时间轴触发）"
+            style={
+              priceAutoFit
+                ? { borderColor: "rgba(96,165,250,0.5)", background: "rgba(37,99,235,0.18)", color: "#bfdbfe" }
+                : { borderColor: COLORS.border, color: COLORS.text }
+            }
+            title={
+              priceAutoFit
+                ? "价格轴自动适配已开启：纵向持续装下可见柱的价格范围。拖动价格轴或纵向拖图区会退出"
+                : "开启价格轴自动适配（也可双击价格轴/时间轴触发）"
+            }
           >
             <Maximize2 size={12} />
             自动适配
@@ -1008,7 +1045,14 @@ export default function FootprintChart() {
             onMouseMove={onMouseMove}
             onMouseLeave={onMouseLeave}
           />
-          {tooltip}
+          {tooltip && (
+            <div
+              ref={tooltipWrapRef}
+              className="pointer-events-none absolute left-0 top-0 z-10 will-change-transform"
+            >
+              {tooltip}
+            </div>
+          )}
           {signalPopover}
           {backfillHint && (
             <div
@@ -1101,8 +1145,8 @@ export default function FootprintChart() {
         style={{ borderColor: COLORS.border, color: COLORS.dim }}
       >
         <span>
-          拖拽/滚轮平移（松手惯性滑行）· Ctrl/⌘+滚轮或双指捏合缩放 · 双击图区复位视图 ·
-          悬停任意格子/统计行看白话解释
+          滚轮缩放时间轴 · 触控板双指或 Shift+滚轮平移（松手惯性滑行）· 捏合/⌘+滚轮以光标为中心缩放 ·
+          拖价格轴调纵向比例 · 双击图区复位视图 · 悬停任意格子/统计行看白话解释
         </span>
         <span>徽标：⚡扫盘 ≣堆积 ◈背离（点击看含义）</span>
       </div>
