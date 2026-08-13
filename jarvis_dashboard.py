@@ -8226,6 +8226,37 @@ def api_mentor_explain_stream(data: dict | None = None):
     )
 
 
+# ─────────────────── [任务 J2] 数据源健康 / 手动切换（独立新区段）───────────────────
+# 顶部栏数据源胶囊（desktop DataSourceCapsule）数据源；实现在 jarvis_datasource +
+# jarvis_net 策略层。status 纯读本地状态零出网；switch「先探测后生效」——目标源
+# 探测失败不切换（币安封禁期探测自动短路不真发，防止延长封禁）。
+
+
+@app.get("/api/datasource/status")
+def api_datasource_status():
+    """数据源全景：模式/策略屏蔽/各源健康（封禁、探测、权重水位）/能力矩阵。"""
+    try:
+        import jarvis_datasource as jds
+        return JSONResponse(jds.status())
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
+
+
+@app.post("/api/datasource/switch")
+async def api_datasource_switch(request: Request):
+    """切换数据源模式 {mode: auto|binance|okx}：先探测目标源，失败保持原源。"""
+    try:
+        import jarvis_datasource as jds
+        try:
+            d = await request.json()
+        except Exception:  # noqa: BLE001 — 空 body 按缺参处理
+            d = {}
+        res = jds.switch(str((d or {}).get("mode", "")), by="dashboard-api")
+        return JSONResponse(res, status_code=200 if res.get("ok") else 409)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="贾维斯可视化仪表盘")
     # [Sprint0] 监听地址/端口默认从配置中心读（dashboard_host/dashboard_port，
