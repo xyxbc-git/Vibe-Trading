@@ -17,6 +17,17 @@ swing 支撑/压力：与 jarvis_twelve_systems._swing_points 同口径（window
 局部极值）在本文件独立实现（任务红线：不改动 jarvis_twelve_systems）；相邻
 价位按 CLUSTER_ATR_MULT×ATR 聚簇并计触碰次数，现价上下分列压力/支撑。
 
+[任务 N2] Premium/Discount 折价溢价区（SMC dealing range，波段口径预登记，
+防事后改口径）：
+  - 波段选取：近 lookback（默认 120）根内的 swing 高/低点（window=5，与
+    swing_levels 同口径）构成 dealing range——range_high=窗口内最高 swing
+    高点，range_low=窗口内最低 swing 低点；窗口内 swing 点不足（高或低 <1
+    个）时退化为该窗口的原始 high/low 极值。
+  - 有效性门槛：range 高度 ≥ 0.5×ATR14，否则视为无显著波段（ok=False）。
+  - 分位口径：pos_pct = (现价-range_low)/(range_high-range_low)×100，夹到
+    [0,100]；zone：>55=premium（溢价，做多=追高）、<45=discount（折价，
+    做空=杀跌）、45~55=equilibrium 均衡带。equilibrium 价=区间 0.5 中点。
+
 所有距离标注均按 ATR 归一（dist_atr）并附百分比（dist_pct），供导师解释层
 把「离入场多远」讲成人话。
 """
@@ -32,6 +43,11 @@ MIN_GAP_ATR_MULT = 0.1     # 噪声门槛：缺口高度 ≥ 0.1×ATR 才计
 CLUSTER_ATR_MULT = 0.25    # swing 价位聚簇半径（×ATR）
 SR_MAX_LEVELS = 6          # 支撑/压力各最多返回条数
 _REQUIRED_COLS = ("open", "high", "low", "close")
+
+# [N2] Premium/Discount 预登记参数（改动须走评审，不许跑完数据后调）
+PD_LOOKBACK = 120          # dealing range 取段窗口（根）
+PD_EQ_BAND = (45.0, 55.0)  # 均衡带分位区间（含边界）
+PD_MIN_RANGE_ATR = 0.5     # 波段有效性门槛：区间高度 ≥ 0.5×ATR
 
 
 # ─────────────────────────── 公共指标（本文件自足） ───────────────────────────
@@ -203,10 +219,98 @@ def swing_levels(df: pd.DataFrame, *, window: int = 5,
     }
 
 
+# ─────────────────────────── [N2] Premium/Discount 折价溢价区 ───────────────────────────
+
+def premium_discount(df: pd.DataFrame, *, lookback: int = PD_LOOKBACK) -> dict:
+    """SMC 折价/溢价区分类（纯函数；波段口径见模块头预登记）。
+
+    返回 {ok, reason, range_high, range_low, equilibrium, price, pos_pct, zone,
+    lookback_bars}；zone ∈ premium|discount|equilibrium（45~55 分位=均衡带）。
+    数据不合格 / 波段高度 < 0.5×ATR → ok=False + reason，其余键为 None。
+    """
+    empty = {"ok": False, "reason": None, "range_high": None, "range_low": None,
+             "equilibrium": None, "price": None, "pos_pct": None, "zone": None,
+             "lookback_bars": None}
+    reason = _valid_df(df)
+    if reason is not None:
+        return {**empty, "reason": reason}
+    try:
+        look = df.iloc[-max(MIN_BARS, int(lookback)):]
+        atr_now = float(_atr_series(df).iloc[-1])
+        if not (math.isfinite(atr_now) and atr_now > 0):
+            return {**empty, "reason": "ATR 无效，无法评估波段有效性"}
+        price = float(df["close"].iloc[-1])
+        highs_i, lows_i = _swing_points(look, window=5)
+        if highs_i and lows_i:
+            range_high = max(float(look["high"].iloc[i]) for i in highs_i)
+            range_low = min(float(look["low"].iloc[i]) for i in lows_i)
+        else:  # swing 点不足：退化为窗口原始极值（预登记兜底口径）
+            range_high = float(look["high"].max())
+            range_low = float(look["low"].min())
+        height = range_high - range_low
+        if height < PD_MIN_RANGE_ATR * atr_now:
+            return {**empty, "reason": (f"波段高度 {height:.6g} < "
+                                        f"{PD_MIN_RANGE_ATR}×ATR，无显著 dealing range")}
+        pos = (price - range_low) / height * 100.0
+        pos_pct = round(min(100.0, max(0.0, pos)), 2)
+        lo_b, hi_b = PD_EQ_BAND
+        zone = ("equilibrium" if lo_b <= pos_pct <= hi_b
+                else "premium" if pos_pct > hi_b else "discount")
+        return {"ok": True, "reason": None,
+                "range_high": _round_price(range_high),
+                "range_low": _round_price(range_low),
+                "equilibrium": _round_price((range_high + range_low) / 2),
+                "price": _round_price(price), "pos_pct": pos_pct, "zone": zone,
+                "lookback_bars": int(len(look))}
+    except Exception as exc:  # noqa: BLE001 — 证据模块绝不拖垮消费方
+        return {**empty, "reason": f"premium_discount 异常降级: {repr(exc)[:100]}"}
+
+
+_PD_ZONE_CN = {"premium": "溢价区", "discount": "折价区", "equilibrium": "均衡带"}
+
+
+def premium_discount_judge(pd_out: dict | None, plan_dir: str) -> dict | None:
+    """导师证据项判定（任务 N2）：做多在溢价/做空在折价 → warn，反之 pass。
+
+    Args:
+        pd_out: premium_discount() 输出（或 detect()['premium_discount']）
+        plan_dir: long / short
+    返回 {level: warn|pass, evidence, detail, raw}——由 jarvis_trade_mentor 以
+    key='premium_discount'（WEIGHTS 无此键 → weight=0）挂进 items：纯人话提示，
+    不改分数。数据缺失 / 方向非法返回 None（证据不可用不硬造）。
+    """
+    if not isinstance(pd_out, dict) or not pd_out.get("ok") \
+            or plan_dir not in ("long", "short"):
+        return None
+    zone, pos = pd_out["zone"], pd_out["pos_pct"]
+    zone_cn = _PD_ZONE_CN.get(zone, zone)
+    base = (f"现价处于 dealing range {zone_cn} {pos:.0f}% 分位"
+            f"（区间 [{pd_out['range_low']}, {pd_out['range_high']}]，"
+            f"均衡价 {pd_out['equilibrium']}）")
+    detail = f"{zone_cn} {pos:.0f}%"
+    raw = {k: pd_out[k] for k in ("zone", "pos_pct", "range_high", "range_low",
+                                  "equilibrium")}
+    counter = (plan_dir == "long" and zone == "premium") or \
+              (plan_dir == "short" and zone == "discount")
+    if counter:
+        advice = ("做多等于追高，回落到折价区/均衡价再考虑低吸"
+                  if plan_dir == "long" else
+                  "做空等于杀跌，反弹到溢价区/均衡价再考虑高空")
+        return {"level": "warn", "evidence": base + f"——{advice}", "detail": detail,
+                "raw": raw}
+    if zone == "equilibrium":
+        return {"level": "pass", "evidence": base + "——处于均衡带，价格位置不加分不减分",
+                "detail": detail, "raw": raw}
+    good = ("折价区低吸，入场位置站在便宜的一侧" if plan_dir == "long"
+            else "溢价区高空，入场位置站在贵的一侧")
+    return {"level": "pass", "evidence": base + f"——{good}", "detail": detail,
+            "raw": raw}
+
+
 # ─────────────────────────── 聚合契约入口（agent-8 对接面） ───────────────────────────
 
 def detect(df: pd.DataFrame, max_zones: int = 10) -> dict:
-    """FVG + swing 支撑/压力 一步到位的聚合契约（jarvis_trade_mentor try-import 用）。
+    """FVG + swing 支撑/压力 + 折价溢价区 一步到位的聚合契约（对接面）。
 
     签名固定：detect(df, max_zones=10)。返回：
       {ok: bool, reason: str|None,           # 数据不合格时 ok=False + 原因
@@ -214,9 +318,13 @@ def detect(df: pd.DataFrame, max_zones: int = 10) -> dict:
        zones: [...],                          # detect_fvg 输出（未回补优先、新鲜优先）
        sr: {...},                             # swing_levels 输出
        nearest_fvg: {...}|None,               # 最近的未回补 FVG（按 dist_atr）
+       premium_discount: {...},               # [N2] 折价溢价区（R8 渲染均衡线/着色）
        summary: str}                          # 一句话小白话摘要
     纯函数、不联网、绝不抛出（异常降级为 ok=False）。
     """
+    _empty_pd = {"ok": False, "reason": "未执行", "range_high": None,
+                 "range_low": None, "equilibrium": None, "price": None,
+                 "pos_pct": None, "zone": None, "lookback_bars": None}
     try:
         reason = _valid_df(df)
         if reason is not None:
@@ -224,11 +332,14 @@ def detect(df: pd.DataFrame, max_zones: int = 10) -> dict:
                     "zones": [], "sr": {"supports": [], "resistances": [],
                                         "nearest_support": None,
                                         "nearest_resistance": None},
-                    "nearest_fvg": None, "summary": f"FVG 检测未执行：{reason}"}
+                    "nearest_fvg": None,
+                    "premium_discount": {**_empty_pd, "reason": reason},
+                    "summary": f"FVG 检测未执行：{reason}"}
         price = float(df["close"].iloc[-1])
         atr_now = float(_atr_series(df).iloc[-1])
         zones = detect_fvg(df, max_zones=max_zones)
         sr = swing_levels(df)
+        pd_out = premium_discount(df)
         open_zones = [z for z in zones if not z["mitigated"]]
         nearest_fvg = min(open_zones, key=lambda z: z["dist_atr"] or 0.0) \
             if open_zones else None
@@ -246,12 +357,17 @@ def detect(df: pd.DataFrame, max_zones: int = 10) -> dict:
             parts.append(f"最近支撑 {ns['price']}（{ns['dist_atr']}×ATR）")
         if nr:
             parts.append(f"最近压力 {nr['price']}（{nr['dist_atr']}×ATR）")
+        if pd_out.get("ok"):
+            parts.append(f"现价处于 {_PD_ZONE_CN.get(pd_out['zone'], pd_out['zone'])} "
+                         f"{pd_out['pos_pct']:.0f}% 分位")
         return {"ok": True, "reason": None, "price": _round_price(price),
                 "atr": _round_price(atr_now), "zones": zones, "sr": sr,
-                "nearest_fvg": nearest_fvg, "summary": "；".join(parts)}
+                "nearest_fvg": nearest_fvg, "premium_discount": pd_out,
+                "summary": "；".join(parts)}
     except Exception as exc:  # noqa: BLE001 — 证据模块绝不拖垮导师主链
         return {"ok": False, "reason": f"FVG 检测异常降级: {repr(exc)[:120]}",
                 "price": None, "atr": None, "zones": [],
                 "sr": {"supports": [], "resistances": [],
                        "nearest_support": None, "nearest_resistance": None},
-                "nearest_fvg": None, "summary": "FVG 检测异常，本次不提供缺口证据"}
+                "nearest_fvg": None, "premium_discount": _empty_pd,
+                "summary": "FVG 检测异常，本次不提供缺口证据"}

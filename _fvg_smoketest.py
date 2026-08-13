@@ -140,6 +140,89 @@ check("H3 聚簇触碰数≥2 且距离标注齐全",
       and any(lv["touches"] >= 2 for lv in sr["supports"] + sr["resistances"]),
       str(sr["supports"][:2] + sr["resistances"][:2]))
 
+# ── J. [N2] Premium/Discount 折价溢价区 ─────────────────────────────────
+
+
+def _range_df(last_close: float, n_pre: int = 80) -> pd.DataFrame:
+    """受控 dealing range：三角波 92~108（swing 高≈108、低≈92）+ 末端拉到指定价。
+
+    末端连续 6 根停在 last_close（±0.3 振幅），不产生新的 swing 极值。
+    """
+    rows = []
+    for i in range(n_pre):
+        phase = i % 16
+        c = 92.0 + (phase if phase <= 8 else 16 - phase) * 2.0
+        rows.append((c, c + 0.3, c - 0.3, c))
+    rows += [(last_close, last_close + 0.3, last_close - 0.3, last_close)] * 6
+    return mk(rows)
+
+
+pd_hi = jf.premium_discount(_range_df(106.0))   # (106-92)/16=87.5%
+check("J1 高位=premium 且分位正确", pd_hi["ok"] and pd_hi["zone"] == "premium"
+      and abs(pd_hi["pos_pct"] - 87.5) < 3.0, str(pd_hi))
+check("J1b 区间/均衡价自洽", pd_hi["ok"]
+      and pd_hi["range_low"] < pd_hi["equilibrium"] < pd_hi["range_high"]
+      and abs(pd_hi["equilibrium"] - (pd_hi["range_high"] + pd_hi["range_low"]) / 2) < 1e-6,
+      str(pd_hi))
+pd_lo = jf.premium_discount(_range_df(94.0))    # (94-92)/16=12.5%
+check("J2 低位=discount", pd_lo["ok"] and pd_lo["zone"] == "discount"
+      and pd_lo["pos_pct"] < 45.0, str(pd_lo))
+pd_mid = jf.premium_discount(_range_df(100.0))  # (100-92)/16=50%
+check("J3 中位=equilibrium 均衡带", pd_mid["ok"] and pd_mid["zone"] == "equilibrium"
+      and 45.0 <= pd_mid["pos_pct"] <= 55.0, str(pd_mid))
+# J4 边界：55 分位（含）仍属均衡带，55 之上为 premium
+pd_b1 = jf.premium_discount(_range_df(100.8))   # (100.8-92)/16=55.0%
+check("J4 55% 边界含在均衡带", pd_b1["ok"] and pd_b1["zone"] == "equilibrium",
+      str((pd_b1["pos_pct"], pd_b1["zone"])))
+pd_b2 = jf.premium_discount(_range_df(101.6))   # 60%
+check("J4b 55% 之上为 premium", pd_b2["ok"] and pd_b2["zone"] == "premium",
+      str((pd_b2["pos_pct"], pd_b2["zone"])))
+# J5 lookback 生效：旧的大区间在窗口外被忽略（近端小区间 96~104）
+_rows_old = [(50.0 + (i % 10) * 8.0, 50.0 + (i % 10) * 8.0 + 0.3,
+              50.0 + (i % 10) * 8.0 - 0.3, 50.0 + (i % 10) * 8.0) for i in range(60)]
+_rows_new = []
+for i in range(70):
+    phase = i % 12
+    c = 96.0 + (phase if phase <= 6 else 12 - phase) * (8.0 / 6.0)
+    _rows_new.append((c, c + 0.3, c - 0.3, c))
+pd_lb = jf.premium_discount(mk(_rows_old + _rows_new), lookback=60)
+check("J5 lookback 截段（旧巨幅区间被忽略）", pd_lb["ok"]
+      and pd_lb["range_high"] <= 105.0 and pd_lb["range_low"] >= 95.0,
+      str((pd_lb["range_low"], pd_lb["range_high"])))
+# J6 无显著波段 → ok=False：swing 区间仅 1.0 而末端巨幅 TR 把 ATR 抬到 ~2.4
+# （区间高度 < 0.5×ATR 触发有效性门槛；纯平盘时区间≈ATR 属有效，不在此列）
+pd_flat = jf.premium_discount(mk([FLAT] * 60 + [(100.0, 110.0, 90.0, 100.0)]))
+check("J6 波段高度不足 0.5×ATR → ok=False", pd_flat["ok"] is False
+      and "dealing range" in (pd_flat["reason"] or ""), str(pd_flat["reason"]))
+check("J7 数据不足/坏输入降级", jf.premium_discount(mk([FLAT] * 10))["ok"] is False
+      and jf.premium_discount(None)["ok"] is False)
+# J8 detect() 契约携带 premium_discount（R8 渲染均衡线用）
+out_pd = jf.detect(_range_df(106.0))
+check("J8 detect 携带 premium_discount 键", out_pd["ok"]
+      and out_pd["premium_discount"]["zone"] == "premium"
+      and "溢价区" in out_pd["summary"], str(out_pd["premium_discount"]))
+check("J8b detect 幂等（含新键）", jf.detect(_range_df(106.0)) == out_pd)
+
+# J9 导师证据判定：逆势 warn / 顺势 pass / 均衡 pass / 缺数据 None
+j_lw = jf.premium_discount_judge(pd_hi, "long")
+check("J9 做多在溢价区 → warn+追高话术", j_lw is not None and j_lw["level"] == "warn"
+      and "追高" in j_lw["evidence"], str(j_lw))
+j_lp = jf.premium_discount_judge(pd_lo, "long")
+check("J9b 做多在折价区 → pass+低吸话术", j_lp is not None and j_lp["level"] == "pass"
+      and "折价" in j_lp["evidence"], str(j_lp))
+j_sw = jf.premium_discount_judge(pd_lo, "short")
+check("J9c 做空在折价区 → warn+杀跌话术", j_sw is not None and j_sw["level"] == "warn"
+      and "杀跌" in j_sw["evidence"], str(j_sw))
+j_sp = jf.premium_discount_judge(pd_hi, "short")
+check("J9d 做空在溢价区 → pass", j_sp is not None and j_sp["level"] == "pass")
+j_eq = jf.premium_discount_judge(pd_mid, "long")
+check("J9e 均衡带 → pass+中性话术", j_eq is not None and j_eq["level"] == "pass"
+      and "均衡" in j_eq["evidence"], str(j_eq))
+check("J9f 缺数据/非法方向 → None",
+      jf.premium_discount_judge(None, "long") is None
+      and jf.premium_discount_judge(pd_flat, "long") is None
+      and jf.premium_discount_judge(pd_hi, "hold") is None)
+
 # ── I. 降级路径：数据不足 / 坏输入 / 缺列，均不抛出 ──────────────────────
 tiny = jf.detect(mk([FLAT] * 10))
 check("I1 数据不足 ok=False+原因", tiny["ok"] is False and "数据不足" in tiny["reason"]

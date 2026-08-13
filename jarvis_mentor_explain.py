@@ -408,7 +408,8 @@ _LIGHT_CN = {"green": "🟢 绿灯：证据结构成立，可按计划执行",
              "red": "🔴 红灯：证据不支持这单，强烈建议放弃"}
 _LEVEL_ICON = {"pass": "✅", "warn": "⚠️", "fail": "❌", "unavailable": "❔"}
 _KEY_CN = {"trend": "趋势/共识", "risk": "风险与止损", "levels": "关键价位",
-           "structure": "结构证据", "micro": "微观资金流"}
+           "structure": "结构证据", "micro": "微观资金流",
+           "event_risk": "事件风险窗", "premium_discount": "折价/溢价区"}
 _FAIL_ADVICE = {
     "trend": "等共识转到与你同向，或出现明确的反转确认再考虑进场",
     "risk": "把止损放到结构位外侧（参考档案的插针深度提示），并守住盈亏比门槛",

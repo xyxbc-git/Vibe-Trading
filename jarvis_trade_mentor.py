@@ -306,8 +306,14 @@ def _fvg_evidence(symbol: str, tf: str) -> dict:
         df = jts.fetch_klines_df(symbol, tf, 300)
         if df is None or len(df) < 30:
             return _ev(False, reason="K线取数失败，FVG 证据不可用")
-        gaps = jarvis_fvg.detect(df)
-        return _ev(True, gaps=[g for g in (gaps or []) if not g.get("mitigated")][:6])
+        # [N2 修] detect(df) 返回 dict 契约 {ok, zones, premium_discount, ...}
+        # （原按 list 迭代必抛 AttributeError → 本证据路恒降级）；zones 才是缺口表
+        out = jarvis_fvg.detect(df)
+        zones = (out or {}).get("zones") or []
+        return _ev(bool((out or {}).get("ok")),
+                   gaps=[g for g in zones if not g.get("mitigated")][:6],
+                   premium_discount=(out or {}).get("premium_discount"),
+                   reason=(out or {}).get("reason"))
     except Exception as exc:  # noqa: BLE001
         return _ev(False, reason=repr(exc)[:120])
 
@@ -854,6 +860,17 @@ def verdict(evidence: dict, plan: dict, rules: list[dict] | None = None,
         _judge_micro(evidence, plan),
         _judge_event_risk(evidence),   # 任务 U：weight=0 仅明细警示，不动预登记权重
     ]
+    # [任务 N2] 折价/溢价区提示（weight=0 纯人话证据，照任务 U 先例不动预登记
+    # 权重；判定纯函数归 jarvis_fvg，动态 import 容错——缺失即跳过不占分母）
+    try:
+        import jarvis_fvg as _jfvg
+        _pd = _jfvg.premium_discount_judge(
+            (evidence.get("fvg") or {}).get("premium_discount"), plan_dir)
+        if _pd:
+            items.append(_item("premium_discount", _pd["level"], _pd["evidence"],
+                               _pd["detail"], _pd.get("raw")))
+    except Exception:  # noqa: BLE001 — 提示层缺失不拖裁决
+        pass
 
     # 加权计分：unavailable 不计分母（证据不全不硬造分数，对齐 supply_demand 哲学）
     score_map = {"pass": 1.0, "warn": 0.5, "fail": 0.0}
