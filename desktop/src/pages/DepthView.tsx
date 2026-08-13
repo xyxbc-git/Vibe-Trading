@@ -11,7 +11,6 @@ import {
   Activity,
   AlertTriangle,
   BookOpenCheck,
-  CheckCircle2,
   ChevronDown,
   ChevronRight,
   Fingerprint,
@@ -21,13 +20,13 @@ import {
   Radio,
   Target,
   Users,
-  XCircle,
 } from "lucide-react";
 import { usePolling } from "@/hooks/useApi";
 import { useSymbol } from "@/hooks/useSymbol";
 import { useLivePrice } from "@/hooks/usePrice";
 import { isStaleEcho } from "@/lib/chartView";
 import { calcMACD } from "@/lib/indicators";
+import { recordShare, shareBaseline } from "@/lib/tapeBaseline";
 import {
   api,
   formatPrice,
@@ -266,101 +265,110 @@ const COVERAGE_CN: Record<string, string> = {
   severe: "严重断档",
 };
 
-interface L0Result {
+/** 非散户净流的主力方向判定阈值（U2：阈值以下统一「主力观望中」，金额退 tooltip） */
+const NET_FLOW_GATE_USD = 100_000;
+
+interface StatusResult {
+  /** 状态式短结论（≤8 字主词），扫一眼得结论 */
   text: string;
-  /** null = 样本不足（不显置信度徽标） */
+  /** 语义色类（灰=均衡无信号 / 绿=多方 / 红=空方 / 蓝=吸筹 / 橙=派发） */
+  toneCls: string;
+  /** 置信度点阵 0-3（0=样本不足不显示） */
+  dots: number;
+  /** 置信档中文（tooltip 用） */
   tierCn: string | null;
   insufficient: boolean;
+  /** tooltip 详情：保留后端原句/依据（术语不进主视野但证据不丢） */
+  detail: string;
 }
 
-/** L0 结论句：后端 verdict.l0_text/confidence/insufficient 优先（D1 终稿字段
- * 落在 verdict 层）；未就绪按现有字段 mock 合成。
- * 纪律（方案 §五）：只描述盘口行为本身，不给方向/开单建议。 */
-function deriveL0(tape: TapeFlowExt, totalTrades: number): L0Result {
+/** U2 状态式结论：从结构化字段合成短状态词；后端 l0_text 原句与阈值口径
+ * 全部退 tooltip。纪律不变（方案 §五）：只描述盘口行为，不给方向/开单建议；
+ * 阈值以下不展示具体小额数字——「-$844」不是信号，是噪声。 */
+function deriveStatus(tape: TapeFlowExt, totalTrades: number): StatusResult {
   const v = tape.verdict as (TapeFlowResponse["verdict"] & TapeVerdictExt) | undefined;
-  // 后端明确判定样本不足 → 直接降级（l0_text 若同时给出则用后端原句）
-  if (v?.insufficient) {
-    return {
-      text: v.l0_text ?? "样本不足，暂不判定——本窗口数据不足以支撑任何结论",
-      tierCn: null,
-      insufficient: true,
-    };
-  }
-  if (v?.l0_text) {
-    return {
-      text: v.l0_text,
-      tierCn: v.confidence ? (CONFIDENCE_CN[v.confidence] ?? v.confidence) : null,
-      insufficient: false,
-    };
-  }
-  // mock 合成（后端字段未就绪）：总样本门禁 + action 行为词
   const effectiveN = v?.total_n ?? totalTrades;
-  if (effectiveN < VERDICT_MIN_TRADES) {
+  const detailBase = v?.l0_text ?? (v?.note ? `${v.action}：${v.note}` : "");
+  const gateNote = v
+    ? `非散户净流 ${fmtSignedUsd(v.inst_net_usd)}（主力方向判定线 $100K，双边金额分层口径）`
+    : "";
+  const detail = [detailBase, gateNote].filter(Boolean).join("\n");
+
+  if (v?.insufficient || !v || effectiveN < VERDICT_MIN_TRADES) {
     return {
-      text: "样本不足，暂不判定——本窗口数据不足以支撑任何结论",
+      text: "样本不足，暂不判定",
+      toneCls: "text-jarvis-text-secondary",
+      dots: 0,
       tierCn: null,
       insufficient: true,
+      detail: detail || "本窗口成交笔数不足以支撑任何结论",
     };
   }
-  if (!v) {
-    return { text: "窗口内数据不足，暂无法判定", tierCn: null, insufficient: true };
-  }
-  // B3 混沌态（后端阻尼标记）：信号频繁翻转时不给行为结论
+  const tierCn = v.confidence
+    ? (CONFIDENCE_CN[v.confidence] ?? v.confidence)
+    : effectiveN >= 200
+      ? "证据充分"
+      : effectiveN >= 50
+        ? "证据一般"
+        : "仅金额分层";
+  const dots = tierCn === "证据充分" ? 3 : tierCn === "证据一般" ? 2 : 1;
   if (v.chaotic) {
-    return { text: "市场混沌，信号打架——本窗口行为方向反复，观望为主", tierCn: null, insufficient: false };
+    return {
+      text: "信号打架 · 观望",
+      toneCls: "text-jarvis-text-secondary",
+      dots,
+      tierCn,
+      insufficient: false,
+      detail: `本窗口行为方向反复翻转，不给行为结论。\n${detail}`,
+    };
   }
-  const tierCn =
-    effectiveN >= 200 ? "证据充分" : effectiveN >= 50 ? "证据一般" : "仅金额分层";
-  const text =
-    v.action === "中性"
-      ? "主力无明显动作（中性）——非散户净流未过判定阈值"
-      : `主力疑似「${v.action}」${v.note ? `：${v.note}` : ""}`;
-  return { text, tierCn, insufficient: false };
+  const a = v.action ?? "";
+  if (a.includes("砸")) {
+    return { text: "空方主导 · 砸盘", toneCls: "text-jarvis-red", dots, tierCn, insufficient: false, detail };
+  }
+  if (a.includes("拉")) {
+    return { text: "多方主导 · 拉盘", toneCls: "text-jarvis-green", dots, tierCn, insufficient: false, detail };
+  }
+  if (a.includes("吸")) {
+    return { text: "主力吸筹", toneCls: "text-sky-400", dots, tierCn, insufficient: false, detail };
+  }
+  if (a.includes("派") || a.includes("出货")) {
+    return { text: "主力派发", toneCls: "text-orange-400", dots, tierCn, insufficient: false, detail };
+  }
+  // 中性/未过阈：统一观望态，绝不把小额净流当信号展示
+  return {
+    text: "主力观望中",
+    toneCls: "text-jarvis-text-secondary",
+    dots,
+    tierCn,
+    insufficient: false,
+    detail: detail || "非散户净流未过主力方向判定线，视为无主力动向",
+  };
 }
 
-interface EvidenceRow {
-  level: "pass" | "warn" | "fail";
-  text: string;
-}
-
-/** L1 人话证据 ≤3 条（复用导师裁决卡 pass/warn/fail 视觉语言）：
- * 净流依据（判定阈值显性化，防玄学感）/ 脉冲异动 / 窗口覆盖度 */
-function deriveEvidence(tape: TapeFlowExt, actualMin: number | null): EvidenceRow[] {
-  const rows: EvidenceRow[] = [];
-  const v = tape.verdict;
-  if (v) {
-    const passGate = Math.abs(v.inst_net_usd) >= 100_000;
-    rows.push({
-      level: passGate ? "pass" : "warn",
-      text: `非散户净流 ${fmtSignedUsd(v.inst_net_usd)}（判定阈值 $100K${passGate ? "，已过阈" : "，未过阈→中性依据"}）`,
-    });
-  }
-  if (v?.burst) {
-    rows.push({
+/** 采集连续性脚注（保留原覆盖度诚实口径，术语收敛为一行小字） */
+function deriveCoverageNote(
+  tape: TapeFlowExt,
+  actualMin: number | null,
+): { level: "pass" | "warn" | "fail"; text: string } {
+  if (actualMin == null) {
+    return {
       level: "warn",
-      text: `${v.burst.side === "buy" ? "买向" : "卖向"}脉冲 ${fmtUsd(v.burst.usd)}——短时异动，${v.burst.note}`,
-    });
+      text: "实测窗口字段待后端接入，当前按标称窗口展示",
+    };
   }
-  if (actualMin != null) {
-    // coverage 终稿为对象 {grade, grade_cn, ...}；兼容早期字符串形态
-    const cov = tape.coverage;
-    const covCn =
-      cov == null
-        ? null
-        : typeof cov === "string"
-          ? (COVERAGE_CN[cov] ?? cov)
-          : (cov.grade_cn ?? (cov.grade ? (COVERAGE_CN[cov.grade] ?? cov.grade) : null));
-    rows.push({
-      level: covCn === "严重断档" ? "fail" : covCn === "有断档" ? "warn" : "pass",
-      text: `近 ${actualMin} 分钟实测数据${covCn ? `（采集${covCn}）` : ""}`,
-    });
-  } else {
-    rows.push({
-      level: "warn",
-      text: "实测窗口/覆盖度字段待后端接入——当前按标称窗口展示，可能名不副实",
-    });
-  }
-  return rows.slice(0, 3);
+  // coverage 终稿为对象 {grade, grade_cn, ...}；兼容早期字符串形态
+  const cov = tape.coverage;
+  const covCn =
+    cov == null
+      ? null
+      : typeof cov === "string"
+        ? (COVERAGE_CN[cov] ?? cov)
+        : (cov.grade_cn ?? (cov.grade ? (COVERAGE_CN[cov.grade] ?? cov.grade) : null));
+  return {
+    level: covCn === "严重断档" ? "fail" : covCn === "有断档" ? "warn" : "pass",
+    text: `近 ${actualMin} 分钟实测${covCn ? ` · 采集${covCn}` : ""}`,
+  };
 }
 
 /* ────────────────────────── ③ DOM 深度阶梯 ────────────────────────── */
@@ -604,25 +612,19 @@ function DepthLadder({
 
 /* ────────────────────────── ④ 成交流画像三块 ────────────────────────── */
 
-/** L1 证据行图标（复用导师裁决卡 pass/warn/fail 视觉语言） */
-function EvidenceIcon({ level }: { level: "pass" | "warn" | "fail" }) {
-  if (level === "pass")
-    return <CheckCircle2 size={13} className="mt-0.5 flex-shrink-0 text-jarvis-green" />;
-  if (level === "warn")
-    return <AlertTriangle size={13} className="mt-0.5 flex-shrink-0 text-jarvis-yellow" />;
-  return <XCircle size={13} className="mt-0.5 flex-shrink-0 text-jarvis-red" />;
-}
-
-/** (a) 结论卡（D2 重构，方案 A1/A2/A3）：
- * L0 一句话结论（第一公民，限盘口行为描述）+ 置信度三档 + 「近 Xmin 实测」诚实窗口
- * + 样本不足强制降级 + 「问导师」入口；L1 ≤3 条人话证据；
- * 四主体条保留但按 A1 样本门禁灰化（n<10 不给精确数与方向色）。 */
+/** (a) 结论卡（U2 重排，D2 骨架保留）：
+ * 顶行状态式大字结论（灰=观望/绿=多方/红=空方/蓝=吸筹/橙=派发）+ 置信度点阵，
+ * 阈值以下统一「主力观望中」不再展示小额数字；三指标 chip（占比带本机基线 /
+ * 净流向阈值语义 / 大单活动）；术语与精确金额全部退 tooltip；「样本不足」
+ * 收敛为右上角单个谦逊徽标；规模分布收成一条堆叠条+单行图例。 */
 function VerdictCard({
   tape,
+  symbol,
   windowMin,
   onAskMentor,
 }: {
   tape: TapeFlowExt;
+  symbol: string;
   windowMin: number;
   onAskMentor: () => void;
 }) {
@@ -631,12 +633,23 @@ function VerdictCard({
   const totalTrades = actors
     ? ACTOR_ORDER.reduce((s, a) => s + (actors[a]?.n ?? 0), 0)
     : 0;
-  const l0 = deriveL0(tape, totalTrades);
+  const st = deriveStatus(tape, totalTrades);
   const actualMin =
     typeof tape.actual_window_min === "number" && tape.actual_window_min > 0
       ? Math.round(tape.actual_window_min)
       : null;
-  const evidence = l0.insufficient ? [] : deriveEvidence(tape, actualMin);
+  const coverage = deriveCoverageNote(tape, actualMin);
+
+  // 非散户占比 · 本机滚动基线（近 ≤30 日观测区间；不足 3 日只显「累积中」）
+  const sharePct = v && !st.insufficient ? v.non_retail_share_pct : null;
+  useEffect(() => {
+    if (sharePct != null) recordShare(symbol, sharePct);
+  }, [symbol, sharePct]);
+  const baseline = sharePct != null ? shareBaseline(symbol, sharePct) : null;
+
+  const netGatePassed = v != null && Math.abs(v.inst_net_usd) >= NET_FLOW_GATE_USD;
+  const bigOrders = actors?.inst;
+  const bigN = bigOrders?.n ?? null;
 
   return (
     <div className="card p-4 space-y-3">
@@ -654,45 +667,46 @@ function VerdictCard({
         >
           {actualMin != null ? `近 ${actualMin}min 实测` : `窗口 ${windowMin}min`}
         </span>
-        {v && !l0.insufficient && (
-          <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-jarvis-border/40 text-jarvis-text-secondary">
-            主导·{v.dominant_cn}
+        {/* U2：样本量诚实态收敛为右上角单个谦逊徽标（各分布桶的灰化照旧） */}
+        {st.insufficient && (
+          <span
+            className="ml-auto text-[10px] px-1.5 py-0.5 rounded-full border border-jarvis-yellow/40 text-jarvis-yellow cursor-help"
+            title={`窗口内样本 ${(v as (TapeFlowResponse["verdict"] & TapeVerdictExt) | undefined)?.total_n ?? totalTrades} 笔，不足以支撑行为判定（门槛 ${VERDICT_MIN_TRADES} 笔）`}
+          >
+            样本不足
           </span>
         )}
       </p>
 
-      {/* L0 一句话结论（第一公民） */}
+      {/* U2 状态式大字结论 + 置信度点阵：扫一眼得结论；原句与阈值口径在 tooltip */}
       <div>
-        <p
-          className={clsx(
-            "text-base font-bold leading-snug",
-            l0.insufficient
-              ? "text-jarvis-text-secondary"
-              : actionColorCls(v?.action ?? ""),
-          )}
-        >
-          {l0.text}
-        </p>
-        <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-          {l0.tierCn && (
+        <div className="flex items-center gap-2 flex-wrap">
+          <p
+            className={clsx("text-lg font-bold leading-snug cursor-help", st.toneCls)}
+            title={st.detail}
+          >
+            {st.text}
+          </p>
+          {st.dots > 0 && (
             <span
-              className={clsx(
-                "text-[10px] px-1.5 py-0.5 rounded border",
-                l0.tierCn === "证据充分"
-                  ? "border-jarvis-green/50 text-jarvis-green"
-                  : l0.tierCn === "证据一般"
-                    ? "border-jarvis-yellow/50 text-jarvis-yellow"
-                    : "border-jarvis-border text-jarvis-text-secondary",
-              )}
-              title="置信度按窗口样本量与证据结构分档（后端契约就绪后以引擎输出为准）"
+              className="flex items-center gap-0.5 cursor-help"
+              title={`置信度：${st.tierCn}（按窗口样本量与证据结构分档）`}
             >
-              {l0.tierCn}
+              {[1, 2, 3].map((i) => (
+                <span
+                  key={i}
+                  className={clsx(
+                    "w-1.5 h-1.5 rounded-full",
+                    i <= st.dots ? "bg-jarvis-blue" : "bg-jarvis-border/60",
+                  )}
+                />
+              ))}
             </span>
           )}
           <button
             type="button"
             onClick={onAskMentor}
-            className="flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border border-jarvis-blue/50 text-jarvis-blue hover:bg-jarvis-blue/10 transition-colors"
+            className="ml-auto flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border border-jarvis-blue/50 text-jarvis-blue hover:bg-jarvis-blue/10 transition-colors"
             title="把这个信号带去导师页写计划——方向与开单建议由导师裁决，不在本卡给出"
           >
             <GraduationCap size={11} />
@@ -701,40 +715,102 @@ function VerdictCard({
         </div>
       </div>
 
-      {/* L1 人话证据 ≤3 条 */}
-      {evidence.length > 0 && (
-        <div className="space-y-1.5">
-          {evidence.map((e, i) => (
-            <div
-              key={i}
-              className="flex items-start gap-1.5 rounded-lg bg-jarvis-bg/60 border border-jarvis-border/40 px-2.5 py-1.5"
-            >
-              <EvidenceIcon level={e.level} />
-              <p className="text-[11px] text-jarvis-text leading-snug">{e.text}</p>
-            </div>
-          ))}
+      {/* U2 三指标 chip：占比（带本机基线区间）/ 净流向（阈值语义）/ 大单活动 */}
+      {v && !st.insufficient && (
+        <div className="grid grid-cols-3 gap-2">
+          {/* 占比 + 本机观测基线（诚实口径：非全量统计） */}
+          <div
+            className="rounded-lg bg-jarvis-bg/60 border border-jarvis-border/40 px-2 py-1.5 cursor-help"
+            title={
+              baseline
+                ? baseline.posPct != null
+                  ? `近 ${baseline.days} 日本机观测区间 ${baseline.lo.toFixed(0)}%~${baseline.hi.toFixed(0)}%，当前处于区间 ${baseline.posPct}% 位置（本机打开本页期间的观测包络，非全量统计基准）`
+                  : `本机基线累积中（已观测 ${baseline.days} 日，满 3 日后给出区间位置）`
+                : "本机基线累积中（首日观测）"
+            }
+          >
+            <p className="text-[9px] text-jarvis-text-secondary">非散户占比</p>
+            <p className="text-sm font-mono font-semibold text-jarvis-text leading-tight">
+              {v.non_retail_share_pct.toFixed(1)}%
+            </p>
+            {baseline && baseline.posPct != null ? (
+              <div className="mt-1 relative h-1 rounded-full bg-jarvis-border/50">
+                <span
+                  className="absolute -top-0.5 w-2 h-2 rounded-full bg-jarvis-purple border border-jarvis-bg"
+                  style={{ left: `calc(${baseline.posPct}% - 4px)` }}
+                />
+              </div>
+            ) : (
+              <p className="text-[9px] text-jarvis-text-secondary/60 leading-tight">
+                基准累积中
+              </p>
+            )}
+            {baseline && baseline.posPct != null && (
+              <p className="text-[9px] text-jarvis-text-secondary/70 leading-tight mt-0.5">
+                近{baseline.days}日 {baseline.lo.toFixed(0)}~{baseline.hi.toFixed(0)}%
+              </p>
+            )}
+          </div>
+
+          {/* 净流向：阈值以下灰色「微弱」，精确金额与阈值口径退 tooltip */}
+          <div
+            className="rounded-lg bg-jarvis-bg/60 border border-jarvis-border/40 px-2 py-1.5 cursor-help"
+            title={`非散户净流 ${fmtSignedUsd(v.inst_net_usd)}；主力方向判定线 $100K——阈值以下视为无主力方向证据，不构成信号`}
+          >
+            <p className="text-[9px] text-jarvis-text-secondary">净流向</p>
+            {netGatePassed ? (
+              <p
+                className={clsx(
+                  "text-sm font-mono font-semibold leading-tight",
+                  v.inst_net_usd >= 0 ? "text-jarvis-green" : "text-jarvis-red",
+                )}
+              >
+                {fmtSignedUsd(v.inst_net_usd)}
+              </p>
+            ) : (
+              <p className="text-sm font-semibold text-jarvis-text-secondary leading-tight">
+                微弱
+              </p>
+            )}
+            <p className="text-[9px] text-jarvis-text-secondary/70 leading-tight mt-0.5">
+              {netGatePassed
+                ? v.inst_net_usd >= 0
+                  ? "买方净流入"
+                  : "卖方净流出"
+                : "未过主力判定线"}
+            </p>
+          </div>
+
+          {/* 大单活动：窗口内大单笔数（金额分层口径） */}
+          <div
+            className="rounded-lg bg-jarvis-bg/60 border border-jarvis-border/40 px-2 py-1.5 cursor-help"
+            title={
+              bigOrders && (bigN ?? 0) >= ACTOR_MIN_TRADES
+                ? `窗口内大单 ${bigN} 笔，净额 ${fmtSignedUsd(bigOrders.net_usd)}（大单=单笔金额达机构档，金额分层推断非真实身份）`
+                : `窗口内大单 ${bigN ?? 0} 笔——样本不足，不给净额方向`
+            }
+          >
+            <p className="text-[9px] text-jarvis-text-secondary">大单活动</p>
+            <p className="text-sm font-mono font-semibold text-jarvis-text leading-tight">
+              {bigN ?? "—"}
+              <span className="text-[10px] font-normal text-jarvis-text-secondary ml-0.5">
+                笔
+              </span>
+            </p>
+            <p className="text-[9px] text-jarvis-text-secondary/70 leading-tight mt-0.5">
+              {(bigN ?? 0) >= ACTOR_MIN_TRADES && bigOrders
+                ? bigOrders.net_usd >= 0
+                  ? "偏买入"
+                  : "偏卖出"
+                : "活跃度低"}
+            </p>
+          </div>
         </div>
       )}
 
-      {v && !l0.insufficient && (
+      {v && !st.insufficient && (
         <>
-          {/* 非散户参与占比进度条 */}
-          <div>
-            <div className="flex items-center justify-between text-[10px] text-jarvis-text-secondary mb-1">
-              <span>非散户参与占比</span>
-              <span className="font-mono text-jarvis-text">
-                {v.non_retail_share_pct.toFixed(1)}%
-              </span>
-            </div>
-            <div className="h-1.5 bg-jarvis-bg rounded-full overflow-hidden">
-              <div
-                className="h-full bg-jarvis-purple rounded-full transition-all"
-                style={{ width: `${Math.min(100, v.non_retail_share_pct)}%` }}
-              />
-            </div>
-          </div>
-
-          {/* 突发脉冲警报（黄色警报框） */}
+          {/* 突发脉冲警报（黄色警报框）：真实短时异动保留原样展示 */}
           {v.burst && (
             <div className="flex items-start gap-1.5 rounded-lg bg-jarvis-yellow/10 border border-jarvis-yellow/40 px-2.5 py-2">
               <AlertTriangle
@@ -799,7 +875,8 @@ function VerdictCard({
               );
             })}
           </div>
-          <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1">
+          {/* U2：图例收成单行（色块+规模词），精确占比/净额全部退 hover tooltip */}
+          <div className="mt-1.5 flex items-center gap-3 flex-wrap">
             {ACTOR_ORDER.map((a) => {
               const s = actors[a] as (typeof actors)[TapeActor] & TapeActorExt;
               if (!s) return null;
@@ -807,48 +884,43 @@ function VerdictCard({
               const insufficient =
                 s.insufficient === true || pct == null || (s.n ?? 0) < ACTOR_MIN_TRADES;
               return (
-                <div key={a} className="flex items-center gap-1.5 text-[10px]">
+                <span
+                  key={a}
+                  className="flex items-center gap-1 text-[10px] text-jarvis-text-secondary cursor-help"
+                  title={
+                    insufficient
+                      ? `${s.size_cn ?? s.actor_cn}：仅 ${s.n} 笔，样本不足不给精确占比与净额方向。${s.label_note ?? "按单笔金额推断，非真实身份"}`
+                      : `${s.size_cn ?? s.actor_cn} 占比 ${pct.toFixed(1)}% · 净额 ${fmtSignedUsd(s.net_usd)} · ${s.n} 笔。${s.label_note ?? "按单笔金额推断，非真实身份"}`
+                  }
+                >
                   <span
                     className={clsx(
                       "w-2 h-2 rounded-sm flex-shrink-0",
                       insufficient ? "bg-jarvis-border/60" : ACTOR_STYLE[a].bar,
                     )}
                   />
-                  {/* A2 终稿：主标签用规模词（size_cn 大单/中单/小单），身份词退 tooltip */}
-                  <span
-                    className="text-jarvis-text-secondary cursor-help"
-                    title={s.label_note ?? `${s.actor_cn}（按单笔金额推断，非真实身份）`}
-                  >
-                    {s.size_cn ?? s.actor_cn}
-                  </span>
-                  {insufficient ? (
-                    <span
-                      className="font-mono ml-auto text-jarvis-text-secondary/60"
-                      title={`仅 ${s.n} 笔成交，样本不足不给精确占比与净额方向`}
-                    >
-                      样本不足
-                    </span>
-                  ) : (
-                    <>
-                      <span className="font-mono text-jarvis-text">
-                        {pct.toFixed(1)}%
-                      </span>
-                      <span
-                        className={clsx(
-                          "font-mono ml-auto",
-                          s.net_usd >= 0 ? "text-jarvis-green" : "text-jarvis-red",
-                        )}
-                      >
-                        {fmtSignedUsd(s.net_usd)}
-                      </span>
-                    </>
-                  )}
-                </div>
+                  {s.size_cn ?? s.actor_cn}
+                  {insufficient && <span className="text-jarvis-text-secondary/50">·少</span>}
+                </span>
               );
             })}
           </div>
         </div>
       )}
+
+      {/* 采集连续性脚注（诚实口径保留，一行小字不抢视野） */}
+      <p
+        className={clsx(
+          "text-[9px] leading-tight pt-1 border-t border-jarvis-border/40",
+          coverage.level === "fail"
+            ? "text-jarvis-red/80"
+            : coverage.level === "warn"
+              ? "text-jarvis-yellow/80"
+              : "text-jarvis-text-secondary/60",
+        )}
+      >
+        {coverage.text}
+      </p>
     </div>
   );
 }
@@ -2199,6 +2271,7 @@ export default function DepthView() {
             {/* D2 L0/L1：结论卡第一公民（问导师入口→导师页，币种走全局 useSymbol 预填） */}
             <VerdictCard
               tape={tape as TapeFlowExt}
+              symbol={symbol}
               windowMin={windowMin}
               onAskMentor={() => navigate("/mentor")}
             />
