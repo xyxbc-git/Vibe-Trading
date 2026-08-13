@@ -790,5 +790,60 @@ check("P1-2 缓冲配置读取（默认 1.0，夹紧范围内）",
       0.0 <= jts._single_sl_buffer_from_config() <= 2.0,
       str(jts._single_sl_buffer_from_config()))
 
+# ── 17. [S3 蓄势雷达] 中性信号触发位 trigger_levels ──────────────────
+
+_df_range = _tri_df()   # 对称三角波：海龟区间内 / dow 交织 → 双双中性
+t_neu = jts.signal_turtle(_df_range)
+check("S3 海龟中性带双向触发位", t_neu["direction"] == "neutral"
+      and t_neu["trigger_levels"] is not None and len(t_neu["trigger_levels"]) == 2,
+      str(t_neu.get("trigger_levels")))
+if t_neu["trigger_levels"]:
+    _sides = {t["side"] for t in t_neu["trigger_levels"]}
+    _hh20 = float(_df_range["high"].iloc[-21:-1].max())
+    _ll20 = float(_df_range["low"].iloc[-21:-1].min())
+    check("S3 海龟触发位=20根区间上下沿",
+          _sides == {"bullish", "bearish"}
+          and any(abs(t["price"] - _hh20) < 1e-6 for t in t_neu["trigger_levels"])
+          and any(abs(t["price"] - _ll20) < 1e-6 for t in t_neu["trigger_levels"]),
+          str(t_neu["trigger_levels"]))
+    check("S3 触发位结构完整且按距离升序",
+          all({"side", "price", "dist_pct", "desc"}.issubset(t.keys())
+              and t["dist_pct"] >= 0 and t["desc"]
+              for t in t_neu["trigger_levels"])
+          and t_neu["trigger_levels"][0]["dist_pct"]
+          <= t_neu["trigger_levels"][-1]["dist_pct"],
+          str(t_neu["trigger_levels"]))
+
+d_neu = jts.signal_dow(_df_range)
+check("S3 道氏交织中性带结构触发位", d_neu["direction"] == "neutral"
+      and d_neu["trigger_levels"] and len(d_neu["trigger_levels"]) == 2
+      and {t["side"] for t in d_neu["trigger_levels"]} == {"bullish", "bearish"},
+      str(d_neu.get("trigger_levels")))
+
+# 全量信号：方向性信号不带 trigger_levels；中性带的结构全部合法
+for _tag, _df in (("上涨盘", df_up), ("震荡盘", _df_range)):
+    for s in jts.run_all(_df):
+        if s["direction"] != "neutral":
+            check(f"S3 [{_tag}] {s['system']} 方向信号无触发位",
+                  s.get("trigger_levels") is None, str(s.get("trigger_levels")))
+        elif s.get("trigger_levels") is not None:
+            check(f"S3 [{_tag}] {s['system']} 中性触发位结构合法",
+                  isinstance(s["trigger_levels"], list) and len(s["trigger_levels"]) >= 1
+                  and all(t["side"] in ("bullish", "bearish")
+                          and math.isfinite(t["price"]) and t["price"] > 0
+                          and t["dist_pct"] is not None and t["dist_pct"] >= 0
+                          and isinstance(t["desc"], str) and t["desc"]
+                          for t in s["trigger_levels"]),
+                  str(s["trigger_levels"])[:160])
+
+# 中性不变量回归：trigger_levels 不影响 trade_plan 恒 None
+check("S3 中性信号仍无交易计划", t_neu["trade_plan"] is None and d_neu["trade_plan"] is None)
+# 方向信号强行传 trigger_levels 会被剥除（_sig 不变量）
+_bogus = jts._sig("x", "x", "bullish", 0.5, "r",
+                  trade_plan={"entry": 1, "entry_type": "market", "stop_loss": 0.9,
+                              "take_profit": 1.2, "rr": 2.0, "note": ""},
+                  trigger_levels=[jts._trigger("bullish", 1.1, 1.0, "t")])
+check("S3 方向信号触发位被剥除（不变量）", _bogus["trigger_levels"] is None)
+
 print(f"\n{'=' * 40}\n通过 {PASS} / 失败 {FAIL}")
 raise SystemExit(1 if FAIL else 0)

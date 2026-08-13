@@ -192,14 +192,37 @@ def _breakout_volume_factor(df: pd.DataFrame, bar_i: int | None = None
         return 1.0, ""
 
 
+def _trigger(side: str, price: float, close: float, desc: str) -> dict:
+    """[S3 蓄势雷达] 中性信号的触发位标注：到哪个价、会发生什么。
+
+    side=触发后的方向（bullish/bearish），dist_pct=现价到触发价距离%。
+    """
+    return {"side": side, "price": _round_price(float(price)),
+            "dist_pct": round(abs(float(price) - close) / close * 100, 2)
+            if close > 0 else None,
+            "desc": desc}
+
+
 def _sig(system: str, name_cn: str, direction: str, strength: float,
          reasoning: str, key_levels: list[dict] | None = None,
-         trade_plan: dict | None = None) -> dict:
-    """统一信号结构（direction/strength 越界自动收敛；trade_plan 可选，缺依据为 None）。"""
+         trade_plan: dict | None = None,
+         trigger_levels: list[dict] | None = None) -> dict:
+    """统一信号结构（direction/strength 越界自动收敛；trade_plan 可选，缺依据为 None）。
+
+    [S3 蓄势雷达] trigger_levels：中性信号亮出自己的触发条件与距离
+    [{side, price, dist_pct, desc}]（按距离升序）——中性≠没信息，震荡市也
+    让用户知道「盯哪几个价位、到了会发生什么」。仅中性信号携带（方向信号
+    有 trade_plan），无可计算触发位时为 None。
+    """
     if direction not in DIRECTIONS:
         direction = "neutral"
     if direction == "neutral":
         trade_plan = None   # 不变量：中性信号绝不携带交易计划
+    else:
+        trigger_levels = None   # 方向信号不带蓄势触发位（已有 trade_plan）
+    if trigger_levels:
+        trigger_levels = sorted(trigger_levels,
+                                key=lambda t: t.get("dist_pct") or 0.0)
     return {
         "system": system,
         "name_cn": name_cn,
@@ -208,6 +231,7 @@ def _sig(system: str, name_cn: str, direction: str, strength: float,
         "reasoning": reasoning,
         "key_levels": key_levels or [],
         "trade_plan": trade_plan,
+        "trigger_levels": trigger_levels or None,
     }
 
 
@@ -350,7 +374,13 @@ def signal_turtle(df: pd.DataFrame) -> dict:
     pos = (close - ll20) / max(hh20 - ll20, 1e-9)
     return _sig(*name, "neutral", 0.2,
                 f"价格 {close:.2f} 处于20日区间 [{ll20:.2f}, {hh20:.2f}] 内（{pos:.0%} 分位），"
-                "未触发突破，观望等待", levels)
+                "未触发突破，观望等待", levels,
+                trigger_levels=[
+                    _trigger("bullish", hh20, close,
+                             f"突破20日高 {hh20:.2f} 转看涨（顺势做多入场）"),
+                    _trigger("bearish", ll20, close,
+                             f"跌破20日低 {ll20:.2f} 转看跌（顺势做空入场）"),
+                ])
 
 
 # ═══════════════════════════ 2. 道氏 ═══════════════════════════
@@ -397,7 +427,13 @@ def signal_dow(df: pd.DataFrame) -> dict:
     if lh or ll:
         return _sig(*name, "bearish", 0.35, "高点或低点单边降低，结构偏空但未完全确认",
                     levels, trade_plan=plan_bear)
-    return _sig(*name, "neutral", 0.2, "swing 高低点交织，无明确趋势结构", levels)
+    return _sig(*name, "neutral", 0.2, "swing 高低点交织，无明确趋势结构", levels,
+                trigger_levels=[
+                    _trigger("bullish", h_vals[-1], close,
+                             f"站上前 swing 高点 {h_vals[-1]:.2f}，高点抬高结构转多"),
+                    _trigger("bearish", l_vals[-1], close,
+                             f"跌破前 swing 低点 {l_vals[-1]:.2f}，低点降低结构转空"),
+                ])
 
 
 # ═══════════════════════════ 3. 艾略特（简化） ═══════════════════════════
@@ -436,7 +472,13 @@ def signal_elliott(df: pd.DataFrame) -> dict:
                         f"回踩 fib 支撑区可视为低吸参考", levels, trade_plan=plan)
         if close >= f618:
             return _sig(*name, "neutral", 0.35,
-                        f"回撤进入 0.382~0.618（{f618:.2f}~{f382:.2f}）黄金分割区，多空转换观察区", levels)
+                        f"回撤进入 0.382~0.618（{f618:.2f}~{f382:.2f}）黄金分割区，多空转换观察区",
+                        levels, trigger_levels=[
+                            _trigger("bullish", f382, close,
+                                     f"收复 fib0.382（{f382:.2f}）浪型守住，回归偏多"),
+                            _trigger("bearish", f618, close,
+                                     f"跌破 fib0.618（{f618:.2f}）上行浪型破坏，转偏空"),
+                        ])
         plan = _plan("bearish", close, "market", f618, lo,
                      "跌破 fib0.618 浪型破坏顺势空；SL=收复 0.618 即离场；TP=波段前低",
                      atr=atr)
@@ -452,7 +494,13 @@ def signal_elliott(df: pd.DataFrame) -> dict:
                     trade_plan=plan)
     if close <= f618:
         return _sig(*name, "neutral", 0.35,
-                    f"反弹进入 0.382~0.618（{f382:.2f}~{f618:.2f}）区间，方向待确认", levels)
+                    f"反弹进入 0.382~0.618（{f382:.2f}~{f618:.2f}）区间，方向待确认",
+                    levels, trigger_levels=[
+                        _trigger("bearish", f382, close,
+                                 f"跌回 fib0.382（{f382:.2f}）下方，反弹夭折延续偏空"),
+                        _trigger("bullish", f618, close,
+                                 f"收复 fib0.618（{f618:.2f}）下行浪型破坏，转偏多"),
+                    ])
     plan = _plan("bullish", close, "market", f618, hi,
                  "收复 fib0.618 浪型反转做多；SL=跌回 0.618 即离场；TP=波段前高", atr=atr)
     return _sig(*name, "bullish", 0.5,
@@ -632,7 +680,13 @@ def signal_chanlun(df: pd.DataFrame) -> dict:
                         f"中枢 [{zd:.2f}, {zg:.2f}] 内上涨笔力度衰减（背离）→ 一卖近似，关注上沿压力",
                         levels, trade_plan=plan)
         return _sig(*name, "neutral", 0.25,
-                    f"现价 {close:.2f} 位于中枢 [{zd:.2f}, {zg:.2f}] 内，等待方向选择", levels)
+                    f"现价 {close:.2f} 位于中枢 [{zd:.2f}, {zg:.2f}] 内，等待方向选择",
+                    levels, trigger_levels=[
+                        _trigger("bullish", zg, close,
+                                 f"站上中枢上沿 {zg:.2f}（三买雏形，回踩不进中枢确认）"),
+                        _trigger("bearish", zd, close,
+                                 f"跌破中枢下沿 {zd:.2f}（三卖雏形，反抽不进中枢确认）"),
+                    ])
     # 无重叠中枢：以最后一笔方向为近似趋势
     d = "bullish" if last_stroke["dir"] == "up" else "bearish"
     return _sig(*name, d, 0.3,
@@ -666,8 +720,10 @@ def signal_rule123(df: pd.DataFrame) -> dict:
     steps_long = 0
     reason_l: list[str] = []
     rebound_high = None
+    down_tl = None          # [S3 蓄势雷达] 未破坏时的触发位
     if down_trend:
         tl = _trendline_val(h1, hv1, h2, hv2, last)
+        down_tl = tl
         if close > tl:
             steps_long += 1
             reason_l.append(f"①收盘 {close:.2f} 上破下降趋势线 {tl:.2f}")
@@ -692,8 +748,10 @@ def signal_rule123(df: pd.DataFrame) -> dict:
     steps_short = 0
     reason_s: list[str] = []
     pullback_low = None
+    up_tl = None            # [S3 蓄势雷达] 未破坏时的触发位
     if up_trend:
         tl = _trendline_val(l1, lv1, l2, lv2, last)
+        up_tl = tl
         if close < tl:
             steps_short += 1
             reason_s.append(f"①收盘 {close:.2f} 下破上升趋势线 {tl:.2f}")
@@ -754,7 +812,17 @@ def signal_rule123(df: pd.DataFrame) -> dict:
                     strength,
                     f"做空三步已完成 {steps_short}/3：" + "；".join(reason_s), levels,
                     trade_plan=plan)
-    return _sig(*name, "neutral", 0.15, "未出现趋势线破坏迹象，123 反转流程未启动")
+    triggers = []
+    if down_trend and down_tl is not None and math.isfinite(down_tl) \
+            and down_tl > 0 and close <= down_tl:
+        triggers.append(_trigger("bullish", down_tl, close,
+                                 f"上破下降趋势线 {down_tl:.2f} 启动做多三步（①）"))
+    if up_trend and up_tl is not None and math.isfinite(up_tl) \
+            and up_tl > 0 and close >= up_tl:
+        triggers.append(_trigger("bearish", up_tl, close,
+                                 f"下破上升趋势线 {up_tl:.2f} 启动做空三步（①）"))
+    return _sig(*name, "neutral", 0.15, "未出现趋势线破坏迹象，123 反转流程未启动",
+                trigger_levels=triggers or None)
 
 
 # ═══════════════════════════ 8. 跳空 ═══════════════════════════
@@ -1593,11 +1661,35 @@ def consensus_multi_tf(tf_consensus: dict[str, dict]) -> dict:
 
 # ═══════════════════ K线取数（复用 jarvis_crypto_data，联网） ═══════════════════
 
+_IV_SECONDS = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+               "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600, "8h": 28800,
+               "12h": 43200, "1d": 86400}
+STALE_BARS = 2.5   # 末根开盘落后超此周期数判停更（与 /api/kline._is_stale 同口径）
+
+
+def _klines_stale(raw, interval: str, now_s: float) -> bool:
+    """[S3/H1] K 线原始数组停更判定：fapi 封禁期 jcd._get 静默吐磁盘旧缓存，
+    结构上无法区分新旧，必须用末根开盘时间戳判（R14 FVG 层同款教训）。"""
+    if not isinstance(raw, list) or not raw:
+        return True
+    try:
+        iv_sec = _IV_SECONDS.get(interval, 900)
+        return now_s - float(raw[-1][0]) / 1000 > iv_sec * STALE_BARS
+    except (IndexError, TypeError, ValueError):
+        return True
+
+
 def fetch_klines_df(symbol: str, interval: str = "4h", limit: int = 300,
                     *, drop_unclosed: bool = False) -> pd.DataFrame | None:
     """从 Binance USDⓈ-M 永续合约拉 K 线转 DataFrame（与 dashboard /api/kline 同源同参）。
 
     本模块唯一联网函数；失败返回 None，绝不抛出。
+
+    [S3/H1 对齐 R14] 停更检测+现货域回退：fapi 被封禁时 jcd._get 静默返回磁盘
+    旧缓存（实测 1h 落后 10.8 根、15m 落后 26 根），12 信号在冻结数据上空转出
+    「假中性」。末根开盘落后 > 2.5×周期 判停更 → 改用现货域重建（两域封禁独立，
+    现货价差可接受，新鲜度优先）；现货同样停更则沿用原数据（保留可用性）。
+    df.attrs["source"] 标记 fapi / spot_fallback（调试用，不改返回契约）。
 
     [D2] drop_unclosed：按 close_time（Binance k[6]，bar 最后一毫秒）判断末根是否
     已收盘，未收盘则丢弃——供战绩回填/共识巡检等「只认已收盘 bar」的口径使用
@@ -1612,9 +1704,22 @@ def fetch_klines_df(symbol: str, interval: str = "4h", limit: int = 300,
         if not sym.endswith(("USDT", "USDC")):
             sym += "USDT"
         lim = max(50, min(int(limit), 500))
-        raw = jcd._get(jcd.FAPI + "/fapi/v1/klines",
-                       {"symbol": sym, "interval": interval, "limit": lim})
+        params = {"symbol": sym, "interval": interval, "limit": lim}
+        raw = jcd._get(jcd.FAPI + "/fapi/v1/klines", params)
         if not isinstance(raw, list) or not raw:
+            raw = None
+        source = "fapi"
+        now_s = _time.time()
+        if _klines_stale(raw, interval, now_s):
+            try:
+                spot_raw = jcd._get(jcd.SPOT_API + "/api/v3/klines", params)
+                # 现货更新才采用（同样停更就没有替换价值，沿用合约口径）
+                if isinstance(spot_raw, list) and spot_raw and (
+                        raw is None or float(spot_raw[-1][0]) > float(raw[-1][0])):
+                    raw, source = spot_raw, "spot_fallback"
+            except Exception:  # noqa: BLE001 — 回退失败沿用原数据
+                pass
+        if raw is None:
             return None
         if drop_unclosed:
             try:
@@ -1628,6 +1733,8 @@ def fetch_klines_df(symbol: str, interval: str = "4h", limit: int = 300,
                  "open": float(k[1]), "high": float(k[2]),
                  "low": float(k[3]), "close": float(k[4]),
                  "volume": float(k[5])} for k in raw]
-        return pd.DataFrame(rows)
+        df = pd.DataFrame(rows)
+        df.attrs["source"] = source
+        return df
     except Exception:  # noqa: BLE001 — 取数失败交由调用方降级
         return None
