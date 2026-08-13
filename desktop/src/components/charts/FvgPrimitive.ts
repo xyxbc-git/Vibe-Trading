@@ -22,16 +22,16 @@ import type {
 type RenderTarget = Parameters<ISeriesPrimitivePaneRenderer["draw"]>[0];
 type AttachedChart = SeriesAttachedParameter<Time, SeriesType>["chart"];
 
-/** Chart 层组装好的展示单元（tooltip 文案在组装侧生成） */
+/** Chart 层组装好的展示单元（tooltip 文案在组装侧生成）。
+ *  [R11] top/bottom 为**残余未回补区间**（Chart 层按 fill_pct 折算，LuxAlgo
+ *  风格：已回补段直接剔除、残余窄带持续延伸——半回补缺口仍是活跃交易区）。 */
 export interface FvgZoneView {
   type: "bullish" | "bearish";
   top: number;
   bottom: number;
   /** 形成 bar 开盘时间（epoch 秒，与蜡烛 time 同源对齐） */
   timeSec: number;
-  /** [R10] 带右端截止时间（epoch 秒）：首次被触及的蜡烛；null=从未触碰延伸到图右缘 */
-  endTimeSec: number | null;
-  /** 最深回踩占缺口高度 0~100 */
+  /** 最深回踩占缺口高度 0~100（标签「残余 N%」用） */
   fillPct: number;
   tooltip: string;
 }
@@ -51,12 +51,9 @@ const COLOR_BULL = "#3fb950";
 const COLOR_BEAR = "#f85149";
 const FILL_ALPHA = 0.1;
 const EDGE_ALPHA = 0.4;
-const FILLED_OVERLAY_ALPHA = 0.1; // 已回补部分的「冲淡」覆盖
 
 interface ZoneLayout {
   xLeft: number;
-  /** null = 延伸到图右缘（未被触碰的活缺口） */
-  xRight: number | null;
   yTop: number;
   yBottom: number;
   view: FvgZoneView;
@@ -142,43 +139,32 @@ class FvgRenderer implements ISeriesPrimitivePaneRenderer {
         if (h <= 0 || top > height || top + h < 0) continue;
         const color = L.view.type === "bullish" ? COLOR_BULL : COLOR_BEAR;
         const x = Math.max(L.xLeft, 0);
-        // [R10] 回补即截断：被触及的缺口右端止于首次触及蜡烛；
-        // 只有从未被触碰的活缺口才延伸到图右缘（SMC 绘图惯例，防叠压）
-        const xEnd = L.xRight === null ? width : Math.min(L.xRight, width);
-        const w = xEnd - x;
-        if (w <= 0) continue;
+        // [R11] LuxAlgo 风格：top/bottom 已是残余未回补区间——已回补段在
+        // Chart 层剔除、残余窄带恒延伸到图右缘（半回补缺口仍是活跃交易区）
+        const w = width - x;
 
         ctx.fillStyle = rgba(color, FILL_ALPHA);
         ctx.fillRect(x, top, w, h);
-        // 上下边界细线（辨识缺口精确价位）
+        // 上下边界细线（辨识残余区精确价位）
         ctx.strokeStyle = rgba(color, EDGE_ALPHA);
         ctx.lineWidth = 1;
         ctx.setLineDash([3, 3]);
         ctx.beginPath();
         ctx.moveTo(x, top + 0.5);
-        ctx.lineTo(xEnd, top + 0.5);
+        ctx.lineTo(width, top + 0.5);
         ctx.moveTo(x, top + h - 0.5);
-        ctx.lineTo(xEnd, top + h - 0.5);
+        ctx.lineTo(width, top + h - 0.5);
         ctx.stroke();
         ctx.setLineDash([]);
 
-        // 部分回补：从「被回踩的一侧」叠深色覆盖表达已消耗比例
-        // （看涨缺口自上而下被回补，看跌自下而上）
-        const fillFrac = Math.max(0, Math.min(1, L.view.fillPct / 100));
-        if (fillFrac > 0) {
-          const fh = h * fillFrac;
-          const fy = L.view.type === "bullish" ? top : top + h - fh;
-          ctx.fillStyle = `rgba(13,17,23,${FILLED_OVERLAY_ALPHA + fillFrac * 0.12})`;
-          ctx.fillRect(x, fy, w, fh);
-        }
-
-        // 左缘标签：方向 + 回补百分比（带太矮时跳过）
-        if (h >= 12 && x + 4 < width) {
+        // 左缘标签：方向 + 残余百分比（带太矮时降到 8 高仍显示简短标签）
+        if (h >= 9 && x + 4 < width) {
           ctx.fillStyle = rgba(color, 0.9);
           ctx.textBaseline = "middle";
+          const remain = Math.max(0, Math.round(100 - L.view.fillPct));
           const label =
             (L.view.type === "bullish" ? "FVG↑" : "FVG↓") +
-            (L.view.fillPct > 0 ? ` ${Math.round(L.view.fillPct)}%回补` : "");
+            (L.view.fillPct > 0 ? ` 残余 ${remain}%` : "");
           ctx.fillText(label, x + 4, top + h / 2);
         }
       }
@@ -254,8 +240,7 @@ export class FvgPrimitive implements ISeriesPrimitive<Time> {
     for (const L of this._layouts) {
       const top = Math.min(L.yTop, L.yBottom);
       const bottom = Math.max(L.yTop, L.yBottom);
-      const withinX = x >= L.xLeft && (L.xRight === null || x <= L.xRight);
-      if (withinX && y >= top && y <= bottom) return L.view.tooltip;
+      if (x >= L.xLeft && y >= top && y <= bottom) return L.view.tooltip;
     }
     return null;
   }
@@ -274,18 +259,7 @@ export class FvgPrimitive implements ISeriesPrimitive<Time> {
       const yBottom = series.priceToCoordinate(z.bottom);
       // 形成 bar 已滚出已加载数据左缘时 x=null：带从图左缘起画（缺口仍有效）
       if (yTop === null || yBottom === null) continue;
-      // [R10] 被触及的缺口截断到触及蜡烛；触及 bar 不在已加载窗口时保守不画尾巴
-      const xr =
-        z.endTimeSec === null
-          ? null
-          : timeScale.timeToCoordinate(z.endTimeSec as Time);
-      this._layouts.push({
-        xLeft: x ?? 0,
-        xRight: z.endTimeSec === null ? null : (xr ?? 0),
-        yTop,
-        yBottom,
-        view: z,
-      });
+      this._layouts.push({ xLeft: x ?? 0, yTop, yBottom, view: z });
     }
     const pd = this._pd;
     if (pd) {

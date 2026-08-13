@@ -1235,8 +1235,10 @@ export default function Chart() {
     if (isStaleEcho(symbol, fvgResp.symbol) || (fvgResp.tf != null && fvgResp.tf !== tfSettled)) {
       return null;
     }
-    // [R10] 裁剪规则：只留「还有交易价值的活缺口」——高回补（≥80%）/完全回补/
-    // 过老（>200 根）隐藏；同屏最多 6 个（检测器已按未回补优先+新鲜优先排序）
+    // [R10/R11] 裁剪规则：只留「还有交易价值的活缺口」——高回补（≥80%）/完全
+    // 回补/过老（>200 根）隐藏；同屏最多 6 个（检测器已按未回补优先+新鲜排序）。
+    // [R11] LuxAlgo 风格画法：部分回补的缺口不截长度、改剔除已回补段——
+    // 残余未回补窄带持续延伸到右缘（半回补缺口的残余仍是活跃磁吸/入场区）
     const HIDE_FILL_PCT = 80;
     const HIDE_AGE_BARS = 200;
     const MAX_SHOWN = 6;
@@ -1248,21 +1250,27 @@ export default function Chart() {
       if ((z.age_bars ?? 0) > HIDE_AGE_BARS) continue;
       if (!(Number.isFinite(z.top) && Number.isFinite(z.bottom) && z.top > z.bottom)) continue;
       const bull = z.type === "bullish";
-      const touched = z.first_touch_ts != null;
+      const fillPct = Math.max(0, Math.min(100, z.fill_pct ?? 0));
+      // 残余区间：bullish 从 top 侧被向下回补 → 残余靠 bottom；bearish 镜像
+      const height = z.top - z.bottom;
+      const eaten = height * (fillPct / 100);
+      const remTop = bull ? z.top - eaten : z.top;
+      const remBottom = bull ? z.bottom : z.bottom + eaten;
+      if (!(remTop - remBottom > 0)) continue;
       out.push({
         type: z.type,
-        top: z.top,
-        bottom: z.bottom,
+        top: remTop,
+        bottom: remBottom,
         timeSec: Math.floor(z.created_ts / 1000),
-        // 回补即截断：带右端止于首次触及蜡烛；从未触碰的活缺口延伸到右缘
-        endTimeSec: touched ? Math.floor(z.first_touch_ts! / 1000) : null,
-        fillPct: z.fill_pct ?? 0,
+        fillPct,
         tooltip:
           `${bull ? "看涨" : "看跌"} FVG（价格失衡缺口）\n` +
-          `区间 ${z.bottom.toLocaleString()} ~ ${z.top.toLocaleString()}\n` +
-          `回补 ${Math.round(z.fill_pct ?? 0)}%${touched ? "（已被触及，带止于首次回踩）" : "（未触碰，持续有效）"}` +
-          ` · 形成于 ${new Date(z.created_ts).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}\n` +
-          `${bull ? "缺口常成回踩支撑区——价格回补进带内是常见入场观察位" : "缺口常成反弹压力区——价格反抽进带内是常见入场观察位"}`,
+          `原始区间 ${z.bottom.toLocaleString()} ~ ${z.top.toLocaleString()}` +
+          (fillPct > 0
+            ? ` · 已回补 ${Math.round(fillPct)}%\n残余活跃区 ${remBottom.toLocaleString()} ~ ${remTop.toLocaleString()}（残余 ${Math.round(100 - fillPct)}%）`
+            : "（未回补，完整有效）") +
+          `\n形成于 ${new Date(z.created_ts).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}\n` +
+          `${bull ? "残余缺口常成回踩支撑区——价格进带内是常见入场观察位" : "残余缺口常成反弹压力区——价格进带内是常见入场观察位"}`,
       });
     }
     return out;
