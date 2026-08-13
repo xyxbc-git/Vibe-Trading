@@ -8122,6 +8122,113 @@ def api_mentor_stats(days: int = 90):
         return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
 
 
+# ─────────────── 交易导师·情绪风控 API（计划裁决/台账/信任回路） ───────────────
+# 说明：裁决核心与台账在 jarvis_trade_mentor（确定性规则引擎，不依赖 LLM 也完整
+# 工作；AI 解释层由并行任务在 verdict 之上做润色，灯色与分数以规则引擎为准）。
+# 这里只挂路由 + 注入本进程共识缓存（与 /api/twelve/consensus 同键复用，零重复取数）。
+
+import jarvis_trade_mentor as jtm
+
+
+class MentorPlanReq(BaseModel):
+    symbol: str = "ETHUSDT"
+    direction: str                      # long / short
+    entry: float
+    stop_loss: float
+    take_profit: float
+    tf: str = "30m"                     # 计划主判读周期（关键位/微观/历史按此取证）
+    reason: str = ""                    # 用户的下单理由（复盘对照用）
+    emotion_score: int = 3              # 情绪自评 1-5（≥4 = 上头，触发强制降档规则）
+
+
+class MentorOutcomeReq(BaseModel):
+    result: str                         # win / loss / breakeven / skipped
+    pnl_pct: float | None = None
+    followed: bool | None = None        # 是否听从了裁决建议（信任回路数据源）
+    note: str = ""
+
+
+def _mentor_consensus_provider(sym: str):
+    """复用本进程 /api/twelve/consensus 的缓存桶（同键直读；未命中返回 None，
+    mentor 侧自动回退直连取数）。"""
+    def _get():
+        hit = _CACHE.get(f"twelve:cons:{sym}:c0")
+        return hit[1] if hit else None
+    return _get
+
+
+@app.post("/api/mentor/plan")
+def api_mentor_plan(req: MentorPlanReq):
+    """提交交易计划 → 实时证据裁决（红黄绿灯）→ 落台账。返回 {ok, plan_id, verdict}。"""
+    try:
+        sym = req.symbol.upper().replace("-", "").replace("/", "")
+        if not sym.endswith(("USDT", "USDC")):
+            sym += "USDT"
+        if req.direction not in ("long", "short"):
+            return JSONResponse({"ok": False, "error": "direction 须为 long/short"},
+                                status_code=422)
+        if min(req.entry, req.stop_loss, req.take_profit) <= 0:
+            return JSONResponse({"ok": False, "error": "entry/stop_loss/take_profit 须为正数"},
+                                status_code=422)
+        plan = {**req.model_dump(), "symbol": sym}
+        ev = jtm.build_evidence(sym, req.direction, req.entry, req.stop_loss,
+                                req.take_profit, tf=req.tf,
+                                consensus_provider=_mentor_consensus_provider(sym))
+        vd = jtm.verdict(ev, plan)
+        pid = jtm.save_plan(plan, vd)
+        return JSONResponse({"ok": True, "plan_id": pid, "verdict": vd})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
+
+
+@app.get("/api/mentor/plans")
+def api_mentor_plans(symbol: str = "", days: int = 30):
+    """计划台账列表（含灯色/分数/回填结果），默认近 30 天。"""
+    try:
+        return JSONResponse({"ok": True,
+                             "plans": jtm.list_plans(symbol or None, days)})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
+
+
+@app.get("/api/mentor/plan/{plan_id}")
+def api_mentor_plan_show(plan_id: int):
+    """单条计划完整详情（含裁决 items 明细，前端复盘页消费）。"""
+    try:
+        out = jtm.get_plan(plan_id)
+        if out is None:
+            return JSONResponse({"ok": False, "error": "plan 不存在"}, status_code=404)
+        return JSONResponse({"ok": True, "plan": out})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
+
+
+@app.post("/api/mentor/plan/{plan_id}/outcome")
+def api_mentor_outcome(plan_id: int, req: MentorOutcomeReq):
+    """事后回填结果（win/loss/breakeven/skipped + 是否听劝）——信任回路的数据来源。"""
+    try:
+        if req.result not in ("win", "loss", "breakeven", "skipped"):
+            return JSONResponse(
+                {"ok": False, "error": "result 须为 win/loss/breakeven/skipped"},
+                status_code=422)
+        ok = jtm.set_outcome(plan_id, result=req.result, pnl_pct=req.pnl_pct,
+                             followed=req.followed, note=req.note)
+        if not ok:
+            return JSONResponse({"ok": False, "error": "plan 不存在"}, status_code=404)
+        return JSONResponse({"ok": True})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
+
+
+@app.get("/api/mentor/stats")
+def api_mentor_stats(days: int = 90):
+    """信任回路统计：红/黄/绿灯各自胜率 + 听劝 vs 不听劝盈亏对比。"""
+    try:
+        return JSONResponse({"ok": True, **jtm.stats(days)})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": repr(e)[:300]}, status_code=500)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="贾维斯可视化仪表盘")
     # [Sprint0] 监听地址/端口默认从配置中心读（dashboard_host/dashboard_port，
