@@ -44,7 +44,7 @@ WS aggTrade → jarvis_tape_classify.ingest（dashboard startup 注册，:3255�
   python jarvis_signal_collector.py coverage --days 7    # 覆盖率自检报表
   python jarvis_signal_collector.py coverage --days 7 --json
   # 作为库：import jarvis_signal_collector as jsc; jsc.start(); jsc.health()
-常驻安装见 docs/贾维斯-信号采集器-常驻运行说明.md（macOS launchd / Linux systemd）。
+常驻安装见 贾维斯-信号采集器-常驻运行说明.md（macOS launchd / Linux systemd）。
 """
 
 from __future__ import annotations

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  贾维斯 T10 常驻信号采集器（KeepAlive 自愈拉起）。
+  安装：cp com.jarvis.collector.plist ~/Library/LaunchAgents/ && launchctl load ~/Library/LaunchAgents/com.jarvis.collector.plist
+  重启：launchctl kickstart -k gui/$(id -u)/com.jarvis.collector
+  卸载：launchctl unload ~/Library/LaunchAgents/com.jarvis.collector.plist
+  说明：路径按本机仓库位置写死（与 com.jarvis.sync 同风格）；仓库迁移时同步改
+        下方三处绝对路径。业务日志由进程自写 ~/.vibe-trading/jarvis_signal_collector.log，
+        状态心跳 ~/.vibe-trading/jarvis_signal_collector_status.json；StandardOut/Err
+        仅兜底捕获 Python 起不来的裸错误，两者不共用文件。
+  ⚠ launchd 只保证「进程活着」，机器合盖休眠时进程会被冻结——本机作息缺口
+    只有常开机器（VPS）能治本，详见 贾维斯-信号采集器-常驻运行说明.md。
+-->
+<dict>
+  <key>Label</key><string>com.jarvis.collector</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/jolly/MyselfProject/TwosZiyan/AILiangH/Vibe-Trading/.venv/bin/python</string>
+    <string>/Users/jolly/MyselfProject/TwosZiyan/AILiangH/Vibe-Trading/jarvis_signal_collector.py</string>
+    <string>run</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/jolly/MyselfProject/TwosZiyan/AILiangH/Vibe-Trading</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/tmp/com.jarvis.collector.launchd.log</string>
+  <key>StandardErrorPath</key><string>/tmp/com.jarvis.collector.launchd.log</string>
+</dict>
+</plist>
