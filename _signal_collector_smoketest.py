@@ -246,13 +246,81 @@ check("截断-重建后史连续尾对齐", hist_times[-1] == T0 + 14 * TFMS
       and all(b - a == TFMS for a, b in zip(hist_times[:-1], hist_times[1:])))
 jsc._OPTS["backfill_bars"] = 288
 
-# ── 10. 种子失败：降级不记台账，等下次事件重试 ────────────────────
+# ── 10. 种子失败：纯 WS 降级起窗（史不足如实记，不算已采）───────────
 FETCH["rows"] = None
 jsc._ACTIVE_SYMBOLS.add("ETHUSDT")
 jsc._process_event("ETHUSDT", "5m", dict(bar_t0))
-check("种子失败-不入台账", all(r["symbol"] != "ETHUSDT" for r in _ledger_rows()))
-check("种子失败-计数", jsc._STATS["seed_fails"] >= 1)
-check("种子失败-未标记种子", ("ETHUSDT", "5m") not in jsc._SEEDED)
+eth_rows = [r for r in _ledger_rows() if r["symbol"] == "ETHUSDT"]
+check("种子失败-降级起窗仍记台账", len(eth_rows) == 1
+      and eth_rows[0]["note"] == "insufficient_history"
+      and eth_rows[0]["n_signals"] is None, str(eth_rows))
+check("种子失败-计数+降级登记", jsc._STATS["seed_fails"] >= 1
+      and ("ETHUSDT", "5m") in jsc._SEED_DEGRADED)
+check("种子失败-已标记种子（WS 累积中）", ("ETHUSDT", "5m") in jsc._SEEDED
+      and len(jsc._HIST[("ETHUSDT", "5m")]) == 1)
+
+# ── 10b. 陈旧缓存种子：新鲜度检查识破，同样降级（封禁期实测场景）────
+jsc._ACTIVE_SYMBOLS.add("XRPUSDT")
+FETCH["rows"] = mk_bars(T0 - 2000 * TFMS, 300)  # 一周前的缓存窗
+jsc._process_event("XRPUSDT", "5m", dict(bar_t0))
+check("陈旧种子-拒用降级", ("XRPUSDT", "5m") in jsc._SEED_DEGRADED
+      and len(jsc._HIST[("XRPUSDT", "5m")]) == 1
+      and jsc._STATS["seed_degraded"] >= 1)
+xrp_rows = [r for r in _ledger_rows() if r["symbol"] == "XRPUSDT"]
+check("陈旧种子-史不足如实记", len(xrp_rows) == 1
+      and xrp_rows[0]["note"] == "insufficient_history", str(xrp_rows))
+
+# ── 10c. 降级窗重播种：REST 恢复后自动回全窗 ──────────────────────
+jsc._SEED_DEGRADED[("XRPUSDT", "5m")] = time.time() - 1  # 冷却已到
+FETCH["rows"] = mk_bars(T0, 300)  # 新鲜窗（贴到事件前一根 T0）
+jsc._process_event("XRPUSDT", "5m", dict(bar_t0, time=T0 + TFMS))
+check("重播种-恢复全窗", ("XRPUSDT", "5m") not in jsc._SEED_DEGRADED
+      and len(jsc._HIST[("XRPUSDT", "5m")]) >= 300,
+      f"hist={len(jsc._HIST[('XRPUSDT', '5m')])}")
+xrp_rows = [r for r in _ledger_rows() if r["symbol"] == "XRPUSDT"]
+check("重播种-本根正常计算", xrp_rows[-1]["bar_open_ms"] == T0 + TFMS
+      and xrp_rows[-1]["n_signals"] == 1, str(xrp_rows[-1]))
+
+# ── 10d. 小缺口回补陈旧/失败：本根缓期占位，回补成功后台账升级 ──────
+jsc._ACTIVE_SYMBOLS.add("BNBUSDT")
+FETCH["rows"] = mk_bars(T0, 300)
+jsc._process_event("BNBUSDT", "5m", dict(bar_t0))          # 正常种子+首记录
+FETCH["rows"] = mk_bars(T0 - 1000 * TFMS, 60)              # 回补拉到陈旧缓存
+jsc._process_event("BNBUSDT", "5m", dict(bar_t0, time=T0 + 3 * TFMS))  # 缺 1,2
+bnb = [r for r in _ledger_rows() if r["symbol"] == "BNBUSDT"]
+check("缓期-占位行 gap_unfilled", bnb[-1]["note"] == "gap_unfilled"
+      and bnb[-1]["n_signals"] is None
+      and bnb[-1]["bar_open_ms"] == T0 + 3 * TFMS, str(bnb[-1]))
+check("缓期-断层窗未入史未计算",
+      [b["time"] for b in jsc._HIST[("BNBUSDT", "5m")]][-1] == T0
+      and jsc._STATS["bars_deferred"] >= 1)
+jsc._BACKFILL_FAIL.clear()                                  # 跳过 60s 冷却
+FETCH["rows"] = mk_bars(T0 + 4 * TFMS, 60)                  # 新鲜窗覆盖缺口
+jsc._process_event("BNBUSDT", "5m", dict(bar_t0, time=T0 + 5 * TFMS))  # 缺 1..4
+bnb = {r["bar_open_ms"]: r for r in _ledger_rows() if r["symbol"] == "BNBUSDT"}
+check("缓期-回补后占位升级为真实行",
+      bnb[T0 + 3 * TFMS]["n_signals"] == 1
+      and bnb[T0 + 3 * TFMS]["source"] == "backfill"
+      and bnb[T0 + 3 * TFMS]["note"] is None, str(bnb.get(T0 + 3 * TFMS)))
+check("缓期-缺口全部补齐", all(T0 + i * TFMS in bnb for i in range(6)),
+      str(sorted(bnb)))
+bnb_hist = [b["time"] for b in jsc._HIST[("BNBUSDT", "5m")]]
+check("缓期-补后史连续", bnb_hist[-1] == T0 + 5 * TFMS
+      and all(b - a == TFMS for a, b in zip(bnb_hist[:-1], bnb_hist[1:])))
+
+# ── 10e. 大缺口 + 回补不可用：弃断层旧史改纯 WS 重建 ───────────────
+jsc._ACTIVE_SYMBOLS.add("DOGEUSDT")
+FETCH["rows"] = mk_bars(T0, 300)
+jsc._process_event("DOGEUSDT", "5m", dict(bar_t0))
+FETCH["rows"] = None                                        # REST 全挂
+big_jump = T0 + 400 * TFMS                                  # 缺 399 根 > cap 288
+jsc._process_event("DOGEUSDT", "5m", dict(bar_t0, time=big_jump))
+doge_hist = [b["time"] for b in jsc._HIST[("DOGEUSDT", "5m")]]
+check("大缺口-弃旧史纯 WS 重建", doge_hist == [big_jump]
+      and ("DOGEUSDT", "5m") in jsc._SEED_DEGRADED, str(doge_hist[-3:]))
+doge = [r for r in _ledger_rows() if r["symbol"] == "DOGEUSDT"]
+check("大缺口-本根史不足如实记", doge[-1]["bar_open_ms"] == big_jump
+      and doge[-1]["note"] == "insufficient_history", str(doge[-1]))
 
 # ── 11. WS 回调：过滤 + 队列满丢弃 ────────────────────────────────
 small_q = queue.Queue(maxsize=2)

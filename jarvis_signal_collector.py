@@ -32,6 +32,15 @@ WS aggTrade → jarvis_tape_classify.ingest（dashboard startup 注册，:3255�
   注意：tape_minute_bars 无法用 kline 回补（aggTrade 逐笔即逝，且 T9 P2 只认
   真实分钟成交），真 bar 覆盖只能靠进程常驻——这正是「常开机器」的价值。
 
+═══ 断层窗防线（2026-08-13 实跑教训：封禁期缓存会给出数天前的陈旧窗）═══
+  REST 被封禁时 jarvis_crypto_data 回退磁盘缓存——种子/回补可能拿到陈旧数据。
+  把「8 天前的 300 根 + 今天的 WS bar」拼成一窗算指标 = 污染 T9 样本。三道防线：
+    1. 种子/回补一律做新鲜度检查（最新根须贴到事件前一根），陈旧即拒用；
+    2. 小缺口回补失败 → 本根缓期（台账记 gap_unfilled 占位，可被升级），
+       下次事件重试；大缺口且回补不可用 → 弃断层旧史改纯 WS 重建窗；
+    3. 降级窗史攒够 30 根前如实记 insufficient_history 不算信号，
+       每小时重试整窗重播种，REST 恢复后自动回到 300 根全窗。
+
 ═══ 双写入者防打架（state 新鲜度守卫）═══
   dashboard 面板开着时也在写 twelve_signal_state。record_batch 前先查该
   (币,TF) 的最大 updated_ts：bar 收盘时刻 ≤ 它 → 本 bar 只记台账不写信号库，
@@ -78,6 +87,7 @@ MIN_BARS_FOR_SIGNALS = 30    # 与 dashboard 一致：不足 30 根不出信号
 BASIS_TTL_S = 300.0          # 基差缓存 TTL（与 dashboard _twelve_basis 同频）
 REST_MIN_INTERVAL_S = 0.25   # 进程内 REST 最小间隔（叠加共享预算之上的礼貌值）
 BACKFILL_RETRY_COOLDOWN_S = 60.0  # 单 (币,TF) 回补失败后的冷却
+RESEED_COOLDOWN_S = 3600.0   # 降级种子（纯 WS 起窗）的整窗重播种重试周期
 LEDGER_PRUNE_INTERVAL_S = 3600.0  # 台账保留期清理节流：每小时一次
 STATUS_WRITE_INTERVAL_S = 60.0    # run() 心跳落状态 json 周期
 
@@ -105,6 +115,8 @@ def _cfg() -> dict:
 
 _HIST: dict[tuple[str, str], deque] = {}     # (SYM, tf) → deque[bar dict]
 _SEEDED: set[tuple[str, str]] = set()
+# 降级种子登记：REST 不可用/缓存陈旧时纯 WS 起窗的 (币,TF) → 下次重播种时刻
+_SEED_DEGRADED: dict[tuple[str, str], float] = {}
 _ACTIVE_SYMBOLS: set[str] = set()
 _ACTIVE_TFS: set[str] = set()
 _Q: Optional[queue.Queue] = None
@@ -118,9 +130,9 @@ _OPTS = {"backfill_bars": 288, "basis": True, "tape": True,
 
 _STATS: dict = {"started_at": None, "events_seen": 0, "events_dropped": 0,
                 "bars_ws": 0, "bars_backfill": 0, "recorded": 0, "changed": 0,
-                "skipped_state_fresher": 0, "seed_fails": 0, "stale_events": 0,
-                "gaps_detected": 0, "gap_bars_lost": 0, "worker_errors": 0,
-                "record_fails": 0}
+                "skipped_state_fresher": 0, "seed_fails": 0, "seed_degraded": 0,
+                "stale_events": 0, "gaps_detected": 0, "gap_bars_lost": 0,
+                "bars_deferred": 0, "worker_errors": 0, "record_fails": 0}
 
 _BASIS_CACHE: dict[str, tuple[float, Optional[dict]]] = {}
 _BACKFILL_FAIL: dict[tuple[str, str], float] = {}
@@ -175,7 +187,12 @@ def ledger_record(symbol: str, tf: str, bar_open_ms: int, bar_close_ms: int,
                   source: str, n_signals: int | None = None,
                   n_changed: int | None = None, lag_ms: int | None = None,
                   note: str | None = None) -> bool:
-    """记一根已处理 bar（UNIQUE 幂等：重复 bar 返回 False）。失败静默 False。"""
+    """记一根已处理 bar。UNIQUE 幂等 + 占位升级语义：
+
+    同一根 bar 已有「真实处理行」（n_signals 非空）时任何重写都被拒绝；
+    只有占位行（gap_unfilled 等 n_signals 为空）允许被后来的真实处理升级——
+    缓期 bar 回补成功后台账自动转正，覆盖率口径不失真。失败静默 False。
+    """
     try:
         _ensure_init()
         with _conn() as conn:
@@ -185,7 +202,12 @@ def ledger_record(symbol: str, tf: str, bar_open_ms: int, bar_close_ms: int,
                   (ts, symbol, tf, bar_open_ms, bar_close_ms, source,
                    n_signals, n_changed, lag_ms, note)
                 VALUES (?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT (symbol, tf, bar_open_ms) DO NOTHING
+                ON CONFLICT (symbol, tf, bar_open_ms) DO UPDATE SET
+                  ts=excluded.ts, source=excluded.source,
+                  n_signals=excluded.n_signals, n_changed=excluded.n_changed,
+                  lag_ms=excluded.lag_ms, note=excluded.note
+                WHERE signal_collect_log.n_signals IS NULL
+                  AND excluded.n_signals IS NOT NULL
                 """,
                 (time.time(), (symbol or "").upper(), tf, int(bar_open_ms),
                  int(bar_close_ms), source, n_signals, n_changed, lag_ms, note))
@@ -409,25 +431,54 @@ def _compute_and_record(sym: str, tf: str, bar: dict, source: str) -> str:
 
 # ────────────────────────── 种子 / 缺口回补 ──────────────────────────
 
-def _seed_pair(sym: str, tf: str) -> bool:
-    """首次事件时拉 300 根史建内存窗；进程重启场景顺带续采台账断点。"""
-    df = _paced_fetch_df(sym, tf, SEED_LIMIT)
-    if df is None or df.empty:
-        _STATS["seed_fails"] += 1
-        return False
-    rows = [{"time": int(r["time"]), "open": float(r["open"]),
+def _df_rows(df) -> list[dict]:
+    """fetch_klines_df 结果 → 归一 bar 行列表（空/None → []）。"""
+    if df is None or getattr(df, "empty", True):
+        return []
+    return [{"time": int(r["time"]), "open": float(r["open"]),
              "high": float(r["high"]), "low": float(r["low"]),
              "close": float(r["close"]), "volume": float(r["volume"])}
             for r in df.to_dict("records")]
-    hist = deque(rows, maxlen=HIST_MAXLEN)
-    _HIST[(sym, tf)] = hist
-    _SEEDED.add((sym, tf))
+
+
+def _seed_pair(sym: str, tf: str, event_open_ms: int) -> bool:
+    """首次事件（或降级重试）拉 300 根史建内存窗。Returns True=全窗种子。
+
+    新鲜度检查：种子最新根必须贴到事件根或其前一根——REST 被封禁时
+    jarvis_crypto_data 会回退磁盘缓存，可能给出数天前的陈旧窗（2026-08-13
+    实测 BTCUSDT 5m 缓存止于 08-05），拿它拼今天的 WS bar = 断层窗算指标。
+    不新鲜 → 纯 WS 降级起窗（史攒够 30 根前如实记 insufficient_history），
+    登记 _SEED_DEGRADED 由 _maybe_reseed 周期重试整窗重播种。
+    """
+    key = (sym, tf)
+    tfms = TF_MS[tf]
+    rows = _df_rows(_paced_fetch_df(sym, tf, SEED_LIMIT))
+    fresh = bool(rows) and rows[-1]["time"] >= event_open_ms - tfms
+    if not fresh:
+        if key not in _SEEDED:
+            _HIST[key] = deque(maxlen=HIST_MAXLEN)
+            _SEEDED.add(key)
+        _SEED_DEGRADED[key] = time.time() + RESEED_COOLDOWN_S
+        _STATS["seed_fails" if not rows else "seed_degraded"] += 1
+        _log(f"⚠ {sym} {tf} 种子不可用/陈旧"
+             + (f"（缓存止于 {time.strftime('%m-%d %H:%M', time.localtime(rows[-1]['time'] / 1000))}）"
+                if rows else "（取数失败）")
+             + "，纯 WS 降级起窗，1h 后重试整窗")
+        return False
+    hist = _HIST.get(key)
+    if hist is None:
+        hist = deque(maxlen=HIST_MAXLEN)
+        _HIST[key] = hist
+    hist.clear()
+    hist.extend(rows)
+    _SEEDED.add(key)
+    _SEED_DEGRADED.pop(key, None)
     _log(f"{sym} {tf} 种子 {len(hist)} 根"
          f"（{time.strftime('%m-%d %H:%M', time.localtime(rows[0]['time'] / 1000))}"
          f" → {time.strftime('%m-%d %H:%M', time.localtime(rows[-1]['time'] / 1000))} 开盘）")
 
     # 断点续采：台账有历史（=进程重启）时，把停机窗口内、种子里已有的 bar
-    # 按时间序回放（新鲜度守卫防状态回退；上限 sigcol_backfill_bars）。
+    # 按时间序回放（state 新鲜度守卫防回退；上限 sigcol_backfill_bars）。
     last = _ledger_last_open(sym, tf)
     if last is not None:
         cap = int(_OPTS["backfill_bars"])
@@ -444,11 +495,25 @@ def _seed_pair(sym: str, tf: str) -> bool:
     return True
 
 
-def _backfill_gap(sym: str, tf: str, last_open_ms: int, new_open_ms: int) -> None:
+def _maybe_reseed(sym: str, tf: str, event_open_ms: int) -> None:
+    """降级起窗的 (币,TF) 周期性重试整窗种子；REST 恢复后自动补回 300 根全窗。"""
+    key = (sym, tf)
+    due = _SEED_DEGRADED.get(key)
+    if due is None or time.time() < due:
+        return
+    if not _seed_pair(sym, tf, event_open_ms):
+        return
+    _log(f"{sym} {tf} 重播种成功，恢复全窗计算")
+
+
+def _backfill_gap(sym: str, tf: str, last_open_ms: int, new_open_ms: int) -> bool:
     """WS 断线缺口回补：一次 REST 拉最新窗，缺口 bar 按时间序回放。
 
-    拿不全（缺口比单次拉取窗还老 / 超回补上限）时用拉到的连续窗重建内存史，
-    绝不在史里留洞喂给指标计算。失败进 60s 冷却，缺口 bar 记损失计数。
+    Returns True=修复成功（内存史与事件根连续），False=修复失败（取数失败/
+    数据陈旧/冷却中/回补关闭——调用方缓期本根，绝不在断层窗上算信号）。
+    新鲜度检查同种子：拉到的最新根必须贴到事件前一根，识破封禁期陈旧缓存。
+    拿不全缺口头部（比单次拉取窗还老 / 超回补上限）时用整段连续新窗原地重建，
+    宁可回放少也不在史里留洞。
     """
     key = (sym, tf)
     tfms = TF_MS[tf]
@@ -457,39 +522,31 @@ def _backfill_gap(sym: str, tf: str, last_open_ms: int, new_open_ms: int) -> Non
     cap = int(_OPTS["backfill_bars"])
     if cap <= 0:
         _STATS["gap_bars_lost"] += max(0, n_missing)
-        return
-    if time.time() - _BACKFILL_FAIL.get(key, 0.0) < BACKFILL_RETRY_COOLDOWN_S:
-        _STATS["gap_bars_lost"] += max(0, n_missing)
-        return
+        return False
+    if time.time() < _BACKFILL_FAIL.get(key, 0.0):
+        return False
     lim = min(500, max(50, n_missing + 3))
-    df = _paced_fetch_df(sym, tf, lim)
-    if df is None or df.empty:
-        _BACKFILL_FAIL[key] = time.time()
-        _STATS["gap_bars_lost"] += max(0, n_missing)
-        _log(f"{sym} {tf} 缺口回补取数失败（{n_missing} 根，60s 冷却）")
-        return
-    rows = [{"time": int(r["time"]), "open": float(r["open"]),
-             "high": float(r["high"]), "low": float(r["low"]),
-             "close": float(r["close"]), "volume": float(r["volume"])}
-            for r in df.to_dict("records")
-            if last_open_ms < int(r["time"]) < new_open_ms]
+    recs = _df_rows(_paced_fetch_df(sym, tf, lim))
+    if not recs or recs[-1]["time"] < new_open_ms - tfms:
+        _BACKFILL_FAIL[key] = time.time() + BACKFILL_RETRY_COOLDOWN_S
+        _log(f"{sym} {tf} 缺口回补失败（缺 {n_missing} 根，"
+             + ("取数失败" if not recs else
+                f"数据陈旧止于 {time.strftime('%m-%d %H:%M', time.localtime(recs[-1]['time'] / 1000))}")
+             + "，60s 冷却）")
+        return False
+    rows = [r for r in recs if last_open_ms < r["time"] < new_open_ms]
     lost = n_missing - len(rows)
     if len(rows) > cap:
         lost += len(rows) - cap
         rows = rows[-cap:]
     hist = _HIST[key]
-    covers_fully = bool(rows) and rows[0]["time"] == last_open_ms + tfms and lost == 0
-    if covers_fully:
+    if lost == 0 and rows and rows[0]["time"] == last_open_ms + tfms:
         for b in rows:
             hist.append(b)
             _compute_and_record(sym, tf, b, "backfill")
     else:
-        # 缺口头部拿不到：用整段连续新窗原地重建（宁可窗短，不留洞算指标；
-        # 原地 clear+extend 保持调用方持有的 deque 引用有效）
-        fresh = [{"time": int(r["time"]), "open": float(r["open"]),
-                  "high": float(r["high"]), "low": float(r["low"]),
-                  "close": float(r["close"]), "volume": float(r["volume"])}
-                 for r in df.to_dict("records") if int(r["time"]) < new_open_ms]
+        # 缺口头部拿不到：整段连续新窗原地重建（clear+extend 保持外部引用有效）
+        fresh = [r for r in recs if r["time"] < new_open_ms]
         hist.clear()
         hist.extend(fresh)
         for b in rows:
@@ -498,19 +555,21 @@ def _backfill_gap(sym: str, tf: str, last_open_ms: int, new_open_ms: int) -> Non
         _STATS["gap_bars_lost"] += lost
     _log(f"{sym} {tf} 缺口回补：缺 {n_missing} 根，回放 {len(rows)} 根"
          + (f"，丢 {lost} 根（超窗/超上限）" if lost > 0 else ""))
+    return True
 
 
 # ────────────────────────── 事件处理（工作线程内）──────────────────────────
 
 def _process_event(sym: str, tf: str, bar: dict) -> None:
     key = (sym, tf)
-    if key not in _SEEDED:
-        if not _seed_pair(sym, tf):
-            return  # 本根放弃；种子成功后缺口回补会补上
-    hist = _HIST[key]
-    tfms = TF_MS[tf]
-    last_open = int(hist[-1]["time"]) if hist else None
     t = int(bar["time"])
+    tfms = TF_MS[tf]
+    if key not in _SEEDED:
+        _seed_pair(sym, tf, t)   # 失败也已降级起窗（纯 WS），继续处理本根
+    else:
+        _maybe_reseed(sym, tf, t)
+    hist = _HIST[key]
+    last_open = int(hist[-1]["time"]) if hist else None
     if last_open is not None and t <= last_open:
         if t == last_open:
             hist[-1] = bar  # WS 收盘帧权威覆盖种子同根（守卫+台账幂等自然去重）
@@ -519,7 +578,24 @@ def _process_event(sym: str, tf: str, bar: dict) -> None:
             _STATS["stale_events"] += 1
         return
     if last_open is not None and t > last_open + tfms:
-        _backfill_gap(sym, tf, last_open, t)
+        if not _backfill_gap(sym, tf, last_open, t):
+            n_missing = (t - last_open) // tfms - 1
+            if n_missing > int(_OPTS["backfill_bars"]):
+                # 缺口大过回补上限且回补不可用（整夜休眠 + REST 封禁等）：
+                # 丢弃断层旧史改纯 WS 重建窗，登记降级待重播种；
+                # 史攒够 30 根前台账如实记 insufficient_history。
+                hist.clear()
+                _SEED_DEGRADED.setdefault(key, time.time() + RESEED_COOLDOWN_S)
+                _STATS["gap_bars_lost"] += n_missing
+                _log(f"{sym} {tf} 缺口 {n_missing} 根超上限且回补不可用，"
+                     "弃断层旧史改纯 WS 重建窗")
+            else:
+                # 小缺口回补失败：本根缓期（不入史不计算，台账记占位可升级），
+                # 下次事件重试回补——绝不把断层窗喂给指标。
+                _STATS["bars_deferred"] += 1
+                ledger_record(sym, tf, t, t + tfms, "ws", note="gap_unfilled",
+                              lag_ms=max(0, int(time.time() * 1000) - (t + tfms)))
+                return
     hist.append(bar)
     _compute_and_record(sym, tf, bar, "ws")
 
