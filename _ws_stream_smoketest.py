@@ -54,6 +54,31 @@ check("端点策略表 4 档", len(jws._ENDPOINT_PLANS) == 4
       and jws._ENDPOINT_PLANS[0][0] == "futures+proxy"
       and jws._ENDPOINT_PLANS[2][0] == "spot+proxy")
 
+# ── 1b. [T10] 订阅覆写：多 kline 周期 + 流类型集合 ──
+names_multi = jws.build_stream_names(["BTCUSDT"], CFG_ALL,
+                                     kline_intervals=["5m", "1h", "5m"])
+check("多周期 kline 去重保序",
+      [n for n in names_multi if "kline" in n] == ["btcusdt@kline_5m", "btcusdt@kline_1h"],
+      str(names_multi))
+names_only_k = jws.build_stream_names(["BTCUSDT", "ETHUSDT"], CFG_ALL,
+                                      kline_intervals=["5m", "4h"],
+                                      stream_types={"kline"})
+check("stream_types 只留 kline（无视配置开关）",
+      names_only_k == ["btcusdt@kline_5m", "btcusdt@kline_4h",
+                       "ethusdt@kline_5m", "ethusdt@kline_4h"], str(names_only_k))
+names_ka = jws.build_stream_names(["BTCUSDT"], CFG_ALL,
+                                  stream_types={"kline", "aggTrade"})
+check("stream_types kline+aggTrade",
+      names_ka == ["btcusdt@kline_1m", "btcusdt@aggTrade"], str(names_ka))
+names_spot_ov = jws.build_stream_names(["BTCUSDT"], CFG_ALL, market="spot",
+                                       stream_types={"forceOrder", "kline"})
+check("覆写下现货仍跳过 forceOrder",
+      names_spot_ov == ["btcusdt@kline_1m"], str(names_spot_ov))
+check("无覆写行为不变（回归）",
+      jws.build_stream_names(["BTCUSDT", "ETHUSDT"], CFG_ALL)
+      == jws.build_stream_names(["BTCUSDT", "ETHUSDT"], CFG_ALL,
+                                kline_intervals=None, stream_types=None))
+
 # ── 2. 消息分类 ──
 check("kline 分类", jws._classify("btcusdt@kline_1m") == ("kline", "BTCUSDT"))
 check("aggTrade 分类", jws._classify("ethusdt@aggTrade") == ("aggTrade", "ETHUSDT"))

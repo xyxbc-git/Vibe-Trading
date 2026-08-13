@@ -243,28 +243,45 @@ def force_orders_recent(symbol: str | None = None, limit: int = 100,
 # ────────────────────────── 流名构建 / 消息分发 ──────────────────────────
 
 def build_stream_names(symbols: list[str], cfg: dict | None = None,
-                       market: str = "futures") -> list[str]:
+                       market: str = "futures",
+                       kline_intervals: list[str] | None = None,
+                       stream_types: set[str] | frozenset | None = None) -> list[str]:
     """按配置开关生成组合流名列表（币安要求符号小写）。
 
     market="spot"（回退模式）：forceOrder 无现货对应流自动跳过；
     现货 depth 增量流只支持 @100ms/@1000ms，250ms 归一到 100ms。
+
+    [T10] kline_intervals：显式 kline 周期列表（如 ["5m","1h"]），每周期一条流，
+    去重保序；None = 沿用配置 ws_kline_interval 单周期（旧行为）。
+    [T10] stream_types：显式启用的流类型集合（无视 ws_stream_* 配置开关，
+    仍受现货回退约束）；None = 走配置开关（旧行为）。供信号采集器等独立进程
+    只订阅自己需要的流，不影响 dashboard 进程的订阅组合。
     """
     c = cfg if cfg is not None else _cfg()
-    kline_iv = str(c.get("ws_kline_interval") or "1m")
     depth_sp = str(c.get("ws_depth_speed") or "250ms")
     spot = market == "spot"
     if spot and depth_sp not in ("100ms", "1000ms"):
         depth_sp = "100ms"
+    if kline_intervals:
+        kline_ivs = [str(iv) for iv in dict.fromkeys(kline_intervals) if str(iv)]
+    else:
+        kline_ivs = [str(c.get("ws_kline_interval") or "1m")]
+
+    def _enabled(stype: str, cfg_key: str) -> bool:
+        if stream_types is not None:
+            return stype in stream_types
+        return bool(c.get(cfg_key, True))
+
     out: list[str] = []
     for sym in symbols:
         s = sym.lower()
-        if c.get("ws_stream_kline", True):
-            out.append(f"{s}@kline_{kline_iv}")
-        if c.get("ws_stream_aggtrade", True):
+        if _enabled("kline", "ws_stream_kline"):
+            out.extend(f"{s}@kline_{iv}" for iv in kline_ivs)
+        if _enabled("aggTrade", "ws_stream_aggtrade"):
             out.append(f"{s}@aggTrade")
-        if c.get("ws_stream_forceorder", True) and not spot:
+        if _enabled("forceOrder", "ws_stream_forceorder") and not spot:
             out.append(f"{s}@forceOrder")
-        if c.get("ws_stream_depth", True):
+        if _enabled("depth", "ws_stream_depth"):
             out.append(f"{s}@depth@{depth_sp}")
     return out
 
@@ -341,6 +358,9 @@ def next_backoff(attempt: int, base_s: float, max_s: float) -> float:
 
 # ────────────────────────── WS 主循环 ──────────────────────────
 
+# [T10] 本进程订阅覆写（start() 传入；None=走配置，见 build_stream_names）
+_START_OPTS: dict = {"kline_intervals": None, "stream_types": None}
+
 # 记住上次成功的端点策略索引（重连时优先复用，减少探测时间）
 # [任务H 方案4] 持久化到磁盘：进程重启后直接从历史可用策略起步，省掉整轮探测
 _LAST_GOOD_PLAN: dict = {"idx": None}
@@ -392,7 +412,9 @@ async def _connect_once(symbols: list[str], cfg: dict, plan_idx: int) -> str:
 
     name, base, use_proxy, is_futures = _ENDPOINT_PLANS[plan_idx]
     market = "futures" if is_futures else "spot"
-    streams = build_stream_names(symbols, cfg, market=market)
+    streams = build_stream_names(symbols, cfg, market=market,
+                                 kline_intervals=_START_OPTS["kline_intervals"],
+                                 stream_types=_START_OPTS["stream_types"])
     if not streams:
         _META["last_error"] = "所有流开关均关闭"
         await asyncio.sleep(30)
@@ -504,12 +526,21 @@ def _thread_main(symbols: list[str]) -> None:
             pass
 
 
-def start(symbols: list[str] | None = None) -> bool:
-    """启动 WS 客户端 daemon 线程（幂等：已运行则直接返回 True）。"""
+def start(symbols: list[str] | None = None, *,
+          kline_intervals: list[str] | None = None,
+          stream_types: set[str] | None = None) -> bool:
+    """启动 WS 客户端 daemon 线程（幂等：已运行则直接返回 True）。
+
+    [T10] kline_intervals / stream_types：本进程订阅覆写（语义见
+    build_stream_names）；只在本次冷启动生效，已运行时忽略新覆写（幂等不变）。
+    """
     global _THREAD
     if _THREAD is not None and _THREAD.is_alive():
         return True
     cfg = _cfg()
+    _START_OPTS["kline_intervals"] = (
+        [str(iv) for iv in kline_intervals] if kline_intervals else None)
+    _START_OPTS["stream_types"] = set(stream_types) if stream_types else None
     if symbols is None:
         symbols = [str(s).upper() for s in (cfg.get("watchlist") or ["BTCUSDT"])]
     # [任务H 方案4] 冷启动读回历史可用策略（进程内已有记忆时不覆盖）
