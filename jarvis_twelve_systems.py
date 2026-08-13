@@ -149,6 +149,49 @@ def _apply_counter_trend_gate(direction: str, strength: float, plan: dict | None
             "不给交易计划，防接飞刀/摸顶）")
 
 
+# ── [信号篇 P1-4] 突破量能确认 ──────────────────────────────────────────────
+# 做市商假突破的经典特征是「量能不足的价格越线」（无真实买盘跟随）；
+# 突破系（海龟/123/跳空）只看价格越线同权对待真假突破。量能因子只调
+# strength 不改方向，共识端自然吸收该信息。
+_VOL_CONFIRM_HI = 1.2    # 突破 bar 量 ≥ 1.2×近20根均量 → 强度保持
+_VOL_CONFIRM_LO = 0.8    # ≤ 0.8×均量 → 强度×0.5（缩量假突破风险）
+_VOL_SHRINK_MULT = 0.5   # 缩量惩罚系数（0.8~1.2 之间线性过渡到 1.0）
+
+
+def _breakout_volume_factor(df: pd.DataFrame, bar_i: int | None = None
+                            ) -> tuple[float, str]:
+    """突破 bar 量能确认因子：该 bar 量 / 其前 20 根均量 → (强度系数, 说明)。
+
+    bar_i 为 df 内的位置下标（跳空传缺口 bar；缺省=末根即当前突破 bar）。
+    量能列缺失、历史不足（<10 根）或数值异常 → (1.0, "")：不惩罚不加注
+    （可用性优先，量能证据不足时不改变原行为）。
+    """
+    try:
+        n = len(df)
+        i = n - 1 if bar_i is None else int(bar_i)
+        if not (0 < i < n):
+            return 1.0, ""
+        base = df["volume"].iloc[max(0, i - 20): i]
+        if len(base) < 10:
+            return 1.0, ""
+        v_avg = float(base.mean())
+        v_now = float(df["volume"].iloc[i])
+        if not (math.isfinite(v_avg) and math.isfinite(v_now)) or v_avg <= 0 or v_now < 0:
+            return 1.0, ""
+        ratio = v_now / v_avg
+        if ratio >= _VOL_CONFIRM_HI:
+            return 1.0, f"放量突破确认（{ratio:.2f}x 均量）"
+        if ratio <= _VOL_CONFIRM_LO:
+            return (_VOL_SHRINK_MULT,
+                    f"缩量突破，假突破风险（{ratio:.2f}x 均量 < {_VOL_CONFIRM_LO:g}x，"
+                    f"强度×{_VOL_SHRINK_MULT:g}）")
+        k = _VOL_SHRINK_MULT + (1.0 - _VOL_SHRINK_MULT) * \
+            (ratio - _VOL_CONFIRM_LO) / (_VOL_CONFIRM_HI - _VOL_CONFIRM_LO)
+        return k, f"量能弱确认（{ratio:.2f}x 均量，强度×{k:.2f}）"
+    except Exception:  # noqa: BLE001 — 量能确认失败不改变原行为，绝不拖垮信号器
+        return 1.0, ""
+
+
 def _sig(system: str, name_cn: str, direction: str, strength: float,
          reasoning: str, key_levels: list[dict] | None = None,
          trade_plan: dict | None = None) -> dict:
@@ -246,25 +289,29 @@ def signal_turtle(df: pd.DataFrame) -> dict:
         stop = close - 2 * atr
         levels += [_lv("10日退出位", exit_low10), _lv("ATR止损(2x)", stop)]
         margin = (close - hh20) / max(atr, 1e-9)
+        vol_k, vol_note = _breakout_volume_factor(df)
         plan = _plan("bullish", hh20, "breakout",
                      hh20 - 2 * atr, hh20 + 4 * atr,
                      f"20日高突破入场；SL=entry-2xATR；TP=entry+2倍风险；"
                      f"另有10日低点 {exit_low10:.2f} 动态退出（以先到者为准）")
-        return _sig(*name, "bullish", min(1.0, 0.5 + margin * 0.25),
+        return _sig(*name, "bullish", min(1.0, 0.5 + margin * 0.25) * vol_k,
                     f"价格 {close:.2f} 突破20日高点 {hh20:.2f}（超出 {margin:.2f} ATR），"
-                    f"顺势做多；退出参考10日低点 {exit_low10:.2f}，止损 {stop:.2f}（2xATR）",
+                    f"顺势做多；退出参考10日低点 {exit_low10:.2f}，止损 {stop:.2f}（2xATR）"
+                    + (f"；{vol_note}" if vol_note else ""),
                     levels, trade_plan=plan)
     if close < ll20:
         stop = close + 2 * atr
         levels += [_lv("10日退出位", exit_high10), _lv("ATR止损(2x)", stop)]
         margin = (ll20 - close) / max(atr, 1e-9)
+        vol_k, vol_note = _breakout_volume_factor(df)
         plan = _plan("bearish", ll20, "breakout",
                      ll20 + 2 * atr, ll20 - 4 * atr,
                      f"20日低跌破入场；SL=entry+2xATR；TP=entry-2倍风险；"
                      f"另有10日高点 {exit_high10:.2f} 动态退出（以先到者为准）")
-        return _sig(*name, "bearish", min(1.0, 0.5 + margin * 0.25),
+        return _sig(*name, "bearish", min(1.0, 0.5 + margin * 0.25) * vol_k,
                     f"价格 {close:.2f} 跌破20日低点 {ll20:.2f}（超出 {margin:.2f} ATR），"
-                    f"顺势做空；退出参考10日高点 {exit_high10:.2f}，止损 {stop:.2f}（2xATR）",
+                    f"顺势做空；退出参考10日高点 {exit_high10:.2f}，止损 {stop:.2f}（2xATR）"
+                    + (f"；{vol_note}" if vol_note else ""),
                     levels, trade_plan=plan)
     pos = (close - ll20) / max(hh20 - ll20, 1e-9)
     return _sig(*name, "neutral", 0.2,
@@ -628,8 +675,14 @@ def signal_rule123(df: pd.DataFrame) -> dict:
             plan = _plan("bullish", rebound_high, "breakout", sl,
                          rebound_high + 1.75 * risk,
                          "123做多：突破反弹高点入场；SL=阶段最低点下方0.5xATR；TP=1.75R")
+        strength = (0.35, 0.6, 0.85)[steps_long - 1]
+        if steps_long >= 2:   # 方向性输出才做突破量能确认（P1-4）
+            vol_k, vol_note = _breakout_volume_factor(df)
+            strength *= vol_k
+            if vol_note:
+                reason_l.append(vol_note)
         return _sig(*name, "bullish" if steps_long >= 2 else "neutral",
-                    (0.35, 0.6, 0.85)[steps_long - 1],
+                    strength,
                     f"做多三步已完成 {steps_long}/3：" + "；".join(reason_l), levels,
                     trade_plan=plan)
     if steps_short > 0:
@@ -642,8 +695,14 @@ def signal_rule123(df: pd.DataFrame) -> dict:
             plan = _plan("bearish", pullback_low, "breakout", sl,
                          pullback_low - 1.75 * risk,
                          "123做空：跌破回调低点入场；SL=阶段最高点上方0.5xATR；TP=1.75R")
+        strength = (0.35, 0.6, 0.85)[steps_short - 1]
+        if steps_short >= 2:
+            vol_k, vol_note = _breakout_volume_factor(df)
+            strength *= vol_k
+            if vol_note:
+                reason_s.append(vol_note)
         return _sig(*name, "bearish" if steps_short >= 2 else "neutral",
-                    (0.35, 0.6, 0.85)[steps_short - 1],
+                    strength,
                     f"做空三步已完成 {steps_short}/3：" + "；".join(reason_s), levels,
                     trade_plan=plan)
     return _sig(*name, "neutral", 0.15, "未出现趋势线破坏迹象，123 反转流程未启动")
@@ -680,14 +739,17 @@ def signal_gap(df: pd.DataFrame) -> dict:
     levels = [_lv("缺口上沿", g["top"]), _lv("缺口下沿", g["bottom"])]
     dist_bars = len(df) - 1 - g["i"]
     gap_h = g["top"] - g["bottom"]
+    # [P1-4] 量能确认取缺口 bar 本身（跳空的「突破 bar」）相对其前 20 根均量
+    vol_k, vol_note = _breakout_volume_factor(df, bar_i=g["i"])
     if g["dir"] == "up":
         if close >= g["bottom"]:
             plan = _plan("bullish", g["top"], "pullback", g["bottom"],
                          g["top"] + gap_h,
                          "回踩向上缺口上沿接多；SL=缺口下沿（回补=失效）；TP=缺口测幅上翻")
-            return _sig(*name, "bullish", min(1.0, 0.45 + 0.05 * dist_bars),
+            return _sig(*name, "bullish", min(1.0, 0.45 + 0.05 * dist_bars) * vol_k,
                         f"向上缺口 [{g['bottom']:.2f}, {g['top']:.2f}] 未回补（{dist_bars} 根），"
-                        "缺口上方运行=支撑有效，回踩缺口不破可做多", levels, trade_plan=plan)
+                        "缺口上方运行=支撑有效，回踩缺口不破可做多"
+                        + (f"；{vol_note}" if vol_note else ""), levels, trade_plan=plan)
         return _sig(*name, "bearish", 0.4,
                     f"价格已跌入向上缺口 [{g['bottom']:.2f}, {g['top']:.2f}] 内部，"
                     "回补进行中，支撑趋弱（回补中不给点位）", levels)
@@ -695,9 +757,10 @@ def signal_gap(df: pd.DataFrame) -> dict:
         plan = _plan("bearish", g["bottom"], "pullback", g["top"],
                      g["bottom"] - gap_h,
                      "反弹至向下缺口下沿承压做空；SL=缺口上沿（回补=失效）；TP=缺口测幅下翻")
-        return _sig(*name, "bearish", min(1.0, 0.45 + 0.05 * dist_bars),
+        return _sig(*name, "bearish", min(1.0, 0.45 + 0.05 * dist_bars) * vol_k,
                     f"向下缺口 [{g['bottom']:.2f}, {g['top']:.2f}] 未回补（{dist_bars} 根），"
-                    "缺口下方运行=压力有效，反弹承压缺口可做空", levels, trade_plan=plan)
+                    "缺口下方运行=压力有效，反弹承压缺口可做空"
+                    + (f"；{vol_note}" if vol_note else ""), levels, trade_plan=plan)
     return _sig(*name, "bullish", 0.4,
                 f"价格已涨入向下缺口 [{g['bottom']:.2f}, {g['top']:.2f}] 内部，"
                 "回补进行中，压力趋弱（回补中不给点位）", levels)
@@ -938,7 +1001,8 @@ SIGNAL_FUNCS = {
 
 SYSTEM_META: dict[str, dict] = {
     "turtle": {
-        "type": "趋势跟随", "trigger": "20日高/低突破 + ATR 止损 + 10日反向极值退出",
+        "type": "趋势跟随",
+        "trigger": "20日高/低突破 + ATR 止损 + 10日反向极值退出＋突破量能确认（缩量×0.5）",
         "best_tfs": ["4h", "1d"],
         "lag": "突破确认型（右侧），入场天然滞后于起点；震荡市假突破多，"
                "突破瞬间追单易买在短期高点",
@@ -970,12 +1034,14 @@ SYSTEM_META: dict[str, dict] = {
         "lag": "中枢突破（三买三卖）为右侧确认；背离类买卖点偏左侧，需下级别确认配合",
     },
     "rule123": {
-        "type": "反转确认", "trigger": "①破趋势线 ②回调不创新低/高 ③破反弹高/回调低 三步",
+        "type": "反转确认",
+        "trigger": "①破趋势线 ②回调不创新低/高 ③破反弹高/回调低 三步＋量能确认（缩量×0.5）",
         "best_tfs": ["1h", "4h"],
         "lag": "三步走完才确认（右侧），错过反转头部但胜率相对高；两步时仅弱信号",
     },
     "gap": {
-        "type": "形态缺口", "trigger": "未回补跳空缺口的支撑/压力牵引",
+        "type": "形态缺口",
+        "trigger": "未回补跳空缺口的支撑/压力牵引＋缺口 bar 量能确认（缩量×0.5）",
         "best_tfs": ["1h", "4h", "1d"],
         "lag": "缺口即时可见（左侧参考位）；加密市场 7×24 缺口少，样本天然稀疏",
     },

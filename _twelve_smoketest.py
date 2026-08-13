@@ -635,5 +635,60 @@ check("P1-3 上涨市超买信号同理降级",
       and osc_up["strength"] <= 0.4 + 1e-9 and "已降级" in osc_up["reasoning"],
       str(osc_up)[:150])
 
+# ── 13. [信号篇 P1-4] 突破量能确认 ──────────────────────────────────
+
+
+def _turtle_breakout_df(breakout_vol: float) -> pd.DataFrame:
+    """59 根窄幅震荡（量恒 1000）+ 末根放/缩量向上突破：海龟量能确认受控输入。"""
+    rows = [{"open": 100.0, "high": 100.6, "low": 99.4,
+             "close": 100.0 + (i % 5) * 0.1, "volume": 1000.0} for i in range(59)]
+    rows.append({"open": 100.4, "high": 106.0, "low": 100.2, "close": 105.8,
+                 "volume": breakout_vol})
+    return pd.DataFrame(rows)
+
+
+t_hi = jts.signal_turtle(_turtle_breakout_df(2000.0))   # 2.0x 均量 ≥1.2 → 保持
+t_mid = jts.signal_turtle(_turtle_breakout_df(1000.0))  # 1.0x → 线性 0.75
+t_low = jts.signal_turtle(_turtle_breakout_df(500.0))   # 0.5x ≤0.8 → ×0.5
+check("P1-4 海龟放量突破强度保持（无假突破标注）",
+      t_hi["direction"] == "bullish" and "假突破" not in t_hi["reasoning"]
+      and "放量" in t_hi["reasoning"], t_hi["reasoning"][:120])
+check("P1-4 海龟缩量突破强度×0.5",
+      abs(t_low["strength"] - t_hi["strength"] * 0.5) < 0.002,
+      f"low={t_low['strength']} hi={t_hi['strength']}")
+check("P1-4 缩量标注「缩量突破，假突破风险」",
+      "缩量突破，假突破风险" in t_low["reasoning"], t_low["reasoning"][:150])
+check("P1-4 中间量能线性过渡（1.0x→×0.75）",
+      abs(t_mid["strength"] - t_hi["strength"] * 0.75) < 0.002,
+      f"mid={t_mid['strength']} hi={t_hi['strength']}")
+check("P1-4 只调强度不改方向",
+      t_low["direction"] == t_hi["direction"] == "bullish")
+check("P1-4 缩量不撤计划（方向仍有 plan）", t_low["trade_plan"] is not None)
+
+
+def _gap_vol_df(gap_vol: float) -> pd.DataFrame:
+    """40 根平盘（量恒 1000）+ 放/缩量向上跳空 + 3 根高位持稳：缺口量能受控输入。"""
+    rows = [{"open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0,
+             "volume": 1000.0} for _ in range(40)]
+    rows.append({"open": 105.0, "high": 106.0, "low": 104.8, "close": 105.5,
+                 "volume": gap_vol})
+    rows += [{"open": 105.5, "high": 106.2, "low": 105.0, "close": 105.8,
+              "volume": 1000.0} for _ in range(3)]
+    return pd.DataFrame(rows)
+
+
+g_hi = jts.signal_gap(_gap_vol_df(2000.0))
+g_low = jts.signal_gap(_gap_vol_df(500.0))
+check("P1-4 跳空量能取缺口 bar：缩量强度×0.5",
+      g_hi["direction"] == "bullish" and g_low["direction"] == "bullish"
+      and abs(g_low["strength"] - g_hi["strength"] * 0.5) < 0.002,
+      f"low={g_low['strength']} hi={g_hi['strength']}")
+check("P1-4 跳空缩量标注假突破风险", "缩量突破，假突破风险" in g_low["reasoning"],
+      g_low["reasoning"][:150])
+
+# 量能数据不足（<10 根历史）→ 不惩罚不加注
+_vk, _vn = jts._breakout_volume_factor(_turtle_breakout_df(500.0).iloc[-8:].reset_index(drop=True))
+check("P1-4 量能历史不足不惩罚", _vk == 1.0 and _vn == "", f"k={_vk} note={_vn}")
+
 print(f"\n{'=' * 40}\n通过 {PASS} / 失败 {FAIL}")
 raise SystemExit(1 if FAIL else 0)
