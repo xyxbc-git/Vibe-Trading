@@ -76,6 +76,17 @@ check("空 zones 容错", jd._fvg_zones_with_ts(df, []) == [])
 paths = {getattr(r, "path", None) for r in jd.app.routes}
 check("GET /api/fvg 已注册", "/api/fvg" in paths)
 
+# ── 4) [R14补] 停更判定（数据源新鲜度分裂修复的守卫）────────────────
+import time as _t
+
+fresh = df.copy()
+fresh["time"] = fresh["time"] - int(fresh["time"].iloc[-1]) + int(_t.time() * 1000) - 900_000
+check("新鲜 df → 不判停更", jd._klines_df_stale(fresh, 900) is False)
+stale = df.copy()  # 合成序列 t0=1.7e12（2023 年）——远古数据必判停更
+check("陈旧 df → 判停更", jd._klines_df_stale(stale, 900) is True)
+check("None/空 df → 判停更", jd._klines_df_stale(None, 900) is True
+      and jd._klines_df_stale(df.iloc[0:0], 900) is True)
+
 print()
 if _FAILED:
     print(f"❌ {len(_FAILED)} 项失败: {_FAILED}")

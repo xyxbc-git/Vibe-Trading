@@ -8355,6 +8355,55 @@ def api_events_status():
 
 # ─────────────────── FVG 失衡区（K 线图叠加层数据源，R8）───────────────────
 
+_FVG_IV_SEC = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800,
+               "1h": 3600, "4h": 14400, "1d": 86400}
+
+
+def _klines_df_stale(df, iv_sec: int) -> bool:
+    """[R14补] K 线 df 停更判定：末根开盘落后现在超 2.5 个周期（与 /api/kline
+    的 _is_stale 同口径）。fapi 封禁期 jcd._get 静默回磁盘旧缓存，单看结构
+    无法区分新旧，必须用 bar 时间戳判。"""
+    try:
+        if df is None or len(df) == 0:
+            return True
+        return time.time() - float(df["time"].iloc[-1]) / 1000 > iv_sec * 2.5
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _fvg_klines_df(sym: str, iv: str):
+    """[R14补] /api/fvg 专用取数：fetch_klines_df（fapi）+ 停更检测 + 现货域回退。
+
+    根因（R14 反例实锤）：前端 K 线图走 /api/kline（有停更检测+现货回退，数据
+    新鲜），FVG 层走 fetch_klines_df（仅 fapi，封禁期吐旧缓存）——两数据源
+    新鲜度分裂，出现「图上早已碰触、FVG 却说没碰过」。对齐 /api/kline 口径：
+    fapi 停更则改用现货域重建 df（两域封禁独立，现货价差可接受，一致性优先）。
+    """
+    import pandas as pd
+    import jarvis_twelve_systems as jts
+    import jarvis_crypto_data as jcd
+    iv_sec = _FVG_IV_SEC.get(iv, 900)
+    df = jts.fetch_klines_df(sym, iv, 300)
+    if not _klines_df_stale(df, iv_sec):
+        return df
+    try:
+        raw = jcd._get(jcd.SPOT_API + "/api/v3/klines",
+                       {"symbol": sym, "interval": iv, "limit": 300}, fast=True)
+        if isinstance(raw, list) and raw:
+            spot = pd.DataFrame([
+                {"time": int(k[0]), "open": float(k[1]), "high": float(k[2]),
+                 "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])}
+                for k in raw
+            ])
+            # 现货更新才采用（同样停更就没有替换价值，沿用合约口径）
+            if len(spot) and (df is None or len(df) == 0
+                              or float(spot["time"].iloc[-1]) > float(df["time"].iloc[-1])):
+                return spot
+    except Exception:  # noqa: BLE001 — 回退失败沿用原 df
+        pass
+    return df
+
+
 def _fvg_zones_with_ts(df, zones: list) -> list:
     """[R8] zone.created_i（df 位置下标）→ created_ts（形成 bar 开盘毫秒时间戳）。
 
@@ -8413,7 +8462,9 @@ def api_fvg(symbol: str = "BTCUSDT", tf: str = "15m", max_zones: int = 10):
 
     def _calc():
         import jarvis_fvg as jfvg
-        df = jts.fetch_klines_df(sym, iv, 300)
+        # [R14补] 停更检测+现货回退：与 /api/kline 同口径，防「图上早已碰触、
+        # FVG 却说没碰过」的数据源新鲜度分裂
+        df = _fvg_klines_df(sym, iv)
         if df is None or len(df) < 30:
             return {"ok": False, "reason": "K线数据不足或拉取失败",
                     "symbol": sym, "tf": iv, "zones": [], "structure_events": []}
