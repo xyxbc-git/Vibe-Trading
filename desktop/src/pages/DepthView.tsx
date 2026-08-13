@@ -208,16 +208,40 @@ function ClsBadge({ cls, clsCn }: { cls: TapeActor; clsCn: string }) {
 
 /* ─────────── ④-D2 画像 P0：L0/L1 结论层（方案 A1/A2/A3，契约 agent-5 D1） ─────────── */
 
-/** D1 后端契约扩展字段（《成交流画像优化方案》§五；未就绪时前端 mock 兜底） */
+/** D1 终稿覆盖度对象（b8c4202：coverage = {grade, grade_cn, pct, gaps, note}） */
+interface TapeCoverage {
+  grade?: string;
+  grade_cn?: string;
+  pct?: number;
+  gaps?: unknown[];
+  note?: string;
+}
+
+/** D1 终稿 verdict 扩展（l0_text/confidence 落在 verdict 层；action 已阻尼） */
+interface TapeVerdictExt {
+  action_raw?: string;
+  chaotic?: boolean;
+  insufficient?: boolean;
+  total_n?: number;
+  confidence?: string;
+  l0_text?: string;
+}
+
+/** D1 终稿 actor 扩展（insufficient=true 时 pct/long_pct 为 null） */
+interface TapeActorExt {
+  size_cn?: string;
+  label_note?: string;
+  confidence?: string;
+  fp_usd?: number;
+  insufficient?: boolean;
+}
+
+/** D1 后端契约扩展字段（b8c4202 终稿；未就绪时前端 mock 兜底） */
 interface TapeFlowExt extends TapeFlowResponse {
   /** trades 实际覆盖跨度（分钟）——「近 Xmin 实测」的唯一诚实口径 */
   actual_window_min?: number;
-  /** 覆盖度：continuous / gapped / severe（或后端中文三档） */
-  coverage?: string;
-  /** 置信度三档：high / medium / low（或后端中文） */
-  confidence?: string;
-  /** 后端 L0 结论句（限盘口行为描述，不含方向建议） */
-  l0_text?: string;
+  /** 覆盖度对象（终稿）；兼容早期字符串形态 */
+  coverage?: TapeCoverage | string;
 }
 
 /** A1 样本量门禁：actor 桶少于该笔数 → 灰化「样本不足」，不给精确数与方向色 */
@@ -249,31 +273,44 @@ interface L0Result {
   insufficient: boolean;
 }
 
-/** L0 结论句：后端 l0_text/confidence 优先；未就绪按现有字段 mock 合成。
+/** L0 结论句：后端 verdict.l0_text/confidence/insufficient 优先（D1 终稿字段
+ * 落在 verdict 层）；未就绪按现有字段 mock 合成。
  * 纪律（方案 §五）：只描述盘口行为本身，不给方向/开单建议。 */
 function deriveL0(tape: TapeFlowExt, totalTrades: number): L0Result {
-  const insufficient = totalTrades < VERDICT_MIN_TRADES && !tape.l0_text;
-  if (insufficient) {
+  const v = tape.verdict as (TapeFlowResponse["verdict"] & TapeVerdictExt) | undefined;
+  // 后端明确判定样本不足 → 直接降级（l0_text 若同时给出则用后端原句）
+  if (v?.insufficient) {
+    return {
+      text: v.l0_text ?? "样本不足，暂不判定——本窗口数据不足以支撑任何结论",
+      tierCn: null,
+      insufficient: true,
+    };
+  }
+  if (v?.l0_text) {
+    return {
+      text: v.l0_text,
+      tierCn: v.confidence ? (CONFIDENCE_CN[v.confidence] ?? v.confidence) : null,
+      insufficient: false,
+    };
+  }
+  // mock 合成（后端字段未就绪）：总样本门禁 + action 行为词
+  const effectiveN = v?.total_n ?? totalTrades;
+  if (effectiveN < VERDICT_MIN_TRADES) {
     return {
       text: "样本不足，暂不判定——本窗口数据不足以支撑任何结论",
       tierCn: null,
       insufficient: true,
     };
   }
-  if (tape.l0_text) {
-    return {
-      text: tape.l0_text,
-      tierCn: tape.confidence ? (CONFIDENCE_CN[tape.confidence] ?? tape.confidence) : null,
-      insufficient: false,
-    };
-  }
-  // mock 合成（D1 未就绪）：verdict.action 是行为词（吸筹/派发/砸盘/拉盘/中性）
-  const v = tape.verdict;
   if (!v) {
     return { text: "窗口内数据不足，暂无法判定", tierCn: null, insufficient: true };
   }
+  // B3 混沌态（后端阻尼标记）：信号频繁翻转时不给行为结论
+  if (v.chaotic) {
+    return { text: "市场混沌，信号打架——本窗口行为方向反复，观望为主", tierCn: null, insufficient: false };
+  }
   const tierCn =
-    totalTrades >= 200 ? "证据充分" : totalTrades >= 50 ? "证据一般" : "仅金额分层";
+    effectiveN >= 200 ? "证据充分" : effectiveN >= 50 ? "证据一般" : "仅金额分层";
   const text =
     v.action === "中性"
       ? "主力无明显动作（中性）——非散户净流未过判定阈值"
@@ -305,7 +342,14 @@ function deriveEvidence(tape: TapeFlowExt, actualMin: number | null): EvidenceRo
     });
   }
   if (actualMin != null) {
-    const covCn = tape.coverage ? (COVERAGE_CN[tape.coverage] ?? tape.coverage) : null;
+    // coverage 终稿为对象 {grade, grade_cn, ...}；兼容早期字符串形态
+    const cov = tape.coverage;
+    const covCn =
+      cov == null
+        ? null
+        : typeof cov === "string"
+          ? (COVERAGE_CN[cov] ?? cov)
+          : (cov.grade_cn ?? (cov.grade ? (COVERAGE_CN[cov.grade] ?? cov.grade) : null));
     rows.push({
       level: covCn === "严重断档" ? "fail" : covCn === "有断档" ? "warn" : "pass",
       text: `近 ${actualMin} 分钟实测数据${covCn ? `（采集${covCn}）` : ""}`,
@@ -735,18 +779,21 @@ function VerdictCard({
           </p>
           <div className="h-2.5 rounded-full overflow-hidden flex bg-jarvis-bg">
             {ACTOR_ORDER.map((a) => {
-              const s = actors[a];
-              if (!s || s.pct <= 0) return null;
-              const insufficient = (s.n ?? 0) < ACTOR_MIN_TRADES;
+              const s = actors[a] as (typeof actors)[TapeActor] & TapeActorExt;
+              // D1 终稿：insufficient=true 时 pct 为 null——判空后再用数值
+              const pct = Number.isFinite(Number(s?.pct)) ? Number(s.pct) : null;
+              if (!s || pct == null || pct <= 0) return null;
+              const insufficient =
+                s.insufficient === true || (s.n ?? 0) < ACTOR_MIN_TRADES;
               return (
                 <div
                   key={a}
                   className={insufficient ? "bg-jarvis-border/60" : ACTOR_STYLE[a].bar}
-                  style={{ width: `${s.pct}%` }}
+                  style={{ width: `${pct}%` }}
                   title={
                     insufficient
-                      ? `${s.actor_cn}：样本不足（${s.n} 笔 < ${ACTOR_MIN_TRADES}），不给精确占比`
-                      : `${s.actor_cn} ${s.pct.toFixed(1)}% · 净额 ${fmtSignedUsd(s.net_usd)}`
+                      ? `${s.size_cn ?? s.actor_cn}：样本不足（${s.n} 笔），不给精确占比`
+                      : `${s.size_cn ?? s.actor_cn} ${pct.toFixed(1)}% · 净额 ${fmtSignedUsd(s.net_usd)}`
                   }
                 />
               );
@@ -754,9 +801,11 @@ function VerdictCard({
           </div>
           <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1">
             {ACTOR_ORDER.map((a) => {
-              const s = actors[a];
+              const s = actors[a] as (typeof actors)[TapeActor] & TapeActorExt;
               if (!s) return null;
-              const insufficient = (s.n ?? 0) < ACTOR_MIN_TRADES;
+              const pct = Number.isFinite(Number(s.pct)) ? Number(s.pct) : null;
+              const insufficient =
+                s.insufficient === true || pct == null || (s.n ?? 0) < ACTOR_MIN_TRADES;
               return (
                 <div key={a} className="flex items-center gap-1.5 text-[10px]">
                   <span
@@ -765,7 +814,13 @@ function VerdictCard({
                       insufficient ? "bg-jarvis-border/60" : ACTOR_STYLE[a].bar,
                     )}
                   />
-                  <span className="text-jarvis-text-secondary">{s.actor_cn}</span>
+                  {/* A2 终稿：主标签用规模词（size_cn 大单/中单/小单），身份词退 tooltip */}
+                  <span
+                    className="text-jarvis-text-secondary cursor-help"
+                    title={s.label_note ?? `${s.actor_cn}（按单笔金额推断，非真实身份）`}
+                  >
+                    {s.size_cn ?? s.actor_cn}
+                  </span>
                   {insufficient ? (
                     <span
                       className="font-mono ml-auto text-jarvis-text-secondary/60"
@@ -776,7 +831,7 @@ function VerdictCard({
                   ) : (
                     <>
                       <span className="font-mono text-jarvis-text">
-                        {s.pct.toFixed(1)}%
+                        {pct.toFixed(1)}%
                       </span>
                       <span
                         className={clsx(
