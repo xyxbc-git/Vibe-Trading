@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   extractKlineRows,
+  fvgInvalidatedByClose,
   mergeKlineRows,
   olderPageCursor,
   rowsIntervalConsistent,
@@ -99,5 +100,36 @@ describe("rowsIntervalConsistent", () => {
     // 同 ts 重复/乱序也必须暴露
     expect(rowsIntervalConsistent([at(0), at(0)], m30)).toBe(false);
     expect(rowsIntervalConsistent([at(m30), at(0)], m30)).toBe(false);
+  });
+});
+
+// ── R14 回归：FVG 收盘穿透失效判定（收盘穿透→隐藏，影线穿透→保留） ──
+describe("fvgInvalidatedByClose", () => {
+  const T0 = 1_700_000_000_000;
+  const bar = (i: number, close: number): KlineRow => ({
+    ts: T0 + i * 900_000, o: close, h: close + 5, l: close - 5, c: close,
+  });
+
+  it("看涨 FVG：形成后收盘跌破下沿 → 失效", () => {
+    const rows = [bar(0, 105), bar(1, 102), bar(2, 96)]; // bar2 收盘 96 < bottom 100
+    expect(fvgInvalidatedByClose(rows, T0, "bullish", 103, 100)).toBe(true);
+  });
+
+  it("看涨 FVG：仅影线下探（收盘仍在下沿上方）→ 保留（防插针误杀）", () => {
+    // bar1 low=97 刺穿 bottom=100，但收盘 102 > 100
+    const rows = [bar(0, 105), bar(1, 102)];
+    expect(fvgInvalidatedByClose(rows, T0, "bullish", 103, 100)).toBe(false);
+  });
+
+  it("看跌 FVG：收盘升破上沿 → 失效；影线上探 → 保留", () => {
+    expect(fvgInvalidatedByClose([bar(1, 108)], T0, "bearish", 105, 102)).toBe(true);
+    // 收盘 104 < top 105（high=109 只是影线）
+    expect(fvgInvalidatedByClose([bar(1, 104)], T0, "bearish", 105, 102)).toBe(false);
+  });
+
+  it("形成之前的 K 线不参与判定（只看 created 之后）", () => {
+    const rows = [bar(0, 90)]; // ts == createdTs 不算之后
+    expect(fvgInvalidatedByClose(rows, T0, "bullish", 103, 100)).toBe(false);
+    expect(fvgInvalidatedByClose([], T0, "bullish", 103, 100)).toBe(false);
   });
 });

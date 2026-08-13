@@ -63,6 +63,28 @@ export function olderPageCursor(rows: KlineRow[]): number | null {
 }
 
 /**
+ * [R14] FVG 收盘穿透失效判定（老交易员口径）：缺口形成后任一根 K 线的
+ * **收盘价**越过缺口远端——看涨 FVG 收盘 < 下沿、看跌收盘 > 上沿——磁吸
+ * 效应已被破坏，缺口失效。用收盘而非影线（与 BOS 同口径，防插针误杀）。
+ * 检测器的 fill_pct 只统计「回踩进区内」的深度，价格快速穿越缺口时
+ * fill 可能仍为 0——本判定补上这个口径缺口（R14 实测 ETHUSDT 实锤）。
+ */
+export function fvgInvalidatedByClose(
+  rows: readonly KlineRow[],
+  createdTsMs: number,
+  type: "bullish" | "bearish",
+  top: number,
+  bottom: number,
+): boolean {
+  for (const r of rows) {
+    if (r.ts <= createdTsMs) continue;
+    if (type === "bullish" && r.c < bottom) return true;
+    if (type === "bearish" && r.c > top) return true;
+  }
+  return false;
+}
+
+/**
  * [R4] 数据集时间戳间隔一致性：全部相邻间隔都是 intervalMs 的正整数倍
  * （允许缺口=倍数>1，绝不允许小于一个周期的间隔——那是混入了更小周期的行）。
  * 切周期的单帧窗口若把旧周期历史页拼进新周期数据，本判定即暴露。

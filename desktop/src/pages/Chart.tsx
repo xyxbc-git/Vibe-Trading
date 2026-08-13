@@ -3,6 +3,7 @@ import { useSearchParams } from "react-router-dom";
 import { useApi, usePolling } from "@/hooks/useApi";
 import { useKlineHistory } from "@/hooks/useKlineHistory";
 import { enumOr, listOr, loadChartToggles, saveChartToggles, toggleOr } from "@/lib/chartToggles";
+import { fvgInvalidatedByClose } from "@/lib/klineHistory";
 import { useSymbol } from "@/hooks/useSymbol";
 import { useLivePrice } from "@/hooks/usePrice";
 import { api, formatPrice, type TwelveSignal, type ConsensusTradePlan, type KeyLevel, type LiqMapResponse, type SignalDirection } from "@/api/client";
@@ -1256,6 +1257,9 @@ export default function Chart() {
       if ((z.fill_pct ?? 0) >= HIDE_FILL_PCT) continue;
       if ((z.age_bars ?? 0) > HIDE_AGE_BARS) continue;
       if (!(Number.isFinite(z.top) && Number.isFinite(z.bottom) && z.top > z.bottom)) continue;
+      // [R14] 收盘穿透即失效：检测器 fill_pct 只算回踩深度，价格快速穿越缺口
+      // 时 fill 可能仍为 0 却早已失效（实测实锤）；用当前 K 线窗口按收盘判定
+      if (fvgInvalidatedByClose(klineRows, z.created_ts, z.type, z.top, z.bottom)) continue;
       const bull = z.type === "bullish";
       const fillPct = Math.max(0, Math.min(100, z.fill_pct ?? 0));
       // 残余区间：bullish 从 top 侧被向下回补 → 残余靠 bottom；bearish 镜像
@@ -1282,7 +1286,7 @@ export default function Chart() {
       });
     }
     return out;
-  }, [fvgOn, fvgResp, symbol, tfSettled]);
+  }, [fvgOn, fvgResp, symbol, tfSettled, klineRows]);
 
   // [N2→R9] 折价溢价区 → 均衡线+边界线+右缘窄带（独立开关 pdOn；检测失败/旧后端缺字段不渲染）
   const fvgPdView = useMemo<PremiumDiscountView | null>(() => {
@@ -1318,8 +1322,12 @@ export default function Chart() {
     if (isStaleEcho(symbol, fvgResp.symbol) || (fvgResp.tf != null && fvgResp.tf !== tfSettled)) {
       return null;
     }
+    // [R14] 结构事件减密：只保留最近 4 个（历史 BOS 信息价值随时间衰减，
+    // 更早的直接隐藏防图面拥挤；检测器 events 按发生顺序返回）
+    const MAX_STRUCT_EVENTS = 4;
+    const recent = (fvgResp.structure_events ?? []).slice(-MAX_STRUCT_EVENTS);
     const out: StructureEventView[] = [];
-    for (const e of fvgResp.structure_events ?? []) {
+    for (const e of recent) {
       if (e.swing_ts == null || e.break_ts == null || !Number.isFinite(e.level)) continue;
       const bull = e.direction === "bullish";
       const isBos = e.kind === "bos";
