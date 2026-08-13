@@ -9,7 +9,7 @@
 // 进行中/已到头/尚无数据时直接忽略；网络失败保留 hasMoreHistory，用户
 // 再拖即重试。返回不足一整页视为历史尽头。
 
-import { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import { useState, useMemo, useRef, useCallback } from "react";
 import { api } from "@/api/client";
 import { usePolling } from "./useApi";
 import {
@@ -95,16 +95,24 @@ export function useKlineHistory(
   const olderRef = useRef<KlineRow[]>([]);
   const inFlightRef = useRef(false);
 
-  // 切币种/周期：先查段缓存（切回免重新分页），未命中才整组清空复位
-  useEffect(() => {
-    keyRef.current = `${symbol}|${interval}`;
-    const cached = olderCache.get(keyRef.current);
+  // 切币种/周期：渲染期同步切换（React「adjusting state when props change」
+  // 模式），先查段缓存（切回免重新分页），未命中整组清空复位。
+  // [R4] 必须在渲染期而非 effect 里做：effect 晚一帧执行会产生「新 datasetKey +
+  // 旧周期历史页」的单帧窗口——KlineChart 在这帧 fitContent 并记住新键，真数据
+  // 到达时被误判为同数据集增量更新、恢复旧周期的可见时间区间，蜡烛被拉宽/压细
+  // （liveRows 的回声校验只保护了实时窗，历史页此前无保护）。
+  const [appliedKey, setAppliedKey] = useState(`${symbol}|${interval}`);
+  const key = `${symbol}|${interval}`;
+  if (appliedKey !== key) {
+    setAppliedKey(key);
+    const cached = olderCache.get(key);
     olderRef.current = cached?.rows ?? [];
     setOlder(olderRef.current);
     setHasMoreHistory(cached?.hasMore ?? true);
     setLoadingOlder(false);
+    keyRef.current = key;
     inFlightRef.current = false;
-  }, [symbol, interval]);
+  }
 
   const rows = useMemo(() => mergeKlineRows(older, liveRows), [older, liveRows]);
 

@@ -61,3 +61,17 @@ export function olderPageCursor(rows: KlineRow[]): number | null {
   for (const r of rows) if (r.ts < min) min = r.ts;
   return min - 1;
 }
+
+/**
+ * [R4] 数据集时间戳间隔一致性：全部相邻间隔都是 intervalMs 的正整数倍
+ * （允许缺口=倍数>1，绝不允许小于一个周期的间隔——那是混入了更小周期的行）。
+ * 切周期的单帧窗口若把旧周期历史页拼进新周期数据，本判定即暴露。
+ */
+export function rowsIntervalConsistent(rows: readonly KlineRow[], intervalMs: number): boolean {
+  if (!(intervalMs > 0)) return false;
+  for (let i = 1; i < rows.length; i++) {
+    const gap = rows[i].ts - rows[i - 1].ts;
+    if (gap <= 0 || gap % intervalMs !== 0) return false;
+  }
+  return true;
+}

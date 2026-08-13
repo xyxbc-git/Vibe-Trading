@@ -3,6 +3,7 @@ import {
   extractKlineRows,
   mergeKlineRows,
   olderPageCursor,
+  rowsIntervalConsistent,
   type KlineRow,
 } from "../klineHistory";
 
@@ -69,5 +70,34 @@ describe("olderPageCursor", () => {
 
   it("returns null for empty rows", () => {
     expect(olderPageCursor([])).toBeNull();
+  });
+});
+
+// ── R4 回归：切周期后数据集时间戳间隔一致性（防「新键旧数据」混拼家族） ──
+describe("rowsIntervalConsistent", () => {
+  const at = (ms: number): KlineRow => ({ ts: ms, o: 1, h: 2, l: 0.5, c: 1.5 });
+
+  it("纯净周期数据（含合法缺口=整数倍间隔）判定一致", () => {
+    const m30 = 1_800_000;
+    expect(rowsIntervalConsistent([at(0), at(m30), at(2 * m30)], m30)).toBe(true);
+    // 缺一根（gap=2×interval）是合法缺口，不算混拼
+    expect(rowsIntervalConsistent([at(0), at(m30), at(3 * m30)], m30)).toBe(true);
+    expect(rowsIntervalConsistent([], m30)).toBe(true);
+    expect(rowsIntervalConsistent([at(0)], m30)).toBe(true);
+  });
+
+  it("旧周期历史页混入新周期数据集（切 TF 单帧窗口场景）判定不一致", () => {
+    const h4 = 14_400_000;
+    const m30 = 1_800_000;
+    // 模拟：4h 历史页 + 30m 实时窗 merge 后的混拼数组
+    const polluted = mergeKlineRows(
+      [at(0), at(h4), at(2 * h4)],                        // 旧 4h 历史页残留
+      [at(2 * h4 + m30), at(2 * h4 + 2 * m30)],           // 新 30m 实时窗
+    );
+    expect(rowsIntervalConsistent(polluted, h4)).toBe(false);  // 4h 口径下 30m 间隔非法
+    // 30m 口径下 4h 间隔是 8 倍整数倍会误判一致——所以口径必须用「大周期」判定；
+    // 同 ts 重复/乱序也必须暴露
+    expect(rowsIntervalConsistent([at(0), at(0)], m30)).toBe(false);
+    expect(rowsIntervalConsistent([at(m30), at(0)], m30)).toBe(false);
   });
 });
