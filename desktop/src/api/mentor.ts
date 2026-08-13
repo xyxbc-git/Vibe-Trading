@@ -202,43 +202,66 @@ export function normalizeStats(raw: unknown): MentorStats | null {
   };
 }
 
-// ─── V2：个人军规（我的军规引擎） ───
+// ─── V2/V4：个人军规（我的军规引擎，契约对齐真后端 jarvis_trade_mentor） ───
 
-/** 单条军规。builtin 默认军规只可改参/停用；custom 自定义为文本型提醒 */
+/** 单条军规（真后端形态：rule_id/title/rtype/params(dict)/enabled(int)）。
+ * builtin = 服务端种子（rule_id 形如 R01；rtype 语义锁定，只可调参/停用）；
+ * 自定义规则 rule_id 形如 U-<ts>（后端无删除接口，只可停用）。 */
 export interface MentorRule {
-  id: string | number;
-  /** 内置规则语义 key（与后端 V1 对齐；自定义规则为 custom_*） */
-  kind: string;
-  text: string;
-  /** 数值参数（可编辑；无参数规则为 null） */
-  param: number | null;
-  param_label?: string | null;
+  id: string;
+  title: string;
+  rtype: string;
+  /** 参数 JSON（如 {min_rr: 2.0} / {tfs: ["30m","1h"], min_agree: 2}） */
+  params: Record<string, unknown>;
   enabled: boolean;
   builtin: boolean;
+  /** true = 本地种子（mock 模式行，可整表覆写；服务端行走单条 upsert） */
+  local?: boolean;
 }
 
-/** 默认 8 条军规（mock 种子；kind 与后端 V1 引擎对齐可平滑切换） */
+/** 军规参数键 → 中文标签（参数编辑控件按 params 键动态生成时用） */
+export const RULE_PARAM_CN: Record<string, string> = {
+  cooldown_min: "冷静期(分)",
+  max_toll: "过路费上限",
+  min_rr: "最低盈亏比",
+  min_agree: "至少同向周期数",
+  max_per_day: "单日上限(单)",
+  streak: "连亏笔数",
+  extended_cooldown_min: "加长冷静期(分)",
+  max_loss_pct: "预亏上限(%)",
+  max_abs_funding: "资金费率阈值",
+  window_min: "等待窗口(分)",
+  win_streak: "连胜笔数",
+  hours: "时段",
+  tfs: "周期",
+  limit: "上限",
+  threshold: "阈值",
+};
+
+/** 本地种子 8 条（仅后端不可达的 mock 模式用；rtype 供 evalRulesLocal 判定） */
 export const DEFAULT_RULES: MentorRule[] = [
-  { id: "r1", kind: "max_daily_trades", text: "单日最多开单数", param: 3, param_label: "单/天", enabled: true, builtin: true },
-  { id: "r2", kind: "stop_after_losses", text: "当日连亏即停手", param: 2, param_label: "笔", enabled: true, builtin: true },
-  { id: "r3", kind: "min_rr", text: "盈亏比不得低于", param: 1.5, param_label: "", enabled: true, builtin: true },
-  { id: "r4", kind: "max_risk_pct", text: "单笔预亏不超过本金", param: 5, param_label: "%", enabled: true, builtin: true },
-  { id: "r5", kind: "no_late_night", text: "凌晨（0-6 点）不开单", param: null, enabled: true, builtin: true },
-  { id: "r6", kind: "emotion_cap", text: "情绪自评达到该分不开单", param: 4, param_label: "分", enabled: true, builtin: true },
-  { id: "r7", kind: "must_have_reason", text: "必须写开单理由（拒绝纯凭感觉）", param: null, enabled: true, builtin: true },
-  { id: "r8", kind: "no_martingale", text: "亏损后不加仓摊平（文本提醒）", param: null, enabled: true, builtin: true },
+  { id: "L1", title: "单日最多开 3 单", rtype: "max_daily_trades", params: { limit: 3 }, enabled: true, builtin: true, local: true },
+  { id: "L2", title: "当日连亏 2 笔停手", rtype: "stop_after_losses", params: { streak: 2 }, enabled: true, builtin: true, local: true },
+  { id: "L3", title: "盈亏比不得低于 1.5", rtype: "min_rr", params: { min_rr: 1.5 }, enabled: true, builtin: true, local: true },
+  { id: "L4", title: "单笔预亏不超过本金 5%", rtype: "max_risk_pct", params: { max_loss_pct: 5 }, enabled: true, builtin: true, local: true },
+  { id: "L5", title: "凌晨（0-6 点）不开单", rtype: "no_late_night", params: {}, enabled: true, builtin: true, local: true },
+  { id: "L6", title: "情绪自评 ≥4 分不开单", rtype: "emotion_cap", params: { threshold: 4 }, enabled: true, builtin: true, local: true },
+  { id: "L7", title: "必须写开单理由（拒绝纯凭感觉）", rtype: "must_have_reason", params: {}, enabled: true, builtin: true, local: true },
+  { id: "L8", title: "亏损后不加仓摊平（文本提醒）", rtype: "custom", params: {}, enabled: true, builtin: true, local: true },
 ];
 
-const RULES_KEY = "jarvis.mentor.rules";
+const RULES_KEY = "jarvis.mentor.rules.v2";
 
 function loadLocalRules(): MentorRule[] {
   try {
     const raw = localStorage.getItem(RULES_KEY);
-    if (!raw) return DEFAULT_RULES.map((r) => ({ ...r }));
+    if (!raw) return DEFAULT_RULES.map((r) => ({ ...r, params: { ...r.params } }));
     const arr = JSON.parse(raw) as MentorRule[];
-    return Array.isArray(arr) && arr.length ? arr : DEFAULT_RULES.map((r) => ({ ...r }));
+    return Array.isArray(arr) && arr.length
+      ? arr
+      : DEFAULT_RULES.map((r) => ({ ...r, params: { ...r.params } }));
   } catch {
-    return DEFAULT_RULES.map((r) => ({ ...r }));
+    return DEFAULT_RULES.map((r) => ({ ...r, params: { ...r.params } }));
   }
 }
 
@@ -250,16 +273,34 @@ function saveLocalRules(rules: MentorRule[]) {
   }
 }
 
-/** 后端规则行归一化（字段名容错） */
-function normalizeRule(raw: Record<string, unknown>, i: number): MentorRule {
+/** 后端规则行归一化（V4：真实契约 rule_id/title/rtype/params/enabled(int)；
+ * 兼容旧本地形态 id/kind/text/param） */
+export function normalizeRule(raw: Record<string, unknown>, i: number): MentorRule {
+  const id = String(raw.rule_id ?? raw.id ?? `srv${i}`);
+  const params =
+    raw.params && typeof raw.params === "object" && !Array.isArray(raw.params)
+      ? (raw.params as Record<string, unknown>)
+      : raw.param != null && Number.isFinite(Number(raw.param))
+        ? { value: Number(raw.param) }
+        : {};
   return {
-    id: (raw.id as string | number) ?? `srv${i}`,
-    kind: typeof raw.kind === "string" ? raw.kind : typeof raw.key === "string" ? raw.key : `rule${i}`,
-    text: typeof raw.text === "string" ? raw.text : typeof raw.name === "string" ? raw.name : `规则 ${i + 1}`,
-    param: Number.isFinite(Number(raw.param)) && raw.param != null ? Number(raw.param) : null,
-    param_label: typeof raw.param_label === "string" ? raw.param_label : null,
-    enabled: raw.enabled !== false && raw.enabled !== 0,
-    builtin: raw.builtin === true || raw.custom !== true,
+    id,
+    title:
+      typeof raw.title === "string" && raw.title
+        ? raw.title
+        : typeof raw.text === "string" && raw.text
+          ? raw.text
+          : `规则 ${i + 1}`,
+    rtype:
+      typeof raw.rtype === "string" && raw.rtype
+        ? raw.rtype
+        : typeof raw.kind === "string" && raw.kind
+          ? raw.kind
+          : "custom",
+    params,
+    enabled: raw.enabled === true || raw.enabled === 1 || raw.enabled === "1",
+    builtin: /^R\d/i.test(id) || raw.builtin === true,
+    local: raw.local === true,
   };
 }
 
@@ -268,6 +309,15 @@ export interface MentorRulesResponse {
   rules: MentorRule[];
   mock?: boolean;
   error?: string;
+}
+
+/** 单条军规 upsert 请求（对齐后端 MentorRuleReq：有 rule_id 更新，无则新增自定义） */
+export interface MentorRulePatch {
+  rule_id?: string;
+  title?: string;
+  rtype?: string;
+  params?: Record<string, unknown>;
+  enabled?: boolean;
 }
 
 // ─── 裁决字段防御性格式化（热修 R1：后端字段可能是对象，直接渲染会崩 React） ───
@@ -342,17 +392,24 @@ export function fmtEvidence(v: unknown): string {
   }
 }
 
-/** 裁决证据行数组归一化（items 与 V2 rules 区段共用） */
+/** 裁决证据行数组归一化（items 与 V2 rules 区段共用）。
+ * 真后端军规行实测形态为 {rule_id, title, status, evidence}——
+ * key/rule_id、level/status 双键名兼容，title 落 detail 次要行。 */
 function normalizeItems(raw: unknown, prefix: string): MentorVerdictItem[] {
   if (!Array.isArray(raw)) return [];
+  const lvl = (v: unknown): "pass" | "warn" | "fail" | null =>
+    v === "pass" || v === "warn" || v === "fail" ? v : null;
   return (raw as Record<string, unknown>[]).map((it, i) => ({
-    key: typeof it.key === "string" ? it.key : `${prefix}${i}`,
-    level: (it.level === "pass" || it.level === "warn" || it.level === "fail"
-      ? it.level
-      : "warn") as "pass" | "warn" | "fail",
+    key:
+      typeof it.key === "string"
+        ? it.key
+        : typeof it.rule_id === "string"
+          ? it.rule_id
+          : `${prefix}${i}`,
+    level: lvl(it.level) ?? lvl(it.status) ?? "warn",
     weight: Number.isFinite(Number(it.weight)) ? Number(it.weight) : 0,
     evidence: it.evidence,
-    detail: it.detail,
+    detail: it.detail ?? it.title,
   }));
 }
 
@@ -629,14 +686,18 @@ export async function evalRulesLocal(input: MentorPlanInput): Promise<MentorVerd
 
   for (const r of rules) {
     const item = (level: "pass" | "warn" | "fail", evidence: string): MentorVerdictItem => ({
-      key: r.kind,
+      key: r.rtype,
       level,
       weight: 0,
       evidence,
     });
-    switch (r.kind) {
+    const p = (k: string, dft: number): number => {
+      const v = Number((r.params ?? {})[k]);
+      return Number.isFinite(v) ? v : dft;
+    };
+    switch (r.rtype) {
       case "max_daily_trades": {
-        const cap = r.param ?? 3;
+        const cap = p("limit", 3);
         if (todayRows == null) {
           out.push(item("warn", `单日≤${cap}单：台账不可达，未核对`));
         } else {
@@ -650,7 +711,7 @@ export async function evalRulesLocal(input: MentorPlanInput): Promise<MentorVerd
         break;
       }
       case "stop_after_losses": {
-        const cap = r.param ?? 2;
+        const cap = p("streak", 2);
         if (todayRows == null) {
           out.push(item("warn", `连亏${cap}笔停手：台账不可达，未核对`));
         } else {
@@ -664,7 +725,7 @@ export async function evalRulesLocal(input: MentorPlanInput): Promise<MentorVerd
         break;
       }
       case "min_rr": {
-        const min = r.param ?? MIN_RR;
+        const min = p("min_rr", MIN_RR);
         if (rr == null) out.push(item("fail", `盈亏比无法计算（点位不自洽），低于你定的 ${min}`));
         else
           out.push(
@@ -675,7 +736,7 @@ export async function evalRulesLocal(input: MentorPlanInput): Promise<MentorVerd
         break;
       }
       case "max_risk_pct": {
-        const cap = r.param ?? 5;
+        const cap = p("max_loss_pct", 5);
         if (!input.principal || input.principal <= 0) {
           out.push(item("warn", `单笔预亏≤本金${cap}%：未填本金，未核对`));
         } else {
@@ -699,7 +760,7 @@ export async function evalRulesLocal(input: MentorPlanInput): Promise<MentorVerd
         break;
       }
       case "emotion_cap": {
-        const cap = r.param ?? 4;
+        const cap = p("threshold", 4);
         const emo = input.emotion_score ?? 3;
         out.push(
           emo >= cap
@@ -719,8 +780,8 @@ export async function evalRulesLocal(input: MentorPlanInput): Promise<MentorVerd
         break;
       }
       default: {
-        // 文本型军规（含 no_martingale 与自定义）：展示型提醒，不判 pass/fail
-        out.push(item("pass", `提醒：${r.text}`));
+        // 文本型/后端专属 rtype 军规：本地无法判定，展示型提醒不判 pass/fail
+        out.push(item("pass", `提醒：${r.title}`));
         break;
       }
     }
@@ -846,10 +907,12 @@ export const mentorApi = {
     }
   },
 
-  /** V2 我的军规：GET /mentor/rules；后端未就绪读本地（默认 8 条种子） */
+  /** V2/V4 我的军规：GET /mentor/rules?all=1（含停用项）；后端未就绪读本地种子 */
   async rules(): Promise<MentorRulesResponse> {
     try {
-      const d = await get<{ ok?: boolean; rules?: unknown[]; error?: string }>("/mentor/rules");
+      const d = await get<{ ok?: boolean; rules?: unknown[]; error?: string }>(
+        "/mentor/rules?all=1",
+      );
       if (d && d.ok !== false && Array.isArray(d.rules)) {
         return {
           ok: true,
@@ -862,17 +925,48 @@ export const mentorApi = {
     }
   },
 
-  /** V2 我的军规：POST /mentor/rules 全量保存；后端未就绪落本地（联调后自动切真） */
-  async saveRules(rules: MentorRule[]): Promise<{ ok: boolean; mock?: boolean; error?: string }> {
-    // 本地永远留一份（军规核对 evalRulesLocal 依赖本地副本，双写保证一致）
-    saveLocalRules(rules);
+  /** V4 单条军规增改启停（对齐后端真实契约：POST /mentor/rules 单条 upsert）。
+   *  有 rule_id 更新（内置只允许 title/params/enabled）；无 rule_id 新增自定义
+   *  （后端自动生成 U-<ts>，rtype 缺省 custom）。 */
+  async upsertRule(patch: MentorRulePatch): Promise<{ ok: boolean; rule_id?: string; mock?: boolean; error?: string }> {
     try {
-      const d = await post<{ ok?: boolean; error?: string }>("/mentor/rules", { rules });
-      if (d.ok !== false) return { ok: true };
-      throw new Error(d?.error || "军规保存失败");
+      const d = await post<{ ok?: boolean; rule_id?: string; error?: string }>(
+        "/mentor/rules",
+        patch,
+      );
+      if (d && d.ok !== false) return { ok: true, rule_id: d.rule_id };
+      return { ok: false, error: d?.error || "军规保存失败" };
     } catch {
+      // 后端不可达：落本地副本（mock 模式；evalRulesLocal 与展示保持一致）
+      const rules = loadLocalRules();
+      if (patch.rule_id) {
+        const row = rules.find((r) => r.id === patch.rule_id);
+        if (row) {
+          if (patch.title != null) row.title = patch.title;
+          if (patch.params != null) row.params = patch.params;
+          if (patch.enabled != null) row.enabled = patch.enabled;
+        } else {
+          return { ok: false, mock: true, error: "本地军规中找不到该条" };
+        }
+      } else {
+        rules.push({
+          id: `U-${Date.now()}`,
+          title: patch.title ?? "自定义军规",
+          rtype: patch.rtype ?? "custom",
+          params: patch.params ?? {},
+          enabled: patch.enabled ?? true,
+          builtin: false,
+          local: true,
+        });
+      }
+      saveLocalRules(rules);
       return { ok: true, mock: true };
     }
+  },
+
+  /** 本地整表覆写（仅 mock 模式恢复默认用；服务端模式请逐条 upsertRule） */
+  saveRulesLocal(rules: MentorRule[]) {
+    saveLocalRules(rules);
   },
 };
 

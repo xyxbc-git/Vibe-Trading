@@ -5,7 +5,14 @@
  * 样本取自 2026-08-13 真后端 POST /api/mentor/plan 实测响应（字段形态逐项覆盖）。
  */
 import { describe, expect, it } from "vitest";
-import { fmtEvidence, normalizeVerdict, normalizeStats, lossStreak, type MentorPlanRow } from "@/api/mentor";
+import {
+  fmtEvidence,
+  normalizeVerdict,
+  normalizeStats,
+  normalizeRule,
+  lossStreak,
+  type MentorPlanRow,
+} from "@/api/mentor";
 
 /** 真后端实测响应 verdict 段（节选自 plan_id=4 的原始 JSON） */
 const REAL_VERDICT = {
@@ -116,7 +123,7 @@ describe("normalizeVerdict（后端 verdict 入口归一化）", () => {
     expect(normalizeVerdict("bad")).toBeNull();
   });
 
-  it("V2：rules 区段归一化透传（后端 V1 军规引擎）", () => {
+  it("V2：rules 区段归一化透传（契约形态 key/level）", () => {
     const v = normalizeVerdict({
       light: "green", score: 90, items: [], summary: "ok",
       rules: [
@@ -127,6 +134,60 @@ describe("normalizeVerdict（后端 verdict 入口归一化）", () => {
     expect(v!.rules).toHaveLength(2);
     expect(v!.rules![0].level).toBe("pass");
     expect(typeof fmtEvidence(v!.rules![1].evidence)).toBe("string");
+  });
+
+  it("V4：rules 区段真后端实测形态（rule_id/status/title/evidence）不再整体降级 warn", () => {
+    // 2026-08-13 真后端 POST /api/mentor/plan 响应的 verdict.rules 节选原样
+    const v = normalizeVerdict({
+      light: "green", score: 70, items: [], summary: "ok",
+      rules: [
+        { rule_id: "R01", title: "红灯单必须过冷静期再提交", status: "pass", evidence: "近期无红灯裁决，无需冷静期" },
+        { rule_id: "R03", title: "盈亏比低于 2 不开单", status: "fail", evidence: "RR=1.20 < 2，赔率不达标" },
+      ],
+    });
+    expect(v!.rules).toHaveLength(2);
+    expect(v!.rules![0].key).toBe("R01");
+    expect(v!.rules![0].level).toBe("pass");   // status → level 映射
+    expect(v!.rules![1].level).toBe("fail");
+    expect(fmtEvidence(v!.rules![0].detail)).toBe("红灯单必须过冷静期再提交"); // title 落 detail
+  });
+});
+
+describe("normalizeRule（V4 军规行真实契约归一化）", () => {
+  it("真后端形态：rule_id/title/rtype/params(dict)/enabled(int)", () => {
+    // 2026-08-13 真后端 GET /api/mentor/rules 实测行原样
+    const r = normalizeRule(
+      {
+        rule_id: "R04",
+        title: "方向必须顺 30m/1h/4h 中至少 2 个周期（5m 只做入场时机）",
+        rtype: "mtf_align",
+        params: { tfs: ["30m", "1h", "4h"], min_agree: 2 },
+        enabled: 1,
+        updated_ts: 1786599966.946831,
+      },
+      3,
+    );
+    expect(r.id).toBe("R04");
+    expect(r.title).toContain("方向必须顺");   // 不再是「规则 4」占位
+    expect(r.rtype).toBe("mtf_align");
+    expect(r.params.min_agree).toBe(2);
+    expect(r.enabled).toBe(true);              // int 1 → boolean
+    expect(r.builtin).toBe(true);              // R 前缀 = 服务端种子
+  });
+
+  it("自定义规则（U- 前缀）builtin=false；enabled 0 → false", () => {
+    const r = normalizeRule(
+      { rule_id: "U-1786600000", title: "跌破日线 MA20 不做多", rtype: "custom", params: {}, enabled: 0 },
+      12,
+    );
+    expect(r.builtin).toBe(false);
+    expect(r.enabled).toBe(false);
+  });
+
+  it("字段缺失兜底：无 title 落「规则 N」占位、params 非法归空对象", () => {
+    const r = normalizeRule({ rule_id: "X1", params: "bad" }, 0);
+    expect(r.title).toBe("规则 1");
+    expect(r.params).toEqual({});
   });
 });
 
