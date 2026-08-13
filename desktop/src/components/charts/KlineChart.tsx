@@ -29,6 +29,7 @@ import { PositionZonePrimitive } from "./PositionZonePrimitive";
 import { IchimokuCloudPrimitive } from "./IchimokuCloudPrimitive";
 import { TrapSignalsPrimitive } from "./TrapSignalsPrimitive";
 import { WyckoffPrimitive } from "./WyckoffPrimitive";
+import { FvgPrimitive, type FvgZoneView } from "./FvgPrimitive";
 
 /** 云图叠加载荷：三条线走 LineSeries，云带（含未来段）走 primitive */
 export interface IchimokuOverlay {
@@ -108,6 +109,12 @@ interface KlineChartProps {
    */
   wyckoff?: WyckoffOverlay | null;
   /**
+   * FVG 失衡区矩形带（R8）：看涨绿/看跌红半透明带从形成蜡烛延伸到图右缘，
+   * normal 层垫在蜡烛下；hover 出方向/区间价/回补%/形成时间摘要。
+   * null/undefined 不渲染。
+   */
+  fvgZones?: FvgZoneView[] | null;
+  /**
    * 数据集标识（如 "BTCUSDT|15m"）。提供时启用「视口保持」模式：仅该 key
    * 变化（切币种/切周期/图表重建）才 fitContent 重置视口；同 key 的数据
    * 更新（轮询刷新、历史前插）恢复原可见时间区间，用户缩放/平移与向左
@@ -168,6 +175,7 @@ export default function KlineChart({
   trapMarks,
   onTrapClick,
   wyckoff,
+  fvgZones,
   datasetKey,
   onNearLeftEdge,
   loadingOlder,
@@ -185,6 +193,7 @@ export default function KlineChart({
   const ichimokuPrimitiveRef = useRef<IchimokuCloudPrimitive | null>(null);
   const trapPrimitiveRef = useRef<TrapSignalsPrimitive | null>(null);
   const wyckoffPrimitiveRef = useRef<WyckoffPrimitive | null>(null);
+  const fvgPrimitiveRef = useRef<FvgPrimitive | null>(null);
   // 点击回调 latest-ref：init effect 里的 subscribeClick 闭包始终调到最新回调
   const onTrapClickRef = useRef(onTrapClick);
   onTrapClickRef.current = onTrapClick;
@@ -270,6 +279,9 @@ export default function KlineChart({
     // 威科夫阶段带（bottom 垫底）+ 12 事件徽章（top，悬停出摘要）
     const wyckoffPrimitive = new WyckoffPrimitive();
     candleSeries.attachPrimitive(wyckoffPrimitive);
+    // FVG 失衡区矩形带（R8，normal 层垫蜡烛下，悬停出摘要）
+    const fvgPrimitive = new FvgPrimitive();
+    candleSeries.attachPrimitive(fvgPrimitive);
 
     // 悬停浮层（多类命中共用一个浮层，陷阱警示 > 徽章 > 预测层）：
     //   0. 诱多/诱空三角警示牌：命中 → 陷阱类型/置信度/价位摘要
@@ -307,7 +319,13 @@ export default function KlineChart({
         param.time !== undefined
           ? ichimokuRef.current?.tipByTime.get(Number(param.time))
           : undefined;
-      setZoneTip(ichiTip ? { x: pt.x, y: pt.y, text: ichiTip } : null);
+      if (ichiTip) {
+        setZoneTip({ x: pt.x, y: pt.y, text: ichiTip });
+        return;
+      }
+      // FVG 带命中（大面积区域，优先级垫底防挡其它 tooltip）
+      const fvgTip = fvgPrimitive.zoneAt(pt.x, pt.y);
+      setZoneTip(fvgTip ? { x: pt.x, y: pt.y, text: fvgTip } : null);
     };
     chart.subscribeCrosshairMove(handleCrosshair);
 
@@ -338,6 +356,7 @@ export default function KlineChart({
     ichimokuPrimitiveRef.current = ichimokuPrimitive;
     trapPrimitiveRef.current = trapPrimitive;
     wyckoffPrimitiveRef.current = wyckoffPrimitive;
+    fvgPrimitiveRef.current = fvgPrimitive;
     priceLinesRef.current = [];
     overlaySeriesRef.current = [];
     ichimokuSeriesRef.current = [];
@@ -368,6 +387,7 @@ export default function KlineChart({
       ichimokuPrimitiveRef.current = null;
       trapPrimitiveRef.current = null;
       wyckoffPrimitiveRef.current = null;
+      fvgPrimitiveRef.current = null;
       priceLinesRef.current = [];
       overlaySeriesRef.current = [];
       ichimokuSeriesRef.current = [];
@@ -570,6 +590,17 @@ export default function KlineChart({
       // chart may have been disposed between render and effect
     }
   }, [wyckoff, initVersion]);
+
+  // FVG 失衡区矩形带（R8）：prop 变化整组重设，传空/未传即清空；
+  // 悬停命中直接查 primitive 的投影结果。
+  useEffect(() => {
+    if (disposedRef.current) return;
+    try {
+      fvgPrimitiveRef.current?.setZones(fvgZones ?? []);
+    } catch {
+      // chart may have been disposed between render and effect
+    }
+  }, [fvgZones, initVersion]);
 
   // 信号结构买卖点标注 → 原生 setMarkers。替换式 API：prop 变化整组重设，
   // 清空/未传时重设为空数组；库要求按 time 升序，窗口外的标注直接丢弃。

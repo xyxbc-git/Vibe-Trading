@@ -91,6 +91,11 @@ export const api = {
 
   // endTimeMs（毫秒，可选）：向前分页游标，返回该时刻及之前的 limit 根
   // （K 线图向左拖懒加载更早历史用）；缺省时 URL 与旧版一致，行为不变。
+  // FVG 失衡区（K 线图叠加层，R8）；60s 后端缓存
+  fvg: (symbol = "BTCUSDT", tf = "15m", maxZones = 10) =>
+    api.get<FvgResponse>(
+      `/fvg?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(tf)}&max_zones=${maxZones}`,
+    ),
   kline: (symbol = "BTCUSDT", interval = "15m", limit = 200, endTimeMs?: number) =>
     api.get<Record<string, unknown>>(
       `/kline?symbol=${symbol}&interval=${interval}&limit=${limit}` +
@@ -2409,6 +2414,39 @@ export interface SignalWinrateTradesResponse {
   trades?: SignalWinrateTrade[];
   /** true = 缓存缺失或旧版缓存无逐笔明细，需重跑一次胜率回测 */
   need_run?: boolean;
+  error?: string;
+}
+
+// ─── FVG 失衡区（GET /api/fvg，K 线图叠加层）───
+
+/** 单个 FVG 缺口区（jarvis_fvg.detect 契约 + created_ts） */
+export interface FvgZone {
+  type: "bullish" | "bearish";
+  top: number;
+  bottom: number;
+  height?: number;
+  height_atr?: number;
+  created_i?: number;
+  /** 形成 bar 开盘毫秒时间戳（前端对齐蜡烛；下标异常时 null） */
+  created_ts?: number | null;
+  age_bars?: number;
+  /** 完全回补=缺口失效 */
+  mitigated: boolean;
+  /** 最深回踩占缺口高度 0~100 */
+  fill_pct: number;
+  dist_pct?: number;
+  dist_atr?: number;
+}
+
+export interface FvgResponse {
+  ok: boolean;
+  reason?: string | null;
+  symbol?: string;
+  tf?: string;
+  as_of?: number;
+  price?: number;
+  atr?: number;
+  zones: FvgZone[];
   error?: string;
 }
 

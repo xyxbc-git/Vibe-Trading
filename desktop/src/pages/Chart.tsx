@@ -7,6 +7,7 @@ import { useSymbol } from "@/hooks/useSymbol";
 import { useLivePrice } from "@/hooks/usePrice";
 import { api, formatPrice, type TwelveSignal, type ConsensusTradePlan, type KeyLevel, type LiqMapResponse, type SignalDirection } from "@/api/client";
 import KlineChart from "@/components/charts/KlineChart";
+import type { FvgZoneView } from "@/components/charts/FvgPrimitive";
 import { EventRibbon } from "@/components/cards/EventCalendarCard";
 import { tradesToMarks } from "@/lib/signalTrades";
 import {
@@ -1215,6 +1216,42 @@ export default function Chart() {
   // 回退 K 线本地演示推演（角标标注），与预测层同一套降级模式 ──
   const [deltaOn, setDeltaOn] = useState(toggleOr(persistedToggles, "deltaOn", false));
 
+  // ── [R8] FVG 失衡区叠加：GET /api/fvg（60s 后端缓存），矩形带画进主图 ──
+  const [fvgOn, setFvgOn] = useState(toggleOr(persistedToggles, "fvgOn", false));
+  const { data: fvgResp } = usePolling(
+    () => (fvgOn ? api.fvg(symbol, tfSettled) : Promise.resolve(null)),
+    fvgOn ? 60_000 : 0,
+    [fvgOn, symbol, tfSettled],
+  );
+  const fvgZoneViews = useMemo<FvgZoneView[] | null>(() => {
+    if (!fvgOn || !fvgResp?.ok) return null;
+    // 回声校验：旧币种/旧周期的慢响应不采用（与其它叠加层同款防串图）
+    if (isStaleEcho(symbol, fvgResp.symbol) || (fvgResp.tf != null && fvgResp.tf !== tfSettled)) {
+      return null;
+    }
+    const out: FvgZoneView[] = [];
+    for (const z of fvgResp.zones ?? []) {
+      // 完全回补的缺口已失效：默认不显示（与任务口径一致）
+      if (z.mitigated || z.created_ts == null) continue;
+      if (!(Number.isFinite(z.top) && Number.isFinite(z.bottom) && z.top > z.bottom)) continue;
+      const bull = z.type === "bullish";
+      out.push({
+        type: z.type,
+        top: z.top,
+        bottom: z.bottom,
+        timeSec: Math.floor(z.created_ts / 1000),
+        fillPct: z.fill_pct ?? 0,
+        tooltip:
+          `${bull ? "看涨" : "看跌"} FVG（价格失衡缺口）\n` +
+          `区间 ${z.bottom.toLocaleString()} ~ ${z.top.toLocaleString()}\n` +
+          `回补 ${Math.round(z.fill_pct ?? 0)}%${(z.fill_pct ?? 0) > 0 ? "（部分回踩）" : "（未回补）"}` +
+          ` · 形成于 ${new Date(z.created_ts).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}\n` +
+          `${bull ? "缺口常成回踩支撑区——价格回补进带内是常见入场观察位" : "缺口常成反弹压力区——价格反抽进带内是常见入场观察位"}`,
+      });
+    }
+    return out;
+  }, [fvgOn, fvgResp, symbol, tfSettled]);
+
   // [R6] 指标开关统一写回：任一开关/画线集合/周期变化即持久化（读-合并-写，
   // 首帧写回初始值幂等；viewMode/ichimoku/trap/wyckoff 沿用各自历史键不迁移）
   useEffect(() => {
@@ -1228,10 +1265,11 @@ export default function Chart() {
       liqOn,
       macdOn,
       deltaOn,
+      fvgOn,
       draws: [...draws],
       tf,
     });
-  }, [smart, autoTune, twelve, plan, predictOn, patternOn, liqOn, macdOn, deltaOn, draws, tf]);
+  }, [smart, autoTune, twelve, plan, predictOn, patternOn, liqOn, macdOn, deltaOn, fvgOn, draws, tf]);
   const [deltaResp, setDeltaResp] = useState<DeltaResponse | null>(null);
   const [deltaLoading, setDeltaLoading] = useState(false);
   const [deltaError, setDeltaError] = useState<string | null>(null);
@@ -1549,6 +1587,15 @@ export default function Chart() {
           className={pillCls(liqOn)}
         >
           磁吸位{liqOn ? "·开" : "·关"}
+        </button>
+
+        {/* [R8] FVG 失衡区：三根 K 线价格失衡缺口矩形带（ICT/订单流入场观察位） */}
+        <button
+          onClick={() => setFvgOn((v) => !v)}
+          title="FVG 失衡区叠加：三根 K 线留下的价格失衡缺口（绿=看涨缺口常成回踩支撑、红=看跌缺口常成反弹压力），带从形成蜡烛延伸到最新；已完全回补的缺口自动消失，部分回补标注百分比。悬停带内看区间价/回补度/形成时间"
+          className={pillCls(fvgOn)}
+        >
+          FVG{fvgOn ? "·开" : "·关"}
         </button>
 
         {/* 图例：解释当前模式下每类线的含义 */}
@@ -2162,6 +2209,7 @@ export default function Chart() {
               livePrice={liveForChart}
               ichimoku={ichimokuData?.overlay ?? null}
               trapMarks={trapMarks}
+              fvgZones={fvgZoneViews}
               onTrapClick={(mark) => setSelectedTrap(mark)}
               wyckoff={wyckoffOverlay}
               datasetKey={`${symbol}|${tfSettled}`}

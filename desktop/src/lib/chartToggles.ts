@@ -31,6 +31,8 @@ export interface ChartToggles {
   macdOn?: boolean;
   /** K 线页：Delta 副图 */
   deltaOn?: boolean;
+  /** K 线页：FVG 失衡区叠加（R8） */
+  fvgOn?: boolean;
   /** K 线页：手动画线模式集合（DrawMode 名） */
   draws?: string[];
   /** K 线页：周期档 */
