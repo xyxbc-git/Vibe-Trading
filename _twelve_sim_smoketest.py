@@ -2262,6 +2262,163 @@ with jtt._conn() as conn:
 for _tf, _sys in [("5m", "gap"), ("15m", "oscillator"), ("30m", "gann")]:
     set_signal(_tf, _sys, "neutral", None)
 
+# ═══════════ 31. 任务L 周期纪律字段消费（tp_mode/tp_rr_ratio/tp_pct_factor/sl_mode/sl_atr_mult） ═══════════
+check("任务L 本地表 5 纪律列已建（init_db CREATE/ALTER 幂等）",
+      all(c in [r[1] for r in jtt._conn().execute(
+          "PRAGMA table_info(twelve_sim_config)").fetchall()]
+          for c in ("tp_mode", "tp_rr_ratio", "tp_pct_factor",
+                    "sl_mode", "sl_atr_mult")))
+
+T21 = T20 + 96 * 3600
+_PRICE["v"] = 100.0
+
+
+def _set_discipline(scope_tf, scope_system, **cols):
+    """直接落一行纪律配置（回读链路的本地形态；upsert_config 不含新字段）。"""
+    with jtt._conn() as conn:
+        conn.execute(
+            "DELETE FROM twelve_sim_config WHERE symbol=? "
+            "AND COALESCE(scope_tf,'')=COALESCE(?,'') "
+            "AND COALESCE(scope_system,'')=COALESCE(?,'')",
+            (SYM, scope_tf, scope_system))
+        keys = ", ".join(cols)
+        marks = ",".join("?" * len(cols))
+        conn.execute(
+            f"INSERT INTO twelve_sim_config (symbol, scope_tf, scope_system, {keys}) "
+            f"VALUES (?,?,?,{marks})", (SYM, scope_tf, scope_system, *cols.values()))
+
+
+def _del_discipline(scope_tf, scope_system):
+    with jtt._conn() as conn:
+        conn.execute(
+            "DELETE FROM twelve_sim_config WHERE symbol=? "
+            "AND COALESCE(scope_tf,'')=COALESCE(?,'') "
+            "AND COALESCE(scope_system,'')=COALESCE(?,'')",
+            (SYM, scope_tf, scope_system))
+
+
+# a) tp_mode=fixed_rr（tf 组级）：信号 TP 103 被改成 entry+2×|entry−SL|=110，SL 原样
+_set_discipline("15m", None, tp_mode="fixed_rr", tp_rr_ratio=2.0)
+set_signal("15m", "oscillator", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 95.0, "take_profit": 103.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T21)
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("15m", "oscillator")]
+check("31a：tp_mode=fixed_rr → TP=entry+2×SL距离（103→110），SL 原样 95 + 纯标记",
+      len(op) == 1 and abs(op[0]["take_profit"] - 110.0) < 1e-9
+      and abs(op[0]["stop_loss"] - 95.0) < 1e-9
+      and op[0]["context_tags"] == "tp_fixed_rr"
+      and op[0]["size_factor"] == 1.0, str(op))
+
+# b) tp_mode=pct_factor（信号级）：信号 TP 距离 3% × 0.5 → TP=101.5
+_set_discipline("5m", "gap", tp_mode="pct_factor", tp_pct_factor=0.5)
+set_signal("5m", "gap", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.0, "take_profit": 103.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T21 + 60)
+op = [o for o in out["symbols"][SYM]["opened"] if (o["tf"], o["system"]) == ("5m", "gap")]
+check("31b：tp_mode=pct_factor ×0.5 → TP 距离 3%→1.5%（103→101.5）",
+      len(op) == 1 and abs(op[0]["take_profit"] - 101.5) < 1e-9
+      and op[0]["context_tags"] == "tp_pct_factor", str(op))
+
+# c) sl_mode=atr_buffer（信号级）：ATR 0.5%×mult 2 → SL 97 外拓到 96；
+#    auto 杠杆按最终 SL 4% 计算（floor(0.5/0.04)=12，验证「杠杆随外拓下调」）
+jtt._ctx_atr = lambda sym, tf: (0.5, "mid")
+_set_discipline("30m", "gann", sl_mode="atr_buffer", sl_atr_mult=2.0)
+set_signal("30m", "gann", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 97.0, "take_profit": 106.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T21 + 120)
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("30m", "gann")]
+check("31c：sl_mode=atr_buffer → SL 97 外拓 2×ATR0.5% 到 96 + auto 杠杆按最终 SL（12×）",
+      len(op) == 1 and abs(op[0]["stop_loss"] - 96.0) < 1e-9
+      and abs(op[0]["take_profit"] - 106.0) < 1e-9
+      and op[0]["context_tags"] == "sl_atr_buffer"
+      and abs(op[0]["leverage"] - 12.0) < 1e-9, str(op))
+jtt._ctx_atr = lambda sym, tf: (None, None)
+
+# d) 三级覆盖优先级：币种级 fixed_rr(2) + 信号级 pct_factor(0.5) → 信号级赢
+#    （SL 99 距 1%：pct 0.5 → TP=101.5（rr 1.5 过门禁）；fixed_rr 若赢则 TP=102）
+_set_discipline(None, None, tp_mode="fixed_rr", tp_rr_ratio=2.0)
+_set_discipline("4h", "turtle", tp_mode="pct_factor", tp_pct_factor=0.5)
+set_signal("4h", "turtle", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 99.0, "take_profit": 103.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T21 + 180)
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("4h", "turtle")]
+check("31d：三级覆盖——信号级 pct_factor 压过币种级 fixed_rr（TP=101.5 非 102）",
+      len(op) == 1 and abs(op[0]["take_profit"] - 101.5) < 1e-9
+      and op[0]["context_tags"] == "tp_pct_factor", str(op))
+_del_discipline(None, None)
+_del_discipline("4h", "turtle")
+jtt.upsert_config(SYM)   # 重建币种级启用行（31d 的币种级纪律行替换了它）
+
+# e) 不自洽/参数缺失回退：atr_buffer 但 ATR 取数不可用（全局 None 桩）
+#    → SL 原样跟随信号 + discipline_fallback 留痕（可用性优先不拦开仓）
+_set_discipline("1d", "oscillator", sl_mode="atr_buffer", sl_atr_mult=2.0)
+set_signal("1d", "oscillator", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 95.0, "take_profit": 110.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T21 + 240)
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("1d", "oscillator")]
+check("31e：ATR 不可用 → 回退 follow_signal（SL 原样 95）+ discipline_fallback 留痕",
+      len(op) == 1 and abs(op[0]["stop_loss"] - 95.0) < 1e-9
+      and op[0]["context_tags"] == "discipline_fallback"
+      and op[0]["size_factor"] == 1.0, str(op))
+_del_discipline("1d", "oscillator")
+
+# f) 挂计划触达成交路径同样生效：15m tf 组级 fixed_rr 仍在（a 建的）
+#    breakout entry=104 SL 99（距 5）→ 成交时 TP=104+2×5=114
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+set_signal("15m", "oscillator", "bullish",
+           {"side": "long", "entry": 104.0, "entry_type": "breakout",
+            "stop_loss": 99.0, "take_profit": 112.0}, strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T21 + 300)
+check("31f：纪律槽位 breakout 先挂计划", len(
+    [p for p in out["symbols"][SYM]["planned"]
+     if (p["tf"], p["system"]) == ("15m", "oscillator")]) == 1,
+    str(out["symbols"][SYM]))
+_PRICE["v"] = 105.0
+out = jtt.run_cycle(cfg={}, now=T21 + 360)
+fl = [f for f in out["symbols"][SYM]["filled"]
+      if (f["tf"], f["system"]) == ("15m", "oscillator")]
+check("31f：计划触达成交 → 成交时刻按 fixed_rr 合成 TP=104+2×5=114",
+      len(fl) == 1 and abs(fl[0]["take_profit"] - 114.0) < 1e-9
+      and "tp_fixed_rr" in str(fl[0]["context_tags"]), str(fl))
+
+# g) NULL 零回归（显式）：同槽位删掉纪律行后，同信号 TP/SL 完全跟随信号
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+_del_discipline("15m", None)
+_del_discipline("5m", "gap")
+_del_discipline("30m", "gann")
+_PRICE["v"] = 100.0
+set_signal("15m", "oscillator", "bullish",
+           {"side": "long", "entry": 100.0, "stop_loss": 98.5, "take_profit": 103.0},
+           strength=0.9)
+out = jtt.run_cycle(cfg={}, now=T21 + 420)
+op = [o for o in out["symbols"][SYM]["opened"]
+      if (o["tf"], o["system"]) == ("15m", "oscillator")]
+check("31g：纪律行删除（NULL）→ 完全跟随信号零变化（TP 103 / SL 98.5 / 无标签）",
+      len(op) == 1 and abs(op[0]["take_profit"] - 103.0) < 1e-9
+      and abs(op[0]["stop_loss"] - 98.5) < 1e-9
+      and op[0]["context_tags"] is None, str(op))
+
+# 复位：清场 + 信号归中（纪律行已在各用例内清理）
+_PRICE["v"] = 100.0
+with jtt._conn() as conn:
+    conn.execute("UPDATE twelve_sim_position SET status='closed' WHERE status='open'")
+    conn.execute("DELETE FROM twelve_sim_position WHERE status='pending'")
+    conn.execute("UPDATE twelve_sim_wallet SET balance=100, equity=100")
+for _tf, _sys in [("5m", "gap"), ("15m", "oscillator"), ("30m", "gann"),
+                  ("4h", "turtle"), ("1d", "oscillator")]:
+    set_signal(_tf, _sys, "neutral", None)
+
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS ✅")
 raise SystemExit(1 if fails else 0)

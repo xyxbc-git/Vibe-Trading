@@ -79,7 +79,13 @@
        直开路径点位缺失/不自洽（_resolve_entry_params 返回 None）同样落
        'no_plan_params' 拒单留痕，不再静默吞单（gann 曾在此隐形消失）；
   5. 参数：止损/止盈/杠杆/仓位% 优先用 twelve_sim_config 覆盖
-     （优先级 信号级 > tf组级 > 币种级），否则用 plan_json 系统推荐；杠杆双兜底：
+     （优先级 信号级 > tf组级 > 币种级），否则用 plan_json 系统推荐；
+     任务L 周期纪律五字段（tp_mode/tp_rr_ratio/tp_pct_factor/sl_mode/
+     sl_atr_mult，RuoYi jarvis_sim_config 回读、同三级粒度）在信号基线
+     之上调整 SL/TP：tp fixed_rr=固定盈亏比 / pct_factor=TP 距离缩放，
+     sl atr_buffer=按 N×ATR 外拓；NULL/follow_signal=现行为零变化；
+     参数缺失或调整不自洽回退跟随信号并落 discipline_fallback 标记；
+     调整后照常过 T2 改写与 T3/门禁链（纪律不绕过地板）；杠杆双兜底：
      配置/plan 均未给时按止损距离自动推荐（S1 解耦：打到止损亏≈保证金25%
      twelve_auto_lev_loss_frac，夹 [1, TF 分层上限 twelve_max_leverage]；
      显式杠杆尊重显式值但同样夹 TF 上限）；
@@ -299,6 +305,10 @@ CONTEXT_TAG_CN = {
     "tf_lowconf": "信号置信低于该周期置信档（降权放行）",
     "sl_widened": "窄止损改写到地板距离 + qty 同比例缩（1R 守恒）",
     "sl_tight_deweight": "止损距离低于地板（deweight 档降权放行）",
+    "tp_fixed_rr": "周期纪律：TP 按固定盈亏比合成（tp_rr_ratio×SL 距离）",
+    "tp_pct_factor": "周期纪律：TP 距离按信号 TP 距离×系数缩放",
+    "sl_atr_buffer": "周期纪律：SL 在信号位基础上按 N×ATR 外拓",
+    "discipline_fallback": "周期纪律参数缺失/不自洽，回退跟随信号（follow_signal）",
 }
 
 # D6 门禁降权标签 → (系数配置键, 默认系数)；_apply_gate_tags 查表打标
@@ -470,10 +480,26 @@ def init_db() -> None:
                 stop_loss_pct   REAL,
                 take_profit_pct REAL,
                 enabled         INTEGER NOT NULL DEFAULT 1,
+                tp_mode         TEXT,
+                tp_rr_ratio     REAL,
+                tp_pct_factor   REAL,
+                sl_mode         TEXT,
+                sl_atr_mult     REAL,
                 UNIQUE (symbol, scope_tf, scope_system)
             )
             """
         )
+        # 任务L 周期纪律字段（RuoYi jarvis_sim_config 回读；NULL=跟随信号现行为）：
+        # 旧库幂等加列（与下方 position/trade _upgrades 同哲学，重复加列=已升级）
+        for _ddl in ("ALTER TABLE twelve_sim_config ADD COLUMN tp_mode TEXT",
+                     "ALTER TABLE twelve_sim_config ADD COLUMN tp_rr_ratio REAL",
+                     "ALTER TABLE twelve_sim_config ADD COLUMN tp_pct_factor REAL",
+                     "ALTER TABLE twelve_sim_config ADD COLUMN sl_mode TEXT",
+                     "ALTER TABLE twelve_sim_config ADD COLUMN sl_atr_mult REAL"):
+            try:
+                conn.execute(_ddl)
+            except Exception:  # noqa: BLE001 — duplicate column = 已升级过
+                pass
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS twelve_sim_signal_log (
@@ -644,8 +670,14 @@ def _fetch_bars(symbol: str, tf: str) -> list[dict] | None:
 
 # ─────────────────────────── 配置：upsert / 读取 / 合并 ───────────────────────────
 
+# 任务L 周期纪律字段（2026-08-13）：tp_mode/sl_mode 为 TEXT 枚举
+# （follow_signal 或 NULL=跟随信号现行为 / fixed_rr / pct_factor / atr_buffer），
+# 数值参数与 mode 配对使用；同样走「信号级 > tf组级 > 币种级」三级非空覆盖。
 _CFG_FIELDS = ("principal", "leverage", "position_pct",
-               "stop_loss_pct", "take_profit_pct", "enabled")
+               "stop_loss_pct", "take_profit_pct", "enabled",
+               "tp_mode", "tp_rr_ratio", "tp_pct_factor",
+               "sl_mode", "sl_atr_mult")
+_CFG_STR_FIELDS = ("tp_mode", "sl_mode")
 
 
 def upsert_config(symbol: str, scope_tf: str | None = None,
@@ -736,8 +768,10 @@ def effective_config(symbol: str, tf: str, system: str,
                      rows: list[dict] | None = None) -> dict:
     """槽位生效配置：逐字段按 信号级 > tf组级 > 币种级 取第一个非 NULL。
 
-    返回 {principal, leverage, position_pct, stop_loss_pct, take_profit_pct, enabled}；
-    leverage/position_pct/sl/tp 可能为 None（= 交给 plan_json / 默认值兜底）。
+    返回 {principal, leverage, position_pct, stop_loss_pct, take_profit_pct,
+    enabled, tp_mode, tp_rr_ratio, tp_pct_factor, sl_mode, sl_atr_mult}；
+    leverage/position_pct/sl/tp 可能为 None（= 交给 plan_json / 默认值兜底）；
+    周期纪律五字段（任务L）NULL=跟随信号现行为，消费口径见 _resolve_entry_params。
     """
     sym = _norm_symbol(symbol)
     if rows is None:
@@ -753,12 +787,22 @@ def effective_config(symbol: str, tf: str, system: str,
             levels[2] = r
     out: dict = {"principal": DEFAULT_PRINCIPAL, "leverage": None,
                  "position_pct": None, "stop_loss_pct": None,
-                 "take_profit_pct": None, "enabled": True}
+                 "take_profit_pct": None, "enabled": True,
+                 "tp_mode": None, "tp_rr_ratio": None, "tp_pct_factor": None,
+                 "sl_mode": None, "sl_atr_mult": None}
     for field in _CFG_FIELDS:
         for lv in levels:
             if lv is not None and lv.get(field) is not None:
-                out[field] = (bool(lv[field]) if field == "enabled"
-                              else float(lv[field]))
+                if field == "enabled":
+                    out[field] = bool(lv[field])
+                elif field in _CFG_STR_FIELDS:
+                    # 纪律 mode 列（TEXT 枚举）：空串视同 NULL 继续向低优先级找
+                    s = str(lv[field]).strip().lower()
+                    if not s:
+                        continue
+                    out[field] = s
+                else:
+                    out[field] = float(lv[field])
                 break
     return out
 
@@ -1048,14 +1092,102 @@ def _risk_gate(tf: str, entry: float, params: dict,
     return None
 
 
+def _apply_tf_discipline(direction: str, price: float, eff: dict,
+                         sl: float, tp: float, tf: str | None,
+                         sym: str | None) -> tuple[float, float, list[dict]]:
+    """任务L 周期纪律：按 eff 三级合并后的纪律字段调整 SL/TP → (sl, tp, tags)。
+
+    字段全 NULL / mode='follow_signal' = 现行为零变化（tags 空）。
+    顺序先 SL 后 TP（fixed_rr 的盈亏比基于最终 SL 才自洽）：
+      · sl_mode='atr_buffer'：SL 在信号位基础上按 sl_atr_mult × 该 TF ATR14%
+        （相对现价）向不利侧外拓（多头更低/空头更高）；ATR 取数失败、
+        mult 缺失/非正、外拓后价格非法 → 回退 follow_signal 并打
+        discipline_fallback 标记（可用性优先，纪律坏了不拦开仓）；
+      · tp_mode='fixed_rr'：TP = entry ± tp_rr_ratio × |entry−最终SL|；
+      · tp_mode='pct_factor'：TP 距离 = 信号 TP 距离 × tp_pct_factor。
+    生效纪律打纯标记 tag（factor=1 不降权），落 context_tags 可复盘；
+    未知 mode 视同 follow_signal（前向兼容，不拦不改）。
+    调整结果仍会照常过 T2 改写与 T3/门禁链（纪律字段不绕过地板）。
+    """
+    tags: list[dict] = []
+    long_side = direction == "long"
+
+    def _fallback(which: str, why: str) -> None:
+        tags.append({"tag": "discipline_fallback", "factor": 1.0,
+                     "note": f"{CONTEXT_TAG_CN['discipline_fallback']}"
+                             f"：{which}——{why}"})
+
+    sl_mode = str(eff.get("sl_mode") or "follow_signal").lower()
+    if sl_mode == "atr_buffer":
+        mult = eff.get("sl_atr_mult")
+        atr_pct = None
+        if sym:
+            try:
+                atr_pct, _b = _ctx_atr(sym, tf or "")
+            except Exception:  # noqa: BLE001 — 纪律坏了不拦开仓
+                atr_pct = None
+        if not mult or float(mult) <= 0:
+            _fallback("sl_mode=atr_buffer", "sl_atr_mult 缺失或非正")
+        elif not atr_pct:
+            _fallback("sl_mode=atr_buffer", "ATR 取数不可用")
+        else:
+            pad = float(mult) * float(atr_pct) / 100.0 * price
+            new_sl = sl - pad if long_side else sl + pad
+            if new_sl > 0 and ((long_side and new_sl < price)
+                               or (not long_side and new_sl > price)):
+                sl = new_sl
+                tags.append({"tag": "sl_atr_buffer", "factor": 1.0,
+                             "note": f"{CONTEXT_TAG_CN['sl_atr_buffer']}"
+                                     f"：{mult:g}×ATR {atr_pct:g}% 外拓"})
+            else:
+                _fallback("sl_mode=atr_buffer", "外拓后价位不自洽")
+
+    tp_mode = str(eff.get("tp_mode") or "follow_signal").lower()
+    if tp_mode == "fixed_rr":
+        ratio = eff.get("tp_rr_ratio")
+        if not ratio or float(ratio) <= 0:
+            _fallback("tp_mode=fixed_rr", "tp_rr_ratio 缺失或非正")
+        else:
+            risk = abs(price - sl)
+            new_tp = price + float(ratio) * risk if long_side \
+                else price - float(ratio) * risk
+            if new_tp > 0 and ((long_side and new_tp > price)
+                               or (not long_side and new_tp < price)):
+                tp = new_tp
+                tags.append({"tag": "tp_fixed_rr", "factor": 1.0,
+                             "note": f"{CONTEXT_TAG_CN['tp_fixed_rr']}"
+                                     f"：RR={float(ratio):g}"})
+            else:
+                _fallback("tp_mode=fixed_rr", "合成 TP 价位不自洽")
+    elif tp_mode == "pct_factor":
+        factor = eff.get("tp_pct_factor")
+        if not factor or float(factor) <= 0:
+            _fallback("tp_mode=pct_factor", "tp_pct_factor 缺失或非正")
+        else:
+            dist = abs(tp - price) * float(factor)
+            new_tp = price + dist if long_side else price - dist
+            if new_tp > 0 and dist > 0:
+                tp = new_tp
+                tags.append({"tag": "tp_pct_factor", "factor": 1.0,
+                             "note": f"{CONTEXT_TAG_CN['tp_pct_factor']}"
+                                     f"：×{float(factor):g}"})
+            else:
+                _fallback("tp_mode=pct_factor", "缩放后 TP 价位不自洽")
+    return sl, tp, tags
+
+
 def _resolve_entry_params(direction: str, price: float, eff: dict,
-                          plan: dict | None, tf: str | None = None) -> dict | None:
+                          plan: dict | None, tf: str | None = None,
+                          sym: str | None = None) -> dict | None:
     """合成一笔开仓参数：配置覆盖 > plan_json 推荐 > 默认/自动推荐。
 
     杠杆兜底顺序：配置 > plan_json > 按止损距离自动推荐（S1：显式杠杆尊重
-    显式值但夹 TF 分层上限；自动推荐按 twelve_auto_lev_loss_frac 解耦）。
-    返回 {stop_loss, take_profit, leverage, position_pct} 或 None（点位不自洽，
-    如现价已越过计划止损/止盈 → 宁缺毋滥不硬开）。
+    显式值但夹 TF 分层上限；自动推荐按 twelve_auto_lev_loss_frac 解耦，
+    基于纪律调整后的最终 SL 计算——SL 外拓时杠杆随之下调，风险口径自洽）。
+    任务L：SL/TP 合成并方向校验后，先过 _apply_tf_discipline 周期纪律调整
+    （NULL=零变化；生效纪律/回退均落 context_tags），再算杠杆。
+    返回 {stop_loss, take_profit, leverage, position_pct[, context_tags]}
+    或 None（点位不自洽，如现价已越过计划止损/止盈 → 宁缺毋滥不硬开）。
     """
     plan = plan or {}
     pos_pct = eff.get("position_pct")
@@ -1086,6 +1218,9 @@ def _resolve_entry_params(direction: str, price: float, eff: dict,
     if not long_side and not (tp < price < sl):
         return None
 
+    # 任务L：周期纪律调整（信号基线之上按配置改写 SL/TP，NULL=零变化）
+    sl, tp, disc_tags = _apply_tf_discipline(direction, price, eff, sl, tp, tf, sym)
+
     lev = eff.get("leverage")
     if lev is None:
         lev = plan.get("leverage")
@@ -1094,8 +1229,11 @@ def _resolve_entry_params(direction: str, price: float, eff: dict,
         lev = min(max(1.0, float(lev)), _tf_max_leverage(tf))
     else:
         lev = _auto_leverage(price, sl, tf)
-    return {"stop_loss": sl, "take_profit": tp,
-            "leverage": lev, "position_pct": pos_pct}
+    out = {"stop_loss": sl, "take_profit": tp,
+           "leverage": lev, "position_pct": pos_pct}
+    if disc_tags:
+        out["context_tags"] = disc_tags
+    return out
 
 
 def _max_drawdown_pct(principal: float, balance_series: list[float]) -> float | None:
@@ -2197,7 +2335,8 @@ def _fill_plan(conn, pen: dict, plan: dict | None, eff: dict, balance: float,
     """
     entry = float(pen["entry_price"])
     tf = str(pen["tf"])
-    params = _resolve_entry_params(str(pen["direction"]), entry, eff, plan, tf)
+    params = _resolve_entry_params(str(pen["direction"]), entry, eff, plan, tf,
+                                   sym=str(pen["symbol"]))
     if params is None:
         return None
     _widen_stop_to_floor(tf, entry, params)   # T2：窄止损先改写/降权再过门禁
@@ -2572,7 +2711,8 @@ def _cycle_symbol(sym: str, cfg: dict, now: float | None = None) -> dict:
                     _do_plan(conn, sym, tf, system, direction, pts, eff, price, ts))
                 continue
             # 计划缺失（无点位可比）/ 现价已处于可成交侧 → 按现价立即成交（现有口径）
-            params = _resolve_entry_params(direction, price, eff, plan, tf)
+            params = _resolve_entry_params(direction, price, eff, plan, tf,
+                                           sym=sym)
             if params is None:
                 # 点位缺失或不自洽，宁缺毋滥不开仓——但不再静默吞单：落
                 # reject 留痕可复盘（gann 曾因方向信号不带 SL/TP 在此隐形
