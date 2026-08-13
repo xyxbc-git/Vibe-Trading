@@ -8326,6 +8326,55 @@ def api_events_status():
         return JSONResponse({"ok": False, "error": repr(exc)[:300]}, status_code=500)
 
 
+# ─────────────────── FVG 失衡区（K 线图叠加层数据源，R8）───────────────────
+
+def _fvg_zones_with_ts(df, zones: list) -> list:
+    """[R8] zone.created_i（df 位置下标）→ created_ts（形成 bar 开盘毫秒时间戳）。
+
+    前端 lightweight-charts 以 bar 时间为稳定锚点画矩形带（历史前插不漂移）；
+    下标越界/字段异常时 created_ts 置 None（前端跳过该 zone，不砸渲染）。
+    """
+    out = []
+    for z in zones or []:
+        try:
+            i = int(z.get("created_i", -1))
+            ts = int(df["time"].iloc[i]) if 0 <= i < len(df) else None
+        except Exception:  # noqa: BLE001
+            ts = None
+        out.append({**z, "created_ts": ts})
+    return out
+
+
+@app.get("/api/fvg")
+def api_fvg(symbol: str = "BTCUSDT", tf: str = "15m", max_zones: int = 10):
+    """FVG（三根 K 线价格失衡缺口）区列表：K 线图叠加层数据源。
+
+    复用 fetch_klines_df 取数（现有缓存/防封禁预算体系，封禁期自动降级磁盘
+    缓存不出网）+ jarvis_fvg.detect（只读复用）；每个 zone 附 created_ts 供
+    前端对齐蜡烛。60s 缓存与 K 线轮询同频。
+    """
+    import jarvis_twelve_systems as jts
+    sym = symbol.upper().replace("-", "").replace("/", "")
+    if not sym.endswith(("USDT", "USDC")):
+        sym += "USDT"
+    iv = tf if tf in {"1m", "5m", "15m", "30m", "1h", "4h", "1d"} else "15m"
+    mz = max(1, min(int(max_zones), 30))
+
+    def _calc():
+        import jarvis_fvg as jfvg
+        df = jts.fetch_klines_df(sym, iv, 300)
+        if df is None or len(df) < 30:
+            return {"ok": False, "reason": "K线数据不足或拉取失败",
+                    "symbol": sym, "tf": iv, "zones": []}
+        out = jfvg.detect(df, max_zones=mz)
+        return {"ok": bool(out.get("ok")), "reason": out.get("reason"),
+                "symbol": sym, "tf": iv, "as_of": time.time(),
+                "price": out.get("price"), "atr": out.get("atr"),
+                "zones": _fvg_zones_with_ts(df, out.get("zones") or [])}
+
+    return JSONResponse(_cached(f"fvg:{sym}:{iv}:{mz}", 60, _calc))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="贾维斯可视化仪表盘")
     # [Sprint0] 监听地址/端口默认从配置中心读（dashboard_host/dashboard_port，
