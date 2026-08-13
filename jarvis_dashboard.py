@@ -4097,6 +4097,30 @@ def _last_bar_closed(df, iv: str) -> bool:
         return False
 
 
+def _annotate_tf_suitability(signals: list, iv: str) -> None:
+    """[信号篇 · 任务S] 就地标注每个信号的周期适配性（纯展示层字段）。
+
+    suitable_tfs：该系统的适用周期列表（[] = TF 无关恒适用，如马丁/套利；
+    None = 配置未登记该系统，不拦）；tf_suitable：当前请求周期是否适用。
+    只加字段不改共识/引擎行为；配置读取失败静默跳过，绝不拖垮信号主体。
+    矩阵定案见 贾维斯-12信号周期适配-20260813.md，配置键 twelve_suitable_tfs。
+    """
+    try:
+        import jarvis_config as jc_mod
+        smap = jc_mod.get("twelve_suitable_tfs")
+        smap = smap if isinstance(smap, dict) else {}
+        for s in signals:
+            tfs = smap.get(s.get("system"))
+            if isinstance(tfs, list):
+                s["suitable_tfs"] = tfs
+                s["tf_suitable"] = (not tfs) or (iv in tfs)
+            else:
+                s["suitable_tfs"] = None
+                s["tf_suitable"] = True
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _closed_signals_for_record(jts, df, iv: str, basis, live_out: dict,
                                live_px: float, bar_closed: bool):
     """[信号篇 P0-1] 变更历史去污染：只允许「已收盘 bar 口径」的信号入库。
@@ -4155,6 +4179,8 @@ def api_twelve_signals(symbol: str = "BTCUSDT", tf: str = "4h", closed_only: int
                         s["last_change_at"] = m["changed_at"]
         except Exception:  # noqa: BLE001
             pass
+        # [任务S] 周期适配标注放在落库之后：展示层字段不进 twelve_signal_state/changes
+        _annotate_tf_suitability(out["signals"], iv)
         return {"ok": True, "symbol": sym, "tf": iv, "as_of": time.time(),
                 "price": px, "bar_closed": bar_closed,
                 "signals": out["signals"], "consensus": out["consensus"]}

@@ -232,6 +232,24 @@ DEFAULTS: dict = {
     # sl_below_atr（止损埋在噪声带内，扫损概率极高）。0=关闭该门禁；
     # ATR 取数失败自动放行（可用性优先，静态档仍兜底）。
     "twelve_sl_atr_mult": 1.5,
+    # ── [信号篇 · 任务S] 12 系统 × 周期适配矩阵（展示层过滤，共识/引擎零变更）──
+    # system → 适用周期列表；[] = TF 无关（资金管理/套利类恒展示）。
+    # 定案依据三方互证（项目实测 > SYSTEM_META 经验 > 经典文献溯源），
+    # 详见 贾维斯-12信号周期适配-20260813.md；用户可在配置中心按口味增删。
+    "twelve_suitable_tfs": {
+        "turtle": ["4h", "1d"],           # 原版 20/55 日 Donchian 日线系统
+        "dow": ["4h", "1d"],              # 主趋势结构为日/周线设计，盘中属噪声
+        "elliott": ["1h", "4h", "1d"],    # 低周期浪型主观噪声大
+        "volatility": ["1h", "4h", "1d"], # 布林/ATR 挤压 D1 信噪比最高（环境提示）
+        "gann": ["4h", "1d"],             # 时间窗以日/周线锚点为主（已不参与投票）
+        "chanlun": ["15m", "30m", "1h", "4h"],  # 级别递归，低于 15m 笔中枢近似噪声大
+        "rule123": ["1h", "4h", "1d"],    # Trader Vic 偏好日线，M5/M15 多假信号
+        "gap": ["1h", "4h", "1d"],        # 缺口本为日线概念，加密 7×24 低周期缺口稀少
+        "martingale": [],                 # 资金管理系统，与 TF 无关
+        "oscillator": ["15m", "30m", "1h"],  # 短周期均值回归；4h+ 信号过疏
+        "triple_rsi": ["1h", "4h"],       # 三重平滑滞后大，5m/15m 实测不达标（T8）
+        "arbitrage": [],                  # 期现基差与 K 线周期无关
+    },
     "twelve_auto_lev_loss_frac": 0.25,  # 自动杠杆目标：打到 SL 亏保证金 25%（旧 0.5）
     "twelve_max_leverage": {          # 杠杆上限（按 TF 分层）；显式杠杆也夹此上限
         "5m": 5, "15m": 8, "30m": 10, "1h": 12, "4h": 15, "1d": 20},
@@ -380,6 +398,7 @@ GROUPS: dict[str, str] = {
     "twelve_max_open_positions": "trading",
     "twelve_reopen_cooldown_min": "trading",
     "twelve_sim_fee_pct": "trading",
+    "twelve_suitable_tfs": "signal",
     # risk——风控红线
     "max_portfolio_risk_pct": "risk",
     "max_effective_pct": "risk",
