@@ -173,6 +173,25 @@ export function planTriggerState(
   return { kind: "waiting", distPct };
 }
 
+/**
+ * [R7] market 类计划徽标：实时建议语义。市价计划每次信号重算都贴现价重新生成，
+ * 不是挂着的订单——「等待/接近触发」措辞会让用户误以为是长期挂单（进而推断
+ * 「早该打损了为什么还在」）。
+ */
+function LiveAdviceBadge({ size = "sm" }: { size?: "sm" | "md" }) {
+  return (
+    <span
+      className={clsx(
+        "inline-flex items-center gap-0.5 rounded bg-jarvis-blue/10 text-jarvis-blue/90 whitespace-nowrap cursor-help",
+        size === "md" ? "text-[10px] px-1.5 py-0.5" : "text-[9px] px-1 py-px",
+      )}
+      title="此为当前价位的即时建议，不是挂单：入场/止损/止盈随每次信号重算贴现价更新，不存在「被打损后还挂着」的情况。按此下单请以你下单时点的实际点位为准"
+    >
+      实时建议 · 随信号刷新
+    </span>
+  );
+}
+
 /** 触发状态徽标（含现价与入场位的实时距离，管理「推荐价≠现价」的预期） */
 function TriggerStateBadge({
   state,
@@ -581,7 +600,9 @@ function PlanChips({
   onShowZone?: () => void;
 }) {
   const side = planSide(plan);
-  const trig = planTriggerState(plan, side, price);
+  // [R7] market=实时建议（随重算贴现价刷新，不判触发态）；pullback/breakout=挂单三态
+  const isMarket = plan.entry_type === "market";
+  const trig = isMarket ? null : planTriggerState(plan, side, price);
   const passed = trig?.kind === "passed";
   return (
     <div className="flex flex-wrap items-center gap-1 mt-1.5">
@@ -590,11 +611,15 @@ function PlanChips({
       {/* 入场方式徽标：回踩/突破=挂单语义，推荐价≠现价是设计意图 */}
       <span
         className="text-[9px] px-1 py-px rounded bg-jarvis-bg text-jarvis-text-secondary whitespace-nowrap cursor-help"
-        title="入场方式：回踩/突破类计划是「挂单」——等价格走到入场位才成交，不是按现价立即下单"
+        title={
+          isMarket
+            ? "市价入场：按信号刷新时点的现价给出的即时建议"
+            : "入场方式：回踩/突破类计划是「挂单」——等价格走到入场位才成交，不是按现价立即下单"
+        }
       >
         {entryTypeCn(plan.entry_type, side)}
       </span>
-      <TriggerStateBadge state={trig} />
+      {isMarket ? <LiveAdviceBadge /> : <TriggerStateBadge state={trig} />}
       <span className={clsx("text-[10px] px-1.5 py-0.5 rounded bg-jarvis-blue/10 text-jarvis-blue font-mono", passed && "opacity-50 line-through")}>
         入 {formatPrice(plan.entry)}
       </span>
@@ -624,7 +649,9 @@ function PlanDetail({
   onShowZone?: () => void;
 }) {
   const side = planSide(plan);
-  const trig = planTriggerState(plan, side, price);
+  // [R7] market=实时建议（随重算贴现价刷新，不判触发态）；pullback/breakout=挂单三态
+  const isMarket = plan.entry_type === "market";
+  const trig = isMarket ? null : planTriggerState(plan, side, price);
   const passed = trig?.kind === "passed";
   return (
     <div className="mt-2 pt-2 border-t border-jarvis-border/60 space-y-1.5">
@@ -634,11 +661,15 @@ function PlanDetail({
           {mismatch && <MismatchWarn />}
           <span
             className="text-[10px] text-jarvis-text-secondary cursor-help"
-            title="入场方式：回踩/突破类计划是「挂单」——等价格走到入场位才成交，不是按现价立即下单"
+            title={
+              isMarket
+                ? "市价入场：按信号刷新时点的现价给出的即时建议"
+                : "入场方式：回踩/突破类计划是「挂单」——等价格走到入场位才成交，不是按现价立即下单"
+            }
           >
             {entryTypeCn(plan.entry_type, side)}
           </span>
-          <TriggerStateBadge state={trig} size="md" />
+          {isMarket ? <LiveAdviceBadge size="md" /> : <TriggerStateBadge state={trig} size="md" />}
         </span>
         <span className="flex items-center gap-1.5">
           {onShowZone && <ZoneChartEntry onShowZone={onShowZone} size="md" />}
