@@ -19,6 +19,7 @@ import TradeRecords from "./pages/TradeRecords";
 import SettingsPage from "./pages/Settings";
 import SignalHistory from "./pages/SignalHistory";
 import DepthView from "./pages/DepthView";
+import Mentor from "./pages/Mentor";
 import FootprintChart from "./components/FootprintChart/FootprintChart";
 
 function PageGuard({ children, name }: { children: React.ReactNode; name: string }) {
@@ -35,6 +36,7 @@ export default function App() {
         <Route path="footprint" element={<PageGuard name="足迹图"><div className="h-full min-h-0"><FootprintChart /></div></PageGuard>} />
         <Route path="trading" element={<PageGuard name="交易中心"><Trading /></PageGuard>} />
         <Route path="trades" element={<PageGuard name="交易记录"><TradeRecords /></PageGuard>} />
+        <Route path="mentor" element={<PageGuard name="情绪风控导师"><Mentor /></PageGuard>} />
         <Route path="funding-arb" element={<PageGuard name="费率套利"><FundingArb /></PageGuard>} />
         <Route path="strategy" element={<PageGuard name="策略实验室"><StrategyLab /></PageGuard>} />
         <Route path="ai-strategy" element={<PageGuard name="AI 策略工坊"><AIStrategy /></PageGuard>} />

@@ -23,6 +23,7 @@ import {
   BookOpenCheck,
   GitCommitHorizontal,
   Footprints,
+  GraduationCap,
 } from "lucide-react";
 
 interface NavItem {
@@ -54,6 +55,7 @@ const NAV_GROUPS: NavGroup[] = [
     title: "交易",
     items: [
       { to: "/trading", label: "交易", icon: <ArrowLeftRight size={20} /> },
+      { to: "/mentor", label: "导师", icon: <GraduationCap size={20} /> },
       { to: "/trades", label: "记录", icon: <History size={20} /> },
       { to: "/funding-arb", label: "套利", icon: <Scale size={20} /> },
       { to: "/scalper", label: "短线", icon: <Zap size={20} /> },
