@@ -603,6 +603,7 @@ function SignalCell({
   onExplain,
   onShowZone,
   onShowStructure,
+  unsuitable = false,
 }: {
   signal: TwelveSignal;
   /** 该 symbol×tf 的胜率回测缓存；null = 尚未回测（不渲染胜率行） */
@@ -624,6 +625,8 @@ function SignalCell({
   onShowZone?: (plan: SignalTradePlan, name: string) => void;
   /** 跳 K 线图叠加该系统的趋势结构（关键位 + 区间 + 方向标注） */
   onShowStructure?: (signal: TwelveSignal) => void;
+  /** [任务S] 该系统不适用当前周期：灰化 + 标注 + 不显示交易计划点位（防看错下单） */
+  unsuitable?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const dir = normalizeDirection(signal.direction);
@@ -649,8 +652,19 @@ function SignalCell({
         "text-left rounded-lg border p-3 transition-colors hover:border-jarvis-blue/50",
         meta.bg,
         meta.border,
+        unsuitable && "opacity-60",
       )}
     >
+      {/* [任务S] 不适用周期标注 + 适用周期角标（防按此周期的信号下单） */}
+      {unsuitable && (
+        <p className="flex items-center gap-1 text-[9px] px-1.5 py-0.5 mb-1.5 rounded bg-jarvis-yellow/15 text-jarvis-yellow">
+          <AlertTriangle size={9} className="shrink-0" />
+          不适用本周期，仅参考
+          {(signal.suitable_tfs?.length ?? 0) > 0 && (
+            <span className="font-mono">· 适用 {signal.suitable_tfs!.join("/")}</span>
+          )}
+        </p>
+      )}
       <div className="flex items-center justify-between gap-1">
         <span className="text-xs font-medium text-jarvis-text truncate">
           {signal.name_cn || signal.system}
@@ -789,8 +803,10 @@ function SignalCell({
         />
       )}
 
-      {/* 交易计划：折叠态紧凑 chips / 展开态完整点位（均带醒目多空徽章 + K线区间入口） */}
-      {signal.trade_plan &&
+      {/* 交易计划：折叠态紧凑 chips / 展开态完整点位（均带醒目多空徽章 + K线区间入口）。
+          [任务S] 不适用周期的卡片不显示任何计划点位——防看错下单的关键 */}
+      {!unsuitable &&
+        signal.trade_plan &&
         (() => {
           const plan = signal.trade_plan;
           // 方向可判定才给「K线区间」入口（区间几何要求多空明确）
@@ -1050,13 +1066,19 @@ export default function SignalBoard({ symbol, tf, onTfChange }: SignalBoardProps
   // 过期响应的 ok:false 不算当前口径失败
   const failed = Boolean(error) || (!stale && data != null && !data.ok);
   const signals = data?.ok && !stale ? (data.signals ?? []) : [];
-  const bullCount = signals.filter(
+  // [任务S] 周期适配分组：tf_suitable===false 的系统默认隐藏（可折叠展开查看）。
+  // 严格 ===false：旧后端无此字段时不过滤，行为与现状一致
+  const suitableSignals = signals.filter((s) => s.tf_suitable !== false);
+  const unsuitableSignals = signals.filter((s) => s.tf_suitable === false);
+  const [showUnsuitable, setShowUnsuitable] = useState(false);
+  // 顶部涨跌计数只统计适用本周期的系统（隐藏的不该影响快览判读）
+  const bullCount = suitableSignals.filter(
     (s) => normalizeDirection(s.direction) === "bullish",
   ).length;
-  const bearCount = signals.filter(
+  const bearCount = suitableSignals.filter(
     (s) => normalizeDirection(s.direction) === "bearish",
   ).length;
-  const neutralCount = signals.length - bullCount - bearCount;
+  const neutralCount = suitableSignals.length - bullCount - bearCount;
 
   // 整体解读：把 12 套投票分布 + 各系统方向摘要交给 AI 解释「为什么分歧」
   const explainConsensus = () => {
@@ -1075,7 +1097,7 @@ export default function SignalBoard({ symbol, tf, onTfChange }: SignalBoardProps
                 votes: data.consensus.votes,
               }
             : null,
-          per_system: signals.map((s) => ({
+          per_system: suitableSignals.map((s) => ({
             name_cn: s.name_cn || s.system,
             direction: s.direction,
             strength: s.strength,
@@ -1226,7 +1248,7 @@ export default function SignalBoard({ symbol, tf, onTfChange }: SignalBoardProps
       ) : (
         <>
           <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-3">
-            {signals.map((s, i) => (
+            {suitableSignals.map((s, i) => (
               <SignalCell
                 key={`${s.system}-${i}`}
                 signal={s}
@@ -1243,6 +1265,39 @@ export default function SignalBoard({ symbol, tf, onTfChange }: SignalBoardProps
               />
             ))}
           </div>
+          {/* [任务S] 不适用本周期的系统默认隐藏，折叠条可展开查看（灰化+无点位） */}
+          {unsuitableSignals.length > 0 && (
+            <>
+              <button
+                onClick={() => setShowUnsuitable((v) => !v)}
+                className="w-full mt-3 flex items-center justify-center gap-1.5 text-[11px] px-2 py-1.5 rounded-md border border-jarvis-border text-jarvis-text-secondary hover:text-jarvis-text hover:bg-white/5 transition-colors"
+                title="这些系统按周期适配矩阵不适用当前周期（如道氏理论不适用 5m）——按它们的信号在本周期下单容易看错。展开仅供参考，不显示交易计划点位"
+              >
+                <ChevronDown
+                  size={12}
+                  className={clsx("transition-transform", showUnsuitable && "rotate-180")}
+                />
+                已隐藏 {unsuitableSignals.length} 个不适用本周期（{dataTf}）的系统
+                {showUnsuitable ? "，点击收起" : "，点击展开"}
+              </button>
+              {showUnsuitable && (
+                <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-3 mt-3">
+                  {unsuitableSignals.map((s, i) => (
+                    <SignalCell
+                      key={`${s.system}-unsuit-${i}`}
+                      signal={s}
+                      winrate={winrate}
+                      currentTf={dataTf}
+                      price={data?.price ?? null}
+                      onExplain={explainSignal}
+                      onShowStructure={showStructureOnChart}
+                      unsuitable
+                    />
+                  ))}
+                </div>
+              )}
+            </>
+          )}
           <p className="text-[10px] text-jarvis-text-secondary mt-2">
             {winrate ? (
               <>

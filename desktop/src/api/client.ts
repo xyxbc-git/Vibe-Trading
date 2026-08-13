@@ -1970,6 +1970,10 @@ export interface TwelveSignal {
   updated_at?: number | null;
   /** 该信号最近一次实质变更时间（unix 秒；从未变更/旧后端为 null） */
   last_change_at?: number | null;
+  /** 当前请求周期是否适用该系统（任务S 展示层过滤；旧后端缺失=不过滤） */
+  tf_suitable?: boolean;
+  /** 该系统的适用周期列表（[]=TF 无关恒适用；null/缺失=未登记不拦） */
+  suitable_tfs?: string[] | null;
 }
 
 // ─── 信号变更历史（GET /api/twelve/signal-history*）───
