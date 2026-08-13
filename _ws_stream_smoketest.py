@@ -163,7 +163,7 @@ check("health 计数已累计", h["streams"]["aggTrade"]["msg_count"] >= 13,
 # ── 8. 配置键落位（GROUPS+BOUNDS+DEFAULTS 三处）──
 import jarvis_config as jc
 ws_keys = [k for k in jc.DEFAULTS if k.startswith("ws_")]
-check("ws 配置键 11 个齐全", len(ws_keys) == 11, str(ws_keys))
+check("ws 配置键 13 个齐全", len(ws_keys) == 13, str(ws_keys))
 check("ws 键全部有分组", all(k in jc.GROUPS for k in ws_keys),
       str([k for k in ws_keys if k not in jc.GROUPS]))
 check("ws_enabled 默认开", jc.DEFAULTS["ws_enabled"] is True)
@@ -172,6 +172,28 @@ check("数值键有 BOUNDS", all(k in jc.BOUNDS for k in
 check("枚举键有 ENUMS", "ws_kline_interval" in jc.ENUMS and "ws_depth_speed" in jc.ENUMS)
 check("buffer 夹护栏", jc.clamp("ws_buffer_size", 5) == 100
       and jc.clamp("ws_buffer_size", 10 ** 9) == 100_000)
+
+# ── 9. [任务N1v2·B] 大订阅拆块 + 退避冷却档 + 补订回执帧容错 ──
+check("拆块默认 15", jws._chunk_size({}) == 15)
+check("拆块可配置", jws._chunk_size({"ws_max_streams_per_conn": 8}) == 8)
+check("拆块 0=不拆", jws._chunk_size({"ws_max_streams_per_conn": 0}) == 0)
+check("拆块坏值回退默认", jws._chunk_size({"ws_max_streams_per_conn": "x"}) == 15)
+_s30 = [f"s{i}@kline_5m" for i in range(30)]
+_mx = jws._chunk_size({"ws_max_streams_per_conn": 15})
+_head, _pend = _s30[:_mx], [_s30[i:i + _mx] for i in range(_mx, len(_s30), _mx)]
+check("30 流拆 15+15", len(_head) == 15 and len(_pend) == 1 and len(_pend[0]) == 15)
+_s31 = _s30 + ["s30@aggTrade"]
+_p31 = [_s31[i:i + _mx] for i in range(_mx, len(_s31), _mx)]
+check("31 流拆 15+15+1", len(_p31) == 2 and len(_p31[-1]) == 1
+      and sum(len(c) for c in _p31) + _mx == 31)
+check("冷却档未达阈值不动", jws.cold_backoff(60.0, 9, {"ws_backoff_cold_s": 300}) == 60.0)
+check("冷却档达阈值抬升", jws.cold_backoff(60.0, 10, {"ws_backoff_cold_s": 300}) == 300.0)
+check("冷却档不降低更大 wait", jws.cold_backoff(500.0, 12, {"ws_backoff_cold_s": 300}) == 500.0)
+check("冷却档坏配置回退 300", jws.cold_backoff(60.0, 10, {"ws_backoff_cold_s": "x"}) == 300.0)
+check("SUBSCRIBE 回执帧忽略不抛",
+      jws.dispatch(json.dumps({"result": None, "id": 1})) == (None, None))
+check("配置键 BOUNDS 落位", "ws_max_streams_per_conn" in jc.BOUNDS
+      and "ws_backoff_cold_s" in jc.BOUNDS)
 
 print(f"\n{'=' * 40}\n通过 {PASS} / 失败 {FAIL}")
 raise SystemExit(1 if FAIL else 0)

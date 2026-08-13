@@ -179,6 +179,12 @@ DEFAULTS: dict = {
     "ws_buffer_size": 1000,           # 每流每币种环形缓冲容量（条）
     "ws_reconnect_base_s": 1.0,       # 重连指数退避起始秒
     "ws_reconnect_max_s": 60.0,       # 重连退避封顶秒
+    # [任务N1v2·B] 握手 URL 最大携带流数：超出部分连接后 SUBSCRIBE 补订
+    # （0=不拆走旧行为）。15 = dashboard 实证可稳定握手的订阅尺寸。
+    "ws_max_streams_per_conn": 15,
+    # [任务N1v2·B] 连续 10 次未成通路后的退避冷却档秒（降握手风暴——
+    # 币安 WS 握手按 IP 限 300 次/5min，共享代理 IP 上第三方也在消耗）。
+    "ws_backoff_cold_s": 300.0,
     "ws_force_order_persist": True,   # forceOrder 是否落 SQLite 保留历史
     # ── REST 防限频（2026-08-05 任务L：共享代理 IP 反复被币安封禁的根因治理）──
     # 单进程对单主机每分钟实际出网请求上限（含重试）；超限走缓存/短错。
@@ -503,6 +509,8 @@ GROUPS: dict[str, str] = {
     "ws_buffer_size": "data",
     "ws_reconnect_base_s": "data",
     "ws_reconnect_max_s": "data",
+    "ws_max_streams_per_conn": "data",
+    "ws_backoff_cold_s": "data",
     "ws_force_order_persist": "data",
     "rest_max_per_min": "data",
     "data_source_mode": "data",
@@ -608,6 +616,8 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "ws_buffer_size": (100, 100_000),
     "ws_reconnect_base_s": (0.5, 30.0),
     "ws_reconnect_max_s": (5.0, 600.0),
+    "ws_max_streams_per_conn": (0, 512),      # 0=不拆；币安单连接流上限 1024
+    "ws_backoff_cold_s": (60.0, 1800.0),
     "rest_max_per_min": (30, 2000),
     "sigcol_backfill_bars": (0, 480),         # 上限 < fetch_klines 单次 500 根天花板
     "sigcol_queue_max": (256, 65_536),

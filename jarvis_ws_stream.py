@@ -356,6 +356,33 @@ def next_backoff(attempt: int, base_s: float, max_s: float) -> float:
         return 5.0
 
 
+# [任务N1v2·B] 连续未成通路的冷却档阈值：fail_streak 达标后退避不再按 60s
+# 常规封顶，抬升到 ws_backoff_cold_s——45+ 次/小时的握手风暴本身就是共享 IP
+# 连接压力（币安 WS 握手按 IP 限 300 次/5min，第三方也在消耗同一预算）。
+_COLD_STREAK_N = 10
+
+
+def _chunk_size(cfg: dict | None = None) -> int:
+    """握手 URL 最大携带流数（0=不拆，旧行为）。配置层异常回退默认 15。"""
+    c = cfg if cfg is not None else _cfg()
+    try:
+        return max(0, int(c.get("ws_max_streams_per_conn", 15)))
+    except (TypeError, ValueError):
+        return 15
+
+
+def cold_backoff(wait: float, fail_streak: int, cfg: dict | None = None) -> float:
+    """连续 fail_streak 次未成通路时把 wait 抬到冷却档；未达标原样返回。"""
+    if fail_streak < _COLD_STREAK_N:
+        return wait
+    c = cfg if cfg is not None else _cfg()
+    try:
+        cold = float(c.get("ws_backoff_cold_s") or 300.0)
+    except (TypeError, ValueError):
+        cold = 300.0
+    return max(wait, cold)
+
+
 # ────────────────────────── WS 主循环 ──────────────────────────
 
 # [T10] 本进程订阅覆写（start() 传入；None=走配置，见 build_stream_names）
@@ -419,7 +446,19 @@ async def _connect_once(symbols: list[str], cfg: dict, plan_idx: int) -> str:
         _META["last_error"] = "所有流开关均关闭"
         await asyncio.sleep(30)
         return "closed"
-    url = base + "?streams=" + "/".join(streams)
+    # [任务N1v2·B] 大订阅拆块：握手 URL 只携带首块 ≤ws_max_streams_per_conn 条，
+    # 其余连接成功后用 SUBSCRIBE 消息补订（币安组合流支持热订阅，回执帧
+    # {"result":null,"id":N} 无 stream 键、dispatch 天然忽略）。
+    # 背景：采集器 30 流组合 URL 四策略连续 45+ 次握手超时，而 dashboard 同机
+    # 同代理 15 流握手秒连——把握手尺寸对齐实证可用的小订阅，降低被代理/
+    # 交易所握手侧限制拒绝的面积。0 = 不拆（旧行为）。
+    url_streams, pending = streams, []
+    max_per = _chunk_size(cfg)
+    if 0 < max_per < len(streams):
+        url_streams = streams[:max_per]
+        pending = [streams[i:i + max_per]
+                   for i in range(max_per, len(streams), max_per)]
+    url = base + "?streams=" + "/".join(url_streams)
     proxy = (os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
              if use_proxy else None)
     _META["url_streams"] = len(streams)
@@ -436,6 +475,17 @@ async def _connect_once(symbols: list[str], cfg: dict, plan_idx: int) -> str:
             _log(f"已连接 [{name}]（{len(streams)} 流 / {len(symbols)} 币）"
                  + (f" via {proxy}" if proxy else " 直连")
                  + ("；⚠️ 现货回退模式 forceOrder 降级" if market == "spot" else ""))
+            if pending:
+                for i, chunk in enumerate(pending, 1):
+                    try:
+                        await ws.send_json({"method": "SUBSCRIBE",
+                                            "params": chunk, "id": i})
+                    except Exception as exc:  # noqa: BLE001
+                        _log(f"[{name}] 补订阅第 {i} 批失败"
+                             f"（{len(chunk)} 流）: {exc!r}，重连重来")
+                        return "closed"
+                _log(f"[{name}] 握手携带 {len(url_streams)} 流，连接后补订 "
+                     f"{len(pending)} 批共 {len(streams) - len(url_streams)} 流")
             got_first = False
             while not _STOP.is_set():
                 if time.time() - _META["connected_at"] > MAX_CONN_AGE_S:
@@ -499,6 +549,11 @@ async def _run_ws(symbols: list[str]) -> None:
             break
         wait = next_backoff(attempt, float(cfg.get("ws_reconnect_base_s") or 1.0),
                             float(cfg.get("ws_reconnect_max_s") or 60.0))
+        cold = cold_backoff(wait, fail_streak, cfg)
+        if cold > wait:
+            wait = cold
+            _log(f"连续 {fail_streak} 次未成通路，退避升冷却档 {wait:g}s"
+                 "（降握手风暴，蹭共享 IP 连接预算恢复窗）")
         attempt += 1
         _META["reconnects"] += 1
         _log(f"{wait:.1f}s 后重连（第 {attempt} 次退避，策略 "
