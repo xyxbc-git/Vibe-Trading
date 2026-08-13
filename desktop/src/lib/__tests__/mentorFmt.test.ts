@@ -5,7 +5,7 @@
  * 样本取自 2026-08-13 真后端 POST /api/mentor/plan 实测响应（字段形态逐项覆盖）。
  */
 import { describe, expect, it } from "vitest";
-import { fmtEvidence, normalizeVerdict } from "@/api/mentor";
+import { fmtEvidence, normalizeVerdict, normalizeStats, lossStreak, type MentorPlanRow } from "@/api/mentor";
 
 /** 真后端实测响应 verdict 段（节选自 plan_id=4 的原始 JSON） */
 const REAL_VERDICT = {
@@ -114,5 +114,88 @@ describe("normalizeVerdict（后端 verdict 入口归一化）", () => {
   it("非对象输入返回 null（调用方走 mock 兜底）", () => {
     expect(normalizeVerdict(null)).toBeNull();
     expect(normalizeVerdict("bad")).toBeNull();
+  });
+
+  it("V2：rules 区段归一化透传（后端 V1 军规引擎）", () => {
+    const v = normalizeVerdict({
+      light: "green", score: 90, items: [], summary: "ok",
+      rules: [
+        { key: "min_rr", level: "pass", evidence: "RR 2.5 ≥ 1.5" },
+        { key: "emotion_cap", level: "fail", evidence: { emo: 5 } }, // 对象证据也不崩
+      ],
+    });
+    expect(v!.rules).toHaveLength(2);
+    expect(v!.rules![0].level).toBe("pass");
+    expect(typeof fmtEvidence(v!.rules![1].evidence)).toBe("string");
+  });
+});
+
+describe("normalizeStats（真后端两种形态归一化）", () => {
+  it("实测形态：by_light 按灯色键控对象 + followed/ignored + n/closed/win_rate 命名", () => {
+    // 2026-08-13 真后端 GET /api/mentor/stats 实测响应原样
+    const s = normalizeStats({
+      ok: true, days: 90, total: 6,
+      by_light: {
+        green: { n: 1, closed: 0, win_rate: null, avg_pnl_pct: null },
+        yellow: { n: 4, closed: 1, win_rate: null, avg_pnl_pct: null },
+        red: { n: 1, closed: 0, win_rate: null, avg_pnl_pct: null },
+      },
+      followed: { n: 1, closed: 1, win_rate: null, avg_pnl_pct: null },
+      ignored: { n: 0, closed: 0, win_rate: null, avg_pnl_pct: null },
+      note: null,
+    });
+    expect(s).not.toBeNull();
+    expect(s!.by_light).toHaveLength(3);
+    const yellow = s!.by_light.find((b) => b.light === "yellow")!;
+    expect(yellow.plans).toBe(4);
+    expect(yellow.executed).toBe(1);
+    expect(yellow.win_rate_pct).toBeNull();
+    expect(s!.followed.trades).toBe(1);
+    expect(s!.not_followed.trades).toBe(0);
+  });
+
+  it("契约形态：by_light 数组 + not_followed", () => {
+    const s = normalizeStats({
+      ok: true,
+      by_light: [
+        { light: "green", plans: 5, executed: 3, wins: 2, losses: 1, win_rate_pct: 66.7, total_pnl_pct: 4.2 },
+      ],
+      followed: { trades: 3, win_rate_pct: 66.7, total_pnl_pct: 4.2 },
+      not_followed: { trades: 1, win_rate_pct: 0, total_pnl_pct: -2.1 },
+    });
+    expect(s!.by_light[0].plans).toBe(5);
+    expect(s!.not_followed.total_pnl_pct).toBe(-2.1);
+  });
+
+  it("win_rate 0-1 小数自动转百分比", () => {
+    const s = normalizeStats({
+      ok: true,
+      by_light: { green: { n: 2, closed: 2, win_rate: 0.5 }, yellow: {}, red: {} },
+      followed: { n: 2, closed: 2, win_rate: 1 },
+      ignored: {},
+    });
+    expect(s!.by_light.find((b) => b.light === "green")!.win_rate_pct).toBe(50);
+    expect(s!.followed.win_rate_pct).toBe(100);
+  });
+
+  it("ok:false / 缺 by_light → null（调用方落 mock）", () => {
+    expect(normalizeStats({ ok: false })).toBeNull();
+    expect(normalizeStats({ ok: true })).toBeNull();
+  });
+});
+
+describe("lossStreak（今日连亏计数）", () => {
+  const row = (t: string, result: "win" | "loss"): MentorPlanRow =>
+    ({
+      id: t, created_at: `2026-08-13 ${t}`, symbol: "BTCUSDT", direction: "long",
+      entry: 1, stop_loss: 0.9, take_profit: 1.2,
+      outcome: { result, followed: true },
+    }) as MentorPlanRow;
+
+  it("尾部连续亏损计数，胜单打断", () => {
+    expect(lossStreak([row("09:00:00", "loss"), row("10:00:00", "loss")])).toBe(2);
+    expect(lossStreak([row("09:00:00", "loss"), row("10:00:00", "win"), row("11:00:00", "loss")])).toBe(1);
+    expect(lossStreak([row("09:00:00", "loss"), row("10:00:00", "win")])).toBe(0);
+    expect(lossStreak([])).toBe(0);
   });
 });

@@ -1,12 +1,13 @@
 import { useMemo, useState } from "react";
 import { clsx } from "clsx";
-import { Scale, PenLine, RefreshCw } from "lucide-react";
+import { Scale, PenLine, RefreshCw, Activity } from "lucide-react";
 import { useApi } from "@/hooks/useApi";
 import { useSymbol } from "@/hooks/useSymbol";
 import {
   mentorApi,
   recallIntent,
   calcRR,
+  lossStreak,
   LIGHT_CN,
   type MentorLight,
   type MentorOutcomeInput,
@@ -33,16 +34,87 @@ function pnlCls(v: number | null | undefined) {
   return n > 0 ? "text-jarvis-green" : "text-jarvis-red";
 }
 
+/** 行为透视数据（V2）：当日计数 / 分时段胜率 / 情绪高低分对比——由台账行现算，
+ *  真/mock 数据同一口径；后端 V1 行为字段上线后可在 normalizeStats 优先采用 */
+function useBehavior(rows: MentorPlanRow[]) {
+  return useMemo(() => {
+    const today = (() => {
+      const d = new Date();
+      const p = (n: number) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+    })();
+    const todayRows = rows.filter((r) => String(r.created_at ?? "").startsWith(today));
+    const executed = (r: MentorPlanRow) =>
+      r.outcome
+        ? r.outcome.result !== "skipped"
+        : recallIntent(r.id)?.action === "executed";
+
+    // 分时段（按创建时刻小时分桶）
+    const buckets = [
+      { key: "dawn", label: "凌晨 0-6", lo: 0, hi: 6 },
+      { key: "morning", label: "早 6-12", lo: 6, hi: 12 },
+      { key: "afternoon", label: "午 12-18", lo: 12, hi: 18 },
+      { key: "night", label: "晚 18-24", lo: 18, hi: 24 },
+    ].map((b) => {
+      const done = rows.filter((r) => {
+        if (!r.outcome || (r.outcome.result !== "win" && r.outcome.result !== "loss")) return false;
+        const hh = Number(String(r.created_at ?? "").slice(11, 13));
+        return Number.isFinite(hh) && hh >= b.lo && hh < b.hi;
+      });
+      const wins = done.filter((r) => r.outcome?.result === "win").length;
+      return {
+        ...b,
+        trades: done.length,
+        winRate: done.length ? Math.round((wins / done.length) * 100) : null,
+      };
+    });
+
+    // 情绪高分（≥4）vs 低分（≤3）
+    const emoBucket = (hi: boolean) => {
+      const done = rows.filter(
+        (r) =>
+          r.outcome &&
+          (r.outcome.result === "win" || r.outcome.result === "loss") &&
+          r.emotion_score != null &&
+          (hi ? Number(r.emotion_score) >= 4 : Number(r.emotion_score) <= 3),
+      );
+      const wins = done.filter((r) => r.outcome?.result === "win").length;
+      const pnl = done.reduce((s, r) => s + (Number(r.outcome?.pnl_pct) || 0), 0);
+      return {
+        trades: done.length,
+        winRate: done.length ? Math.round((wins / done.length) * 100) : null,
+        pnl: Math.round(pnl * 100) / 100,
+      };
+    };
+
+    return {
+      todaySubmitted: todayRows.length,
+      todayExecuted: todayRows.filter(executed).length,
+      todayLossStreak: lossStreak(todayRows),
+      buckets,
+      emotionHigh: emoBucket(true),
+      emotionLow: emoBucket(false),
+    };
+  }, [rows]);
+}
+
 /** 信任看板：改变行为的核心反馈，视觉最重 */
-function TrustBoard({ mock, refreshKey }: { mock: boolean; refreshKey: number }) {
+function TrustBoard({ mock, refreshKey, rows }: { mock: boolean; refreshKey: number; rows: MentorPlanRow[] }) {
   const { data: stats } = useApi(() => mentorApi.stats(), [refreshKey]);
+  const behavior = useBehavior(rows);
 
   const red = stats?.by_light.find((b) => b.light === "red");
   const green = stats?.by_light.find((b) => b.light === "green");
   const yellow = stats?.by_light.find((b) => b.light === "yellow");
   const fmtRate = (v: number | null | undefined) => (v == null ? "—" : `${v}%`);
-  const fmtPnl = (v: number | undefined) =>
+  const fmtPnl = (v: number | null | undefined) =>
     v == null ? "—" : `${v > 0 ? "+" : ""}${v.toFixed(2)}%`;
+  /** 桶盈亏展示：mock 口径累计 total、真后端口径均值 avg（标「均」） */
+  const bucketPnl = (b?: { total_pnl_pct?: number; avg_pnl_pct?: number | null }) => {
+    if (!b) return "—";
+    if (b.avg_pnl_pct != null) return `均 ${fmtPnl(b.avg_pnl_pct)}`;
+    return fmtPnl(b.total_pnl_pct);
+  };
 
   return (
     <div className="card mb-4 border-jarvis-blue/40">
@@ -66,9 +138,9 @@ function TrustBoard({ mock, refreshKey }: { mock: boolean; refreshKey: number })
             {fmtRate(stats?.followed.win_rate_pct)}
           </p>
           <p className="mt-1 text-xs text-jarvis-text-secondary">
-            {stats?.followed.trades ?? 0} 笔 · 累计{" "}
-            <span className={pnlCls(stats?.followed.total_pnl_pct)}>
-              {fmtPnl(stats?.followed.total_pnl_pct)}
+            {stats?.followed.trades ?? 0} 笔 · 盈亏{" "}
+            <span className={pnlCls(stats?.followed.avg_pnl_pct ?? stats?.followed.total_pnl_pct)}>
+              {bucketPnl(stats?.followed)}
             </span>
           </p>
         </div>
@@ -78,9 +150,9 @@ function TrustBoard({ mock, refreshKey }: { mock: boolean; refreshKey: number })
             {fmtRate(stats?.not_followed.win_rate_pct)}
           </p>
           <p className="mt-1 text-xs text-jarvis-text-secondary">
-            {stats?.not_followed.trades ?? 0} 笔 · 累计{" "}
-            <span className={pnlCls(stats?.not_followed.total_pnl_pct)}>
-              {fmtPnl(stats?.not_followed.total_pnl_pct)}
+            {stats?.not_followed.trades ?? 0} 笔 · 盈亏{" "}
+            <span className={pnlCls(stats?.not_followed.avg_pnl_pct ?? stats?.not_followed.total_pnl_pct)}>
+              {bucketPnl(stats?.not_followed)}
             </span>
           </p>
         </div>
@@ -101,12 +173,107 @@ function TrustBoard({ mock, refreshKey }: { mock: boolean; refreshKey: number })
               </p>
               <p className="text-[11px] text-jarvis-text-secondary">
                 执行 {b?.executed ?? 0}/{b?.plans ?? 0} 笔 ·{" "}
-                <span className={pnlCls(b?.total_pnl_pct)}>{fmtPnl(b?.total_pnl_pct)}</span>
+                <span className={pnlCls(b?.avg_pnl_pct ?? b?.total_pnl_pct)}>{bucketPnl(b)}</span>
               </p>
             </div>
           );
         })}
       </div>
+
+      {/* V2 行为透视：当日纪律计数 / 分时段胜率 / 情绪高低分对比（台账现算） */}
+      <div className="mt-4 border-t border-jarvis-border/60 pt-3">
+        <p className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-jarvis-text-secondary">
+          <Activity size={13} className="text-jarvis-blue" />
+          行为透视 · 按当前筛选范围现算
+        </p>
+
+        {/* 当日计数 */}
+        <div className="grid grid-cols-3 gap-3">
+          <div className="rounded-lg border border-jarvis-border bg-jarvis-bg/60 p-3 text-center">
+            <p className="text-[11px] text-jarvis-text-secondary">今日提交</p>
+            <p className="font-mono text-xl font-semibold text-jarvis-text">{behavior.todaySubmitted}</p>
+          </div>
+          <div className="rounded-lg border border-jarvis-border bg-jarvis-bg/60 p-3 text-center">
+            <p className="text-[11px] text-jarvis-text-secondary">今日执行</p>
+            <p className="font-mono text-xl font-semibold text-jarvis-text">{behavior.todayExecuted}</p>
+          </div>
+          <div
+            className={clsx(
+              "rounded-lg border p-3 text-center",
+              behavior.todayLossStreak >= 2
+                ? "border-jarvis-red/60 bg-jarvis-red/10"
+                : "border-jarvis-border bg-jarvis-bg/60",
+            )}
+          >
+            <p className="text-[11px] text-jarvis-text-secondary">今日连亏</p>
+            <p
+              className={clsx(
+                "font-mono text-xl font-semibold",
+                behavior.todayLossStreak >= 2 ? "text-jarvis-red" : "text-jarvis-text",
+              )}
+            >
+              {behavior.todayLossStreak}
+            </p>
+          </div>
+        </div>
+        {behavior.todayLossStreak >= 2 && (
+          <div className="mt-2 rounded-lg border border-jarvis-red/50 bg-jarvis-red/15 px-3 py-2 text-center text-sm font-bold text-jarvis-red">
+            已连亏 {behavior.todayLossStreak} 笔——今天建议收手，明天再来
+          </div>
+        )}
+
+        {/* 分时段胜率 */}
+        <div className="mt-3">
+          <p className="mb-1.5 text-[11px] text-jarvis-text-secondary">
+            分时段胜率（按开单时刻）——看看自己哪个时段是重灾区
+          </p>
+          <div className="space-y-1.5">
+            {behavior.buckets.map((b) => (
+              <div key={b.key} className="flex items-center gap-2">
+                <span className="w-16 shrink-0 text-[11px] text-jarvis-text-secondary">{b.label}</span>
+                <div className="h-3.5 flex-1 overflow-hidden rounded bg-jarvis-bg">
+                  {b.winRate != null && (
+                    <div
+                      className={clsx("h-full rounded", b.winRate >= 50 ? "bg-jarvis-green/70" : "bg-jarvis-red/70")}
+                      style={{ width: `${Math.max(b.winRate, 4)}%` }}
+                    />
+                  )}
+                </div>
+                <span className="w-20 shrink-0 text-right font-mono text-[11px] text-jarvis-text-secondary">
+                  {b.winRate != null ? `${b.winRate}% · ${b.trades}笔` : "无成交"}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* 情绪高分 vs 低分 */}
+        <div className="mt-3 grid grid-cols-2 gap-3">
+          {[
+            { label: "冲动开的单（情绪≥4分）", d: behavior.emotionHigh, danger: true },
+            { label: "平静开的单（情绪≤3分）", d: behavior.emotionLow, danger: false },
+          ].map(({ label, d, danger }) => (
+            <div
+              key={label}
+              className={clsx(
+                "rounded-lg border p-3 text-center",
+                danger ? "border-jarvis-red/30 bg-jarvis-red/5" : "border-jarvis-green/30 bg-jarvis-green/5",
+              )}
+            >
+              <p className="text-[11px] text-jarvis-text-secondary">{label}</p>
+              {d.trades >= 3 ? (
+                <p className="mt-1 font-mono text-sm text-jarvis-text">
+                  胜率 {d.winRate}% · <span className={pnlCls(d.pnl)}>{d.pnl > 0 ? "+" : ""}{d.pnl}%</span>
+                  <span className="ml-1 text-[10px] text-jarvis-text-secondary">（{d.trades}笔）</span>
+                </p>
+              ) : (
+                <p className="mt-1 text-xs text-jarvis-text-secondary">数据积累中（{d.trades}/3 笔）</p>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+
       <p className="mt-3 text-xs text-jarvis-text-secondary">
         红灯单胜率持续低于绿灯单，就是导师值得信的证据；反过来也一样——这里不讲道理，只看账。
       </p>
@@ -256,7 +423,7 @@ export default function LedgerPage() {
 
   return (
     <div>
-      <TrustBoard mock={Boolean(data?.mock)} refreshKey={refreshKey} />
+      <TrustBoard mock={Boolean(data?.mock)} refreshKey={refreshKey} rows={rows} />
 
       {/* 筛选条 */}
       <div className="mb-3 flex items-center gap-2">

@@ -1,13 +1,14 @@
 import { useState } from "react";
 import { clsx } from "clsx";
-import { GraduationCap, NotebookPen, BookOpenCheck } from "lucide-react";
+import { GraduationCap, NotebookPen, BookOpenCheck, ShieldCheck } from "lucide-react";
 import ErrorBoundary from "@/components/common/ErrorBoundary";
 import PlanForm from "./PlanForm";
 import VerdictCard from "./VerdictCard";
 import LedgerPage from "./LedgerPage";
+import RulesTab from "./RulesTab";
 import { mentorApi, type MentorPlanInput, type MentorPlanResponse } from "@/api/mentor";
 
-type Tab = "plan" | "ledger";
+type Tab = "plan" | "ledger" | "rules";
 
 /**
  * 情绪风控导师（任务 O）：
@@ -45,6 +46,7 @@ export default function Mentor() {
           [
             { key: "plan", label: "开单前 · 写计划", icon: <NotebookPen size={15} /> },
             { key: "ledger", label: "复盘 · 信任看板", icon: <BookOpenCheck size={15} /> },
+            { key: "rules", label: "我的军规", icon: <ShieldCheck size={15} /> },
           ] as { key: Tab; label: string; icon: React.ReactNode }[]
         ).map((t) => (
           <button
@@ -79,6 +81,7 @@ export default function Mentor() {
                   planId={current.plan_id}
                   verdict={current.verdict}
                   mock={current.mock}
+                  rulesLocal={current.rules_local}
                 />
               </ErrorBoundary>
             ) : (
@@ -95,9 +98,13 @@ export default function Mentor() {
             )}
           </div>
         </div>
-      ) : (
+      ) : tab === "ledger" ? (
         <ErrorBoundary fallbackTitle="复盘台账渲染异常">
           <LedgerPage />
+        </ErrorBoundary>
+      ) : (
+        <ErrorBoundary fallbackTitle="军规管理渲染异常">
+          <RulesTab />
         </ErrorBoundary>
       )}
     </div>

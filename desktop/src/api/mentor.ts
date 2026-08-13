@@ -41,6 +41,8 @@ export interface MentorVerdict {
   summary: string;
   /** 红灯冷静期（分钟）；无冷静期缺省 */
   cooldown_min?: number;
+  /** V2：个人军规逐条核对（后端 V1 rules 区段；mock 时本地军规现算） */
+  rules?: MentorVerdictItem[];
 }
 
 /** 下单前计划输入 */
@@ -66,6 +68,8 @@ export interface MentorPlanResponse {
   verdict: MentorVerdict;
   /** true = 本地 mock 结果（后端未就绪） */
   mock?: boolean;
+  /** true = 军规区段为本地核对（后端 V1 rules 未就绪时前端兜底） */
+  rules_local?: boolean;
   error?: string;
 }
 
@@ -112,13 +116,156 @@ export interface MentorLightStat {
   losses: number;
   win_rate_pct: number | null;
   total_pnl_pct: number;
+  /** 真后端口径为均值（avg_pnl_pct）时落此字段，展示层标「均」 */
+  avg_pnl_pct?: number | null;
+}
+
+export interface MentorTrustBucket {
+  trades: number;
+  win_rate_pct: number | null;
+  total_pnl_pct: number;
+  avg_pnl_pct?: number | null;
 }
 
 export interface MentorStats {
   ok: boolean;
   by_light: MentorLightStat[];
-  followed: { trades: number; win_rate_pct: number | null; total_pnl_pct: number };
-  not_followed: { trades: number; win_rate_pct: number | null; total_pnl_pct: number };
+  followed: MentorTrustBucket;
+  not_followed: MentorTrustBucket;
+  mock?: boolean;
+  error?: string;
+}
+
+/** 真后端 /mentor/stats 归一化：
+ * 兼容两种形态——契约版（by_light 数组 / not_followed）与实测版
+ * （by_light 按灯色键控对象 / ignored / n·closed·win_rate·avg_pnl_pct 命名）。 */
+export function normalizeStats(raw: unknown): MentorStats | null {
+  if (!raw || typeof raw !== "object") return null;
+  const d = raw as Record<string, unknown>;
+  if (d.ok === false) return null;
+
+  const num = (v: unknown): number => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  const rate = (v: unknown): number | null => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return null;
+    // 0-1 视为小数占比转百分比；>1 视为已是百分比
+    return Math.round((n <= 1 ? n * 100 : n) * 10) / 10;
+  };
+
+  const liftBucket = (b: unknown): MentorTrustBucket => {
+    const o = (b && typeof b === "object" ? b : {}) as Record<string, unknown>;
+    return {
+      trades: num(o.trades ?? o.closed ?? o.n),
+      win_rate_pct: rate(o.win_rate_pct ?? o.win_rate),
+      total_pnl_pct: num(o.total_pnl_pct),
+      avg_pnl_pct: o.avg_pnl_pct != null ? num(o.avg_pnl_pct) : undefined,
+    };
+  };
+
+  const lights: MentorLight[] = ["green", "yellow", "red"];
+  let byLight: MentorLightStat[];
+  if (Array.isArray(d.by_light)) {
+    byLight = (d.by_light as Record<string, unknown>[]).map((b) => ({
+      light: (lights.includes(b.light as MentorLight) ? b.light : "yellow") as MentorLight,
+      plans: num(b.plans ?? b.n),
+      executed: num(b.executed ?? b.closed),
+      wins: num(b.wins),
+      losses: num(b.losses),
+      win_rate_pct: rate(b.win_rate_pct ?? b.win_rate),
+      total_pnl_pct: num(b.total_pnl_pct),
+      avg_pnl_pct: b.avg_pnl_pct != null ? num(b.avg_pnl_pct) : undefined,
+    }));
+  } else if (d.by_light && typeof d.by_light === "object") {
+    const m = d.by_light as Record<string, Record<string, unknown>>;
+    byLight = lights.map((light) => {
+      const b = m[light] ?? {};
+      return {
+        light,
+        plans: num(b.n ?? b.plans),
+        executed: num(b.closed ?? b.executed),
+        wins: num(b.wins),
+        losses: num(b.losses),
+        win_rate_pct: rate(b.win_rate ?? b.win_rate_pct),
+        total_pnl_pct: num(b.total_pnl_pct),
+        avg_pnl_pct: b.avg_pnl_pct != null ? num(b.avg_pnl_pct) : undefined,
+      };
+    });
+  } else {
+    return null;
+  }
+
+  return {
+    ok: true,
+    by_light: byLight,
+    followed: liftBucket(d.followed),
+    not_followed: liftBucket(d.not_followed ?? d.ignored),
+  };
+}
+
+// ─── V2：个人军规（我的军规引擎） ───
+
+/** 单条军规。builtin 默认军规只可改参/停用；custom 自定义为文本型提醒 */
+export interface MentorRule {
+  id: string | number;
+  /** 内置规则语义 key（与后端 V1 对齐；自定义规则为 custom_*） */
+  kind: string;
+  text: string;
+  /** 数值参数（可编辑；无参数规则为 null） */
+  param: number | null;
+  param_label?: string | null;
+  enabled: boolean;
+  builtin: boolean;
+}
+
+/** 默认 8 条军规（mock 种子；kind 与后端 V1 引擎对齐可平滑切换） */
+export const DEFAULT_RULES: MentorRule[] = [
+  { id: "r1", kind: "max_daily_trades", text: "单日最多开单数", param: 3, param_label: "单/天", enabled: true, builtin: true },
+  { id: "r2", kind: "stop_after_losses", text: "当日连亏即停手", param: 2, param_label: "笔", enabled: true, builtin: true },
+  { id: "r3", kind: "min_rr", text: "盈亏比不得低于", param: 1.5, param_label: "", enabled: true, builtin: true },
+  { id: "r4", kind: "max_risk_pct", text: "单笔预亏不超过本金", param: 5, param_label: "%", enabled: true, builtin: true },
+  { id: "r5", kind: "no_late_night", text: "凌晨（0-6 点）不开单", param: null, enabled: true, builtin: true },
+  { id: "r6", kind: "emotion_cap", text: "情绪自评达到该分不开单", param: 4, param_label: "分", enabled: true, builtin: true },
+  { id: "r7", kind: "must_have_reason", text: "必须写开单理由（拒绝纯凭感觉）", param: null, enabled: true, builtin: true },
+  { id: "r8", kind: "no_martingale", text: "亏损后不加仓摊平（文本提醒）", param: null, enabled: true, builtin: true },
+];
+
+const RULES_KEY = "jarvis.mentor.rules";
+
+function loadLocalRules(): MentorRule[] {
+  try {
+    const raw = localStorage.getItem(RULES_KEY);
+    if (!raw) return DEFAULT_RULES.map((r) => ({ ...r }));
+    const arr = JSON.parse(raw) as MentorRule[];
+    return Array.isArray(arr) && arr.length ? arr : DEFAULT_RULES.map((r) => ({ ...r }));
+  } catch {
+    return DEFAULT_RULES.map((r) => ({ ...r }));
+  }
+}
+
+function saveLocalRules(rules: MentorRule[]) {
+  try {
+    localStorage.setItem(RULES_KEY, JSON.stringify(rules));
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 后端规则行归一化（字段名容错） */
+function normalizeRule(raw: Record<string, unknown>, i: number): MentorRule {
+  return {
+    id: (raw.id as string | number) ?? `srv${i}`,
+    kind: typeof raw.kind === "string" ? raw.kind : typeof raw.key === "string" ? raw.key : `rule${i}`,
+    text: typeof raw.text === "string" ? raw.text : typeof raw.name === "string" ? raw.name : `规则 ${i + 1}`,
+    param: Number.isFinite(Number(raw.param)) && raw.param != null ? Number(raw.param) : null,
+    param_label: typeof raw.param_label === "string" ? raw.param_label : null,
+    enabled: raw.enabled !== false && raw.enabled !== 0,
+    builtin: raw.builtin === true || raw.custom !== true,
+  };
+}
+
+export interface MentorRulesResponse {
+  ok: boolean;
+  rules: MentorRule[];
   mock?: boolean;
   error?: string;
 }
@@ -195,7 +342,21 @@ export function fmtEvidence(v: unknown): string {
   }
 }
 
-/** 后端 verdict 归一化：light/score/items 容错（字段缺失/形态漂移不崩 UI） */
+/** 裁决证据行数组归一化（items 与 V2 rules 区段共用） */
+function normalizeItems(raw: unknown, prefix: string): MentorVerdictItem[] {
+  if (!Array.isArray(raw)) return [];
+  return (raw as Record<string, unknown>[]).map((it, i) => ({
+    key: typeof it.key === "string" ? it.key : `${prefix}${i}`,
+    level: (it.level === "pass" || it.level === "warn" || it.level === "fail"
+      ? it.level
+      : "warn") as "pass" | "warn" | "fail",
+    weight: Number.isFinite(Number(it.weight)) ? Number(it.weight) : 0,
+    evidence: it.evidence,
+    detail: it.detail,
+  }));
+}
+
+/** 后端 verdict 归一化：light/score/items/rules 容错（字段缺失/形态漂移不崩 UI） */
 export function normalizeVerdict(raw: unknown): MentorVerdict | null {
   if (!raw || typeof raw !== "object") return null;
   const v = raw as Record<string, unknown>;
@@ -204,24 +365,15 @@ export function normalizeVerdict(raw: unknown): MentorVerdict | null {
       ? v.light
       : "yellow";
   const score = Number(v.score);
-  const items = Array.isArray(v.items)
-    ? (v.items as Record<string, unknown>[]).map((it, i) => ({
-        key: typeof it.key === "string" ? it.key : `item${i}`,
-        level: (it.level === "pass" || it.level === "warn" || it.level === "fail"
-          ? it.level
-          : "warn") as "pass" | "warn" | "fail",
-        weight: Number.isFinite(Number(it.weight)) ? Number(it.weight) : 0,
-        evidence: it.evidence,
-        detail: it.detail,
-      }))
-    : [];
   const cooldown = Number(v.cooldown_min);
+  const rules = normalizeItems(v.rules, "rule");
   return {
     light,
     score: Number.isFinite(score) ? Math.round(score) : 0,
-    items,
+    items: normalizeItems(v.items, "item"),
     summary: fmtEvidence(v.summary),
     ...(Number.isFinite(cooldown) && cooldown > 0 ? { cooldown_min: cooldown } : {}),
+    ...(rules.length ? { rules } : {}),
   };
 }
 
@@ -432,6 +584,150 @@ function mockStats(rows: MentorPlanRow[]): MentorStats {
   return { ok: true, by_light: byLight, followed: bucket(true), not_followed: bucket(false), mock: true };
 }
 
+// ─── V2：本地军规核对（后端 V1 rules 区段未就绪时的兜底；逐条人话证据） ───
+
+function todayStrLocal(): string {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** 今日连亏笔数（按创建时间升序取尾部连续 loss） */
+export function lossStreak(rows: MentorPlanRow[]): number {
+  const done = rows
+    .filter((r) => r.outcome && (r.outcome.result === "win" || r.outcome.result === "loss"))
+    .sort((a, b) => String(a.created_at ?? "").localeCompare(String(b.created_at ?? "")));
+  let streak = 0;
+  for (let i = done.length - 1; i >= 0; i--) {
+    if (done[i].outcome?.result === "loss") streak++;
+    else break;
+  }
+  return streak;
+}
+
+/**
+ * 用本地启用军规逐条核对当前计划（异步：计数类规则读当日台账）。
+ * 返回 MentorVerdictItem[]（weight=0，渲染层军规区不展示权重）。
+ */
+export async function evalRulesLocal(input: MentorPlanInput): Promise<MentorVerdictItem[]> {
+  const rules = loadLocalRules().filter((r) => r.enabled);
+  if (!rules.length) return [];
+
+  // 今日台账（真/mock 同一入口；失败时计数类规则降级为 warn）
+  let todayRows: MentorPlanRow[] | null = null;
+  try {
+    const res = await mentorApi.plans(undefined, 1);
+    const today = todayStrLocal();
+    todayRows = res.rows.filter((r) => String(r.created_at ?? "").startsWith(today));
+  } catch {
+    todayRows = null;
+  }
+
+  const rr = calcRR(input.direction, input.entry, input.stop_loss, input.take_profit);
+  const hour = new Date().getHours();
+  const out: MentorVerdictItem[] = [];
+
+  for (const r of rules) {
+    const item = (level: "pass" | "warn" | "fail", evidence: string): MentorVerdictItem => ({
+      key: r.kind,
+      level,
+      weight: 0,
+      evidence,
+    });
+    switch (r.kind) {
+      case "max_daily_trades": {
+        const cap = r.param ?? 3;
+        if (todayRows == null) {
+          out.push(item("warn", `单日≤${cap}单：台账不可达，未核对`));
+        } else {
+          const n = todayRows.length;
+          out.push(
+            n >= cap
+              ? item("fail", `今天已提交 ${n} 单，达到你定的上限 ${cap} 单——这单是超额的`)
+              : item("pass", `今天第 ${n + 1} 单，在你定的 ${cap} 单以内`),
+          );
+        }
+        break;
+      }
+      case "stop_after_losses": {
+        const cap = r.param ?? 2;
+        if (todayRows == null) {
+          out.push(item("warn", `连亏${cap}笔停手：台账不可达，未核对`));
+        } else {
+          const streak = lossStreak(todayRows);
+          out.push(
+            streak >= cap
+              ? item("fail", `今天已连亏 ${streak} 笔，按你的军规该收手了`)
+              : item("pass", `今日连亏 ${streak} 笔，未触发 ${cap} 笔停手线`),
+          );
+        }
+        break;
+      }
+      case "min_rr": {
+        const min = r.param ?? MIN_RR;
+        if (rr == null) out.push(item("fail", `盈亏比无法计算（点位不自洽），低于你定的 ${min}`));
+        else
+          out.push(
+            rr < min
+              ? item("fail", `RR ${rr.toFixed(2)} 低于你定的下限 ${min}`)
+              : item("pass", `RR ${rr.toFixed(2)} ≥ ${min}，符合军规`),
+          );
+        break;
+      }
+      case "max_risk_pct": {
+        const cap = r.param ?? 5;
+        if (!input.principal || input.principal <= 0) {
+          out.push(item("warn", `单笔预亏≤本金${cap}%：未填本金，未核对`));
+        } else {
+          const lev = input.leverage && input.leverage > 0 ? input.leverage : 1;
+          const slDist = Math.abs(input.entry - input.stop_loss) / input.entry;
+          const riskPct = lev * slDist * 100;
+          out.push(
+            riskPct > cap
+              ? item("fail", `打到止损预亏约占本金 ${riskPct.toFixed(1)}%，超过你定的 ${cap}%`)
+              : item("pass", `预亏约占本金 ${riskPct.toFixed(1)}%，在 ${cap}% 以内`),
+          );
+        }
+        break;
+      }
+      case "no_late_night": {
+        out.push(
+          hour < 6
+            ? item("fail", `现在是凌晨 ${hour} 点——你的军规说这个时段不开单（判断力最差的时候）`)
+            : item("pass", `当前 ${hour} 点，不在凌晨禁开时段`),
+        );
+        break;
+      }
+      case "emotion_cap": {
+        const cap = r.param ?? 4;
+        const emo = input.emotion_score ?? 3;
+        out.push(
+          emo >= cap
+            ? item("fail", `情绪自评 ${emo}/5 达到你定的 ${cap} 分红线——先冷静再说`)
+            : item("pass", `情绪自评 ${emo}/5，低于 ${cap} 分红线`),
+        );
+        break;
+      }
+      case "must_have_reason": {
+        const tags = (input.reason_tags ?? []).filter((t) => t !== "凭感觉");
+        const hasText = (input.reason_text ?? "").trim().length >= 10;
+        out.push(
+          tags.length === 0 && !hasText
+            ? item("fail", "没有可验证的开单理由（只有感觉不算）——违反你自己的军规")
+            : item("pass", "有可验证的开单依据"),
+        );
+        break;
+      }
+      default: {
+        // 文本型军规（含 no_martingale 与自定义）：展示型提醒，不判 pass/fail
+        out.push(item("pass", `提醒：${r.text}`));
+        break;
+      }
+    }
+  }
+  return out;
+}
+
 // ─── 请求封装（真接口优先，失败降级 mock） ───
 
 async function post<T>(endpoint: string, body: unknown, timeoutMs = 15_000): Promise<T> {
@@ -464,24 +760,38 @@ async function get<T>(endpoint: string, timeoutMs = 15_000): Promise<T> {
 }
 
 export const mentorApi = {
-  /** 提交计划 → 裁决。后端不可达/未实现时本地 mock 裁决并落本地台账。 */
+  /** 提交计划 → 裁决。后端不可达/未实现时本地 mock 裁决并落本地台账。
+   *  V2：后端 verdict 无 rules 区段时，用本地军规现算补齐（rules_local=true）。 */
   async submitPlan(input: MentorPlanInput): Promise<MentorPlanResponse> {
+    let real: MentorPlanResponse | null = null;
     try {
       const d = await post<MentorPlanResponse>("/mentor/plan", input);
       if (d && d.ok !== false && d.verdict) {
         // R1 热修：真实后端 verdict 字段形态漂移（detail 为对象等），入口归一化
         const verdict = normalizeVerdict(d.verdict);
-        if (verdict) return { ok: true, plan_id: d.plan_id, verdict };
+        if (verdict) real = { ok: true, plan_id: d.plan_id, verdict };
       }
-      throw new Error(d?.error || "裁决响应异常");
+      if (!real) throw new Error(d?.error || "裁决响应异常");
     } catch {
       const verdict = mockVerdict(input);
       const rows = loadMockPlans();
       const id = `m${Date.now()}-${mockSeq++}`;
       rows.unshift({ id, created_at: now(), ...input, verdict, outcome: null });
       saveMockPlans(rows);
-      return { ok: true, plan_id: id, verdict, mock: true };
+      real = { ok: true, plan_id: id, verdict, mock: true };
     }
+    if (!real.verdict.rules || real.verdict.rules.length === 0) {
+      try {
+        const localRules = await evalRulesLocal(input);
+        if (localRules.length) {
+          real.verdict.rules = localRules;
+          real.rules_local = true;
+        }
+      } catch {
+        /* 军规核对失败不阻塞裁决主链路 */
+      }
+    }
+    return real;
   },
 
   /** 台账列表；后端未就绪时读本地 mock 台账 */
@@ -524,14 +834,44 @@ export const mentorApi = {
     }
   },
 
-  /** 信任看板统计；后端未就绪时由本地 mock 台账现算 */
+  /** 信任看板统计；真后端两种形态归一化，后端未就绪时由本地 mock 台账现算 */
   async stats(): Promise<MentorStats> {
     try {
-      const d = await get<MentorStats>("/mentor/stats");
-      if (d && d.ok !== false && Array.isArray(d.by_light)) return d;
-      throw new Error(d?.error || "统计响应异常");
+      const d = await get<unknown>("/mentor/stats");
+      const normalized = normalizeStats(d);
+      if (normalized) return normalized;
+      throw new Error("统计响应异常");
     } catch {
       return mockStats(loadMockPlans());
+    }
+  },
+
+  /** V2 我的军规：GET /mentor/rules；后端未就绪读本地（默认 8 条种子） */
+  async rules(): Promise<MentorRulesResponse> {
+    try {
+      const d = await get<{ ok?: boolean; rules?: unknown[]; error?: string }>("/mentor/rules");
+      if (d && d.ok !== false && Array.isArray(d.rules)) {
+        return {
+          ok: true,
+          rules: (d.rules as Record<string, unknown>[]).map(normalizeRule),
+        };
+      }
+      throw new Error(d?.error || "军规响应异常");
+    } catch {
+      return { ok: true, rules: loadLocalRules(), mock: true };
+    }
+  },
+
+  /** V2 我的军规：POST /mentor/rules 全量保存；后端未就绪落本地（联调后自动切真） */
+  async saveRules(rules: MentorRule[]): Promise<{ ok: boolean; mock?: boolean; error?: string }> {
+    // 本地永远留一份（军规核对 evalRulesLocal 依赖本地副本，双写保证一致）
+    saveLocalRules(rules);
+    try {
+      const d = await post<{ ok?: boolean; error?: string }>("/mentor/rules", { rules });
+      if (d.ok !== false) return { ok: true };
+      throw new Error(d?.error || "军规保存失败");
+    } catch {
+      return { ok: true, mock: true };
     }
   },
 };

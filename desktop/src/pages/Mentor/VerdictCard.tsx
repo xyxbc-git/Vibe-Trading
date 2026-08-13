@@ -72,16 +72,20 @@ export default function VerdictCard({
   planId,
   verdict,
   mock,
+  rulesLocal,
   onDecided,
 }: {
   planId: number | string;
   verdict: MentorVerdict;
   /** true = 本地演示裁决（后端待联调） */
   mock?: boolean;
+  /** true = 军规区段为前端本地核对（后端 V1 rules 未就绪） */
+  rulesLocal?: boolean;
   /** 用户做出执行/放弃决定后的回调（刷新台账） */
   onDecided?: (action: "executed" | "skipped") => void;
 }) {
-  const { light, score, items, summary } = verdict;
+  const { light, score, items, summary, rules } = verdict;
+  const rulesAllPass = (rules ?? []).length > 0 && (rules ?? []).every((r) => r.level === "pass");
 
   // ─── 红灯冷静期倒计时 ───
   const cooldownSec = light === "red" ? Math.max(0, Math.round((verdict.cooldown_min ?? 0) * 60)) : 0;
@@ -215,6 +219,44 @@ export default function VerdictCard({
           );
         })}
       </div>
+
+      {/* V2 军规核对：你自己定的规矩，导师替你逐条盯 */}
+      {rules && rules.length > 0 && (
+        <div className="mb-4">
+          <div className="mb-1.5 flex items-center justify-between">
+            <p className="text-xs font-semibold text-jarvis-text-secondary">
+              军规核对（{rules.filter((r) => r.level === "pass").length}/{rules.length}）
+            </p>
+            {rulesLocal && (
+              <span className="text-[10px] text-jarvis-text-secondary">本地核对 · 后端军规引擎待联调</span>
+            )}
+          </div>
+          {rulesAllPass ? (
+            <div className="mb-2 rounded-lg border border-jarvis-green/40 bg-jarvis-green/10 px-3 py-2.5 text-center text-sm font-bold text-jarvis-green">
+              ✅ 符合你的全部军规
+            </div>
+          ) : null}
+          <div className="space-y-1.5">
+            {rules.map((r, i) => {
+              const detailText = fmtEvidence(r.detail);
+              return (
+                <div
+                  key={`${r.key}-${i}`}
+                  className="flex items-start gap-2 rounded-lg border border-jarvis-border/40 bg-jarvis-bg/40 px-3 py-1.5"
+                >
+                  <LevelIcon level={r.level} />
+                  <div className="min-w-0">
+                    <p className="text-[13px] text-jarvis-text">{fmtEvidence(r.evidence)}</p>
+                    {detailText !== "—" && (
+                      <p className="mt-0.5 text-xs text-jarvis-text-secondary">{detailText}</p>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* 红灯冷静期 */}
       {light === "red" && cooldownActive && (
