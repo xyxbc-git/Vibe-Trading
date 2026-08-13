@@ -154,6 +154,27 @@ export function priceFitOf(g: GeomRef): { zoomY: number; centerPrice: number } |
   };
 }
 
+/**
+ * 视口复位（纯函数，hook 的 resetFollow 与测试共用）：回到最新 + 默认缩放 +
+ * 价格轴回 Auto + 清十字线。[R4] 切币种/切周期必须调用——旧数据集残留的
+ * zoomX 会让新数据 barW 过小触发 RenderMode 降级（足迹只剩蜡烛），残留的
+ * scrollX/rightGapBars/centerPrice 会让视口错位（柱群缩角+大片空白）。
+ * zoomX/zoomY 本值不动，向 target=1 平滑插值过渡（stepViewport 收敛）。
+ */
+export function resetViewport(vp: ViewportState): void {
+  vp.follow = true;
+  vp.centerPrice = null;
+  vp.centerPriceTarget = null;
+  vp.priceAutoFit = true;
+  vp.velX = 0;
+  vp.rightGapBars = RIGHT_GAP_BARS_DEFAULT;
+  vp.zoomTargetX = 1;
+  vp.zoomTargetY = 1;
+  vp.anchor = null;
+  // 十字线一并清掉（指针仍在画布内时下一次 mousemove 即恢复，无感）
+  vp.crosshair = null;
+}
+
 export interface ZoomBounds {
   minX: number;
   maxX: number;
@@ -233,18 +254,10 @@ export function useViewport(getGeom: () => GeomRef): ViewportApi {
     setPriceAutoFit(vpRef.current.priceAutoFit);
   }, []);
 
-  /** 一键复位：回到最新 + 默认缩放 + 价格轴回 Auto（迷失后一步找回） */
+  /** 一键复位：回到最新 + 默认缩放 + 价格轴回 Auto（迷失后一步找回）。
+   *  切币种/切周期的数据集切换也走这里做视口原子重置（R4）。 */
   const resetFollow = useCallback(() => {
-    const vp = vpRef.current;
-    vp.follow = true;
-    vp.centerPrice = null;
-    vp.centerPriceTarget = null;
-    vp.priceAutoFit = true;
-    vp.velX = 0;
-    vp.rightGapBars = RIGHT_GAP_BARS_DEFAULT;
-    vp.zoomTargetX = 1;
-    vp.zoomTargetY = 1;
-    vp.anchor = null;
+    resetViewport(vpRef.current);
     syncFollow();
   }, [syncFollow]);
 

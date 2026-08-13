@@ -412,15 +412,21 @@ export default function FootprintChart() {
     };
   }, [symbol, refreshAnalysis]);
 
-  // 切币种：价格量级完全不同（BTC 6.4 万 vs DOGE 0.12），必须重置视口，
-  // 否则物化过的 centerPrice/scrollX 会让画面落在不存在的价位区域
-  const prevSymbolRef = useRef(symbol);
+  // 切币种/切周期/实时↔历史回看：数据集时间粒度、价格量级或时间跨度完全不同，
+  // 必须原子重置视口。切币种：BTC 6.4 万 vs DOGE 0.12，物化过的 centerPrice
+  // 落在不存在的价位区域；切周期（R4 热修）：旧周期残留的 zoomX 会让新数据
+  // barW 过小、RenderMode 被降级成 candles（足迹只剩普通蜡烛），残留的
+  // scrollX/rightGapBars/centerPrice 则让视口错位（柱群缩在一角+大片空白，
+  // 观感即「左右断裂中间空洞」）；历史→实时同理（历史分支自身落地后还会再
+  // reset 一次，幂等无害）。
+  const prevDatasetRef = useRef(`${symbol}|${tf}|${histDate ?? "live"}`);
   useEffect(() => {
-    if (prevSymbolRef.current !== symbol) {
-      prevSymbolRef.current = symbol;
+    const key = `${symbol}|${tf}|${histDate ?? "live"}`;
+    if (prevDatasetRef.current !== key) {
+      prevDatasetRef.current = key;
       resetFollow();
     }
-  }, [symbol, resetFollow]);
+  }, [symbol, tf, histDate, resetFollow]);
 
   // 数据接入：历史 getBars + 实时 subscribe（同 time 更新末柱，新 time 追加）
   useEffect(() => {

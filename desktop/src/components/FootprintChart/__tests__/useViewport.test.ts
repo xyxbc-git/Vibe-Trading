@@ -8,12 +8,14 @@ import {
   dragPriceStep,
   initialViewport,
   priceFitOf,
+  resetViewport,
   stepViewport,
   wheelNotchZoomFactor,
   zoomBoundsOf,
   type WheelSample,
 } from "../useViewport";
-import { BASE_BAR_W, MAX_ZOOM, MIN_ZOOM, rowHOf } from "../renderer";
+import { BASE_BAR_W, MAX_ZOOM, MIN_ZOOM, computeLayout, rowHOf } from "../renderer";
+import type { FootprintBar } from "../../../types/footprint";
 
 const geom = (over: Partial<Parameters<typeof zoomBoundsOf>[0]> = {}) => ({
   chartW: 880,
@@ -263,5 +265,92 @@ describe("priceAutoFit 价格轴自动适配（TradingView 价格轴 Auto）", (
     vp.centerPrice = 123;
     expect(stepViewport(vp, fitGeom, 1 / 60)).toBe(false);
     expect(vp.centerPrice).toBe(123);
+  });
+});
+
+// ── R4 热修回归：切周期视口原子重置（1m→5m 图形错乱根因防护） ──────────
+describe("resetViewport 数据集切换原子复位", () => {
+  const mkBar = (time: number, px: number): FootprintBar => ({
+    symbol: "BTCUSDT",
+    time,
+    timeframe: "5m",
+    open: px,
+    high: px + 5,
+    low: px - 5,
+    close: px + 2,
+    levels: [{ price: px, bidVol: 10, askVol: 12 }],
+    totalVol: 22,
+    delta: 2,
+    cumDelta: 2,
+    poc: px,
+  });
+
+  /** 模拟用户在 1m 上的操作残留：极小缩放 + 手动滚动位 + 大留白 + 退出 Auto */
+  const polluted = () => {
+    const vp = initialViewport();
+    vp.zoomX = 0.03; // barW≈2.6px → RenderMode 会降级 candles（「只剩蜡烛」根因）
+    vp.zoomTargetX = 0.03;
+    vp.zoomY = 0.4;
+    vp.zoomTargetY = 0.4;
+    vp.follow = false;
+    vp.scrollX = 120_000; // 1m 千余根柱空间下的滚动位（5m 数据集下严重越界）
+    vp.velX = 800;
+    vp.rightGapBars = 30; // 拖出的巨大右留白（错位「空洞」根因之一）
+    vp.priceAutoFit = false;
+    vp.centerPrice = 64_000;
+    vp.centerPriceTarget = null;
+    vp.anchor = { mx: 10, my: 10 };
+    vp.crosshair = { mx: 100, my: 100 };
+    return vp;
+  };
+
+  it("复位归位全部视口状态字段（含 WIP 新增的 Auto/十字线）", () => {
+    const vp = polluted();
+    resetViewport(vp);
+    expect(vp.follow).toBe(true);
+    expect(vp.centerPrice).toBeNull();
+    expect(vp.centerPriceTarget).toBeNull();
+    expect(vp.priceAutoFit).toBe(true);
+    expect(vp.velX).toBe(0);
+    expect(vp.zoomTargetX).toBe(1);
+    expect(vp.zoomTargetY).toBe(1);
+    expect(vp.anchor).toBeNull();
+    expect(vp.crosshair).toBeNull();
+    expect(vp.rightGapBars).toBe(initialViewport().rightGapBars);
+  });
+
+  it("复位+收敛后新周期布局恢复：足迹模式回归、最新柱可见、无越界滚动", () => {
+    const bars = Array.from({ length: 60 }, (_, i) => mkBar(i * 300_000, 64_000));
+    const vp = polluted();
+
+    // 未复位（旧代码路径）：残留 zoomX 使 mode 降级 candles —— bug 现象复现
+    const before = computeLayout(vp, bars, 900, 600, 0.1);
+    expect(before.mode).toBe("candles");
+
+    // 复位 + rAF 插值收敛（zoom 向 target=1 平滑趋近）
+    resetViewport(vp);
+    for (let i = 0; i < 600 && (vp.zoomX !== 1 || vp.zoomY !== 1); i++) {
+      stepViewport(
+        vp,
+        {
+          chartW: 838,
+          maxScroll: 0,
+          centerPriceEff: 64_000,
+          plotH: 494,
+          tick: 0.1,
+          visLo: 63_995,
+          visHi: 64_007,
+          barCount: bars.length,
+        },
+        1 / 60,
+      );
+    }
+    expect(vp.zoomX).toBe(1);
+
+    const after = computeLayout(vp, bars, 900, 600, 0.1);
+    expect(after.mode).not.toBe("candles"); // 足迹格子模式回归
+    expect(after.scrollX).toBe(after.maxScroll); // follow 态贴最新
+    expect(after.visEnd).toBe(bars.length); // 最新柱在可见窗口内
+    expect(after.visStart).toBeGreaterThanOrEqual(0);
   });
 });
